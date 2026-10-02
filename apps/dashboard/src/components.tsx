@@ -3,7 +3,9 @@ import {
   PHASE_FLOW,
   excerpt,
   letterOf,
+  previewView,
   type AuditCard,
+  type SiteRow,
   type Lane,
   type LaneTrain,
   type LandedCommit,
@@ -219,9 +221,51 @@ function TrainCar({ lt }: { lt: LaneTrain }) {
         {phase ? phase.replace("_", " ") : train.status}
         {train.headSha && <code> · {short(train.headSha)}</code>}
       </div>
+      <PreviewLink lt={lt} />
       {train.status === "EJECTED" && train.reason && <div className="car__reason">{excerpt(train.reason.replace(/prompt [0-9a-f-]{36}/, "a prompt"), 70)}</div>}
     </article>
   );
+}
+
+const hostOf = (url: string) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+};
+
+/** The train's Worker Preview: "deploying…" while DEPLOYING, then a link (struck through once torn down). */
+function PreviewLink({ lt }: { lt: LaneTrain }) {
+  const v = previewView(lt.train, lt.preview);
+  switch (v.kind) {
+    case "none":
+      return null;
+    case "deploying":
+      return (
+        <div className="car__preview car__preview--deploying">
+          <i /> deploying preview…
+        </div>
+      );
+    case "live":
+      return (
+        <a className="car__preview car__preview--live" href={v.url} target="_blank" rel="noreferrer" title={v.url}>
+          ↗ {hostOf(v.url)}
+        </a>
+      );
+    case "failed":
+      return (
+        <div className="car__preview car__preview--failed" title={v.summary ?? undefined}>
+          preview failed{v.summary ? `: ${excerpt(v.summary, 40)}` : ""}
+        </div>
+      );
+    case "gone":
+      return (
+        <div className="car__preview car__preview--gone" title={v.url ?? undefined}>
+          preview torn down
+        </div>
+      );
+  }
 }
 
 function CardView({ card, active, onClick }: { card: AuditCard; active: boolean; onClick: () => void }) {
@@ -243,6 +287,15 @@ function CardView({ card, active, onClick }: { card: AuditCard; active: boolean;
 
 export function LedgerPanel({ card, lane, onClose }: { card: AuditCard; lane: Lane; onClose: () => void }) {
   const p = card.payload;
+  // Escape closes the drawer from anywhere (the drawer never takes focus, so a
+  // handler on the <aside> itself would not fire).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
   return (
     <aside className="ledger" role="dialog" aria-label="Cognitive Ledger">
       <header className="ledger__head">
@@ -344,6 +397,54 @@ export function Composer(props: { disabled: boolean; onSubmit: (text: string) =>
         </button>
       </div>
     </form>
+  );
+}
+
+// ── sites ─────────────────────────────────────────────────────────────────
+
+const STATUS_TONE: Record<string, string> = { PENDING: "building", LIVE: "merged", FAILED: "failed", TORN_DOWN: "" };
+
+/** Compact per-environment view of deployments (previews today; staging/canary/prod from P3). */
+export function Sites({ rows, state }: { rows: SiteRow[]; state: State }) {
+  return (
+    <section className="sites panel" aria-label="sites">
+      <p className="eyebrow">SITES</p>
+      <ul className="sites__list">
+        {rows.map((row) => (
+          <li key={row.environment} className={`site${row.configured ? "" : " site--off"}`}>
+            <div className="site__head">
+              <b>{row.environment}</b>
+              {!row.configured ? (
+                <span className="site__muted">not configured</span>
+              ) : row.environment === "preview" ? (
+                <span className="site__muted">
+                  {row.deployments.length} active{row.retired ? ` · ${row.retired} torn down` : ""}
+                </span>
+              ) : null}
+            </div>
+            {row.configured &&
+              row.deployments.slice(0, 6).map((d) => {
+                const train = d.trainId ? state.trains[d.trainId] : undefined;
+                const cars = train ? train.includedPrompts.map((id) => letterOf(state, id)).join("+") : d.deploymentId;
+                return (
+                  <div key={d.deploymentId} className="site__row">
+                    <span className={`chip chip--sm chip--${STATUS_TONE[d.status] ?? ""}`}>{d.status === "PENDING" ? "DEPLOYING" : d.status.replace("_", " ")}</span>
+                    <span className="site__cars">{cars}</span>
+                    {d.url && d.status === "LIVE" ? (
+                      <a href={d.url} target="_blank" rel="noreferrer" title={d.url}>
+                        {hostOf(d.url)}
+                      </a>
+                    ) : (
+                      <span className="site__muted">{d.summary ? excerpt(d.summary, 36) : d.commitSha ? short(d.commitSha) : ""}</span>
+                    )}
+                  </div>
+                );
+              })}
+            {row.environment === "preview" && row.configured && row.deployments.length === 0 && <div className="site__muted">no live previews</div>}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

@@ -24,7 +24,7 @@ describe("DroneWorkflow (Workflows runtime, scripted mode, fake ports)", () => {
 
     const gen = (await instance.waitForStepResult({ name: "generate change set" })) as { model: string; changeSet: { files: unknown[] } };
     expect(gen.model).toBe("queenos/scripted-drone-v1");
-    expect(gen.changeSet.files).toHaveLength(2);
+    expect(gen.changeSet.files).toHaveLength(3);
 
     expect(w.git.pushes.map((p) => [p.url, p.remoteRef])).toEqual([
       [remoteOf("hive-train-wf0000000001"), "main"],

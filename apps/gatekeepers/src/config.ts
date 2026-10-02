@@ -21,7 +21,10 @@ export interface GateConfig {
   artifactsNamespace: string;
   allowedDeps: string[];
   allowedHosts: string[];
-  /** Max `lookup train` attempts while waiting for the Queen to reach TESTING. */
+  /**
+   * Max `lookup train` attempts while waiting for the Queen to reach TESTING.
+   * Default 24 x 5 s = 2 min: covers the build-result race AND the preview deploy (DEPLOYING).
+   */
   phaseRetries: number;
   phaseWaitMs: number;
   aiGateway: AiGatewayConfig;
@@ -85,7 +88,7 @@ export function readConfig(env: GateVars): GateConfig {
     artifactsNamespace: env.ARTIFACTS_NAMESPACE?.trim() || "queenos",
     allowedDeps: splitList(env.POLICY_ALLOWED_DEPS, DEFAULT_ALLOWED_DEPS),
     allowedHosts: splitList(env.SECURITY_ALLOWED_HOSTS, DEFAULT_ALLOWED_HOSTS),
-    phaseRetries: int(env.GATE_PHASE_RETRIES, 8, 1, 30),
+    phaseRetries: int(env.GATE_PHASE_RETRIES, 24, 1, 60),
     phaseWaitMs: int(env.GATE_PHASE_WAIT_MS, 5000, 0, 60_000),
     aiGateway: gw,
     aiGatewayToken: token,

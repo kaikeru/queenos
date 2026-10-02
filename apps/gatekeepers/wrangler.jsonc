@@ -51,8 +51,10 @@
     "POLICY_ALLOWED_DEPS": "hono,zod,acorn,isomorphic-git,@queenos/*,@cloudflare/*,typescript,vitest,wrangler,eslint,typescript-eslint,@types/*",
     // fetch("https://host/...") literals must target these hosts ("*.x.y" = subdomains).
     "SECURITY_ALLOWED_HOSTS": "gateway.ai.cloudflare.com,api.cloudflare.com,*.artifacts.cloudflare.net,localhost,127.0.0.1",
-    // The push event can arrive before the Queen has processed build-result: re-check the phase this often.
-    "GATE_PHASE_RETRIES": "8",
+    // The push event can arrive before the Queen has processed build-result, and the Herald
+    // deploys the Worker Preview (phase DEPLOYING) before TESTING: re-check the phase this
+    // often. 24 x 5 s = 2 minutes.
+    "GATE_PHASE_RETRIES": "24",
     "GATE_PHASE_WAIT_MS": "5000",
     "AI_GATEWAY_ACCOUNT_ID": "",
     "AI_GATEWAY_ID": "queenos",

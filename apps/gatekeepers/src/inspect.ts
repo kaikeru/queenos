@@ -6,10 +6,11 @@
  */
 import type { GateConfig } from "./config";
 import type { GateTask } from "./event";
-import { formatFinding, isCodePath, isSkippedPath, type ScanReport } from "./findings";
+import { formatFinding, isCodePath, isSkippedPath, toReport, type Finding, type ScanReport } from "./findings";
 import type { GatekeeperPorts, GitSession } from "./ports";
 import { scanPolicy } from "./policy";
 import { scanSecurity, MAX_SCAN_BYTES } from "./security";
+import { SMOKE_CHECK } from "./smoke";
 import type { TestRun } from "./test-runner";
 
 export const MAX_FILES = 3_000;
@@ -103,7 +104,16 @@ export function renderFindings(label: string, r: ScanReport): string {
   return [`${label} scan failed: ${errors.length} error finding(s) in ${r.filesScanned} file(s)`, ...errors.map(formatFinding)].join("\n");
 }
 
-export async function inspectPush(ports: GatekeeperPorts, task: GateTask, config: GateConfig, trainId: string): Promise<Inspection> {
+export const SMOKE_SKIPPED_RULE = "preview-smoke-skipped";
+
+export async function inspectPush(
+  ports: GatekeeperPorts,
+  task: GateTask,
+  config: GateConfig,
+  trainId: string,
+  /** The train's Worker Preview URL. Absent (sim mode, old trains): the smoke test is skipped with a warning. */
+  previewUrl: string | null = null,
+): Promise<Inspection> {
   const startedAtMs = Date.now();
   const access = await ports.artifacts.access(task.repo, "read");
   const repo = await ports.git.clone({ remote: access.remote, token: access.token, ref: task.branch, depth: CLONE_DEPTH });
@@ -115,27 +125,48 @@ export async function inspectPush(ports: GatekeeperPorts, task: GateTask, config
   const { files, total } = await readTree(repo);
 
   const policy = scanPolicy(files, { allowedDeps: config.allowedDeps });
-  const security = scanSecurity(files, { allowedHosts: config.allowedHosts });
+  let security = scanSecurity(files, { allowedHosts: config.allowedHosts });
+  if (!previewUrl) {
+    const skipped: Finding = {
+      rule: SMOKE_SKIPPED_RULE,
+      severity: "warning",
+      file: "(preview)",
+      message: "train has no previewUrl: the preview smoke test was skipped",
+    };
+    security = toReport([...security.findings, skipped], security.filesScanned);
+  }
 
   let tests: TestSummary | null = null;
   let failureLog: string | null = null;
   let failingCheck: string | null = null;
 
   if (policy.passed && security.passed) {
+    // 1. The real check: the deployed preview must answer GET / with 2xx.
+    const smoke = previewUrl ? await ports.smoke.check(previewUrl) : null;
     const changedFiles: Record<string, string> = {};
     for (const p of changed) if (files[p] !== undefined) changedFiles[p] = files[p];
-    const run: TestRun = await ports.tests.run({
-      repo: task.repo,
-      trainId,
-      after: task.after,
-      changedPaths: [...changed].sort(),
-      changedFiles,
-      commitMessages: messages,
-      fileCount: total,
-    });
+    // 2. The scripted/sandbox runner, only when the smoke test did not already fail the train.
+    const run: TestRun =
+      smoke && !smoke.passed
+        ? {
+            passed: false,
+            checks: 1,
+            log: smoke.log,
+            failingCheck: SMOKE_CHECK,
+            ...(smoke.firstError ? { firstError: smoke.firstError } : {}),
+          }
+        : await ports.tests.run({
+            repo: task.repo,
+            trainId,
+            after: task.after,
+            changedPaths: [...changed].sort(),
+            changedFiles,
+            commitMessages: messages,
+            fileCount: total,
+          });
     tests = {
       passed: run.passed,
-      checks: run.checks,
+      checks: run.checks + (smoke?.passed ? 1 : 0),
       log: run.passed ? null : run.log.slice(0, MAX_LOG_IN_STEP),
       ...(run.failingCheck ? { failingCheck: run.failingCheck } : {}),
       ...(run.firstError ? { firstError: run.firstError } : {}),

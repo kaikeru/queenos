@@ -1,11 +1,10 @@
 /**
- * Train forks on Cloudflare Artifacts (see docs/discovery.md §1).
- *
- * Forks are repo-level: `(await ARTIFACTS.get(source)).fork(name)`. There is
- * no branch/ref/merge API, so a train is a whole repo named
- * `<namespace>-train-<shortid>`, and landing is a git push done by a drone.
+ * Provisioner ports: every side effect goes through this object (mirrors
+ * apps/drones). Tests swap in fakes via ProvisionerWorkflow.createPorts().
  */
-import { QueenError } from "./errors";
+import type { ProvisionResult } from "@queenos/queen-types";
+
+// ── Artifacts ────────────────────────────────────────────────────────────
 
 export interface ForkResult {
   artifactRepo: string;
@@ -13,26 +12,26 @@ export interface ForkResult {
   baseSha: string;
 }
 
-export interface ForkProvisioner {
+export interface ArtifactsPort {
   /**
    * Fork `sourceRepo` (the hive repo, or the predecessor train's fork) into
    * `forkName`. Idempotent: an existing fork of that name is reused, so a
-   * retried intent after a crash converges.
+   * retried command converges.
    */
   forkTrain(sourceRepo: string, forkName: string): Promise<ForkResult>;
-  /** Delete a fork. Returns false when it did not exist. */
-  deleteFork(name: string): Promise<boolean>;
+  /** Delete a repo. Returns false when it did not exist. */
+  deleteRepo(name: string): Promise<boolean>;
 }
 
 /** Codes that mean "the repo is still being created; try again shortly". */
 const IN_PROGRESS = new Set(["FORK_IN_PROGRESS", "CREATE_IN_PROGRESS", "IMPORT_IN_PROGRESS"]);
 
-function errorCode(e: unknown): string | undefined {
+export function errorCode(e: unknown): string | undefined {
   const code = (e as { code?: unknown } | null)?.code;
   return typeof code === "string" ? code : undefined;
 }
 
-export interface ArtifactsProvisionerOptions {
+export interface BindingArtifactsOptions {
   /** Branch whose head becomes the train's base SHA. Default "main". */
   branch?: string;
   /** Attempts for in-progress errors. Default 6. */
@@ -42,7 +41,8 @@ export interface ArtifactsProvisionerOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
-export class ArtifactsForkProvisioner implements ForkProvisioner {
+/** Ported from apps/queen/src/artifacts.ts (ArtifactsForkProvisioner). */
+export class BindingArtifactsPort implements ArtifactsPort {
   private readonly branch: string;
   private readonly attempts: number;
   private readonly baseDelayMs: number;
@@ -50,7 +50,7 @@ export class ArtifactsForkProvisioner implements ForkProvisioner {
 
   constructor(
     private readonly artifacts: Artifacts | undefined,
-    opts: ArtifactsProvisionerOptions = {},
+    opts: BindingArtifactsOptions = {},
   ) {
     this.branch = opts.branch ?? "main";
     this.attempts = opts.attempts ?? 6;
@@ -61,6 +61,7 @@ export class ArtifactsForkProvisioner implements ForkProvisioner {
   async forkTrain(sourceRepo: string, forkName: string): Promise<ForkResult> {
     const artifacts = this.binding();
     await this.retry(async () => {
+      // Repo handles are Disposable RPC stubs (docs/discovery.md §1).
       using source = await artifacts.get(sourceRepo);
       try {
         await source.fork(forkName, {
@@ -75,19 +76,19 @@ export class ArtifactsForkProvisioner implements ForkProvisioner {
     const baseSha = await this.retry(async () => {
       using fork = await artifacts.get(forkName);
       const [head] = await fork.log({ ref: this.branch, limit: 1 });
-      if (!head) throw new QueenError("UNAVAILABLE", `fork ${forkName} has no ${this.branch} branch`);
+      if (!head) throw new Error(`UNAVAILABLE: fork ${forkName} has no ${this.branch} branch`);
       return head.hash;
     });
     return { artifactRepo: forkName, baseSha };
   }
 
-  async deleteFork(name: string): Promise<boolean> {
+  async deleteRepo(name: string): Promise<boolean> {
     const artifacts = this.binding();
     return this.retry(() => artifacts.delete(name));
   }
 
   private binding(): Artifacts {
-    if (!this.artifacts) throw new QueenError("UNAVAILABLE", "ARTIFACTS binding is not configured");
+    if (!this.artifacts) throw new Error("UNAVAILABLE: ARTIFACTS binding is not configured");
     return this.artifacts;
   }
 
@@ -101,4 +102,37 @@ export class ArtifactsForkProvisioner implements ForkProvisioner {
       }
     }
   }
+}
+
+// ── Queen ────────────────────────────────────────────────────────────────
+
+/** RPC surface of apps/queen's QueenNode used by the provisioner. */
+export interface QueenPort {
+  reportProvisionResult(input: ProvisionResult): Promise<unknown>;
+}
+
+/** Cross-script DO binding to QueenNode; one DO per hive, `idFromName(hive)`. */
+export function queenRpc(ns: DurableObjectNamespace | undefined, hive: string): QueenPort {
+  if (!ns) throw new Error("UNAVAILABLE: QUEEN binding is not configured");
+  // The binding is untyped across scripts; QueenPort mirrors QueenNode's RPC methods.
+  return ns.get(ns.idFromName(hive)) as unknown as QueenPort;
+}
+
+// ── bundle ───────────────────────────────────────────────────────────────
+
+export interface ProvisionerPorts {
+  artifacts: ArtifactsPort;
+  queen(hive: string): QueenPort;
+}
+
+export interface ProvisionerEnvBindings {
+  ARTIFACTS?: Artifacts;
+  QUEEN?: DurableObjectNamespace;
+}
+
+export function createProdPorts(env: ProvisionerEnvBindings): ProvisionerPorts {
+  return {
+    artifacts: new BindingArtifactsPort(env.ARTIFACTS),
+    queen: (hive) => queenRpc(env.QUEEN, hive),
+  };
 }

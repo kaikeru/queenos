@@ -26,7 +26,7 @@ const SECRET_RULES: SecretRule[] = [
   { id: "anthropic-key", re: /\bsk-ant-[A-Za-z0-9_-]{20,}/ },
   { id: "openai-key", re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}/ },
   { id: "slack-token", re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/ },
-  { id: "artifacts-token", re: /\bart_v1_[0-9a-f]{40}/ },
+  { id: "artifacts-token", re: /\bart_v\d+_[A-Za-z0-9_]{20,}/ }, // art_v1_<hex> (docs) and art_v2_x_<hex> (observed 2026-10-02)
   { id: "cloudflare-token", re: /\b(?:CLOUDFLARE|CF)_API_TOKEN\s*[:=]\s*["']?[A-Za-z0-9_-]{30,}/ },
   { id: "generic-secret", re: /\b(?:api[_-]?key|secret|passw(?:or)?d|auth[_-]?token|access[_-]?token)\b["']?\s*[:=]\s*["'][A-Za-z0-9/+_=.-]{20,}["']/i },
 ];

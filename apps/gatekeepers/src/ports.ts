@@ -7,6 +7,7 @@ import { AiGatewayClient, cloneRepo, type GitRepo } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import type { GateTask } from "./event";
 import type { ScribeLlm } from "./scribe";
+import { FetchSmokeProbe, type SmokeProbe } from "./smoke";
 import { createTestRunner, type TestRunner } from "./test-runner";
 
 // ── Artifacts ────────────────────────────────────────────────────────────
@@ -146,6 +147,8 @@ export interface GatekeeperPorts {
   /** Null: extractive Scribe. */
   llm: ScribeLlm | null;
   tests: TestRunner;
+  /** `GET <previewUrl>/` against the train's Worker Preview. */
+  smoke: SmokeProbe;
   failures: FailureStore;
   dispatcher: GateDispatcher;
 }
@@ -166,6 +169,7 @@ export function createProdPorts(env: GateEnvBindings, config: GateConfig): Gatek
     queen: (hive) => queenRpc(env.QUEEN, hive),
     llm: useLlm ? new AiGatewayClient({ config: config.aiGateway, token: config.aiGatewayToken }) : null,
     tests: createTestRunner(config.testMode),
+    smoke: new FetchSmokeProbe(),
     failures: new VectorizeFailureStore(env.AI, env.VECTORIZE),
     dispatcher: new WorkflowGateDispatcher(env.GATEKEEPER_WORKFLOW),
   };

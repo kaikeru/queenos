@@ -128,6 +128,14 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .car__meta { font: 12px var(--mono); color: var(--dim); letter-spacing: 0.06em; }
 .car__reason { font-size: 12px; color: var(--red); margin-top: 4px; opacity: 0.9; }
 
+.car__preview { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; font: 12px var(--mono); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.car__preview--live { color: var(--cyan); text-decoration: none; border-bottom: 1px dashed rgba(60, 217, 255, 0.5); }
+.car__preview--live:hover { color: var(--text); border-bottom-color: var(--text); }
+.car__preview--deploying { color: var(--yellow); }
+.car__preview--deploying i { width: 8px; height: 8px; border-radius: 50%; background: var(--yellow); animation: pulse 1s infinite; }
+.car__preview--failed { color: var(--red); }
+.car__preview--gone { color: var(--faint); text-decoration: line-through; }
+
 /* audit cards */
 .cards { display: flex; gap: 14px; flex-wrap: wrap; }
 .cards__group { display: flex; flex-direction: column; gap: 6px; }
@@ -154,6 +162,18 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .btn--primary { background: rgba(60, 217, 255, 0.12); border-color: rgba(60, 217, 255, 0.5); color: var(--cyan); }
 .btn--swarm { flex: 1; background: linear-gradient(135deg, rgba(167, 139, 250, 0.25), rgba(60, 217, 255, 0.2)); border-color: rgba(167, 139, 250, 0.6); }
+
+.sites__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.site { background: var(--bg-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.site--off { opacity: 0.55; }
+.site__head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.site__head b { font: 700 13px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; }
+.site__muted { font: 12px var(--mono); color: var(--faint); }
+.site__row { display: grid; grid-template-columns: auto auto 1fr; gap: 8px; align-items: center; font: 12px var(--mono); }
+.site__row a { color: var(--cyan); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.site__row a:hover { text-decoration: underline; }
+.site__cars { color: var(--dim); }
+.chip--sm { font-size: 10px; padding: 2px 6px; }
 
 .ticker { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 .ticker .live { color: var(--red); margin-left: 8px; animation: pulse 1.4s infinite; }

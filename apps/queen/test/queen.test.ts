@@ -1,10 +1,10 @@
 import { env, exports } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { DroneTask, QueenServerMessage } from "@queenos/queen-types";
+import type { DeployCommand, DroneTask, ProvisionCommand, QueenServerMessage } from "@queenos/queen-types";
 import type { QueenNode, SocketAttachment } from "../src/queen-node";
 import { migrate } from "../src/db";
-import type { FakeForkProvisioner, RecordingDispatcher } from "./fakes";
+import type { RecordingDispatcher, RecordingHerald, RecordingProvisioner } from "./fakes";
 
 const worker = exports.default;
 /** wrangler.jsonc env.test sets QUEEN_INTERNAL_TOKEN. */
@@ -51,20 +51,75 @@ interface TrainRow {
   artifact_repo: string;
   fork_source: string | null;
   fork_state: string;
+  deploy_state: string;
+  preview_url: string | null;
 }
+
+type Fork = Extract<ProvisionCommand, { op: "FORK" }>;
 
 function inspect(ns: string) {
   return runInDurableObject(stubFor(ns), (q: QueenNode) => {
-    const fake = q.ports.provisioner as FakeForkProvisioner;
+    const provisioner = q.ports.provisioner as RecordingProvisioner;
+    const herald = q.ports.herald as RecordingHerald;
     const drones = q.ports.dispatcher as RecordingDispatcher;
+    const provisions = provisioner.commands.map((c) => ({ ...c })) as ProvisionCommand[];
+    const deploys = herald.commands.map((c) => ({ ...c })) as DeployCommand[];
     return {
-      forks: [...fake.forks],
-      deleted: [...fake.deleted],
+      provisions,
+      deploys,
+      forks: provisions.filter((c): c is Fork => c.op === "FORK").map((c) => ({ source: c.sourceRepo, name: c.forkName, commandId: c.commandId, trainId: c.trainId })),
+      deleted: provisions.flatMap((c) => (c.op === "DELETE" ? [c.repo] : [])),
       tasks: drones.tasks.map((t) => ({ ...t })) as DroneTask[],
       trains: q.sql.exec("SELECT * FROM merge_trains ORDER BY seq").toArray() as unknown as TrainRow[],
       prompts: q.sql.exec("SELECT prompt_id, status, summary, attempts FROM prompt_runs ORDER BY seq").toArray(),
     };
   });
+}
+
+const previewUrl = (trainId: string) => `https://${trainId}-preview.test.dev`;
+
+/**
+ * Play the executors: report every not-yet-reported FORK (and, unless
+ * `deploys` is false, every preview DEPLOY) as ok over the HTTP webhooks,
+ * until nothing new is dispatched.
+ */
+async function settle(ns: string, reported: Set<string>, opts: { deploys?: boolean } = {}): Promise<void> {
+  for (let round = 0; round < 20; round++) {
+    const s = await inspect(ns);
+    let progressed = false;
+    for (const c of s.provisions) {
+      if (c.op !== "FORK" || reported.has(c.commandId)) continue;
+      reported.add(c.commandId);
+      progressed = true;
+      const res = await post(ns, "/internal/webhook/provision-result", {
+        commandId: c.commandId,
+        op: "FORK",
+        trainId: c.trainId,
+        ok: true,
+        artifactRepo: c.forkName,
+        baseSha: `sha-of-${c.sourceRepo}`,
+      });
+      expect(res.status).toBe(200);
+    }
+    if (opts.deploys !== false) {
+      for (const c of s.deploys) {
+        if (c.op !== "DEPLOY" || reported.has(c.commandId)) continue;
+        reported.add(c.commandId);
+        progressed = true;
+        const res = await post(ns, "/internal/webhook/deploy-result", {
+          commandId: c.commandId,
+          op: "DEPLOY",
+          environment: "preview",
+          trainId: c.trainId,
+          ok: true,
+          url: previewUrl(c.trainId!),
+          commitSha: c.commitSha,
+        });
+        expect(res.status).toBe(200);
+      }
+    }
+    if (!progressed) return;
+  }
 }
 
 async function connect(path: string): Promise<{ ws: WebSocket; next: (pred?: (m: QueenServerMessage) => boolean) => Promise<QueenServerMessage> }> {
@@ -113,16 +168,26 @@ describe("merge train via HTTP", () => {
     expect(s.trains.map((t) => t.status)).toEqual(["BUILDING", "BUILDING", "BUILDING"]);
     const [t1, t2, t3] = s.trains;
     expect(t1!.artifact_repo).toMatch(new RegExp(`^${ns}-train-[0-9a-f]{12}$`));
-    expect(s.forks).toEqual([{ source: ns, name: t1!.artifact_repo }]);
+    // The Queen only dispatches the fork; nothing is built until the Provisioner reports.
+    expect(s.forks).toEqual([{ source: ns, name: t1!.artifact_repo, commandId: `${t1!.train_id}-fork-1`, trainId: t1!.train_id }]);
+    expect(s.tasks).toEqual([]);
+    const reported = new Set<string>();
+    await settle(ns, reported);
+    s = await inspect(ns);
     expect(s.tasks).toEqual([
       expect.objectContaining({ trainId: t1!.train_id, promptId: a, role: "BUILDER", action: "BUILD", ragContext: [] }),
     ]);
 
     for (const t of [t1!, t2!]) {
       const res = await post(ns, "/internal/webhook/build-result", { trainId: t.train_id, headSha: `h-${t.train_id}` });
-      expect(await res.json()).toMatchObject({ outcome: "applied", train: { status: "TESTING" } });
+      expect(await res.json()).toMatchObject({ outcome: "applied", train: { status: "TESTING", phase: "DEPLOYING" } });
+      await settle(ns, reported, { deploys: false });
     }
     s = await inspect(ns);
+    expect(s.deploys.map((d) => d.op === "DEPLOY" && [d.trainId, d.environment, d.artifactRepo, d.commitSha])).toEqual([
+      [t1!.train_id, "preview", t1!.artifact_repo, `h-${t1!.train_id}`],
+      [t2!.train_id, "preview", t2!.artifact_repo, `h-${t2!.train_id}`],
+    ]);
     expect(s.forks.map((f) => f.source)).toEqual([ns, t1!.artifact_repo, t2!.artifact_repo]);
     expect(s.forks.map((f) => f.name)).toEqual([t1!.artifact_repo, t2!.artifact_repo, t3!.artifact_repo]);
     expect(s.tasks.map((t) => t.promptId)).toEqual([a, b, c]);
@@ -132,8 +197,11 @@ describe("merge train via HTTP", () => {
     const ns = newHive();
     const [a, b, c] = [await submit(ns, "A"), await submit(ns, "B"), await submit(ns, "C")];
     const [t1, t2, t3] = (await inspect(ns)).trains;
+    const reported = new Set<string>();
+    await settle(ns, reported);
     for (const t of [t1!, t2!, t3!]) {
       await post(ns, "/internal/webhook/build-result", { trainId: t.train_id, headSha: `h-${t.prompt_id}` });
+      await settle(ns, reported);
     }
 
     // B fails: B ejected (rework), C superseded and re-provisioned as main+[A,C].
@@ -165,8 +233,10 @@ describe("merge train via HTTP", () => {
     expect(await late.json()).toMatchObject({ outcome: "ignored:stale", train: { status: "EJECTED" } });
 
     // A REWORK drone carries the Scribe summary once B's new train forks.
+    await settle(ns, reported);
     const cTrain = active[1]!;
     await post(ns, "/internal/webhook/build-result", { trainId: cTrain.train_id, headSha: "h-c2" });
+    await settle(ns, reported);
     s = await inspect(ns);
     expect(s.tasks.at(-1)).toMatchObject({ promptId: b, action: "REWORK", scribeSummary: "B: 3 tests failed" });
   });
@@ -186,6 +256,129 @@ describe("merge train via HTTP", () => {
   });
 });
 
+type Snapshot = Extract<QueenServerMessage, { type: "snapshot" }>;
+const snapshotOf = async (ns: string) => (await worker.fetch(`http://q/hives/${ns}/snapshot`)).json<Snapshot>();
+
+/** One prompt, forked, built and (optionally) with its preview live. Returns the train. */
+async function oneTrain(ns: string, opts: { live?: boolean } = {}) {
+  await submit(ns, "A");
+  const reported = new Set<string>();
+  await settle(ns, reported);
+  const [t] = (await inspect(ns)).trains;
+  await post(ns, "/internal/webhook/build-result", { trainId: t!.train_id, headSha: "h-a" });
+  if (opts.live) await settle(ns, reported);
+  return { trainId: t!.train_id, repo: t!.artifact_repo, reported };
+}
+
+describe("executor results", () => {
+  it("reportProvisionResult (RPC) advances the planner exactly like the old inline fork; duplicates are no-ops", async () => {
+    const ns = newHive();
+    await submit(ns, "A");
+    const [t] = (await inspect(ns)).trains;
+    const result = { commandId: `${t!.train_id}-fork-1`, op: "FORK" as const, trainId: t!.train_id, ok: true, artifactRepo: t!.artifact_repo, baseSha: "base-1" };
+    const first = await stubFor(ns).reportProvisionResult(result);
+    expect(first).toMatchObject({ outcome: "applied", train: { baseSha: "base-1", status: "BUILDING", phase: "BUILDING" } });
+    const dup = await stubFor(ns).reportProvisionResult(result);
+    expect(dup.outcome).toBe("ignored:duplicate");
+    const stale = await stubFor(ns).reportProvisionResult({ ...result, commandId: "old-fork-0" });
+    expect(stale.outcome).toBe("ignored:stale");
+    const s = await inspect(ns);
+    expect(s.tasks).toHaveLength(1);
+    expect(s.trains[0]).toMatchObject({ fork_state: "READY" });
+    expect(await rpcError(stubFor(ns).reportProvisionResult({ ...result, trainId: "nope" }))).toMatch(/^NOT_FOUND: /);
+    expect(await rpcError(stubFor(ns).reportProvisionResult({ ...result, op: "MOVE" } as never))).toMatch(/^INVALID_INPUT: /);
+  });
+
+  it("a failed fork is retried under a new command id (provision-result over HTTP)", async () => {
+    const ns = newHive();
+    await submit(ns, "A");
+    const [t] = (await inspect(ns)).trains;
+    const res = await post(ns, "/internal/webhook/provision-result", { commandId: `${t!.train_id}-fork-1`, op: "FORK", trainId: t!.train_id, ok: false, summary: "503" });
+    expect(await res.json()).toMatchObject({ outcome: "applied", train: { phase: "BUILDING" } });
+    expect((await inspect(ns)).forks.map((f) => f.commandId)).toEqual([`${t!.train_id}-fork-1`, `${t!.train_id}-fork-2`]);
+  });
+
+  it("deploy-result (HTTP): a LIVE preview moves DEPLOYING -> TESTING and shows in snapshots", async () => {
+    const ns = newHive();
+    const { trainId } = await oneTrain(ns);
+    let snap = await snapshotOf(ns);
+    expect(snap.trains[0]).toMatchObject({ phase: "DEPLOYING", status: "TESTING", previewUrl: null });
+    expect(snap.deployments).toEqual([expect.objectContaining({ deploymentId: `preview-${trainId}`, environment: "preview", status: "PENDING", commitSha: "h-a" })]);
+
+    const body = { commandId: `${trainId}-deploy-1`, op: "DEPLOY", environment: "preview", trainId, ok: true, url: previewUrl(trainId), versionId: "v-1" };
+    const res = await post(ns, "/internal/webhook/deploy-result", body);
+    expect(await res.json()).toMatchObject({ outcome: "applied", train: { phase: "TESTING", previewUrl: previewUrl(trainId) } });
+    expect(await (await post(ns, "/internal/webhook/deploy-result", body)).json()).toMatchObject({ outcome: "ignored:duplicate" });
+
+    snap = await snapshotOf(ns);
+    expect(snap.trains[0]).toMatchObject({ phase: "TESTING", previewUrl: previewUrl(trainId) });
+    expect(snap.deployments).toEqual([expect.objectContaining({ status: "LIVE", url: previewUrl(trainId), versionId: "v-1", hive: ns })]);
+    // Gatekeepers can now pass the train.
+    const pass = await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "smoke ok" });
+    expect(await pass.json()).toMatchObject({ outcome: "applied", train: { phase: "LANDING" } });
+  });
+
+  it("a gatekeeper pass while DEPLOYING is premature", async () => {
+    const ns = newHive();
+    const { trainId } = await oneTrain(ns);
+    const res = await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "too early" });
+    expect(await res.json()).toMatchObject({ outcome: "ignored:premature", train: { phase: "DEPLOYING" } });
+  });
+
+  it("reportDeployResult (RPC) failure ejects the train for rework and tears the preview down", async () => {
+    const ns = newHive();
+    const { trainId } = await oneTrain(ns);
+    const r = await stubFor(ns).reportDeployResult({
+      commandId: `${trainId}-deploy-1`,
+      op: "DEPLOY",
+      environment: "preview",
+      trainId,
+      ok: false,
+      summary: "Worker threw on startup.",
+    });
+    expect(r).toMatchObject({ outcome: "applied", train: { status: "EJECTED", reason: "failed: preview deploy failed: Worker threw on startup." } });
+    const s = await inspect(ns);
+    expect(s.deploys.map((d) => [d.op, d.commandId])).toEqual([
+      ["DEPLOY", `${trainId}-deploy-1`],
+      ["TEARDOWN", `${trainId}-teardown-1`],
+    ]);
+    expect(s.prompts[0]).toMatchObject({ status: "QUEUED", summary: "Worker threw on startup.", attempts: 1 });
+    const snap = await snapshotOf(ns);
+    expect(snap.deployments?.[0]).toMatchObject({ status: "FAILED", summary: "Worker threw on startup." });
+  });
+
+  it("MERGED tears the preview down; a teardown result without trainId is matched by command id", async () => {
+    const ns = newHive();
+    const { trainId } = await oneTrain(ns, { live: true });
+    await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "ok" });
+    await post(ns, "/internal/webhook/land-result", { trainId, landed: true, mainSha: "m1" });
+    const s = await inspect(ns);
+    expect(s.deploys.at(-1)).toEqual({ op: "TEARDOWN", commandId: `${trainId}-teardown-1`, hive: ns, environment: "preview", trainId });
+    expect(s.trains[0]).toMatchObject({ phase: "MERGED", deploy_state: "TEARING_DOWN", preview_url: previewUrl(trainId) });
+
+    const td = { commandId: `${trainId}-teardown-1`, op: "TEARDOWN", environment: "preview", ok: true };
+    expect(await (await post(ns, "/internal/webhook/deploy-result", td)).json()).toMatchObject({ outcome: "applied", train: { status: "MERGED" } });
+    expect(await (await post(ns, "/internal/webhook/deploy-result", td)).json()).toMatchObject({ outcome: "ignored:duplicate" });
+    expect((await snapshotOf(ns)).deployments?.[0]).toMatchObject({ status: "TORN_DOWN" });
+    expect(await rpcError(stubFor(ns).reportDeployResult({ commandId: "unknown-cmd", op: "TEARDOWN", environment: "preview", ok: true }))).toMatch(
+      /^NOT_FOUND: /,
+    );
+  });
+
+  it("a failed dispatch is re-sent by the reconcile alarm under the same command id", async () => {
+    const ns = newHive();
+    await runInDurableObject(stubFor(ns), (q: QueenNode) => {
+      (q.ports.provisioner as RecordingProvisioner).failNext = 1;
+    });
+    await submit(ns, "A");
+    expect((await inspect(ns)).forks).toEqual([]);
+    const [t] = (await inspect(ns)).trains;
+    expect(t).toMatchObject({ fork_state: "PENDING" });
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    expect((await inspect(ns)).forks.map((f) => f.commandId)).toEqual([`${t!.train_id}-fork-1`]);
+  });
+});
+
 describe("validation", () => {
   it("rejects invalid payloads with 400 / 404", async () => {
     const ns = newHive();
@@ -196,6 +389,10 @@ describe("validation", () => {
       ["/internal/webhook/train-result", { trainId: "t", passed: "yes", summary: "" }, 400],
       ["/internal/webhook/train-result", { trainId: "missing", passed: true, summary: "" }, 404],
       ["/internal/webhook/land-result", { trainId: "t", landed: true }, 400],
+      ["/internal/webhook/provision-result", { commandId: "c", op: "FORK", trainId: "t", ok: "yes" }, 400],
+      ["/internal/webhook/provision-result", { commandId: "c", op: "FORK", trainId: "missing", ok: true }, 404],
+      ["/internal/webhook/deploy-result", { commandId: "c", op: "DEPLOY", environment: "preview", ok: true, url: "nope" }, 400],
+      ["/internal/webhook/deploy-result", { commandId: "c", op: "DEPLOY", environment: "preview", ok: true }, 404],
       ["/audit", { promptId: "p", droneRole: "BUILDER", status: "ok" }, 400],
       ["/audit", { promptId: "missing", droneRole: "BUILDER", status: "RUNNING" }, 404],
       ["/scribe", { summary: "no ids" }, 400],
@@ -238,9 +435,11 @@ describe("War Room WebSocket", () => {
     if (snap.type === "snapshot") expect(snap.promptRuns).toHaveLength(1);
 
     const [t] = (await inspect(ns)).trains;
+    await settle(ns, new Set());
     await post(ns, "/internal/webhook/build-result", { trainId: t!.train_id, headSha: "h" });
-    const upd = await next((m) => m.type === "train.updated");
-    expect(upd).toMatchObject({ type: "train.updated", train: { trainId: t!.train_id, status: "TESTING" } });
+    const upd = await next((m) => m.type === "train.updated" && m.train.phase === "DEPLOYING");
+    expect(upd).toMatchObject({ type: "train.updated", train: { trainId: t!.train_id, status: "TESTING", phase: "DEPLOYING" } });
+    expect(await next((m) => m.type === "deployment.updated")).toMatchObject({ deployment: { trainId: t!.train_id, status: "PENDING" } });
     ws.close(1000, "done");
   });
 
@@ -317,8 +516,8 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([1, 1, 1]);
-    expect(state.tables).toEqual(["audit_trail", "merge_trains", "prompt_runs"]);
+    expect([state.before, state.after, state.version]).toEqual([2, 2, 2]);
+    expect(state.tables).toEqual(["audit_trail", "deployments", "merge_trains", "prompt_runs"]);
     ws.close(1000, "done");
   });
 });

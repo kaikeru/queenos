@@ -6,11 +6,16 @@ export type TrainState = z.infer<typeof TrainStateSchema>;
 /**
  * Queen-internal train lifecycle, exposed so the War Room can show *why* a
  * train is BUILDING or TESTING. `status` is derived from it:
- * WAITING_PARENT/BUILDING -> BUILDING; TESTING/PASSED/LANDING -> TESTING.
+ * WAITING_PARENT/BUILDING -> BUILDING; DEPLOYING/TESTING/PASSED/LANDING -> TESTING.
+ *
+ * DEPLOYING: the builder pushed and the Herald is deploying the train head to
+ * its per-train Worker Preview. Gatekeepers wait for TESTING, then smoke-test
+ * `MergeTrain.previewUrl`.
  */
 export const TrainPhaseSchema = z.enum([
   "WAITING_PARENT",
   "BUILDING",
+  "DEPLOYING",
   "TESTING",
   "PASSED",
   "LANDING",

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ChangeSetError, MAX_FILE_BYTES, MAX_FILES, parseChangeSet, validateChangeSet } from "../src/change-set";
 import { DEFAULT_MODEL, readConfig, ConfigError } from "../src/config";
-import { SCRIPTED_MODEL, fnv1a, scriptedChangeSet, slugify } from "../src/scripted";
+import { SCRIPTED_MODEL, fnv1a, mergeRegistry, registryModules, renderRegistry, scriptedChangeSet, slugify } from "../src/scripted";
 import { buildBuilderMessages } from "../src/prompt";
 
 const ok = { files: [{ path: "src/a.ts", content: "export {};\n" }], reasoningSteps: ["r"], discardedPaths: [] };
@@ -46,7 +46,11 @@ describe("scripted generator", () => {
     expect(scriptedChangeSet(t)).toEqual(a);
     expect(validateChangeSet(a)).toEqual(a);
     const id = fnv1a("p-1:Add a Dark Mode toggle!");
-    expect(a.files.map((f) => f.path)).toEqual([`features/add-a-dark-mode-toggle-${id}.md`, `src/features/add-a-dark-mode-toggle-${id}.ts`]);
+    expect(a.files.map((f) => f.path)).toEqual([
+      `features/add-a-dark-mode-toggle-${id}.md`,
+      `src/features/add-a-dark-mode-toggle-${id}.js`,
+      "src/features/index.js",
+    ]);
     expect(a.files[0]!.content).toContain("Add a Dark Mode toggle!");
     expect(a.reasoningSteps.length).toBeGreaterThanOrEqual(3);
     expect(a.discardedPaths.length).toBe(1);
@@ -61,8 +65,51 @@ describe("scripted generator", () => {
     const r = scriptedChangeSet({ ...t, action: "REWORK", scribeSummary: "tests failed on null theme", ragContext: ["theme.ts uses tokens"] });
     expect(r.files[0]!.content).toContain("tests failed on null theme");
     expect(r.files[0]!.content).toContain("theme.ts uses tokens");
-    expect(r.files[1]!.content).toContain("revision: 2");
+    expect(r.files[1]!.content).toContain("revision = 2");
     expect(r.reasoningSteps.join(" ")).toMatch(/Rework/);
+  });
+
+  /** Evaluate a generated ES module: strip `export` and collect the named exports. */
+  const load = (code: string) =>
+    new Function(`${code.replace(/^export /gm, "")}; return { slug, revision, handle, guard: typeof guard === "function" ? guard : undefined };`)() as {
+      slug: string;
+      revision: number;
+      handle(): Response;
+      guard?: () => void;
+    };
+
+  it("emits a deployable JS module that serves /features/<slug> and a matching registry", async () => {
+    const a = scriptedChangeSet(t);
+    const mod = load(a.files[1]!.content);
+    expect(mod.slug).toBe("add-a-dark-mode-toggle");
+    expect(mod.guard).toBeUndefined();
+    expect(await mod.handle().json()).toEqual({ feature: "add-a-dark-mode-toggle", promptId: "p-1", revision: 1, enabled: true });
+    const file = a.files[1]!.path.replace("src/features/", "");
+    expect(a.files[2]!.content).toBe(renderRegistry([file]));
+    expect(a.files[2]!.content).toContain(`import * as f0 from "./${file}";`);
+    expect(a.files[2]!.content).toContain("export const features = [f0];");
+  });
+
+  it("[fail] on the first BUILD ships a guard that throws; the REWORK fixes it", () => {
+    const bad = scriptedChangeSet({ ...t, promptText: "Add retries [fail]" });
+    expect(() => load(bad.files[1]!.content).guard!()).toThrow(TypeError);
+    const fixed = scriptedChangeSet({ ...t, promptText: "Add retries [fail]", action: "REWORK", scribeSummary: "GET / returned 500" });
+    expect(load(fixed.files[1]!.content).guard).toBeUndefined();
+    expect(load(fixed.files[1]!.content).revision).toBe(2);
+    // Same module path, so the rework overwrites the buggy file.
+    expect(fixed.files[1]!.path).toBe(bad.files[1]!.path);
+    expect(fixed.files[0]!.content).toMatch(/^## Rework\s*$/m);
+    // Prompts without the marker never ship the bug.
+    expect(load(scriptedChangeSet(t).files[1]!.content).guard).toBeUndefined();
+  });
+
+  it("merges the registry with features already on the train", () => {
+    const first = renderRegistry(["b-1.js"]);
+    const merged = mergeRegistry(first, ["a-2.js", "b-1.js"]);
+    expect(registryModules(merged)).toEqual(["a-2.js", "b-1.js"]);
+    expect(merged).toContain("export const features = [f0, f1];");
+    expect(mergeRegistry(null, ["x.js"])).toBe(renderRegistry(["x.js"]));
+    expect(renderRegistry([])).toContain("export const features = [];");
   });
 
   it("slugifies safely", () => {

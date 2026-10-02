@@ -109,13 +109,16 @@ Needs a Workers Paid account (Artifacts) and wrangler 4.145+. Steps marked **(un
    - Artifacts namespace `queenos` is referenced by the bindings; create the hive repo named after the hive namespace (e.g. `demo`) with `env.ARTIFACTS.create("demo")` from any Worker, or the Artifacts REST API **(unverified: no wrangler subcommand is assumed; the runbook has a snippet)**. It must have an initial commit on `main`.
    - Vectorize index for failure memory: `wrangler vectorize create queenos-failures --dimensions=768 --metric=cosine`. This matches the gatekeepers' binding and the 768-dim `@cf/baai/bge-base-en-v1.5` embeddings.
    - AI Gateway named `queenos` (authenticated), with your provider key stored via BYOK in the dashboard.
-2. **Deploy order.** Workers bind to each other: the Queen binds the drones Workflow (`script_name: queenos-drones`), drones bind the Queen DO (`script_name: queen`), and gatekeepers bind the Queen DO. Whether wrangler accepts a binding to a script that does not exist yet is **unverified**. Try, in order:
-   ```bash
-   pnpm --filter @queenos/queen deploy         # worker name: queen
-   pnpm --filter @queenos/drones deploy        # worker name: queenos-drones
-   pnpm --filter @queenos/gatekeepers deploy   # worker name: queenos-gatekeepers
-   ```
-   If the first deploy is rejected because `queenos-drones` is missing, deploy drones, then queen, then redeploy drones. Gatekeepers go last because they depend on the Queen's DO class.
+2. **Deploy order.** The Workers bind to each other in a cycle, and wrangler rejects a binding to a script that doesn't exist yet (code 10061, verified in `docs/day1-results.md`):
+   - the Queen binds the drones, provisioner and herald Workflows;
+   - every executor binds the Queen's Durable Object.
+   
+   Bootstrap it in three passes:
+   1. Deploy the Queen **without** its cross-script `workflows` bindings, so the DO class exists.
+   2. Deploy `queenos-drones`, `queenos-provisioner`, `queenos-herald` and `queenos-gatekeepers`.
+   3. Redeploy the Queen with the full config.
+   
+   A scripted bootstrap is planned for P2. Until then, temporarily comment out the Queen's `workflows` array for the first pass.
    Deploy scripts pass `--env=""` so wrangler targets the top-level config. The `sim` and `test` envs are not for deployment.
 3. **Secrets.**
    ```bash

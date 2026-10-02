@@ -54,6 +54,7 @@ describe("BUILD (scripted)", () => {
     expect(head?.message).toContain(droneTrailer(DroneTaskSchema.parse(task())));
     const files = await repo.listFiles();
     for (const f of scriptedChangeSet(DroneTaskSchema.parse(task())).files) expect(files).toContain(f.path);
+    expect(files).toContain("src/features/index.js");
 
     // Ledger note on the code commit.
     const note = parseLedger((await repo.readNote(out.codeSha))!);
@@ -68,6 +69,17 @@ describe("BUILD (scripted)", () => {
     const [running, passed] = q.audits();
     expect(running).toMatchObject({ promptId: "prompt-1", droneRole: "BUILDER", status: "RUNNING", gitNotesPayload: null });
     expect(passed).toMatchObject({ droneRole: "BUILDER", status: "PASSED", gitNotesPayload: note });
+  });
+
+  it("keeps earlier features registered when a second train builds on the first", async () => {
+    const { w } = await world();
+    await runDrone(task({ promptId: "p-a", promptText: "Add search" }), new InlineSteps(), w.ports(), scripted);
+    await runDrone(task({ promptId: "p-b", promptText: "Add export [fail]" }), new InlineSteps(), w.ports(), scripted);
+    const registry = (await w.git.repo("hive-train-aaaaaaaaaaaa").readFiles(["src/features/index.js"]))["src/features/index.js"]!;
+    expect(registry.match(/^import \* as /gm)).toHaveLength(2);
+    expect(registry).toMatch(/add-export-fail-[0-9a-f]{8}\.js/);
+    expect(registry).toMatch(/add-search-[0-9a-f]{8}\.js/);
+    expect(registry).toContain("export const features = [f0, f1];");
   });
 
   it("falls back to .queen/ledger/<sha>.json when the notes push is refused", async () => {

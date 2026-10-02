@@ -12,6 +12,8 @@ const routes: Array<[string, string, unknown]> = [
   ["/internal/webhook/train-result", "POST", { trainId: "t1", status: "PASSED" }],
   ["/internal/webhook/build-result", "POST", {}],
   ["/internal/webhook/land-result", "POST", {}],
+  ["/internal/webhook/provision-result", "POST", {}],
+  ["/internal/webhook/deploy-result", "POST", {}],
   ["/trains/t1/result", "POST", {}],
   ["/audit", "POST", {}],
   ["/scribe", "POST", scribe],

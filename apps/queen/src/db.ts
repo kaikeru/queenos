@@ -4,11 +4,13 @@
  */
 import {
   AuditEventSchema,
+  DeploymentSchema,
   MergeTrainSchema,
   PromptRunSchema,
   type AuditEvent,
+  type Deployment,
 } from "@queenos/queen-types";
-import type { ForkState, PromptRecord, TrainAction, TrainPhase, TrainRecord } from "./train/planner";
+import type { DeployState, ForkState, PromptRecord, TrainAction, TrainPhase, TrainRecord } from "./train/planner";
 
 /**
  * Append-only migration list. Version N is `MIGRATIONS[N - 1]`.
@@ -79,6 +81,39 @@ const MIGRATIONS: readonly string[] = [
   );
   CREATE INDEX audit_trail_created ON audit_trail(created_at);
   `,
+  `
+  -- v2: the Queen orchestrates only. Forks/deletes go to the Provisioner
+  -- Workflow and preview deploys/teardowns to the Herald Workflow. Each
+  -- command id (= Workflow instance id) is persisted here before dispatch;
+  -- results are matched against it (idempotent by command id).
+  ALTER TABLE merge_trains ADD COLUMN fork_command_id TEXT;
+  ALTER TABLE merge_trains ADD COLUMN delete_command_id TEXT;
+  -- NONE/PENDING/LIVE/FAILED/TEARING_DOWN/TORN_DOWN/TEARDOWN_FAILED
+  ALTER TABLE merge_trains ADD COLUMN deploy_state TEXT NOT NULL DEFAULT 'NONE';
+  ALTER TABLE merge_trains ADD COLUMN deploy_command_id TEXT;
+  ALTER TABLE merge_trains ADD COLUMN teardown_command_id TEXT;
+  ALTER TABLE merge_trains ADD COLUMN preview_url TEXT;
+  CREATE INDEX merge_trains_deploy_cmd ON merge_trains(deploy_command_id);
+  CREATE INDEX merge_trains_teardown_cmd ON merge_trains(teardown_command_id);
+
+  -- DeploymentSchema rows: one per environment (staging/canary/prod, from P3)
+  -- plus one per train preview (deployment_id = 'preview-<train_id>').
+  CREATE TABLE deployments (
+    deployment_id TEXT PRIMARY KEY,
+    hive TEXT NOT NULL,
+    environment TEXT NOT NULL CHECK (environment IN ('preview', 'staging', 'canary', 'prod')),
+    train_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('PENDING', 'LIVE', 'FAILED', 'TORN_DOWN')),
+    url TEXT,
+    version_id TEXT,
+    commit_sha TEXT,
+    percent INTEGER,
+    summary TEXT,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX deployments_train ON deployments(train_id);
+  CREATE INDEX deployments_updated ON deployments(updated_at);
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -128,6 +163,7 @@ export function rowToTrain(r: Row): TrainRecord {
     summary: str(r.summary),
     headSha: str(r.head_sha),
     landedSha: str(r.landed_sha),
+    previewUrl: str(r.preview_url),
   });
   return {
     ...base,
@@ -142,7 +178,49 @@ export function rowToTrain(r: Row): TrainRecord {
     reason: str(r.reason),
     action: String(r.action) as TrainAction,
     dispatched: Number(r.dispatched) === 1,
+    forkCommandId: str(r.fork_command_id),
+    deleteCommandId: str(r.delete_command_id),
+    deployState: String(r.deploy_state ?? "NONE") as DeployState,
+    deployCommandId: str(r.deploy_command_id),
+    teardownCommandId: str(r.teardown_command_id),
+    previewUrl: str(r.preview_url),
   };
+}
+
+export function rowToDeployment(r: Row): Deployment {
+  return DeploymentSchema.parse({
+    deploymentId: r.deployment_id,
+    hive: r.hive,
+    environment: r.environment,
+    trainId: str(r.train_id),
+    status: r.status,
+    url: str(r.url),
+    versionId: str(r.version_id),
+    commitSha: str(r.commit_sha),
+    percent: r.percent === null ? null : Number(r.percent),
+    summary: str(r.summary),
+    updatedAt: r.updated_at,
+  });
+}
+
+export function upsertDeployment(sql: SqlStorage, d: Deployment): void {
+  sql.exec(
+    `INSERT INTO deployments (deployment_id, hive, environment, train_id, status, url, version_id, commit_sha, percent, summary, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(deployment_id) DO UPDATE SET status = excluded.status, url = excluded.url, version_id = excluded.version_id,
+       commit_sha = excluded.commit_sha, percent = excluded.percent, summary = excluded.summary, updated_at = excluded.updated_at`,
+    d.deploymentId,
+    d.hive,
+    d.environment,
+    d.trainId,
+    d.status,
+    d.url,
+    d.versionId,
+    d.commitSha,
+    d.percent,
+    d.summary,
+    d.updatedAt,
+  );
 }
 
 export function rowToAudit(r: Row): AuditEvent {
@@ -175,12 +253,17 @@ export function upsertPrompt(sql: SqlStorage, p: PromptRecord): void {
 export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
   sql.exec(
     `INSERT INTO merge_trains (train_id, base_sha, included_prompts, artifact_repo, status, created_at, seq, prompt_id,
-       phase, fork_state, fork_source, head_sha, landed_sha, summary, reason, action, dispatched)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, status = excluded.status, phase = excluded.phase,
+       phase, fork_state, fork_source, head_sha, landed_sha, summary, reason, action, dispatched,
+       fork_command_id, delete_command_id, deploy_state, deploy_command_id, teardown_command_id, preview_url)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
+       status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
        landed_sha = excluded.landed_sha, summary = excluded.summary, reason = excluded.reason,
-       dispatched = excluded.dispatched`,
+       dispatched = excluded.dispatched, fork_command_id = excluded.fork_command_id,
+       delete_command_id = excluded.delete_command_id, deploy_state = excluded.deploy_state,
+       deploy_command_id = excluded.deploy_command_id, teardown_command_id = excluded.teardown_command_id,
+       preview_url = excluded.preview_url`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -198,5 +281,11 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     t.reason,
     t.action,
     t.dispatched ? 1 : 0,
+    t.forkCommandId,
+    t.deleteCommandId,
+    t.deployState,
+    t.deployCommandId,
+    t.teardownCommandId,
+    t.previewUrl,
   );
 }

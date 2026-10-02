@@ -1,6 +1,17 @@
 /** Reducer tests (vitest, plain node environment; the reducer has no runtime imports). */
 import { expect, test } from "vitest";
-import { buildCards, buildLanes, initialState, letterFor, reducer, type Action, type State } from "../src/reducer";
+import {
+  PHASE_FLOW,
+  buildCards,
+  buildLanes,
+  buildSites,
+  initialState,
+  letterFor,
+  previewView,
+  reducer,
+  type Action,
+  type State,
+} from "../src/reducer";
 
 const prompt = (id: string, createdAt: number, status = "QUEUED", text = `prompt ${id}`) => ({
   promptId: id,
@@ -135,4 +146,79 @@ test("error and invalid frames land in the ticker; pong is a no-op", () => {
 
 test("letterFor rolls past Z", () => {
   expect([0, 25, 26, 27].map(letterFor)).toEqual(["A", "Z", "AA", "AB"]);
+});
+
+const deployment = (trainId: string, status: string, updatedAt: number, extra: Record<string, unknown> = {}) => ({
+  deploymentId: `preview-${trainId}`,
+  hive: "demo",
+  environment: "preview",
+  trainId,
+  status,
+  url: null,
+  versionId: null,
+  commitSha: "abcdef1234",
+  percent: null,
+  summary: null,
+  updatedAt,
+  ...extra,
+});
+const URL_T2 = "https://t2-preview.sim.queenos.dev";
+
+test("snapshots without deployments (older Queens) yield an empty map; with deployments they load", () => {
+  expect(run(snapshot).deployments).toEqual({});
+  const s = run(server({ type: "snapshot", promptRuns: [], trains: [], recentAudit: [], deployments: [deployment("t2", "LIVE", 5, { url: URL_T2 })] }));
+  expect(Object.keys(s.deployments)).toEqual(["preview-t2"]);
+});
+
+test("deployment.updated upserts, logs status changes once, and ignores out-of-order frames", () => {
+  let s = run(snapshot);
+  s = reducer(s, server({ type: "deployment.updated", deployment: deployment("t2", "PENDING", 10) }));
+  expect(s.ticker[0]!.text).toBe("Train A+B deploying preview @ abcdef1");
+  s = reducer(s, server({ type: "deployment.updated", deployment: deployment("t2", "LIVE", 20, { url: URL_T2 }) }));
+  expect(s.deployments["preview-t2"]).toMatchObject({ status: "LIVE", url: URL_T2 });
+  expect(s.ticker[0]!.text).toBe(`Train A+B preview live at ${URL_T2}`);
+  const ticks = s.ticker.length;
+  s = reducer(s, server({ type: "deployment.updated", deployment: deployment("t2", "LIVE", 21, { url: URL_T2 }) }));
+  expect(s.ticker.length).toBe(ticks); // same status: no new line
+  const before = s;
+  expect(reducer(s, server({ type: "deployment.updated", deployment: deployment("t2", "PENDING", 15) }))).toBe(before);
+  s = reducer(s, server({ type: "deployment.updated", deployment: deployment("t2", "FAILED", 30, { summary: "teardown failed: 500" }) }));
+  expect(s.ticker[0]).toMatchObject({ kind: "error", text: "Train A+B preview failed: teardown failed: 500" });
+  s = reducer(s, server({ type: "deployment.updated", deployment: deployment("t2", "TORN_DOWN", 40) }));
+  expect(s.ticker[0]!.text).toBe("Train A+B preview torn down");
+});
+
+test("lanes carry each train's preview; previewView covers deploying, live, failed and torn down", () => {
+  const deploying = train("t2", ["p1", "p2"], "TESTING", { createdAt: 20, phase: "DEPLOYING", previewUrl: null });
+  let s = run(snapshot, server({ type: "train.updated", train: deploying }), server({ type: "deployment.updated", deployment: deployment("t2", "PENDING", 10) }));
+  const lt = buildLanes(s)[1]!.trains[0]!;
+  expect(lt.preview?.status).toBe("PENDING");
+  expect(previewView(lt.train, lt.preview)).toEqual({ kind: "deploying" });
+
+  const live = { ...deploying, phase: "TESTING", previewUrl: URL_T2 };
+  s = reducer(s, server({ type: "train.updated", train: live }));
+  s = reducer(s, server({ type: "deployment.updated", deployment: deployment("t2", "LIVE", 20, { url: URL_T2 }) }));
+  const lt2 = buildLanes(s)[1]!.trains[0]!;
+  expect(previewView(lt2.train, lt2.preview)).toEqual({ kind: "live", url: URL_T2 });
+  expect(previewView(lt2.train, { ...lt2.preview!, status: "TORN_DOWN" })).toEqual({ kind: "gone", url: URL_T2 });
+  expect(previewView(lt2.train, { ...lt2.preview!, status: "FAILED", summary: "boom" })).toEqual({ kind: "failed", summary: "boom" });
+  expect(previewView(train("t9", ["p1"]) as never, null)).toEqual({ kind: "none" });
+  expect(PHASE_FLOW.indexOf("DEPLOYING")).toBe(PHASE_FLOW.indexOf("BUILDING") + 1);
+});
+
+test("sites list previews by environment; staging, canary and prod are not configured yet", () => {
+  const s = run(
+    snapshot,
+    server({ type: "deployment.updated", deployment: deployment("t1", "TORN_DOWN", 10) }),
+    server({ type: "deployment.updated", deployment: deployment("t2", "LIVE", 20, { url: URL_T2 }) }),
+  );
+  const sites = buildSites(s);
+  expect(sites.map((r) => [r.environment, r.configured])).toEqual([
+    ["preview", true],
+    ["staging", false],
+    ["canary", false],
+    ["prod", false],
+  ]);
+  expect(sites[0]).toMatchObject({ retired: 1 });
+  expect(sites[0]!.deployments.map((d) => d.trainId)).toEqual(["t2"]);
 });

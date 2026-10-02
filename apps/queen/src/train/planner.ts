@@ -11,8 +11,18 @@
  * - Results arrive in any order. A passed train lands only when it is the
  *   head of the queue (every earlier train has MERGED). Later passed trains
  *   wait and cascade once the head lands.
+ * - The Queen performs no I/O. Forks and fork deletes are commands to the
+ *   Provisioner Workflow; preview deploys and teardowns are commands to the
+ *   Herald Workflow. Each command id is stored on the train row (persisted
+ *   before dispatch); results come back asynchronously and are matched by
+ *   command id, so duplicate and late results are idempotent.
+ * - After the builder pushes, the train is DEPLOYING: the Herald deploys the
+ *   head to a per-train Worker Preview. A LIVE preview moves the train to
+ *   TESTING (gatekeepers smoke-test `previewUrl`); a failed deploy fails the
+ *   train like a failed test. Successor forks chain on the push, not the deploy.
  * - Landing is a git push performed by a LANDER drone (Artifacts has no merge
  *   API). The train is MERGED only when the lander confirms the new main SHA.
+ * - MERGED and EJECTED trains get their fork deleted and their preview torn down.
  * - A failed train is EJECTED and its fork deleted. Every later train that
  *   contains the failed prompt is superseded (EJECTED) and re-provisioned under
  *   a new train id, forked from the nearest surviving predecessor (or main).
@@ -24,11 +34,16 @@
  */
 import type {
   BuildResult,
+  DeployCommand,
+  DeployResult,
+  Deployment,
   DroneTask,
   LandResult,
   MergeTrain,
   PromptRun,
   PromptStatus,
+  ProvisionCommand,
+  ProvisionResult,
   QueenServerMessage,
   TrainPhase as QueenTrainPhase,
   TrainResult,
@@ -41,8 +56,13 @@ import type {
  */
 export type TrainPhase = QueenTrainPhase;
 
-export type ForkState = "NONE" | "PENDING" | "READY" | "DELETING" | "DELETED";
+export type ForkState = "NONE" | "PENDING" | "READY" | "DELETING" | "DELETED" | "DELETE_FAILED";
+/** Lifecycle of the train's Worker Preview (Herald). */
+export type DeployState = "NONE" | "PENDING" | "LIVE" | "FAILED" | "TEARING_DOWN" | "TORN_DOWN" | "TEARDOWN_FAILED";
 export type TrainAction = "BUILD" | "REWORK";
+
+/** Fork attempts (each a new Provisioner instance) before the train fails. */
+export const MAX_FORK_ATTEMPTS = 3;
 
 export interface TrainRecord extends MergeTrain {
   seq: number;
@@ -61,6 +81,16 @@ export interface TrainRecord extends MergeTrain {
   action: TrainAction;
   /** Whether the drone for the current phase (BUILDING / LANDING) was dispatched. */
   dispatched: boolean;
+  /** Current Provisioner FORK command (also the Workflow instance id). */
+  forkCommandId: string | null;
+  /** Current Provisioner DELETE command. */
+  deleteCommandId: string | null;
+  deployState: DeployState;
+  /** Current Herald DEPLOY (preview) command. */
+  deployCommandId: string | null;
+  /** Current Herald TEARDOWN (preview) command. */
+  teardownCommandId: string | null;
+  previewUrl: string | null;
 }
 
 export interface PromptRecord extends PromptRun {
@@ -73,6 +103,8 @@ export interface HiveState {
   prompts: PromptRecord[];
   /** All active trains, plus any terminal train relevant to the call. */
   trains: TrainRecord[];
+  /** Deployment rows of the loaded trains (preview rows are `preview-<trainId>`). */
+  deployments?: Deployment[];
   maxTrainSeq: number;
   maxPromptSeq: number;
 }
@@ -86,8 +118,8 @@ export interface PlannerContext {
 }
 
 export type Effect =
-  | { type: "provisionFork"; trainId: string; source: string; artifactRepo: string }
-  | { type: "deleteFork"; trainId: string; artifactRepo: string }
+  | { type: "provision"; trainId: string; command: ProvisionCommand }
+  | { type: "deploy"; trainId: string; command: DeployCommand }
   | { type: "dispatchDrone"; trainId: string; task: DroneTask }
   | { type: "broadcast"; message: QueenServerMessage };
 
@@ -102,11 +134,15 @@ export interface PlanResult {
   outcome: Outcome;
   prompts: PromptRecord[];
   trains: TrainRecord[];
+  deployments: Deployment[];
   effects: Effect[];
 }
 
 const TERMINAL: ReadonlySet<TrainPhase> = new Set(["MERGED", "EJECTED"]);
-const PUSHED: ReadonlySet<TrainPhase> = new Set(["TESTING", "PASSED", "LANDING"]);
+/** Phases in which the builder has pushed, so a successor can fork from this train. */
+const PUSHED: ReadonlySet<TrainPhase> = new Set(["DEPLOYING", "TESTING", "PASSED", "LANDING"]);
+/** Preview states that may have left a live (or half-created) Worker Preview behind. */
+const PREVIEW_EXISTS: ReadonlySet<DeployState> = new Set(["PENDING", "LIVE", "FAILED"]);
 
 export function isActive(t: TrainRecord): boolean {
   return !TERMINAL.has(t.phase);
@@ -117,6 +153,8 @@ export function statusOf(phase: TrainPhase): TrainState {
     case "WAITING_PARENT":
     case "BUILDING":
       return "BUILDING";
+    // Pushed and being verified: deploying the preview is the first test step.
+    case "DEPLOYING":
     case "TESTING":
     case "PASSED":
     case "LANDING":
@@ -129,6 +167,20 @@ export function statusOf(phase: TrainPhase): TrainState {
 /** Artifacts repo names allow alphanumerics, dots, hyphens and underscores. */
 export function trainRepoName(namespace: string, trainId: string): string {
   return `${namespace}-train-${trainId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12)}`;
+}
+
+/** Deterministic, attempt-numbered command id: `<trainId>-<op>-<n>`. */
+export function nextCommandId(trainId: string, op: string, previous: string | null): string {
+  const n = previous ? Number(/-(\d+)$/.exec(previous)?.[1] ?? 0) + 1 : 1;
+  return `${trainId}-${op}-${n}`;
+}
+
+export function commandAttempt(commandId: string | null): number {
+  return commandId ? Number(/-(\d+)$/.exec(commandId)?.[1] ?? 0) : 0;
+}
+
+export function previewDeploymentId(trainId: string): string {
+  return `preview-${trainId}`;
 }
 
 export function toMergeTrain(t: TrainRecord): MergeTrain {
@@ -144,6 +196,7 @@ export function toMergeTrain(t: TrainRecord): MergeTrain {
     summary: t.summary,
     headSha: t.headSha,
     landedSha: t.landedSha,
+    previewUrl: t.previewUrl,
   };
 }
 
@@ -165,6 +218,8 @@ export class TrainPlanner {
   private readonly maxReworks: number;
   private readonly dirtyPrompts = new Map<string, boolean>(); // id -> broadcast?
   private readonly dirtyTrains = new Map<string, boolean>();
+  private readonly deployments = new Map<string, Deployment>();
+  private readonly dirtyDeployments = new Set<string>();
   private effects: Effect[] = [];
 
   constructor(
@@ -173,6 +228,7 @@ export class TrainPlanner {
   ) {
     for (const p of state.prompts) this.prompts.set(p.promptId, { ...p });
     this.trains = state.trains.map((t) => ({ ...t, includedPrompts: [...t.includedPrompts] }));
+    for (const d of state.deployments ?? []) this.deployments.set(d.deploymentId, { ...d });
     this.maxTrainSeq = state.maxTrainSeq;
     this.maxPromptSeq = state.maxPromptSeq;
     this.maxReworks = ctx.maxReworks ?? 2;
@@ -198,28 +254,101 @@ export class TrainPlanner {
     return this.finish("applied");
   }
 
-  /** The DO finished creating the fork. */
-  forkReady(input: { trainId: string; artifactRepo: string; baseSha: string }): PlanResult {
-    const t = this.find(input.trainId);
+  /** The Provisioner reports a FORK or DELETE outcome (matched by command id). */
+  provisionResult(r: ProvisionResult): PlanResult {
+    const t = this.find(r.trainId);
     if (!t) return this.finish("ignored:unknown");
+    return r.op === "FORK" ? this.forkResult(t, r) : this.deleteResult(t, r);
+  }
+
+  private forkResult(t: TrainRecord, r: ProvisionResult): PlanResult {
+    if (r.commandId !== t.forkCommandId) return this.finish("ignored:stale"); // an older attempt
     if (!isActive(t)) {
-      // Superseded while the fork was in flight: the fork is an orphan.
-      if (t.forkState !== "DELETING") this.deleteFork(t);
+      // Superseded while the fork was in flight: a created fork is an orphan.
+      if (r.ok && t.forkState !== "DELETING") this.deleteFork(t);
       return this.finish("ignored:stale");
     }
     if (t.forkState !== "PENDING") return this.finish("ignored:duplicate");
-    this.setTrain(t, { forkState: "READY", baseSha: input.baseSha, dispatched: false });
+    if (!r.ok) {
+      const summary = r.summary || `Provisioner could not fork ${t.forkSource ?? "the hive repo"}`;
+      if (commandAttempt(t.forkCommandId) < MAX_FORK_ATTEMPTS) {
+        // Retry with a new command (Workflow instance ids are single-use).
+        this.setTrain(t, { phase: "WAITING_PARENT", forkState: "NONE" }, false);
+        this.scheduleFork(t);
+      } else {
+        this.setPromptSummary(t.promptId, summary);
+        this.fail(t, `fork failed: ${summary}`);
+      }
+      return this.finish("applied");
+    }
+    this.setTrain(t, {
+      forkState: "READY",
+      baseSha: r.baseSha ?? t.baseSha,
+      artifactRepo: r.artifactRepo ?? t.artifactRepo,
+      dispatched: false,
+    });
     this.setPromptStatus(t.promptId, "BUILDING");
     this.dispatchBuilder(t);
     return this.finish("applied");
   }
 
-  /** The DO deleted a fork (or it was already gone). Internal bookkeeping only. */
-  forkDeleted(trainId: string): PlanResult {
-    const t = this.find(trainId);
-    if (!t) return this.finish("ignored:unknown");
+  private deleteResult(t: TrainRecord, r: ProvisionResult): PlanResult {
+    if (r.commandId !== t.deleteCommandId) return this.finish("ignored:stale");
     if (t.forkState !== "DELETING") return this.finish("ignored:duplicate");
-    this.setTrain(t, { forkState: "DELETED" }, false);
+    // Bookkeeping only: a failed delete is recorded, never retried in a loop.
+    this.setTrain(t, { forkState: r.ok ? "DELETED" : "DELETE_FAILED" }, false);
+    return this.finish("applied");
+  }
+
+  /** The Herald reports a preview DEPLOY or TEARDOWN outcome (matched by command id). */
+  deployResult(r: DeployResult): PlanResult {
+    const t = r.trainId ? this.find(r.trainId) : this.trains.find((x) => x.deployCommandId === r.commandId || x.teardownCommandId === r.commandId);
+    if (!t || r.environment !== "preview") return this.finish("ignored:unknown");
+    if (r.op === "DEPLOY") return this.previewDeployed(t, r);
+    if (r.op === "TEARDOWN") return this.previewTornDown(t, r);
+    return this.finish("ignored:unknown");
+  }
+
+  private previewDeployed(t: TrainRecord, r: DeployResult): PlanResult {
+    if (r.commandId !== t.deployCommandId) return this.finish("ignored:stale");
+    if (!isActive(t)) {
+      // The deploy finished after the train ended (it was never seen LIVE) and
+      // its teardown was already issued: the preview may have been re-created
+      // behind that teardown, so tear it down again. Recording the URL makes a
+      // duplicate of this late report a no-op.
+      const seen = this.deployments.get(previewDeploymentId(t.trainId))?.url ?? t.previewUrl;
+      if (r.ok && !seen) {
+        this.setDeployment(t, { url: r.url ?? null });
+        this.teardownPreview(t, true);
+      }
+      return this.finish("ignored:stale");
+    }
+    if (t.deployState !== "PENDING") return this.finish("ignored:duplicate");
+    if (t.phase !== "DEPLOYING") return this.finish("ignored:premature");
+    const commitSha = r.commitSha ?? t.headSha;
+    if (!r.ok || !r.url) {
+      const summary = r.summary || (r.ok ? "Herald reported a deploy without a preview URL." : "Preview deploy failed.");
+      this.setTrain(t, { deployState: "FAILED" }, false);
+      this.setDeployment(t, { status: "FAILED", summary, commitSha, versionId: r.versionId ?? null });
+      this.setPromptSummary(t.promptId, summary);
+      this.fail(t, `preview deploy failed: ${summary}`);
+      return this.finish("applied");
+    }
+    this.setTrain(t, { deployState: "LIVE", previewUrl: r.url, phase: "TESTING" });
+    this.setDeployment(t, { status: "LIVE", url: r.url, versionId: r.versionId ?? null, commitSha, summary: r.summary ?? null });
+    return this.finish("applied");
+  }
+
+  private previewTornDown(t: TrainRecord, r: DeployResult): PlanResult {
+    if (r.commandId !== t.teardownCommandId) return this.finish("ignored:stale");
+    if (t.deployState !== "TEARING_DOWN") return this.finish("ignored:duplicate");
+    if (r.ok) {
+      this.setTrain(t, { deployState: "TORN_DOWN" }, false);
+      this.setDeployment(t, { status: "TORN_DOWN" });
+    } else {
+      this.setTrain(t, { deployState: "TEARDOWN_FAILED" }, false);
+      this.setDeployment(t, { status: "FAILED", summary: `teardown failed: ${r.summary ?? "unknown error"}`.slice(0, 500) });
+    }
     return this.finish("applied");
   }
 
@@ -231,15 +360,19 @@ export class TrainPlanner {
     return this.finish("applied");
   }
 
-  /** A builder pushed the train head; successors may now fork from it. */
+  /**
+   * A builder pushed the train head: deploy its preview (DEPLOYING), and let
+   * the successor fork from it right away (chaining does not wait on deploys).
+   */
   buildResult(r: BuildResult): PlanResult {
     const t = this.find(r.trainId);
     if (!t) return this.finish("ignored:unknown");
     if (!isActive(t)) return this.finish("ignored:stale");
     if (t.phase !== "BUILDING") return this.finish("ignored:duplicate");
     if (t.forkState !== "READY") return this.finish("ignored:premature");
-    this.setTrain(t, { phase: "TESTING", headSha: r.headSha });
+    this.setTrain(t, { phase: "DEPLOYING", headSha: r.headSha });
     this.setPromptStatus(t.promptId, "IN_TRAIN");
+    this.deployPreview(t);
     this.scheduleSuccessor(t);
     return this.finish("applied");
   }
@@ -253,20 +386,20 @@ export class TrainPlanner {
     if (t.phase === "WAITING_PARENT" || t.forkState !== "READY") {
       return this.finish("ignored:premature");
     }
+    // A pass must come from testing the live preview; a failure (e.g. the
+    // builder giving up) is honoured in any phase.
+    if (r.passed && t.phase !== "TESTING") return this.finish("ignored:premature");
     this.setPromptSummary(t.promptId, r.summary);
     if (!r.passed) {
       this.fail(t, r.summary);
       return this.finish("applied");
     }
-    const wasBuilding = t.phase === "BUILDING";
     this.setTrain(t, {
       phase: "PASSED",
       summary: r.summary,
       headSha: r.commitSha ?? t.headSha,
     });
     this.setPromptStatus(t.promptId, "IN_TRAIN");
-    // A pass implies the builder pushed, even if build-result never arrived.
-    if (wasBuilding) this.scheduleSuccessor(t);
     this.maybeLand();
     return this.finish("applied");
   }
@@ -285,6 +418,7 @@ export class TrainPlanner {
     }
     this.setTrain(t, { phase: "MERGED", landedSha: r.mainSha ?? null });
     this.deleteFork(t);
+    this.teardownPreview(t);
     this.setPromptStatus(t.promptId, "MERGED");
     if (r.summary) this.setPromptSummary(t.promptId, r.summary);
     this.maybeLand();
@@ -292,13 +426,19 @@ export class TrainPlanner {
   }
 
   /**
-   * Crash / failure recovery (DO alarm): re-issue pending forks (re-deriving
-   * their source), pending deletes and undispatched drones.
+   * Crash / failure recovery (DO alarm): re-dispatch every pending command
+   * (same command id, so a command that did start is not started twice),
+   * re-deriving a pending fork's source, plus undispatched drones.
    */
   reconcile(): PlanResult {
     for (const t of this.trains) {
       if (t.forkState === "DELETING") {
-        this.effects.push({ type: "deleteFork", trainId: t.trainId, artifactRepo: t.artifactRepo });
+        if (!t.deleteCommandId) this.setTrain(t, { deleteCommandId: nextCommandId(t.trainId, "delete", null) }, false);
+        this.emitDelete(t);
+      }
+      if (t.deployState === "TEARING_DOWN") {
+        if (!t.teardownCommandId) this.setTrain(t, { teardownCommandId: nextCommandId(t.trainId, "teardown", null) }, false);
+        this.emitTeardown(t);
       }
     }
     for (const t of this.active()) {
@@ -310,16 +450,18 @@ export class TrainPlanner {
           // Predecessor was superseded/re-queued: wait for the new one.
           this.setTrain(t, { phase: "WAITING_PARENT", forkState: "NONE", forkSource: null });
         } else {
-          if (source !== t.forkSource) this.setTrain(t, { forkSource: source }, false);
-          this.effects.push({
-            type: "provisionFork",
-            trainId: t.trainId,
-            source,
-            artifactRepo: t.artifactRepo,
-          });
+          if (source !== t.forkSource || !t.forkCommandId) {
+            // New params need a new command (instance ids are single-use).
+            this.setTrain(t, { forkSource: source, forkCommandId: nextCommandId(t.trainId, "fork", t.forkCommandId) }, false);
+          }
+          this.emitFork(t);
         }
       } else if (t.phase === "BUILDING" && t.forkState === "READY" && !t.dispatched) {
         this.dispatchBuilder(t);
+      } else if (t.phase === "DEPLOYING" && t.deployState === "PENDING") {
+        this.emitDeploy(t);
+      } else if (t.phase === "DEPLOYING" && t.deployState === "NONE") {
+        this.deployPreview(t);
       } else if (t.phase === "LANDING" && !t.dispatched) {
         this.dispatchLander(t);
       }
@@ -372,6 +514,12 @@ export class TrainPlanner {
       reason: null,
       action,
       dispatched: false,
+      forkCommandId: null,
+      deleteCommandId: null,
+      deployState: "NONE",
+      deployCommandId: null,
+      teardownCommandId: null,
+      previewUrl: null,
     };
     this.trains.push(train);
     this.markTrain(train);
@@ -384,13 +532,98 @@ export class TrainPlanner {
     if (t.phase !== "WAITING_PARENT") return;
     const source = this.forkSourceFor(t);
     if (source === null) return;
-    this.setTrain(t, { phase: "BUILDING", forkState: "PENDING", forkSource: source });
-    this.effects.push({
-      type: "provisionFork",
-      trainId: t.trainId,
-      source,
-      artifactRepo: t.artifactRepo,
+    this.setTrain(t, {
+      phase: "BUILDING",
+      forkState: "PENDING",
+      forkSource: source,
+      forkCommandId: nextCommandId(t.trainId, "fork", t.forkCommandId),
     });
+    this.emitFork(t);
+  }
+
+  private emitFork(t: TrainRecord): void {
+    this.effects.push({
+      type: "provision",
+      trainId: t.trainId,
+      command: {
+        op: "FORK",
+        commandId: t.forkCommandId!,
+        hive: this.ctx.namespace,
+        trainId: t.trainId,
+        sourceRepo: t.forkSource!,
+        forkName: t.artifactRepo,
+      },
+    });
+  }
+
+  private emitDelete(t: TrainRecord): void {
+    this.effects.push({
+      type: "provision",
+      trainId: t.trainId,
+      command: { op: "DELETE", commandId: t.deleteCommandId!, hive: this.ctx.namespace, trainId: t.trainId, repo: t.artifactRepo },
+    });
+  }
+
+  private deployPreview(t: TrainRecord): void {
+    if (!t.headSha) return;
+    this.setTrain(t, { deployState: "PENDING", deployCommandId: nextCommandId(t.trainId, "deploy", t.deployCommandId) }, false);
+    this.setDeployment(t, { status: "PENDING", url: null, versionId: null, commitSha: t.headSha, summary: null });
+    this.emitDeploy(t);
+  }
+
+  private emitDeploy(t: TrainRecord): void {
+    this.effects.push({
+      type: "deploy",
+      trainId: t.trainId,
+      command: {
+        op: "DEPLOY",
+        commandId: t.deployCommandId!,
+        hive: this.ctx.namespace,
+        environment: "preview",
+        trainId: t.trainId,
+        artifactRepo: t.artifactRepo,
+        commitSha: t.headSha!,
+      },
+    });
+  }
+
+  /**
+   * Issue a preview TEARDOWN (a new command each time). `force` re-issues one
+   * even while another is in flight: a deploy that completed late may have
+   * re-created the preview behind the earlier teardown.
+   */
+  private teardownPreview(t: TrainRecord, force = false): void {
+    if (t.deployCommandId === null) return; // never deployed
+    if (t.deployState === "TEARING_DOWN" && !force) return;
+    this.setTrain(t, { deployState: "TEARING_DOWN", teardownCommandId: nextCommandId(t.trainId, "teardown", t.teardownCommandId) }, false);
+    this.emitTeardown(t);
+  }
+
+  private emitTeardown(t: TrainRecord): void {
+    this.effects.push({
+      type: "deploy",
+      trainId: t.trainId,
+      command: { op: "TEARDOWN", commandId: t.teardownCommandId!, hive: this.ctx.namespace, environment: "preview", trainId: t.trainId },
+    });
+  }
+
+  private setDeployment(t: TrainRecord, patch: Partial<Deployment>): void {
+    const id = previewDeploymentId(t.trainId);
+    const prev: Deployment = this.deployments.get(id) ?? {
+      deploymentId: id,
+      hive: this.ctx.namespace,
+      environment: "preview",
+      trainId: t.trainId,
+      status: "PENDING",
+      url: null,
+      versionId: null,
+      commitSha: null,
+      percent: null,
+      summary: null,
+      updatedAt: this.ctx.now,
+    };
+    this.deployments.set(id, { ...prev, ...patch, updatedAt: this.ctx.now });
+    this.dirtyDeployments.add(id);
   }
 
   private scheduleSuccessor(t: TrainRecord): void {
@@ -441,11 +674,12 @@ export class TrainPlanner {
   private eject(t: TrainRecord, reason: string): void {
     this.setTrain(t, { phase: "EJECTED", reason });
     if (t.forkState === "PENDING" || t.forkState === "READY") this.deleteFork(t);
+    if (PREVIEW_EXISTS.has(t.deployState)) this.teardownPreview(t);
   }
 
   private deleteFork(t: TrainRecord): void {
-    this.setTrain(t, { forkState: "DELETING" }, false);
-    this.effects.push({ type: "deleteFork", trainId: t.trainId, artifactRepo: t.artifactRepo });
+    this.setTrain(t, { forkState: "DELETING", deleteCommandId: nextCommandId(t.trainId, "delete", t.deleteCommandId) }, false);
+    this.emitDelete(t);
   }
 
   private dispatchBuilder(t: TrainRecord): void {
@@ -522,6 +756,7 @@ export class TrainPlanner {
       const t = this.find(id)!;
       return { ...t, includedPrompts: [...t.includedPrompts] };
     });
+    const deployments = [...this.dirtyDeployments].map((id) => ({ ...this.deployments.get(id)! }));
     const broadcasts: Effect[] = [
       ...prompts
         .filter((p) => this.dirtyPrompts.get(p.promptId))
@@ -529,10 +764,12 @@ export class TrainPlanner {
       ...trains
         .filter((t) => this.dirtyTrains.get(t.trainId))
         .map((t): Effect => ({ type: "broadcast", message: { type: "train.updated", train: toMergeTrain(t) } })),
+      ...deployments.map((d): Effect => ({ type: "broadcast", message: { type: "deployment.updated", deployment: d } })),
     ];
-    const result: PlanResult = { outcome, prompts, trains, effects: [...this.effects, ...broadcasts] };
+    const result: PlanResult = { outcome, prompts, trains, deployments, effects: [...this.effects, ...broadcasts] };
     this.dirtyPrompts.clear();
     this.dirtyTrains.clear();
+    this.dirtyDeployments.clear();
     this.effects = [];
     return result;
   }

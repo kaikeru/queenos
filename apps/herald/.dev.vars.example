@@ -1,0 +1,6 @@
+# Copy to .dev.vars for `wrangler dev`. In production: `wrangler secret put CLOUDFLARE_API_TOKEN`.
+#
+# P1 only: an account-owned Cloudflare API token for the account in
+# CLOUDFLARE_ACCOUNT_ID (wrangler.jsonc vars), with "Workers Scripts: Edit".
+# P2 moves it into the Vault DO.
+CLOUDFLARE_API_TOKEN=

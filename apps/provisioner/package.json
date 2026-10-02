@@ -1,0 +1,29 @@
+{
+  "name": "@queenos/provisioner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --env=\"\"",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
+    "lint": "eslint .",
+    "cf-typegen": "wrangler types --include-runtime=false",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@queenos/queen-types": "workspace:*",
+    "hono": "^4.13.12",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/workers-types": "^5.20261002.1",
+    "@queenos/eslint-config": "workspace:*",
+    "@queenos/tsconfig": "workspace:*",
+    "eslint": "^9.39.5",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.147.0"
+  }
+}

@@ -3,9 +3,13 @@ import {
   AppendAuditSchema,
   AuditStatusSchema,
   BuildResultSchema,
+  DeployCommandSchema,
+  DeployResultSchema,
   DroneTaskSchema,
   GitNotesPayloadSchema,
   LandResultSchema,
+  ProvisionCommandSchema,
+  ProvisionResultSchema,
   QueenClientMessageSchema,
   QueenServerMessageSchema,
   ScribeSummarySchema,
@@ -144,5 +148,54 @@ describe("MergeTrain train internals", () => {
     expect(
       QueenServerMessageSchema.safeParse({ type: "train.updated", train: { ...train, summary: "x".repeat(501) } }).success,
     ).toBe(false);
+  });
+});
+
+describe("executors + deployments", () => {
+  const deployment = {
+    deploymentId: "preview-t1",
+    hive: "h",
+    environment: "preview",
+    trainId: "t1",
+    status: "LIVE",
+    url: "https://t1-preview.sim.queenos.dev",
+    versionId: null,
+    commitSha: "abc",
+    percent: null,
+    summary: null,
+    updatedAt: 1,
+  };
+
+  it("round-trips deployment.updated and a snapshot with deployments", () => {
+    const upd = { type: "deployment.updated", deployment };
+    expect(QueenServerMessageSchema.parse(JSON.parse(JSON.stringify(upd)))).toEqual(upd);
+    const snap = { type: "snapshot", promptRuns: [], trains: [], recentAudit: [], deployments: [deployment] };
+    expect(QueenServerMessageSchema.parse(snap)).toEqual(snap);
+  });
+
+  it("keeps snapshot.deployments optional for older Queens", () => {
+    const snap = QueenServerMessageSchema.parse({ type: "snapshot", promptRuns: [], trains: [], recentAudit: [] });
+    expect(snap.type === "snapshot" && (snap.deployments ?? [])).toEqual([]);
+  });
+
+  it("accepts the DEPLOYING phase and a nullable previewUrl on trains", () => {
+    const t = { ...train, status: "TESTING", phase: "DEPLOYING", previewUrl: null };
+    expect(QueenServerMessageSchema.safeParse({ type: "train.updated", train: t }).success).toBe(true);
+    const live = { ...t, phase: "TESTING", previewUrl: "https://x.dev" };
+    const parsed = QueenServerMessageSchema.parse({ type: "train.updated", train: live });
+    expect(parsed.type === "train.updated" && parsed.train.previewUrl).toBe("https://x.dev");
+  });
+
+  it("validates provision and deploy commands/results", () => {
+    expect(
+      ProvisionCommandSchema.safeParse({ op: "FORK", commandId: "t1-fork-1", hive: "h", trainId: "t1", sourceRepo: "h", forkName: "h-train-t1" })
+        .success,
+    ).toBe(true);
+    expect(ProvisionResultSchema.safeParse({ commandId: "c", op: "FORK", trainId: "t1", ok: "yes" }).success).toBe(false);
+    expect(
+      DeployCommandSchema.safeParse({ op: "DEPLOY", commandId: "c", hive: "h", environment: "preview", trainId: "t", artifactRepo: "r", commitSha: "s" })
+        .success,
+    ).toBe(true);
+    expect(DeployResultSchema.safeParse({ commandId: "c", op: "DEPLOY", environment: "preview", ok: true, url: "not a url" }).success).toBe(false);
   });
 });

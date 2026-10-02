@@ -154,6 +154,61 @@ describe("runGate: static policy / security failures", () => {
   });
 });
 
+describe("runGate: preview smoke test", () => {
+  const PREVIEW = "https://t-0a1b2c3d4e5f-hive-app.sub.workers.dev";
+
+  it("hits the train's previewUrl, then still runs the scripted runner; no warning finding", async () => {
+    const { w, after } = await setup();
+    w.queen.train.previewUrl = PREVIEW;
+    const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), config());
+    expect(out).toMatchObject({ passed: true });
+    expect(w.smoke.urls).toEqual([PREVIEW]);
+    const ledger = JSON.stringify(w.queen.audits().map((a) => a.gitNotesPayload));
+    expect(ledger).not.toContain("preview-smoke-skipped");
+    expect(w.queen.reports()[0]!.summary).toContain("tests (20 checks)"); // 19 scripted + 1 smoke
+  });
+
+  it("a non-2xx preview fails the gate; the Scribe gets the status + body; the scripted runner is skipped", async () => {
+    const { w, after } = await setup();
+    w.queen.train.previewUrl = PREVIEW;
+    w.smoke.result = {
+      passed: false,
+      status: 500,
+      log: ["> smoke: GET /", " FAIL  preview smoke > GET / returns 2xx", "AssertionError: preview smoke failed: GET / returned HTTP 500 (expected 2xx)", 'response body: {"ok":false,"error":"boom"}'].join("\n"),
+      firstError: "AssertionError: preview smoke failed: GET / returned HTTP 500 (expected 2xx)",
+    };
+    let scriptedRan = false;
+    w.tests = { mode: "scripted", run: async () => ((scriptedRan = true), { passed: true, checks: 1, log: "" }) };
+    const steps = new InlineSteps();
+    const out = await runGate(gateTask(after), steps, w.ports(), config());
+    expect(out).toMatchObject({ status: "gated", passed: false });
+    expect(scriptedRan).toBe(false);
+    expect(w.queen.reports()[0]).toMatchObject({ passed: false, summary: expect.stringContaining("HTTP 500") });
+    expect(w.queen.scribes()[0]!.summary).toContain("preview smoke");
+    expect(w.failures.stored[0]![0]!.text).toContain('response body: {"ok":false,"error":"boom"}');
+  });
+
+  it("no previewUrl (sim / old trains): smoke is skipped with a warning finding, the gate still passes", async () => {
+    const { w, after } = await setup();
+    const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), config());
+    expect(out).toMatchObject({ passed: true });
+    expect(w.smoke.urls).toEqual([]);
+    const securityResult = w.queen.audits().find((a) => a.droneRole === "SECURITY" && a.status === "PASSED")!;
+    expect(securityResult.gitNotesPayload!.reasoningSteps.join("\n")).toMatch(/\[warning\] preview-smoke-skipped .*skipped/);
+  });
+
+  it("waits through DEPLOYING until the Queen reaches TESTING", async () => {
+    const { w, after } = await setup();
+    w.queen.train.previewUrl = PREVIEW;
+    w.queen.phases = ["BUILDING", "DEPLOYING", "DEPLOYING", "TESTING"];
+    const steps = new InlineSteps();
+    const out = await runGate(gateTask(after), steps, w.ports(), config({ GATE_PHASE_RETRIES: "6" }));
+    expect(out).toMatchObject({ passed: true });
+    expect(steps.sleeps).toHaveLength(3);
+    expect(w.smoke.urls).toEqual([PREVIEW]);
+  });
+});
+
 describe("runGate: Queen phase race and guards", () => {
   it("waits (step.sleep) until the Queen reaches TESTING", async () => {
     const { w, after } = await setup();

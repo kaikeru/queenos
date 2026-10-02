@@ -19,6 +19,15 @@ describe("security scan", () => {
     expect(JSON.stringify(r.findings)).not.toContain("a".repeat(36));
   });
 
+  it("finds Artifacts repo tokens in both the documented and observed formats", () => {
+    expect(
+      rules({
+        "v1.ts": `const t = "art_v1_${"0".repeat(40)}";`,
+        "v2.ts": `const t = "art_v2_x_${"f".repeat(40)}?expires=1790000000";`,
+      }),
+    ).toEqual(["error:secret-pattern:v1.ts:1", "error:secret-pattern:v2.ts:1"]);
+  });
+
   it("ignores documented placeholder keys", () => {
     expect(rules({ "a.ts": 'const k = "AKIAIOSFODNN7EXAMPLE";', ".dev.vars.example": "CF_API_TOKEN=YOUR_TOKEN_HERE_XXXXXXXXXXXXXXXXXXXX" })).toEqual([]);
   });

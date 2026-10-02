@@ -2,7 +2,9 @@ import { Hono, type Context } from "hono";
 import {
   AppendAuditSchema,
   BuildResultSchema,
+  DeployResultSchema,
   LandResultSchema,
+  ProvisionResultSchema,
   ScribeSummarySchema,
   SubmitPromptSchema,
   TrainResultSchema,
@@ -114,6 +116,18 @@ hive.post("/internal/webhook/build-result", async (c) => {
 hive.post("/internal/webhook/land-result", async (c) => {
   const result = parseOrThrow(LandResultSchema, await body(c), "land result");
   return c.json(await stub(c, hiveOf(c)).reportLandResult(result));
+});
+
+// Provisioner reports a FORK / DELETE outcome (idempotent by commandId).
+hive.post("/internal/webhook/provision-result", async (c) => {
+  const result = parseOrThrow(ProvisionResultSchema, await body(c), "provision result");
+  return c.json(await stub(c, hiveOf(c)).reportProvisionResult(result));
+});
+
+// Herald reports a preview DEPLOY / TEARDOWN outcome (idempotent by commandId).
+hive.post("/internal/webhook/deploy-result", async (c) => {
+  const result = parseOrThrow(DeployResultSchema, await body(c), "deploy result");
+  return c.json(await stub(c, hiveOf(c)).reportDeployResult(result));
 });
 
 hive.post("/audit", async (c) => {

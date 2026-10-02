@@ -23,7 +23,7 @@ import type { DroneConfig } from "./config";
 export interface RepoAccess {
   /** HTTPS git remote of the repo. */
   remote: string;
-  /** Short-lived repo token (`art_v1_…?expires=…`). Never leaves the step that minted it. */
+  /** Short-lived repo token (`art_v2_x_…?expires=…`). Never leaves the step that minted it. */
   token: string;
 }
 

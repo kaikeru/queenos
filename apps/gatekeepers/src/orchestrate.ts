@@ -75,7 +75,7 @@ export async function handlePush(payload: unknown, step: StepRunner, ports: Gate
 // ── the gate ────────────────────────────────────────────────────────────────
 
 export type Lookup =
-  | { status: "ready"; trainId: string; promptId: string; promptText: string }
+  | { status: "ready"; trainId: string; promptId: string; promptText: string; previewUrl: string | null }
   | { status: "waiting"; phase: string }
   | { status: "ignored"; reason: string };
 
@@ -86,13 +86,16 @@ export async function lookupTrain(queen: QueenPort, task: Pick<GateTask, "repo" 
   const train = snap.trains.find((t) => t.artifactRepo === task.repo);
   if (!train) return { status: "ignored", reason: "unknown-train" };
   const phase = train.phase ?? train.status;
-  if (phase === "BUILDING" || phase === "WAITING_PARENT") return { status: "waiting", phase };
+  // DEPLOYING: the Herald is putting the train on a Worker Preview; TESTING follows with `previewUrl` set.
+  if (phase === "BUILDING" || phase === "WAITING_PARENT" || phase === "DEPLOYING") return { status: "waiting", phase };
   if (phase !== "TESTING") return { status: "ignored", reason: `phase-${phase}` };
   if (train.headSha && train.headSha !== task.after) return { status: "ignored", reason: "not-train-head" };
   const promptId = train.includedPrompts.at(-1) ?? "";
   if (!promptId) return { status: "ignored", reason: "train-without-prompt" };
   const promptText = snap.promptRuns.find((p) => p.promptId === promptId)?.promptText ?? promptId;
-  return { status: "ready", trainId: train.trainId, promptId, promptText: promptText.slice(0, 500) };
+  // `previewUrl` is absent in sim mode and on trains from before the Herald existed.
+  const previewUrl = (train as { previewUrl?: string | null }).previewUrl || null;
+  return { status: "ready", trainId: train.trainId, promptId, promptText: promptText.slice(0, 500), previewUrl };
 }
 
 export type GateRunResult =
@@ -138,7 +141,7 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   let inspection: Inspection;
   try {
     inspection = await step.do("inspect: clone, scan, test", INSPECT_STEP, () =>
-      inspectPush(ports, task, config, train.trainId).catch((e) => Promise.reject(toStepError(e))),
+      inspectPush(ports, task, config, train.trainId, train.previewUrl).catch((e) => Promise.reject(toStepError(e))),
     );
   } catch (e) {
     return failInfra(ctx, e);

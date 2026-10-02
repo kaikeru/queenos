@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // apps/queen binds to this Worker by name ("script_name": "queenos-provisioner").
+  "name": "queenos-provisioner",
+  "main": "src/index.ts",
+  // Implies nodejs_compat (+v2). Do not add nodejs_compat.
+  "compatibility_date": "2026-10-02",
+  "workflows": [
+    {
+      // apps/queen's PROVISIONER binding names this workflow + class.
+      "name": "provisioner-workflow",
+      "binding": "PROVISIONER_WORKFLOW",
+      "class_name": "ProvisionerWorkflow"
+    }
+  ],
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
+  "durable_objects": {
+    "bindings": [
+      // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen").
+      // One QueenNode per hive: QUEEN.idFromName(hive).
+      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" }
+    ]
+  },
+  "env": {
+    // Used only by vitest (see vitest.config.ts). Named envs do not inherit
+    // bindings: no ARTIFACTS (remote-only) and no cross-script QUEEN DO (the pool
+    // has no dev registry). Tests inject fake ports via test/worker.ts.
+    "test": {
+      "workflows": [{ "name": "provisioner-workflow", "binding": "PROVISIONER_WORKFLOW", "class_name": "ProvisionerWorkflow" }]
+    }
+  }
+}

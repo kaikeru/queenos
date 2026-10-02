@@ -1,24 +1,25 @@
-import type { DroneTask } from "@queenos/queen-types";
-import type { ForkProvisioner, ForkResult } from "../src/artifacts";
+import type { DeployCommand, DroneTask, ProvisionCommand } from "@queenos/queen-types";
 import type { DroneDispatcher } from "../src/drones";
+import type { CommandDispatcher } from "../src/executors";
 
-/** In-memory Artifacts stand-in (tests run with remoteBindings: false). */
-export class FakeForkProvisioner implements ForkProvisioner {
-  readonly forks: { source: string; name: string }[] = [];
-  readonly deleted: string[] = [];
-  readonly live = new Set<string>();
+/** Records every dispatched executor command; results are reported by the test. */
+export class RecordingCommands<C extends { commandId: string }> implements CommandDispatcher<C> {
+  readonly commands: C[] = [];
+  /** Throw on the next N dispatches (exercises the reconcile alarm). */
+  failNext = 0;
 
-  async forkTrain(source: string, name: string): Promise<ForkResult> {
-    this.forks.push({ source, name });
-    this.live.add(name);
-    return { artifactRepo: name, baseSha: `sha-of-${source}` };
-  }
-
-  async deleteFork(name: string): Promise<boolean> {
-    this.deleted.push(name);
-    return this.live.delete(name);
+  async dispatch(command: C): Promise<{ instanceId: string }> {
+    if (this.failNext > 0) {
+      this.failNext--;
+      throw new Error("UNAVAILABLE: fake executor is down");
+    }
+    this.commands.push(command);
+    return { instanceId: command.commandId };
   }
 }
+
+export class RecordingProvisioner extends RecordingCommands<ProvisionCommand> {}
+export class RecordingHerald extends RecordingCommands<DeployCommand> {}
 
 export class RecordingDispatcher implements DroneDispatcher {
   readonly tasks: DroneTask[] = [];

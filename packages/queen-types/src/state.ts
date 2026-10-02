@@ -51,6 +51,7 @@ export const MergeTrainSchema = z.object({
   summary: z.string().max(500).nullable().optional(), // summary (Scribe verdict, <= 500 chars)
   headSha: z.string().nullable().optional(), // head_sha (pushed by the builder)
   landedSha: z.string().nullable().optional(), // landed_sha (hive main after landing)
+  previewUrl: z.string().nullable().optional(), // preview_url (Herald's Worker Preview URL; set when DEPLOYING -> TESTING)
 });
 export type MergeTrain = z.infer<typeof MergeTrainSchema>;
 

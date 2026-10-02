@@ -5,12 +5,19 @@
  *
  * Context compaction: the Queen never stores raw code, diffs or stack traces,
  * only Scribe summaries (<= 500 chars, enforced by the queen-types schemas).
+ *
+ * Orchestrator only: the Queen decides, records and dispatches. It performs no
+ * external I/O itself; forks/deletes run in the Provisioner Workflow, preview
+ * deploys/teardowns in the Herald Workflow, builds/landings in drones. Each
+ * reports back over RPC (reportProvisionResult, reportDeployResult, ...).
  */
 import { DurableObject } from "cloudflare:workers";
 import {
   AppendAuditSchema,
   BuildResultSchema,
+  DeployResultSchema,
   LandResultSchema,
+  ProvisionResultSchema,
   QueenClientMessageSchema,
   ScribeSummarySchema,
   SubmitPromptSchema,
@@ -18,17 +25,29 @@ import {
   type AppendAuditInput,
   type AuditEvent,
   type BuildResult,
+  type DeployResult,
+  type Deployment,
   type LandResultInput,
   type MergeTrain,
   type PromptRun,
+  type ProvisionResult,
   type QueenServerMessage,
   type ScribeSummary,
   type SubmitPrompt,
   type TrainResult,
 } from "@queenos/queen-types";
-import { ArtifactsForkProvisioner, type ForkProvisioner, type ForkResult } from "./artifacts";
-import { migrate, rowToAudit, rowToPrompt, rowToTrain, upsertPrompt, upsertTrain } from "./db";
+import {
+  migrate,
+  rowToAudit,
+  rowToDeployment,
+  rowToPrompt,
+  rowToTrain,
+  upsertDeployment,
+  upsertPrompt,
+  upsertTrain,
+} from "./db";
 import { WorkflowDroneDispatcher, type DroneDispatcher } from "./drones";
+import { WorkflowCommandDispatcher, type DeployDispatcher, type ProvisionerDispatcher } from "./executors";
 import { QueenError, asQueenError, parseOrThrow } from "./errors";
 import {
   TrainPlanner,
@@ -58,7 +77,11 @@ const SNAPSHOT_LIMIT = 200;
 const AUDIT_SNAPSHOT_LIMIT = 50;
 
 export interface QueenPorts {
-  provisioner: ForkProvisioner;
+  /** Provisioner Workflow (FORK / DELETE). */
+  provisioner: ProvisionerDispatcher;
+  /** Herald Workflow (DEPLOY / TEARDOWN / ROLLBACK). */
+  herald: DeployDispatcher;
+  /** Drone Workflow (BUILD / REWORK / LAND). */
   dispatcher: DroneDispatcher;
 }
 
@@ -98,10 +121,11 @@ export class QueenNode extends DurableObject<Env> {
     this.ports = this.createPorts(env);
   }
 
-  /** Seam for tests: override to inject fake Artifacts / drone ports. */
+  /** Seam for tests and sim: override to inject fake executor / drone ports. */
   protected createPorts(env: Env): QueenPorts {
     return {
-      provisioner: new ArtifactsForkProvisioner(env.ARTIFACTS),
+      provisioner: new WorkflowCommandDispatcher(env.PROVISIONER, "PROVISIONER"),
+      herald: new WorkflowCommandDispatcher(env.HERALD, "HERALD"),
       dispatcher: new WorkflowDroneDispatcher(env.DRONES),
     };
   }
@@ -139,6 +163,28 @@ export class QueenNode extends DurableObject<Env> {
   async reportLandResult(input: LandResultInput): Promise<TrainUpdate> {
     const r = parseOrThrow(LandResultSchema, input, "land result");
     return this.trainTransition(r.trainId, (p) => p.landResult(r));
+  }
+
+  /**
+   * Provisioner outcome for a FORK or DELETE command
+   * (POST /internal/webhook/provision-result). Idempotent by commandId: a
+   * duplicate or superseded result returns an `ignored:*` outcome.
+   */
+  async reportProvisionResult(input: ProvisionResult): Promise<TrainUpdate> {
+    const r = parseOrThrow(ProvisionResultSchema, input, "provision result");
+    return this.trainTransition(r.trainId, (p) => p.provisionResult(r));
+  }
+
+  /**
+   * Herald outcome for a preview DEPLOY or TEARDOWN command
+   * (POST /internal/webhook/deploy-result). Idempotent by commandId. The train
+   * is resolved from `trainId`, or else from the command id.
+   */
+  async reportDeployResult(input: DeployResult): Promise<TrainUpdate> {
+    const r = parseOrThrow(DeployResultSchema, input, "deploy result");
+    const trainId = r.trainId ?? this.trainIdForCommand(r.commandId);
+    if (!trainId) throw new QueenError("NOT_FOUND", `no train for command ${r.commandId}`);
+    return this.trainTransition(trainId, (p) => p.deployResult({ ...r, trainId }));
   }
 
   /** Cognitive Ledger entry from a drone. */
@@ -205,7 +251,20 @@ export class QueenNode extends DurableObject<Env> {
           .toArray()
           .map(rowToAudit),
       ),
+      deployments: this.listDeployments(),
     };
+  }
+
+  /** Environment rows plus the newest per-train preview rows, oldest first. */
+  listDeployments(): Deployment[] {
+    return this.sql
+      .exec(
+        `SELECT * FROM (SELECT rowid AS rid, * FROM deployments ORDER BY (environment = 'preview'), updated_at DESC, rowid DESC LIMIT ?)
+         ORDER BY updated_at, rid`,
+        SNAPSHOT_LIMIT,
+      )
+      .toArray()
+      .map(rowToDeployment);
   }
 
   /** Reconcile fork/delete/dispatch intents that failed or were interrupted. */
@@ -328,15 +387,22 @@ export class QueenNode extends DurableObject<Env> {
     return row ? rowToPrompt(row) : null;
   }
 
+  private trainIdForCommand(commandId: string): string | null {
+    const row = this.sql
+      .exec("SELECT train_id FROM merge_trains WHERE deploy_command_id = ? OR teardown_command_id = ? LIMIT 1", commandId, commandId)
+      .toArray()[0];
+    return row ? String(row.train_id) : null;
+  }
+
   private loadTrain(trainId: string) {
     const row = this.sql.exec("SELECT * FROM merge_trains WHERE train_id = ?", trainId).toArray()[0];
     return row ? rowToTrain(row) : null;
   }
 
-  /** Active trains, trains with a pending fork delete, and any explicitly named ones. */
+  /** Active trains, trains with a pending fork delete or preview teardown, and any explicitly named ones. */
   private loadState(trainIds: string[]): HiveState {
     const named = trainIds.length ? ` OR train_id IN (${trainIds.map(() => "?").join(",")})` : "";
-    const cond = `phase NOT IN ('MERGED', 'EJECTED') OR fork_state = 'DELETING'${named}`;
+    const cond = `phase NOT IN ('MERGED', 'EJECTED') OR fork_state = 'DELETING' OR deploy_state = 'TEARING_DOWN'${named}`;
     const trains = this.sql
       .exec(`SELECT * FROM merge_trains WHERE ${cond} ORDER BY seq`, ...trainIds)
       .toArray()
@@ -345,8 +411,12 @@ export class QueenNode extends DurableObject<Env> {
       .exec(`SELECT * FROM prompt_runs WHERE prompt_id IN (SELECT prompt_id FROM merge_trains WHERE ${cond})`, ...trainIds)
       .toArray()
       .map(rowToPrompt);
+    const deployments = this.sql
+      .exec(`SELECT * FROM deployments WHERE train_id IN (SELECT train_id FROM merge_trains WHERE ${cond})`, ...trainIds)
+      .toArray()
+      .map(rowToDeployment);
     const max = (table: string) => Number(this.sql.exec(`SELECT COALESCE(MAX(seq), 0) AS m FROM ${table}`).one().m);
-    return { prompts, trains, maxTrainSeq: max("merge_trains"), maxPromptSeq: max("prompt_runs") };
+    return { prompts, trains, deployments, maxTrainSeq: max("merge_trains"), maxPromptSeq: max("prompt_runs") };
   }
 
   /** Load -> plan, synchronously (no await), so concurrent calls never interleave mid-plan. */
@@ -369,15 +439,17 @@ export class QueenNode extends DurableObject<Env> {
   }
 
   /**
-   * Persist first (one transaction), then broadcast, then run I/O effects
-   * outside any transaction. Fork/delete/dispatch intents are already durable,
-   * so a crash between steps is repaired by the reconcile alarm.
+   * Persist first (one transaction), then broadcast, then dispatch commands
+   * outside any transaction. Command ids are already durable on the train
+   * rows, so a crash between steps is repaired by the reconcile alarm, and a
+   * re-dispatch of the same command id is a no-op.
    */
   private async apply(plan: PlanResult): Promise<void> {
-    if (plan.prompts.length || plan.trains.length) {
+    if (plan.prompts.length || plan.trains.length || plan.deployments.length) {
       this.ctx.storage.transactionSync(() => {
         for (const p of plan.prompts) upsertPrompt(this.sql, p);
         for (const t of plan.trains) upsertTrain(this.sql, t);
+        for (const d of plan.deployments) upsertDeployment(this.sql, d);
       });
     }
     for (const e of plan.effects) if (e.type === "broadcast") this.broadcast(e.message);
@@ -385,25 +457,23 @@ export class QueenNode extends DurableObject<Env> {
   }
 
   private async execute(e: Exclude<Effect, { type: "broadcast" }>): Promise<void> {
-    const hive = this.hiveNamespace()!;
     switch (e.type) {
-      case "provisionFork": {
-        let fork: ForkResult;
+      case "provision": {
+        // Async: the Provisioner reports back via reportProvisionResult.
         try {
-          fork = await this.ports.provisioner.forkTrain(e.source, e.artifactRepo);
+          await this.ports.provisioner.dispatch(e.command);
         } catch (err) {
           return this.ioFailed(e, err);
         }
-        await this.apply(this.plan(hive, [e.trainId], (p) => p.forkReady({ trainId: e.trainId, ...fork })));
         return;
       }
-      case "deleteFork": {
+      case "deploy": {
+        // Async: the Herald reports back via reportDeployResult.
         try {
-          await this.ports.provisioner.deleteFork(e.artifactRepo);
+          await this.ports.herald.dispatch(e.command);
         } catch (err) {
           return this.ioFailed(e, err);
         }
-        await this.apply(this.plan(hive, [e.trainId], (p) => p.forkDeleted(e.trainId)));
         return;
       }
       case "dispatchDrone": {
@@ -412,6 +482,7 @@ export class QueenNode extends DurableObject<Env> {
         } catch (err) {
           return this.ioFailed(e, err);
         }
+        const hive = this.hiveNamespace()!;
         const phase = e.task.action === "LAND" ? "LANDING" : "BUILDING";
         await this.apply(this.plan(hive, [e.trainId], (p) => p.dispatched(e.trainId, phase)));
         return;

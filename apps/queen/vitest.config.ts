@@ -4,12 +4,11 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      // The ARTIFACTS binding only exists remotely; never open a remote proxy
-      // session (needs Cloudflare credentials) when running tests.
+      // Never open a remote proxy session (needs Cloudflare credentials).
       remoteBindings: false,
-      // The "test" env omits the cross-script DRONES Workflow: the pool has no
-      // dev registry to reach another script. Tests inject a recording
-      // DroneDispatcher (and a fake ForkProvisioner) via test/worker.ts.
+      // The "test" env omits the cross-script Workflows (DRONES, PROVISIONER,
+      // HERALD): the pool has no dev registry to reach another script. Tests
+      // inject recording dispatchers via test/worker.ts.
       wrangler: { configPath: "./wrangler.jsonc", environment: "test" },
       main: "./test/worker.ts",
       miniflare: {

@@ -9,6 +9,8 @@
 import type {
   AuditEvent,
   AuditStatus,
+  DeployEnvironment,
+  Deployment,
   DroneRole,
   GitNotesPayload,
   MergeTrain,
@@ -39,6 +41,8 @@ export interface State {
   trains: Record<string, MergeTrain>;
   /** Train ids in creation order. */
   trainOrder: string[];
+  /** Deployments by deploymentId (per-train previews; staging/canary/prod from P3). */
+  deployments: Record<string, Deployment>;
   audit: AuditEvent[];
   /** Newest first. */
   ticker: TickerItem[];
@@ -61,6 +65,7 @@ export const initialState: State = {
   promptOrder: [],
   trains: {},
   trainOrder: [],
+  deployments: {},
   audit: [],
   ticker: [],
   landed: [],
@@ -156,6 +161,7 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
         promptOrder: byCreated(msg.promptRuns).map((p) => p.promptId),
         trains,
         trainOrder: byCreated(msg.trains).map((t) => t.trainId),
+        deployments: Object.fromEntries((msg.deployments ?? []).map((d) => [d.deploymentId, d])),
         audit: msg.recentAudit.slice(-AUDIT_LIMIT),
         landed: [],
       };
@@ -204,6 +210,26 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
       if (t.summary && t.summary !== prev?.summary) {
         const who = tail ? `[${letterOf(next, tail)}] ` : "";
         next = pushTicker(next, "scribe", `${who}${t.summary}`, at);
+      }
+      return next;
+    }
+    case "deployment.updated": {
+      const d = msg.deployment;
+      const prev = state.deployments[d.deploymentId];
+      if (prev && prev.updatedAt > d.updatedAt) return state; // out-of-order frame
+      let next: State = { ...state, deployments: { ...state.deployments, [d.deploymentId]: d } };
+      if (prev?.status !== d.status) {
+        const train = d.trainId ? next.trains[d.trainId] : undefined;
+        const who = train ? `Train ${train.includedPrompts.map((id) => letterOf(next, id)).join("+")} ` : "";
+        const text =
+          d.status === "PENDING"
+            ? `${who}deploying ${d.environment}${d.commitSha ? ` @ ${d.commitSha.slice(0, 7)}` : ""}`
+            : d.status === "LIVE"
+              ? `${who}${d.environment} live${d.url ? ` at ${d.url}` : ""}`
+              : d.status === "FAILED"
+                ? `${who}${d.environment} failed${d.summary ? `: ${d.summary}` : ""}`
+                : `${who}${d.environment} torn down`;
+        next = pushTicker(next, d.status === "FAILED" ? "error" : "status", text, at);
       }
       return next;
     }
@@ -277,6 +303,8 @@ export interface LaneTrain {
   current: boolean;
   /** Why an ejected train ended: it failed itself, or was superseded. */
   ejectKind: "failed" | "superseded" | null;
+  /** The train's Worker Preview row, if it was ever deployed. */
+  preview: Deployment | null;
 }
 
 export interface Lane {
@@ -308,9 +336,52 @@ export function buildLanes(state: State): Lane[] {
         current: k === trains.length - 1,
         ejectKind:
           train.status !== "EJECTED" ? null : train.reason?.startsWith("superseded") ? "superseded" : "failed",
+        preview: state.deployments[`preview-${train.trainId}`] ?? null,
       })),
     };
   });
 }
 
-export const PHASE_FLOW = ["WAITING_PARENT", "BUILDING", "TESTING", "PASSED", "LANDING", "MERGED"] as const;
+export const PHASE_FLOW = ["WAITING_PARENT", "BUILDING", "DEPLOYING", "TESTING", "PASSED", "LANDING", "MERGED"] as const;
+
+/** How a train card shows its preview. */
+export type PreviewView =
+  | { kind: "none" }
+  | { kind: "deploying" }
+  | { kind: "live"; url: string }
+  | { kind: "failed"; summary: string | null }
+  | { kind: "gone"; url: string | null };
+
+export function previewView(train: MergeTrain, preview: Deployment | null): PreviewView {
+  if (preview?.status === "TORN_DOWN") return { kind: "gone", url: train.previewUrl ?? preview.url };
+  if (preview?.status === "FAILED") return { kind: "failed", summary: preview.summary };
+  const url = train.previewUrl ?? preview?.url ?? null;
+  if (train.phase === "DEPLOYING" || (preview?.status === "PENDING" && !url)) return { kind: "deploying" };
+  return url ? { kind: "live", url } : { kind: "none" };
+}
+
+export const ENVIRONMENTS: readonly DeployEnvironment[] = ["preview", "staging", "canary", "prod"];
+
+export interface SiteRow {
+  environment: DeployEnvironment;
+  /** Staging, canary and prod are not wired up until P3. */
+  configured: boolean;
+  /** For preview: active (non-torn-down) previews, newest first. Others: the env row. */
+  deployments: Deployment[];
+  /** Torn-down previews (counted only). */
+  retired: number;
+}
+
+export function buildSites(state: Pick<State, "deployments">): SiteRow[] {
+  const all = Object.values(state.deployments);
+  return ENVIRONMENTS.map((environment) => {
+    const rows = all.filter((d) => d.environment === environment).sort((a, b) => b.updatedAt - a.updatedAt);
+    const active = rows.filter((d) => d.status !== "TORN_DOWN");
+    return {
+      environment,
+      configured: environment === "preview" || rows.length > 0,
+      deployments: active,
+      retired: rows.length - active.length,
+    };
+  });
+}

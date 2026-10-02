@@ -7,7 +7,7 @@ QueenOS is an autonomous, agentic Git platform built entirely on Cloudflare prim
 ## Workspace layout
 
 - **apps/dashboard** — React + Vite SPA
-- **apps/queen** — Hono Worker + QueenNode Durable Object (SQLite-backed, WebSocket hibernation). `pnpm --filter @queenos/queen dev:sim` runs it in sim mode: fake Artifacts and auto-advancing fake drones, no Cloudflare credentials needed
+- **apps/queen** — Hono Worker + QueenNode Durable Object (SQLite-backed, WebSocket hibernation). `pnpm --filter @queenos/queen dev:sim` runs it in sim mode: fake executors (provisioner, herald, drones, gatekeepers) that auto-advance, no Cloudflare credentials needed
 - **apps/gatekeepers** — Worker handling Artifacts push events
 - **apps/drones** — Cloudflare Workflows
 - **packages/hive-kit** — Worker-safe git (isomorphic-git + in-memory fs), AI Gateway client and Cognitive Ledger helpers shared by drones and gatekeepers (@queenos/hive-kit)

@@ -7,9 +7,9 @@ import type { DroneTask, GitNotesPayload } from "@queenos/queen-types";
 import { ledgerFilePath, serializeLedger } from "@queenos/hive-kit";
 import { ChangeSetError, parseChangeSet, type ChangeSet } from "./change-set";
 import type { DroneConfig } from "./config";
-import type { DronePorts } from "./ports";
+import type { DronePorts, GitSession } from "./ports";
 import { BUILDER_SYSTEM_PROMPT, buildBuilderMessages } from "./prompt";
-import { SCRIPTED_MODEL, scriptedChangeSet } from "./scripted";
+import { FEATURE_REGISTRY_PATH, SCRIPTED_MODEL, mergeRegistry, registryModules, scriptedChangeSet } from "./scripted";
 
 export type LedgerStore = "git-notes" | "ledger-file";
 
@@ -78,6 +78,19 @@ export interface CommitPushResult {
   resumed: boolean;
 }
 
+/**
+ * The change set only knows its own feature, but trains chain: merge the
+ * template's feature registry with the one already on the branch so earlier
+ * features stay registered.
+ */
+async function withMergedRegistry(repo: GitSession, files: ChangeSet["files"]): Promise<ChangeSet["files"]> {
+  const entry = files.find((f) => f.path === FEATURE_REGISTRY_PATH);
+  if (!entry) return files;
+  const existing = (await repo.readFiles([FEATURE_REGISTRY_PATH]).catch(() => ({}) as Record<string, string>))[FEATURE_REGISTRY_PATH] ?? null;
+  const merged = mergeRegistry(existing, registryModules(entry.content));
+  return files.map((f) => (f === entry ? { ...f, content: merged } : f));
+}
+
 export async function commitAndPush(ports: Pick<DronePorts, "artifacts" | "git">, input: CommitPushInput): Promise<CommitPushResult> {
   const { task, changeSet, ledger, timestamp } = input;
   // Token is minted inside this step and never returned: it must not land in step state.
@@ -96,7 +109,7 @@ export async function commitAndPush(ports: Pick<DronePorts, "artifacts" | "git">
     if (ledgerFor) return { headSha: head.oid, codeSha: ledgerFor, ledgerStore: "ledger-file", resumed };
     codeSha = head.oid;
   } else {
-    await repo.writeFiles(changeSet.files);
+    await repo.writeFiles(await withMergedRegistry(repo, changeSet.files));
     codeSha = await repo.commitAll({ message: commitMessage(task, changeSet), timestamp });
   }
 

@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useReducer, useState } from "react";
 import { DEMO_PROMPTS } from "./demo";
-import { Composer, Lanes, LedgerPanel, MainTrack, Ticker, TopBar } from "./components";
-import { buildLanes, initialState, reducer, type AuditCard, type Lane } from "./reducer";
+import { Composer, Lanes, LedgerPanel, MainTrack, Sites, Ticker, TopBar } from "./components";
+import { buildLanes, buildSites, initialState, reducer, type AuditCard, type Lane } from "./reducer";
 import { useQueenSocket } from "./useQueenSocket";
 
 const hive = new URLSearchParams(window.location.search).get("hive") || "demo";
@@ -13,6 +13,8 @@ export function App() {
   const [swarming, setSwarming] = useState(false);
 
   const lanes = useMemo(() => buildLanes(state), [state]);
+  const sites = useMemo(() => buildSites(state), [state.deployments]);
+  const closeLedger = useCallback(() => setSelectedKey(null), []);
   // Re-resolve the open card from live state so a RUNNING card updates in place.
   const selected = useMemo<{ card: AuditCard; lane: Lane } | null>(() => {
     if (!selectedKey) return null;
@@ -51,10 +53,11 @@ export function App() {
         </main>
         <aside className="layout__side">
           <Composer disabled={status !== "open"} onSubmit={submit} onSwarm={() => void swarm()} swarming={swarming} />
+          <Sites rows={sites} state={state} />
           <Ticker items={state.ticker} />
         </aside>
       </div>
-      {selected && <LedgerPanel card={selected.card} lane={selected.lane} onClose={() => setSelectedKey(null)} />}
+      {selected && <LedgerPanel card={selected.card} lane={selected.lane} onClose={closeLedger} />}
     </div>
   );
 }

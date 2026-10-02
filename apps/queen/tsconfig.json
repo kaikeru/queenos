@@ -1,6 +1,6 @@
 {
   "extends": "@queenos/tsconfig/worker.json",
-  // ESNext.Disposable types `using` / Symbol.dispose (Artifacts repo handles are Disposable RPC stubs).
+  // ESNext.Disposable: kept for `using` on Disposable RPC stubs.
   "compilerOptions": { "lib": ["ES2022", "ESNext.Disposable"] },
   "include": ["src", "worker-configuration.d.ts"]
 }

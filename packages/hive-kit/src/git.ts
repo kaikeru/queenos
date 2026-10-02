@@ -393,7 +393,7 @@ function hashString(s: string): number {
 export interface CloneOptions {
   /** HTTPS remote, e.g. `https://<acct>.artifacts.cloudflare.net/git/<ns>/<repo>.git`. */
   remote: string;
-  /** Artifacts repo token (`art_v1_…?expires=…`). */
+  /** Artifacts repo token (`art_v2_x_…?expires=…`). */
   token?: string;
   /** Branch to clone. Default: the remote HEAD. */
   ref?: string;

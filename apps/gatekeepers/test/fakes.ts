@@ -23,6 +23,7 @@ import type {
   RepoAccess,
 } from "../src/ports";
 import type { ScribeLlm } from "../src/scribe";
+import type { SmokeProbe, SmokeResult } from "../src/smoke";
 import { ScriptedTestRunner, type TestRunner } from "../src/test-runner";
 
 export const T0 = 1_790_000_000;
@@ -86,6 +87,7 @@ export interface FakeTrain {
   phase: string;
   headSha: string | null;
   includedPrompts: string[];
+  previewUrl?: string | null;
 }
 
 type QueenCall =
@@ -115,6 +117,7 @@ export class FakeQueen implements QueenPort {
       createdAt: T0,
       phase: (t === this.train ? phase : t.phase) as "TESTING",
       headSha: t.headSha,
+      ...(t.previewUrl !== undefined ? { previewUrl: t.previewUrl } : {}),
     });
     return {
       type: "snapshot",
@@ -184,12 +187,22 @@ export class FakeDispatcher implements GateDispatcher {
   }
 }
 
+export class FakeSmoke implements SmokeProbe {
+  readonly urls: string[] = [];
+  result: SmokeResult = { passed: true, status: 200, log: "smoke: ok" };
+  async check(url: string): Promise<SmokeResult> {
+    this.urls.push(url);
+    return this.result;
+  }
+}
+
 export class FakeWorld {
   readonly artifacts = new FakeArtifacts();
   readonly git = new FakeGitHost();
   readonly queen = new FakeQueen();
   readonly failures = new FakeFailureStore();
   readonly dispatcher = new FakeDispatcher();
+  readonly smoke = new FakeSmoke();
   llm: ScribeLlm | null = null;
   tests: TestRunner = new ScriptedTestRunner();
 
@@ -200,6 +213,7 @@ export class FakeWorld {
       queen: () => this.queen,
       llm: this.llm,
       tests: this.tests,
+      smoke: this.smoke,
       failures: this.failures,
       dispatcher: this.dispatcher,
     };
