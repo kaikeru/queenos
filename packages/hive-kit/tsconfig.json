@@ -1,0 +1,1 @@
+{ "extends": "@queenos/tsconfig/worker.json", "include": ["src"] }

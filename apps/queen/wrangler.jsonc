@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "queen",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
+  "durable_objects": {
+    "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["QueenNode"] }],
+  // Cross-script binding to the drones Worker's Workflow. `script_name` must be
+  // the deployed name of apps/drones (its wrangler.jsonc "name").
+  "workflows": [
+    {
+      "binding": "DRONES",
+      "name": "drone-workflow",
+      "class_name": "DroneWorkflow",
+      "script_name": "queenos-drones"
+    }
+  ],
+  // Secret (not in this file): `wrangler secret put QUEEN_INTERNAL_TOKEN`.
+  // Guards /internal/*, /audit, /scribe, /trains/:id/result. See .dev.vars.example.
+  "env": {
+    // Used only by vitest (see vitest.config.ts). Named envs do not inherit
+    // bindings, so this env has the DO but no ARTIFACTS and no DRONES (wrangler
+    // warns about that on every test run; it is intentional).
+    // Local demo: `pnpm dev:sim`. Fake Artifacts + auto-advancing fake drones
+    // (src/sim/worker.ts); needs no Cloudflare credentials, LLM or Workflow.
+    "sim": {
+      "main": "src/sim/worker.ts",
+      // Local demo only: no secret needed. Never set this in the default env.
+      "vars": { "QUEEN_INTERNAL_AUTH": "disabled" },
+      "durable_objects": {
+        "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
+      },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["QueenNode"] }]
+    },
+    "test": {
+      // Fixed non-secret token so tests exercise the real auth path.
+      "vars": { "QUEEN_INTERNAL_TOKEN": "test-internal-token" },
+      "durable_objects": {
+        "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
+      }
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // apps/queen binds to this Worker by name ("script_name": "queenos-drones").
+  "name": "queenos-drones",
+  "main": "src/index.ts",
+  // Implies nodejs_compat (+v2): isomorphic-git's bare `Buffer` global works
+  // with no flags (docs/discovery.md §2). Do not add nodejs_compat.
+  "compatibility_date": "2026-10-02",
+  // isomorphic-git pack/sha1 work is CPU-heavy; Workflow steps may use up to 5 min.
+  "limits": { "cpu_ms": 300000 },
+  "workflows": [
+    {
+      // apps/queen's DRONES binding names this workflow + class.
+      "name": "drone-workflow",
+      "binding": "DRONE_WORKFLOW",
+      "class_name": "DroneWorkflow"
+    }
+  ],
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
+  "durable_objects": {
+    "bindings": [
+      // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen").
+      // One QueenNode per hive: QUEEN.idFromName(namespace).
+      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" }
+    ]
+  },
+  "vars": {
+    // "live" calls the LLM through AI Gateway; "scripted" returns a deterministic
+    // change set (demo video, tests). Git + Artifacts run for real in both.
+    "DRONE_LLM_MODE": "scripted",
+    // Artificial "thinking" time in scripted mode (durable step.sleep).
+    "DRONE_SCRIPTED_DELAY_MS": "4000",
+    "AI_GATEWAY_ACCOUNT_ID": "",
+    "AI_GATEWAY_ID": "queenos",
+    "AI_PROVIDER": "anthropic",
+    "AI_MODEL": "claude-opus-5-5"
+    // Secret (wrangler secret put CF_AIG_TOKEN): CF_AIG_TOKEN. See .dev.vars.example.
+  },
+  "env": {
+    // Used only by vitest (see vitest.config.ts). Named envs do not inherit
+    // bindings: no ARTIFACTS (remote-only) and no cross-script QUEEN DO (the pool
+    // has no dev registry). Tests inject fake ports via test/worker.ts.
+    "test": {
+      "workflows": [{ "name": "drone-workflow", "binding": "DRONE_WORKFLOW", "class_name": "DroneWorkflow" }],
+      "vars": {
+        "DRONE_LLM_MODE": "scripted",
+        "DRONE_SCRIPTED_DELAY_MS": "0",
+        "AI_GATEWAY_ACCOUNT_ID": "",
+        "AI_GATEWAY_ID": "queenos",
+        "AI_PROVIDER": "anthropic",
+        "AI_MODEL": "claude-opus-5-5"
+      }
+    }
+  }
+}

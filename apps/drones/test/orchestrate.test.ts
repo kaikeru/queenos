@@ -1,0 +1,246 @@
+import { describe, expect, it } from "vitest";
+import { AiGatewayError, ledgerFilePath, parseLedger } from "@queenos/hive-kit";
+import { DroneTaskSchema } from "@queenos/queen-types";
+import { commitAndPush, droneTrailer, generateChangeSet } from "../src/build";
+import { readConfig } from "../src/config";
+import { DroneFailedError, runDrone } from "../src/orchestrate";
+import { SCRIPTED_MODEL, scriptedChangeSet } from "../src/scripted";
+import { FakeLlm, FakeWorld, InlineSteps, remoteOf, task } from "./fakes";
+
+const scripted = readConfig({ DRONE_LLM_MODE: "scripted", DRONE_SCRIPTED_DELAY_MS: "1500" });
+const live = readConfig({ DRONE_LLM_MODE: "live", AI_GATEWAY_ACCOUNT_ID: "acct", AI_GATEWAY_ID: "gw", CF_AIG_TOKEN: "tok" });
+
+async function world(repo = "hive-train-aaaaaaaaaaaa") {
+  const w = new FakeWorld();
+  const base = await w.git.seed(repo);
+  return { w, base };
+}
+
+describe("BUILD (scripted)", () => {
+  it("clones, commits, notes, pushes and reports to the Queen", async () => {
+    const { w, base } = await world();
+    const steps = new InlineSteps();
+    const out = await runDrone(task(), steps, w.ports(), scripted);
+
+    expect(out).toMatchObject({ action: "BUILD", status: "built", ledgerStore: "git-notes", queenOutcome: "applied" });
+    if (out.status !== "built") throw new Error("unreachable");
+    expect(out.headSha).toBe(out.codeSha);
+
+    expect(steps.names()).toEqual([
+      "clock: start",
+      "audit: running",
+      "generate change set",
+      "clock: generated",
+      "clone, commit, note, push",
+      "report: build result",
+      "audit: passed",
+    ]);
+    expect(steps.sleeps).toEqual([{ name: "scripted: thinking", ms: 1500 }]);
+
+    // Write token minted for the fork; clone of main at depth 1.
+    expect(w.artifacts.calls).toEqual([{ repo: "hive-train-aaaaaaaaaaaa", scope: "write" }]);
+    expect(w.git.clones).toEqual([expect.objectContaining({ remote: remoteOf("hive-train-aaaaaaaaaaaa"), ref: "main", depth: 1 })]);
+
+    // Branch pushed, then the notes ref.
+    expect(w.git.pushes.map((p) => [p.remoteRef, p.oid])).toEqual([
+      ["main", out.codeSha],
+      ["refs/notes/queen", expect.stringMatching(/^[0-9a-f]{40}$/)],
+    ]);
+
+    // The commit is real: parent = fork base, scripted files, drone trailer, fixed timestamp.
+    const repo = w.git.repo("hive-train-aaaaaaaaaaaa");
+    const head = await repo.head();
+    expect(head?.parents).toEqual([base]);
+    expect(head?.message).toContain(droneTrailer(DroneTaskSchema.parse(task())));
+    const files = await repo.listFiles();
+    for (const f of scriptedChangeSet(DroneTaskSchema.parse(task())).files) expect(files).toContain(f.path);
+
+    // Ledger note on the code commit.
+    const note = parseLedger((await repo.readNote(out.codeSha))!);
+    expect(note).toMatchObject({ taskPrompt: task().promptText, model: SCRIPTED_MODEL, temperature: 0, result: "success" });
+    expect(note.reasoningSteps.length).toBeGreaterThan(2);
+    expect(note.executionTimeMs).toBeGreaterThanOrEqual(0);
+
+    // Queen: RUNNING audit, build result, PASSED audit carrying the same ledger.
+    const q = w.queen("hive");
+    expect(q.calls.map((c) => c.method)).toEqual(["appendAudit", "reportBuildResult", "appendAudit"]);
+    expect(q.calls[1]!.input).toEqual({ trainId: "train-1", headSha: out.headSha });
+    const [running, passed] = q.audits();
+    expect(running).toMatchObject({ promptId: "prompt-1", droneRole: "BUILDER", status: "RUNNING", gitNotesPayload: null });
+    expect(passed).toMatchObject({ droneRole: "BUILDER", status: "PASSED", gitNotesPayload: note });
+  });
+
+  it("falls back to .queen/ledger/<sha>.json when the notes push is refused", async () => {
+    const { w } = await world();
+    w.git.rejectNotes = true;
+    const out = await runDrone(task(), new InlineSteps(), w.ports(), scripted);
+    if (out.status !== "built") throw new Error("expected built");
+
+    expect(out.ledgerStore).toBe("ledger-file");
+    expect(out.notesError).toMatch(/refs\/notes/);
+    expect(out.headSha).not.toBe(out.codeSha);
+
+    const repo = w.git.repo("hive-train-aaaaaaaaaaaa");
+    const ledgerCommit = await repo.head();
+    expect(ledgerCommit?.oid).toBe(out.headSha);
+    expect(ledgerCommit?.parents).toEqual([out.codeSha]);
+    expect(ledgerCommit?.message).toContain(`Queen-Ledger-For: ${out.codeSha}`);
+    const files = await repo.readFiles([ledgerFilePath(out.codeSha)]);
+    expect(parseLedger(files[ledgerFilePath(out.codeSha)]!)).toMatchObject({ result: "success", model: SCRIPTED_MODEL });
+
+    // Two branch pushes (code, then ledger commit); the Queen tests the ledger commit.
+    expect(w.git.pushes.map((p) => p.remoteRef)).toEqual(["main", "main"]);
+    expect(w.queen("hive").calls[1]!.input).toEqual({ trainId: "train-1", headSha: out.headSha });
+  });
+
+  it("a retried commit step recognises its own pushed work (no duplicate commit)", async () => {
+    const { w } = await world();
+    const t = DroneTaskSchema.parse(task());
+    const gen = await generateChangeSet(t, w.ports(), scripted);
+    const input = {
+      task: t,
+      changeSet: gen.changeSet,
+      ledger: { taskPrompt: t.promptText, model: gen.model, temperature: 0, reasoningSteps: [], result: "success" as const, executionTimeMs: 1, discardedPaths: [] },
+      timestamp: 1_790_000_000,
+    };
+    const first = await commitAndPush(w.ports(), input);
+    const second = await commitAndPush(w.ports(), input);
+    expect(first.resumed).toBe(false);
+    expect(second).toMatchObject({ resumed: true, codeSha: first.codeSha, headSha: first.headSha });
+
+    w.git.rejectNotes = true; // retry after a ledger-file fallback was pushed
+    const t2 = { ...t, trainId: "train-2", promptId: "prompt-2" };
+    const input2 = { ...input, task: t2, changeSet: (await generateChangeSet(t2, w.ports(), scripted)).changeSet };
+    const fb = await commitAndPush(w.ports(), input2);
+    const again = await commitAndPush(w.ports(), input2);
+    expect(again).toEqual({ headSha: fb.headSha, codeSha: fb.codeSha, ledgerStore: "ledger-file", resumed: true });
+  });
+
+  it("fixed timestamps give the same SHA for the same task on the same base", async () => {
+    const t = DroneTaskSchema.parse(task());
+    const run = async () => {
+      const { w } = await world();
+      const gen = await generateChangeSet(t, w.ports(), scripted);
+      const ledger = { taskPrompt: "p", model: "m", temperature: 0, reasoningSteps: [], result: "success" as const, executionTimeMs: 1, discardedPaths: [] };
+      return (await commitAndPush(w.ports(), { task: t, changeSet: gen.changeSet, ledger, timestamp: 1_790_000_000 })).codeSha;
+    };
+    expect(await run()).toBe(await run());
+  });
+});
+
+describe("BUILD / REWORK (live LLM via fake gateway)", () => {
+  const reply = JSON.stringify({
+    files: [{ path: "src/theme.ts", content: "export const dark = true;\n" }],
+    reasoningSteps: ["fixed null theme"],
+    discardedPaths: ["src/legacy-theme.ts"],
+  });
+
+  it("REWORK sends RAG memory + Scribe summary, no temperature, and records the model", async () => {
+    const { w } = await world();
+    const llm = new FakeLlm(() => reply);
+    w.llm = llm;
+    const t = task({ action: "REWORK", ragContext: ["theme tokens live in src/theme.ts"], scribeSummary: "Tests failed: theme was null." });
+    const out = await runDrone(t, new InlineSteps(), w.ports(), live);
+
+    expect(out).toMatchObject({ action: "REWORK", status: "built" });
+    expect(llm.requests).toHaveLength(1);
+    const req = llm.requests[0]!;
+    expect(req.system).toMatch(/QueenOS builder drone/);
+    expect(req.messages[0]!.content).toContain("theme tokens live in src/theme.ts");
+    expect(req.messages[0]!.content).toContain("Tests failed: theme was null.");
+    expect(req).not.toHaveProperty("temperature");
+
+    const passed = w.queen("hive").audits()[1]!;
+    expect(passed.gitNotesPayload).toMatchObject({
+      model: "claude-opus-5-5",
+      reasoningSteps: ["fixed null theme"],
+      discardedPaths: ["src/legacy-theme.ts"],
+    });
+    expect(await w.git.repo("hive-train-aaaaaaaaaaaa").readFiles(["src/theme.ts"])).toEqual({ "src/theme.ts": "export const dark = true;\n" });
+  });
+
+  it("retries invalid model output, then reports a failed train and a REJECTED audit", async () => {
+    const { w } = await world();
+    w.llm = new FakeLlm(() => "I cannot produce JSON today");
+    const steps = new InlineSteps();
+    await expect(runDrone(task(), steps, w.ports(), live)).rejects.toBeInstanceOf(DroneFailedError);
+
+    expect(steps.log.find((l) => l.name === "generate change set")).toEqual({ name: "generate change set", attempts: 4, ok: false });
+    const q = w.queen("hive");
+    const failure = q.calls.find((c) => c.method === "reportTrainResult");
+    expect(failure?.input).toMatchObject({ trainId: "train-1", passed: false, summary: expect.stringMatching(/generation: no JSON object/) });
+    expect(q.audits().map((a) => a.status)).toEqual(["RUNNING", "REJECTED"]);
+    expect(q.audits()[1]!.gitNotesPayload).toMatchObject({ result: "failure" });
+    expect(w.git.pushes).toEqual([]);
+  });
+
+  it("does not retry non-retryable gateway errors (401)", async () => {
+    const { w } = await world();
+    w.llm = new FakeLlm(() => new AiGatewayError("AI Gateway anthropic 401: bad token", 401, false));
+    const steps = new InlineSteps();
+    await expect(runDrone(task(), steps, w.ports(), live)).rejects.toThrow(/401/);
+    expect(steps.log.find((l) => l.name === "generate change set")?.attempts).toBe(1);
+  });
+});
+
+describe("LAND", () => {
+  async function landWorld() {
+    const { w } = await world();
+    await w.git.seed("hive");
+    // The builder already pushed a train head to the fork.
+    const built = await runDrone(task(), new InlineSteps(), w.ports(), scripted);
+    if (built.status !== "built") throw new Error("setup");
+    return { w, head: built.headSha };
+  }
+
+  it("pushes the train head to the hive repo's main and reports the new main SHA", async () => {
+    const { w, head } = await landWorld();
+    w.git.pushes.length = 0;
+    const steps = new InlineSteps();
+    const out = await runDrone(task({ role: "LANDER", action: "LAND", baseRef: head }), steps, w.ports(), scripted);
+
+    expect(out).toMatchObject({ action: "LAND", status: "landed", mainSha: head, queenOutcome: "applied" });
+    expect(w.artifacts.calls.slice(-2)).toEqual([
+      { repo: "hive-train-aaaaaaaaaaaa", scope: "read" },
+      { repo: "hive", scope: "write" },
+    ]);
+    expect(w.git.pushes).toEqual([{ url: remoteOf("hive"), ref: "refs/heads/queen-land", remoteRef: "refs/heads/main", oid: head }]);
+
+    const q = w.queen("hive");
+    const land = q.calls.find((c) => c.method === "reportLandResult");
+    expect(land?.input).toMatchObject({ trainId: "train-1", landed: true, mainSha: head });
+    expect(q.audits().slice(-2)).toEqual([
+      expect.objectContaining({ droneRole: "LANDER", status: "RUNNING" }),
+      expect.objectContaining({ droneRole: "LANDER", status: "PASSED", gitNotesPayload: expect.objectContaining({ result: "success" }) }),
+    ]);
+    expect(steps.names()).toContain("land: push train head to hive main");
+  });
+
+  it("reports landed:false on a non-fast-forward", async () => {
+    const { w, head } = await landWorld();
+    w.git.nonFastForward.add(remoteOf("hive"));
+    const out = await runDrone(task({ role: "LANDER", action: "LAND", baseRef: head }), new InlineSteps(), w.ports(), scripted);
+
+    expect(out).toMatchObject({ status: "not-landed", summary: expect.stringMatching(/not a fast-forward/) });
+    const q = w.queen("hive");
+    expect(q.calls.find((c) => c.method === "reportLandResult")?.input).toEqual({
+      trainId: "train-1",
+      landed: false,
+      summary: expect.stringMatching(/hive\/main moved/),
+    });
+    expect(q.audits().at(-1)).toMatchObject({ droneRole: "LANDER", status: "REJECTED" });
+  });
+
+  it("reports landed:false when the train head is not in the fork", async () => {
+    const { w } = await landWorld();
+    const out = await runDrone(task({ role: "LANDER", action: "LAND", baseRef: "f".repeat(40) }), new InlineSteps(), w.ports(), scripted);
+    expect(out).toMatchObject({ status: "not-landed", summary: expect.stringMatching(/not in fork/) });
+  });
+});
+
+describe("input validation", () => {
+  it("rejects a malformed task without retrying", async () => {
+    const { w } = await world();
+    await expect(runDrone({ trainId: "x" }, new InlineSteps(), w.ports(), scripted)).rejects.toBeInstanceOf(DroneFailedError);
+  });
+});

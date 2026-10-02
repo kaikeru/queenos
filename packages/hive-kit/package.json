@@ -1,0 +1,36 @@
+{
+  "name": "@queenos/hive-kit",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Edge-compatible runtime kit for QueenOS drones and gatekeepers: in-memory fs, isomorphic-git helpers, AI Gateway client, Cognitive Ledger.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@queenos/queen-types": "workspace:*",
+    "isomorphic-git": "^1.42.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261002.1",
+    "@queenos/eslint-config": "workspace:*",
+    "@queenos/tsconfig": "workspace:*",
+    "eslint": "^9.39.5",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  }
+}

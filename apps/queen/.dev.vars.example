@@ -1,0 +1,10 @@
+# Copy to .dev.vars for `wrangler dev`. In production: `wrangler secret put QUEEN_INTERNAL_TOKEN`.
+#
+# Shared bearer secret for machine-only HTTP routes (/internal/*, /audit, /scribe,
+# /trains/:id/result). Callers send `Authorization: Bearer <token>`. If unset, those
+# routes return 503 (fail closed). Generate one with: openssl rand -hex 32
+# (DO RPC callers - drones, gatekeepers - do not need it.)
+QUEEN_INTERNAL_TOKEN=
+
+# `pnpm dev:sim` (--env sim) sets QUEEN_INTERNAL_AUTH="disabled" in wrangler.jsonc, so
+# the local demo needs no token. Never set QUEEN_INTERNAL_AUTH outside sim/test.

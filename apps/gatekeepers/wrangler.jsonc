@@ -1,0 +1,85 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "queenos-gatekeepers",
+  "main": "src/index.ts",
+  // Implies nodejs_compat (+v2): isomorphic-git's bare `Buffer` global works
+  // with no flags (docs/discovery.md §2). Do not add nodejs_compat.
+  "compatibility_date": "2026-10-02",
+  // Clone + AST scan of a whole tree is CPU-heavy; Workflow steps may use up to 5 min.
+  "limits": { "cpu_ms": 300000 },
+  "workflows": [
+    {
+      // The push trigger below must name a Workflow defined by THIS Worker.
+      "name": "gatekeeper-workflow",
+      "binding": "GATEKEEPER_WORKFLOW",
+      "class_name": "GatekeeperWorkflow"
+    }
+  ],
+  "triggers": {
+    // Shape enforced by wrangler 4.147 (config-schema.json: ArtifactsEventTrigger).
+    // The docs' `target:{scriptName,workflowName}` / `filter.repoName` shape is rejected.
+    "events": [
+      {
+        "type": "cf.artifacts.repo.pushed",
+        "filter": { "namespace": "queenos" },
+        "targets": [{ "type": "workflow", "workflow_name": "gatekeeper-workflow" }]
+      }
+    ]
+  },
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
+  "durable_objects": {
+    "bindings": [
+      // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen").
+      // One QueenNode per hive: QUEEN.idFromName(hive).
+      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" }
+    ]
+  },
+  // Failure memory for RAG. Create once:
+  //   wrangler vectorize create queenos-failures --dimensions=768 --metric=cosine
+  // (768 = @cf/baai/bge-base-en-v1.5). Best effort: the gate never fails on Vectorize.
+  "vectorize": [{ "binding": "VECTORIZE", "index_name": "queenos-failures" }],
+  "ai": { "binding": "AI" },
+  "vars": {
+    // "scripted": deterministic tests (fail on the [fail] marker) + extractive Scribe.
+    // "sandbox": not implemented yet (TODO @cloudflare/sandbox).
+    "GATE_TEST_MODE": "scripted",
+    // auto = LLM Scribe only when GATE_TEST_MODE != scripted and CF_AIG_TOKEN is set.
+    "SCRIBE_MODE": "auto",
+    // Must match triggers.events[].filter.namespace.
+    "ARTIFACTS_NAMESPACE": "queenos",
+    // Comma-separated; "scope/*" and "prefix*" wildcards. package.json deps and bare imports must match.
+    "POLICY_ALLOWED_DEPS": "hono,zod,acorn,isomorphic-git,@queenos/*,@cloudflare/*,typescript,vitest,wrangler,eslint,typescript-eslint,@types/*",
+    // fetch("https://host/...") literals must target these hosts ("*.x.y" = subdomains).
+    "SECURITY_ALLOWED_HOSTS": "gateway.ai.cloudflare.com,api.cloudflare.com,*.artifacts.cloudflare.net,localhost,127.0.0.1",
+    // The push event can arrive before the Queen has processed build-result: re-check the phase this often.
+    "GATE_PHASE_RETRIES": "8",
+    "GATE_PHASE_WAIT_MS": "5000",
+    "AI_GATEWAY_ACCOUNT_ID": "",
+    "AI_GATEWAY_ID": "queenos",
+    "AI_PROVIDER": "anthropic",
+    // Fast + cheap model for the Scribe.
+    "AI_MODEL": "claude-haiku-4-5"
+    // Secret (wrangler secret put CF_AIG_TOKEN): CF_AIG_TOKEN. See .dev.vars.example.
+  },
+  "env": {
+    // Used only by vitest (see vitest.config.ts). Named envs do not inherit
+    // bindings: no ARTIFACTS / Vectorize / AI (remote-only), no cross-script QUEEN
+    // DO, and no event trigger. Tests inject fake ports via test/worker.ts.
+    "test": {
+      "workflows": [{ "name": "gatekeeper-workflow", "binding": "GATEKEEPER_WORKFLOW", "class_name": "GatekeeperWorkflow" }],
+      "vars": {
+        "GATE_TEST_MODE": "scripted",
+        "SCRIBE_MODE": "extractive",
+        "ARTIFACTS_NAMESPACE": "queenos",
+        "POLICY_ALLOWED_DEPS": "hono,zod,acorn,isomorphic-git,@queenos/*,@cloudflare/*,typescript,vitest,wrangler,eslint,typescript-eslint,@types/*",
+        "SECURITY_ALLOWED_HOSTS": "gateway.ai.cloudflare.com,api.cloudflare.com,*.artifacts.cloudflare.net,localhost,127.0.0.1",
+        "GATE_PHASE_RETRIES": "3",
+        "GATE_PHASE_WAIT_MS": "0",
+        "AI_GATEWAY_ACCOUNT_ID": "",
+        "AI_GATEWAY_ID": "queenos",
+        "AI_PROVIDER": "anthropic",
+        "AI_MODEL": "claude-haiku-4-5"
+      }
+    }
+  }
+}

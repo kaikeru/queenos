@@ -1,0 +1,75 @@
+import { z } from "zod";
+
+export const TrainStateSchema = z.enum(["BUILDING", "TESTING", "MERGED", "EJECTED"]);
+export type TrainState = z.infer<typeof TrainStateSchema>;
+
+/**
+ * Queen-internal train lifecycle, exposed so the War Room can show *why* a
+ * train is BUILDING or TESTING. `status` is derived from it:
+ * WAITING_PARENT/BUILDING -> BUILDING; TESTING/PASSED/LANDING -> TESTING.
+ */
+export const TrainPhaseSchema = z.enum([
+  "WAITING_PARENT",
+  "BUILDING",
+  "TESTING",
+  "PASSED",
+  "LANDING",
+  "MERGED",
+  "EJECTED",
+]);
+export type TrainPhase = z.infer<typeof TrainPhaseSchema>;
+
+/** Input: a user submits a prompt into a namespace. */
+export const SubmitPromptSchema = z.object({
+  namespace: z.string().min(1),
+  promptText: z.string().min(1),
+});
+export type SubmitPrompt = z.infer<typeof SubmitPromptSchema>;
+
+/**
+ * Scribe compaction (<= 2 sentences). The Queen never sees raw logs,
+ * only these summaries.
+ */
+export const ScribeSummarySchema = z.object({
+  promptId: z.string().min(1).optional(),
+  trainId: z.string().min(1).optional(),
+  summary: z.string().max(500),
+});
+export type ScribeSummary = z.infer<typeof ScribeSummarySchema>;
+
+/** A drone or gatekeeper reporting a train's TESTING outcome. */
+export const TrainResultSchema = z.object({
+  trainId: z.string().min(1),
+  passed: z.boolean(),
+  /** Scribe's <=2-sentence compaction. */
+  summary: z.string().max(500),
+  commitSha: z.string().min(1).optional(),
+});
+export type TrainResult = z.infer<typeof TrainResultSchema>;
+
+/** A builder drone reporting that it pushed the train head to its fork. */
+export const BuildResultSchema = z.object({
+  trainId: z.string().min(1),
+  headSha: z.string().min(1),
+});
+export type BuildResult = z.infer<typeof BuildResultSchema>;
+
+/**
+ * A lander drone reporting the outcome of pushing a train head to the hive's
+ * main branch. There is no merge API in Artifacts, so landing is a git push.
+ */
+export const LandResultSchema = z
+  .object({
+    trainId: z.string().min(1),
+    landed: z.boolean(),
+    /** The hive main SHA after the push. Required when `landed` is true. */
+    mainSha: z.string().min(1).optional(),
+    /** Scribe's <=2-sentence compaction. */
+    summary: z.string().max(500).default(""),
+  })
+  .refine((r) => !r.landed || r.mainSha !== undefined, {
+    message: "mainSha is required when landed is true",
+    path: ["mainSha"],
+  });
+export type LandResult = z.infer<typeof LandResultSchema>;
+export type LandResultInput = z.input<typeof LandResultSchema>;
