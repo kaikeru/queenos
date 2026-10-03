@@ -124,11 +124,13 @@ Needs a Workers Paid account (Artifacts) and wrangler 4.145+. Steps marked **(un
    ```bash
    openssl rand -hex 32                                    # generate a token
    pnpm --filter @queenos/queen exec wrangler secret put QUEEN_INTERNAL_TOKEN
-   pnpm --filter @queenos/drones exec wrangler secret put CF_AIG_TOKEN
-   pnpm --filter @queenos/gatekeepers exec wrangler secret put CF_AIG_TOKEN
    ```
-   `QUEEN_INTERNAL_TOKEN` guards the Queen's machine-only HTTP routes. Without it those routes return 503. `CF_AIG_TOKEN` is the AI Gateway auth token.
-4. **Vars** in `apps/drones/wrangler.jsonc` (and gatekeepers): set `AI_GATEWAY_ACCOUNT_ID` to your account id; defaults are `AI_GATEWAY_ID=queenos`, `AI_PROVIDER=anthropic`, `AI_MODEL=claude-opus-5-5`. `DRONE_LLM_MODE` is `scripted` (deterministic change sets, good for the demo video) or `live`.
+   `QUEEN_INTERNAL_TOKEN` guards the Queen's machine-only HTTP routes. Without it those routes return 503. The LLM needs no token (see AI Gateway below).
+4. **AI Gateway.** LLM calls use the Workers AI `AI` binding through the gateway `queenos`, pre-authenticated within the account, so there are no tokens or secrets.
+   - The gateway `queenos` must exist (it does on the dev account).
+   - Optional: add your Anthropic key in the dashboard under AI Gateway > `queenos` > Provider Keys with alias `default`. Without it, third-party models fall back to Unified Billing.
+   - Per-role models are wrangler vars: `MODEL_BUILDER` (drones, default `anthropic/claude-opus-5-5`) and `MODEL_SCRIBE` (gatekeepers, default `anthropic/claude-haiku-4-5`). Use `anthropic/...` or a Workers AI `@cf/...` model.
+   - `DRONE_LLM_MODE` is `scripted` (deterministic change sets, good for the demo video) or `live`.
 5. **Event subscription.** Subscribe `cf.artifacts.repo.pushed` to the gatekeepers Workflow via `triggers.events` in its wrangler config **(unverified: payload shape and filter syntax, see the runbook)**.
 6. **Dashboard.** Build with `VITE_QUEEN_URL=https://<queen>.workers.dev pnpm --filter @queenos/dashboard build` and host `apps/dashboard/dist` on any static host **(not set up in this repo)**.
 

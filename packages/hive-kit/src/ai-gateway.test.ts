@@ -1,120 +1,88 @@
 import { describe, expect, it } from "vitest";
-import type { AiGatewayConfig } from "@queenos/queen-types";
-import { AiGatewayClient, AiGatewayError, aiGatewayUrl, type FetchLike } from "./ai-gateway.js";
+import { AiGatewayError, createAiClient, modelForRole, type AiRunner } from "./ai-gateway.js";
 
-const anthropic: AiGatewayConfig = { accountId: "acct123", gatewayId: "queen-gw", provider: "anthropic", model: "claude-opus-5-5" };
-const openai: AiGatewayConfig = { ...anthropic, provider: "openai", model: "gpt-x" };
+type Call = { model: string; input: Record<string, unknown>; options: unknown };
 
-function fakeFetch(status: number, body: unknown) {
-  const calls: { url: string; init: RequestInit }[] = [];
-  const fetch: FetchLike = async (url, init) => {
-    calls.push({ url, init });
-    return new Response(typeof body === "string" ? body : JSON.stringify(body), { status });
+function fake(out: unknown | (() => unknown)) {
+  const calls: Call[] = [];
+  const ai: AiRunner = {
+    async run(model, input, options) {
+      calls.push({ model, input, options });
+      return typeof out === "function" ? (out as () => unknown)() : out;
+    },
   };
-  return { fetch, calls };
+  return { ai, calls };
 }
 
-const headersOf = (init: RequestInit) => init.headers as Record<string, string>;
+const thirdParty = {
+  choices: [{ message: { role: "assistant", content: "hello" }, finish_reason: "stop" }],
+  usage: { prompt_tokens: 7, completion_tokens: 3 },
+};
 
-describe("AI Gateway client", () => {
-  it("builds the Anthropic BYOK request: URL, cf-aig-authorization, no provider key", async () => {
-    const { fetch, calls } = fakeFetch(200, {
-      model: "claude-opus-5-5",
-      stop_reason: "end_turn",
-      content: [
-        { type: "thinking", thinking: "" },
-        { type: "text", text: '{"files":[]}' },
-      ],
-      usage: { input_tokens: 12, output_tokens: 34 },
-    });
-    const client = new AiGatewayClient({ config: anthropic, token: "aig-secret", fetch });
-    const res = await client.complete({
-      system: "sys",
+describe("AiClient", () => {
+  it("sends system as the first message through the gateway, with no auth", async () => {
+    const { ai, calls } = fake(thirdParty);
+    const res = await createAiClient({ ai, gatewayId: "queenos" }).complete({
+      model: "anthropic/claude-haiku-4-5",
+      system: "be brief",
       messages: [{ role: "user", content: "hi" }],
-      maxTokens: 1000,
+      maxTokens: 50,
       metadata: { trainId: "t1" },
     });
-
-    expect(calls).toHaveLength(1);
-    const { url, init } = calls[0]!;
-    expect(url).toBe("https://gateway.ai.cloudflare.com/v1/acct123/queen-gw/anthropic/v1/messages");
-    expect(init.method).toBe("POST");
-    const h = headersOf(init);
-    expect(h["cf-aig-authorization"]).toBe("Bearer aig-secret");
-    expect(h["anthropic-version"]).toBe("2023-06-01");
-    expect(h["cf-aig-metadata"]).toBe('{"trainId":"t1"}');
-    const lower = Object.keys(h).map((k) => k.toLowerCase());
-    expect(lower).not.toContain("x-api-key");
-    expect(lower).not.toContain("authorization");
-
-    const body = JSON.parse(init.body as string);
-    expect(body).toEqual({ model: "claude-opus-5-5", max_tokens: 1000, system: "sys", messages: [{ role: "user", content: "hi" }] });
-    expect(body).not.toHaveProperty("temperature"); // Opus 5.5 rejects sampling params
-
-    expect(res).toEqual({
-      text: '{"files":[]}',
-      usage: { inputTokens: 12, outputTokens: 34 },
-      model: "claude-opus-5-5",
-      provider: "anthropic",
-      stopReason: "end_turn",
-    });
+    expect(calls).toEqual([
+      {
+        model: "anthropic/claude-haiku-4-5",
+        input: { messages: [{ role: "system", content: "be brief" }, { role: "user", content: "hi" }], max_tokens: 50 },
+        options: { gateway: { id: "queenos", metadata: { trainId: "t1" } } },
+      },
+    ]);
+    expect(res).toEqual({ text: "hello", model: "anthropic/claude-haiku-4-5", usage: { inputTokens: 7, outputTokens: 3 }, finishReason: "stop" });
   });
 
-  it("sends temperature and effort only when set", async () => {
-    const { fetch, calls } = fakeFetch(200, { content: [] });
-    await new AiGatewayClient({ config: anthropic, token: "t", fetch }).complete({
-      messages: [{ role: "user", content: "x" }],
-      temperature: 0.2,
-      effort: "low",
-    });
-    const body = JSON.parse(calls[0]!.init.body as string);
-    expect(body.temperature).toBe(0.2);
-    expect(body.output_config).toEqual({ effort: "low" });
+  it("sends temperature only when set, omits system when absent", async () => {
+    const { ai, calls } = fake(thirdParty);
+    const c = createAiClient({ ai, gatewayId: "g" });
+    await c.complete({ model: "m", messages: [{ role: "user", content: "x" }] });
+    await c.complete({ model: "m", messages: [{ role: "user", content: "x" }], temperature: 0.2 });
+    expect(calls[0]!.input).toEqual({ messages: [{ role: "user", content: "x" }], max_tokens: 16_000 });
+    expect(calls[1]!.input).toMatchObject({ temperature: 0.2 });
   });
 
-  it("builds the OpenAI chat-completions request", async () => {
-    const { fetch, calls } = fakeFetch(200, {
-      model: "gpt-x",
-      choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
-      usage: { prompt_tokens: 3, completion_tokens: 4 },
-    });
-    const res = await new AiGatewayClient({ config: openai, token: "t", fetch, byokAlias: "prod" }).complete({
-      system: "sys",
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const { url, init } = calls[0]!;
-    expect(url).toBe(aiGatewayUrl(openai));
-    expect(url).toMatch(/\/openai\/chat\/completions$/);
-    const h = headersOf(init);
-    expect(h["cf-aig-byok-alias"]).toBe("prod");
-    expect(h).not.toHaveProperty("anthropic-version");
-    expect(Object.keys(h).map((k) => k.toLowerCase())).not.toContain("authorization");
-    expect(JSON.parse(init.body as string).messages[0]).toEqual({ role: "system", content: "sys" });
-    expect(res.text).toBe("ok");
-    expect(res.usage).toEqual({ inputTokens: 3, outputTokens: 4 });
+  it("reads the Workers AI { response } shape", async () => {
+    const { ai } = fake({ response: "from llama", usage: { prompt_tokens: 1, completion_tokens: 2 } });
+    const res = await createAiClient({ ai, gatewayId: "g" }).complete({ model: "@cf/meta/llama-3.1-8b-instruct", messages: [{ role: "user", content: "x" }] });
+    expect(res).toMatchObject({ text: "from llama", model: "@cf/meta/llama-3.1-8b-instruct", usage: { inputTokens: 1, outputTokens: 2 } });
   });
 
-  it("classifies errors as retryable or not", async () => {
-    const run = async (status: number, body: unknown = { error: "x" }) => {
-      const { fetch } = fakeFetch(status, body);
-      try {
-        await new AiGatewayClient({ config: anthropic, token: "t", fetch }).complete({ messages: [{ role: "user", content: "x" }] });
-        return null;
-      } catch (e) {
-        return e as AiGatewayError;
-      }
+  it("classifies thrown errors and refusals", async () => {
+    const run = async (e: unknown) => {
+      const { ai } = fake(() => {
+        throw e;
+      });
+      return createAiClient({ ai, gatewayId: "g" })
+        .complete({ model: "m", messages: [{ role: "user", content: "x" }] })
+        .catch((x: unknown) => x as AiGatewayError);
     };
-    expect((await run(401))?.retryable).toBe(false);
-    expect((await run(400))?.status).toBe(400);
-    expect((await run(429))?.retryable).toBe(true);
-    expect((await run(503))?.retryable).toBe(true);
-    const refusal = await run(200, { stop_reason: "refusal", content: [] });
-    expect(refusal).toBeInstanceOf(AiGatewayError);
-    expect(refusal?.retryable).toBe(false);
-    expect((await run(200, "not json"))?.retryable).toBe(true);
-  });
+    expect(await run(new Error("3040: Capacity temporarily exceeded, please try again."))).toMatchObject({ retryable: true });
+    expect(await run(new Error("429 rate limited"))).toMatchObject({ status: 429, retryable: true });
+    expect(await run(new Error("upstream 503"))).toMatchObject({ status: 503, retryable: true });
+    expect(await run(new Error("401 Unauthorized"))).toMatchObject({ status: 401, retryable: false });
+    expect(await run(Object.assign(new Error("bad"), { status: 400 }))).toMatchObject({ status: 400, retryable: false });
+    expect(await run(new Error("socket hang up"))).toMatchObject({ status: 0, retryable: true });
 
-  it("requires a token", () => {
-    expect(() => new AiGatewayClient({ config: anthropic, token: "" })).toThrow(AiGatewayError);
+    const { ai } = fake({ choices: [{ message: { content: null, refusal: "no" } }] });
+    const refusal = await createAiClient({ ai, gatewayId: "g" })
+      .complete({ model: "m", messages: [{ role: "user", content: "x" }] })
+      .catch((x: unknown) => x as AiGatewayError);
+    expect(refusal).toBeInstanceOf(AiGatewayError);
+    expect(refusal).toMatchObject({ retryable: false });
+  });
+});
+
+describe("modelForRole", () => {
+  it("uses MODEL_<ROLE> or the role default", () => {
+    expect(modelForRole("BUILDER", {})).toBe("anthropic/claude-opus-5-5");
+    expect(modelForRole("SCRIBE", { MODEL_SCRIBE: "" })).toBe("anthropic/claude-haiku-4-5");
+    expect(modelForRole("SCRIBE", { MODEL_SCRIBE: " @cf/meta/llama-3.1-8b-instruct " })).toBe("@cf/meta/llama-3.1-8b-instruct");
   });
 });

@@ -65,11 +65,12 @@ export function enforceSummary(text: string): string {
   return clip(sentences.slice(0, 2).join(" ").trim());
 }
 
-export async function summarizeFailure(opts: { log: string; failingCheck?: string; llm: ScribeLlm | null; metadata?: Record<string, string> }): Promise<ScribeResult> {
+export async function summarizeFailure(opts: { log: string; failingCheck?: string; llm: ScribeLlm | null; model: string; metadata?: Record<string, string> }): Promise<ScribeResult> {
   const fallback = (): ScribeResult => ({ summary: extractiveSummary(opts.log, opts.failingCheck), method: "extractive" });
   if (!opts.llm) return fallback();
   try {
     const res = await opts.llm.complete({
+      model: opts.model,
       system: SCRIBE_PROMPT,
       messages: [{ role: "user", content: truncateLog(opts.log) }],
       maxTokens: 200,

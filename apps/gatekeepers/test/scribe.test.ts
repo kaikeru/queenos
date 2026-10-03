@@ -41,9 +41,10 @@ describe("LLM scribe", () => {
   it("sends the two-sentence prompt, truncates to ~20k, and enforces two sentences / 500 chars", async () => {
     const llm = new FakeLlm(`The build broke. A marker was found. ${"Extra sentence. ".repeat(100)}`);
     const log = `Error: boom\n${"line of noise\n".repeat(5_000)}`;
-    const r = await summarizeFailure({ log, llm });
+    const r = await summarizeFailure({ log, llm, model: "m" });
     expect(r.method).toBe("llm");
     expect(r.summary).toBe("The build broke. A marker was found.");
+    expect(llm.requests[0]!.model).toBe("m");
     expect(llm.requests[0]!.system).toBe(SCRIBE_PROMPT);
     expect(llm.requests[0]!.system).toBe("Summarize this failure in exactly two sentences.");
     expect(llm.requests[0]!.messages[0]!.content.length).toBeLessThanOrEqual(MAX_LOG_CHARS + 10);
@@ -55,13 +56,13 @@ describe("LLM scribe", () => {
 
   it("falls back to extractive on non-retryable errors and rethrows retryable ones", async () => {
     const log = "Error: nope";
-    const r = await summarizeFailure({ log, llm: new FakeLlm(new AiGatewayError("bad request", 400, false)) });
+    const r = await summarizeFailure({ log, model: "m", llm: new FakeLlm(new AiGatewayError("bad request", 400, false)) });
     expect(r.method).toBe("extractive");
-    await expect(summarizeFailure({ log, llm: new FakeLlm(new AiGatewayError("busy", 429, true)) })).rejects.toThrow("busy");
+    await expect(summarizeFailure({ log, model: "m", llm: new FakeLlm(new AiGatewayError("busy", 429, true)) })).rejects.toThrow("busy");
   });
 
   it("uses the extractive path with no llm", async () => {
-    expect((await summarizeFailure({ log: "Error: x", llm: null })).method).toBe("extractive");
+    expect((await summarizeFailure({ log: "Error: x", llm: null, model: "m" })).method).toBe("extractive");
   });
 
   it("truncateLog keeps head and tail", () => {

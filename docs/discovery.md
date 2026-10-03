@@ -131,6 +131,9 @@ Note that `mkdir` must be recursive in `writeFile` for nested paths. The Cloudfl
 
 ## 3. AI Gateway BYOK
 
+> **Superseded (2026-10-02):** QueenOS now calls models through the Workers `ai` binding (`env.AI.run(model, …, { gateway: { id: "queenos" } })`). It is pre-authenticated, so there is no `cf-aig-authorization` token, and BYOK uses the `default` alias. The section below is kept as history.
+
+
 **URLs** (provider-native passthrough):
 - Anthropic: `https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/anthropic/v1/messages` ([CF:ai-gateway/usage/providers/anthropic](https://developers.cloudflare.com/ai-gateway/usage/providers/anthropic/))
 - OpenAI: `…/{gateway_id}/openai/chat/completions` and `…/openai/responses` ([providers/openai](https://developers.cloudflare.com/ai-gateway/usage/providers/openai/) l.31-35)

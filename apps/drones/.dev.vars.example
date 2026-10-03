@@ -1,11 +1,7 @@
-# Copy to .dev.vars for `wrangler dev`. In production: `wrangler secret put CF_AIG_TOKEN`.
-#
-# AI Gateway auth token (authenticated gateway + BYOK stored provider keys).
-# Sent as `cf-aig-authorization: Bearer <token>`; no provider API key is ever
-# sent by the drone. Only required when DRONE_LLM_MODE=live.
-CF_AIG_TOKEN=
+# Copy to .dev.vars for `wrangler dev`. No secrets: LLM calls use the AI binding
+# through AI Gateway (pre-authenticated within the account).
 
 # Optional overrides of wrangler.jsonc vars:
 # DRONE_LLM_MODE=live
-# AI_GATEWAY_ACCOUNT_ID=<cloudflare account id>
+# MODEL_BUILDER=anthropic/claude-opus-5-5   # or an @cf/... Workers AI model
 # AI_TEMPERATURE=   # leave unset for claude-opus-5-5 (it rejects sampling params)

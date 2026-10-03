@@ -3,7 +3,7 @@
  * object (mirrors apps/drones). Tests swap in fakes via GatekeeperWorkflow.createPorts().
  */
 import type { AppendAuditInput, AuditEvent, QueenServerMessage, ScribeSummary, TrainResult } from "@queenos/queen-types";
-import { AiGatewayClient, cloneRepo, type GitRepo } from "@queenos/hive-kit";
+import { cloneRepo, createAiClient, type AiRunner, type GitRepo } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import type { GateTask } from "./event";
 import type { ScribeLlm } from "./scribe";
@@ -162,12 +162,13 @@ export interface GateEnvBindings {
 }
 
 export function createProdPorts(env: GateEnvBindings, config: GateConfig): GatekeeperPorts {
-  const useLlm = config.scribeMode === "llm" || (config.scribeMode === "auto" && config.testMode !== "scripted" && config.aiGatewayToken !== "");
+  const useLlm = config.scribeMode === "llm" || (config.scribeMode === "auto" && config.testMode !== "scripted" && env.AI !== undefined);
+  if (useLlm && !env.AI) throw new Error("UNAVAILABLE: SCRIBE_MODE=llm needs the AI binding");
   return {
     artifacts: new BindingArtifactsPort(env.ARTIFACTS),
     git: isomorphicGitPort,
     queen: (hive) => queenRpc(env.QUEEN, hive),
-    llm: useLlm ? new AiGatewayClient({ config: config.aiGateway, token: config.aiGatewayToken }) : null,
+    llm: useLlm ? createAiClient({ ai: env.AI as unknown as AiRunner, gatewayId: config.aiGateway.gatewayId }) : null,
     tests: createTestRunner(config.testMode),
     smoke: new FetchSmokeProbe(),
     failures: new VectorizeFailureStore(env.AI, env.VECTORIZE),

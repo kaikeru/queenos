@@ -1,11 +1,9 @@
 /** Gatekeeper configuration from vars + secrets (wrangler.jsonc, .dev.vars). */
-import { AiGatewayConfigSchema, type AiGatewayConfig } from "@queenos/queen-types";
+import { modelForRole } from "@queenos/hive-kit";
+import type { AiGatewayConfig } from "@queenos/queen-types";
 
 export type TestMode = "scripted" | "sandbox";
 export type ScribeMode = "auto" | "llm" | "extractive";
-
-/** Fast, cheap model for the Scribe (two-sentence compaction). */
-export const DEFAULT_SCRIBE_MODEL = "claude-haiku-4-5";
 
 /** Default dependency allowlist; `scope/*` and `prefix*` wildcards are supported. */
 export const DEFAULT_ALLOWED_DEPS =
@@ -27,9 +25,8 @@ export interface GateConfig {
    */
   phaseRetries: number;
   phaseWaitMs: number;
+  /** Gateway id and the Scribe model (MODEL_SCRIBE). */
   aiGateway: AiGatewayConfig;
-  /** Secret CF_AIG_TOKEN; empty means "no LLM" (Scribe falls back to extractive). */
-  aiGatewayToken: string;
 }
 
 export interface GateVars {
@@ -40,11 +37,8 @@ export interface GateVars {
   SECURITY_ALLOWED_HOSTS?: string;
   GATE_PHASE_RETRIES?: string;
   GATE_PHASE_WAIT_MS?: string;
-  AI_GATEWAY_ACCOUNT_ID?: string;
   AI_GATEWAY_ID?: string;
-  AI_PROVIDER?: string;
-  AI_MODEL?: string;
-  CF_AIG_TOKEN?: string;
+  MODEL_SCRIBE?: string;
 }
 
 export class ConfigError extends Error {
@@ -71,17 +65,6 @@ export function readConfig(env: GateVars): GateConfig {
   if (scribeMode !== "auto" && scribeMode !== "llm" && scribeMode !== "extractive") {
     throw new ConfigError(`SCRIBE_MODE must be "auto", "llm" or "extractive", got "${scribeMode}"`);
   }
-  const gw = {
-    accountId: env.AI_GATEWAY_ACCOUNT_ID ?? "",
-    gatewayId: env.AI_GATEWAY_ID ?? "",
-    provider: (env.AI_PROVIDER ?? "anthropic") as AiGatewayConfig["provider"],
-    model: env.AI_MODEL || DEFAULT_SCRIBE_MODEL,
-  };
-  const token = env.CF_AIG_TOKEN ?? "";
-  if (scribeMode === "llm") {
-    if (!AiGatewayConfigSchema.safeParse(gw).success) throw new ConfigError("SCRIBE_MODE=llm needs AI_GATEWAY_ACCOUNT_ID, AI_GATEWAY_ID, AI_PROVIDER, AI_MODEL");
-    if (!token) throw new ConfigError("SCRIBE_MODE=llm needs the CF_AIG_TOKEN secret");
-  }
   return {
     testMode,
     scribeMode,
@@ -90,8 +73,7 @@ export function readConfig(env: GateVars): GateConfig {
     allowedHosts: splitList(env.SECURITY_ALLOWED_HOSTS, DEFAULT_ALLOWED_HOSTS),
     phaseRetries: int(env.GATE_PHASE_RETRIES, 24, 1, 60),
     phaseWaitMs: int(env.GATE_PHASE_WAIT_MS, 5000, 0, 60_000),
-    aiGateway: gw,
-    aiGatewayToken: token,
+    aiGateway: { gatewayId: env.AI_GATEWAY_ID?.trim() || "queenos", model: modelForRole("SCRIBE", env) },
   };
 }
 

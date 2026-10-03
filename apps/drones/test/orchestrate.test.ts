@@ -8,7 +8,7 @@ import { SCRIPTED_MODEL, scriptedChangeSet } from "../src/scripted";
 import { FakeLlm, FakeWorld, InlineSteps, remoteOf, task } from "./fakes";
 
 const scripted = readConfig({ DRONE_LLM_MODE: "scripted", DRONE_SCRIPTED_DELAY_MS: "1500" });
-const live = readConfig({ DRONE_LLM_MODE: "live", AI_GATEWAY_ACCOUNT_ID: "acct", AI_GATEWAY_ID: "gw", CF_AIG_TOKEN: "tok" });
+const live = readConfig({ DRONE_LLM_MODE: "live", AI_GATEWAY_ID: "gw" });
 
 async function world(repo = "hive-train-aaaaaaaaaaaa") {
   const w = new FakeWorld();
@@ -164,7 +164,7 @@ describe("BUILD / REWORK (live LLM via fake gateway)", () => {
 
     const passed = w.queen("hive").audits()[1]!;
     expect(passed.gitNotesPayload).toMatchObject({
-      model: "claude-opus-5-5",
+      model: "anthropic/claude-opus-5-5",
       reasoningSteps: ["fixed null theme"],
       discardedPaths: ["src/legacy-theme.ts"],
     });
@@ -188,7 +188,7 @@ describe("BUILD / REWORK (live LLM via fake gateway)", () => {
 
   it("does not retry non-retryable gateway errors (401)", async () => {
     const { w } = await world();
-    w.llm = new FakeLlm(() => new AiGatewayError("AI Gateway anthropic 401: bad token", 401, false));
+    w.llm = new FakeLlm(() => new AiGatewayError("AI run failed: 401 bad token", 401, false));
     const steps = new InlineSteps();
     await expect(runDrone(task(), steps, w.ports(), live)).rejects.toThrow(/401/);
     expect(steps.log.find((l) => l.name === "generate change set")?.attempts).toBe(1);

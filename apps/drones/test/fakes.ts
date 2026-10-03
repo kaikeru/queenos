@@ -138,7 +138,7 @@ export class FakeLlm implements LlmPort {
     this.requests.push(req);
     const r = this.reply(req, this.requests.length);
     if (r instanceof Error) throw r;
-    return { text: r, usage: { inputTokens: 10, outputTokens: 20 }, model: "claude-opus-5-5", provider: "anthropic", stopReason: "end_turn" };
+    return { text: r, usage: { inputTokens: 10, outputTokens: 20 }, model: req.model, finishReason: "stop" };
   }
 }
 

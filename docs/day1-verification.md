@@ -109,20 +109,14 @@ const { remote, token } = await env.ARTIFACTS.create(`${HIVE}-b`);   // creation
 
 Record: exact `remote` string (scheme, host, path, `.git` suffix?); whether a token is embedded or must come separately via `createToken()`; token TTL/scopes; the `username` isomorphic-git needs in `onAuth`. Compare with what `packages/hive-kit/src/git.ts` and `apps/drones` assume and fix any mismatch.
 
-## 6. AI Gateway BYOK with `cf-aig-authorization` only
+## 6. AI Gateway via the Workers AI binding
 
-Store the Anthropic key in the gateway (dashboard > AI > AI Gateway > `queenos` > Provider Keys), enable Authenticated Gateway, then:
+No tokens. Deploy a throwaway Worker with an `ai` binding that calls
+`env.AI.run("@cf/meta/llama-3.1-8b-instruct", { messages: [...] }, { gateway: { id: "queenos" } })`, curl it, then check
+`GET /accounts/$CF_ACCOUNT_ID/ai-gateway/gateways/queenos/logs?per_page=5` for the request. Delete the Worker afterwards.
+Optionally store the Anthropic key in the dashboard (AI Gateway > `queenos` > Provider Keys, alias `default`); otherwise third-party models bill Unified Billing credits.
 
-```bash
-curl -s "https://gateway.ai.cloudflare.com/v1/$CF_ACCOUNT_ID/queenos/anthropic/v1/messages" \
-  -H "cf-aig-authorization: Bearer $CF_AIG_TOKEN" \
-  -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
-  -d '{"model":"claude-opus-5-5","max_tokens":64,"messages":[{"role":"user","content":"say ok"}]}'
-# negative controls:
-curl -s -o /dev/null -w '%{http_code}\n' "https://gateway.ai.cloudflare.com/v1/$CF_ACCOUNT_ID/queenos/anthropic/v1/messages" -H "content-type: application/json" -d '{}'   # expect 401 without the token
-```
-
-Record: HTTP status and body of the success call (no `x-api-key` sent); whether `anthropic-version` is required; whether the response is passed through unchanged (usage fields, stop_reason); that the request shows in the gateway logs; whether `claude-opus-5-5` rejects `temperature` (drones omit it). Then run a drone in live mode (`DRONE_LLM_MODE=live`) once end to end.
+Record: the raw output shape for `@cf/...` and for `anthropic/...` (`choices[0].message.content` vs `response`); that the request shows in the gateway logs; whether `claude-opus-5-5` rejects `temperature` (drones omit it). Then run a drone in live mode (`DRONE_LLM_MODE=live`) once end to end.
 
 ## Results
 

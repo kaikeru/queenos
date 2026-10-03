@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ChangeSetError, MAX_FILE_BYTES, MAX_FILES, parseChangeSet, validateChangeSet } from "../src/change-set";
-import { DEFAULT_MODEL, readConfig, ConfigError } from "../src/config";
+import { readConfig, ConfigError } from "../src/config";
 import { SCRIPTED_MODEL, fnv1a, mergeRegistry, registryModules, renderRegistry, scriptedChangeSet, slugify } from "../src/scripted";
 import { buildBuilderMessages } from "../src/prompt";
 
@@ -138,15 +138,14 @@ describe("config", () => {
   it("defaults to scripted mode", () => {
     const c = readConfig({});
     expect(c.llmMode).toBe("scripted");
-    expect(c.aiGateway.model).toBe(DEFAULT_MODEL);
+    expect(c.aiGateway.model).toBe("anthropic/claude-opus-5-5");
     expect(c.sendTemperature).toBe(false);
     expect(SCRIPTED_MODEL).toMatch(/scripted/);
   });
-  it("live mode requires gateway ids and the CF_AIG_TOKEN secret", () => {
-    expect(() => readConfig({ DRONE_LLM_MODE: "live", AI_GATEWAY_ACCOUNT_ID: "a", AI_GATEWAY_ID: "g" })).toThrow(/CF_AIG_TOKEN/);
-    expect(() => readConfig({ DRONE_LLM_MODE: "live", CF_AIG_TOKEN: "t" })).toThrow(ConfigError);
-    const c = readConfig({ DRONE_LLM_MODE: "live", AI_GATEWAY_ACCOUNT_ID: "a", AI_GATEWAY_ID: "g", CF_AIG_TOKEN: "t", AI_TEMPERATURE: "0.3" });
-    expect(c.aiGateway).toEqual({ accountId: "a", gatewayId: "g", provider: "anthropic", model: DEFAULT_MODEL });
+  it("resolves the Builder model and gateway id from vars", () => {
+    expect(readConfig({ DRONE_LLM_MODE: "live" }).aiGateway).toEqual({ gatewayId: "queenos", model: "anthropic/claude-opus-5-5" });
+    const c = readConfig({ DRONE_LLM_MODE: "live", AI_GATEWAY_ID: "g", MODEL_BUILDER: "@cf/meta/llama-3.1-8b-instruct", AI_TEMPERATURE: "0.3" });
+    expect(c.aiGateway).toEqual({ gatewayId: "g", model: "@cf/meta/llama-3.1-8b-instruct" });
     expect(c).toMatchObject({ temperature: 0.3, sendTemperature: true });
   });
   it("rejects unknown modes and caps the scripted delay", () => {

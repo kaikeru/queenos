@@ -174,7 +174,7 @@ export class FakeLlm implements ScribeLlm {
   async complete(req: CompletionRequest): Promise<CompletionResult> {
     this.requests.push(req);
     if (this.reply instanceof Error) throw this.reply;
-    return { text: this.reply, usage: { inputTokens: 1, outputTokens: 1 }, model: "claude-haiku-4-5", provider: "anthropic", stopReason: "end_turn" };
+    return { text: this.reply, usage: { inputTokens: 1, outputTokens: 1 }, model: req.model, finishReason: "stop" };
   }
 }
 

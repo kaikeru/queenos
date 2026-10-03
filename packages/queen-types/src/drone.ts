@@ -24,9 +24,8 @@ export type DroneTask = z.infer<typeof DroneTaskSchema>;
 export type DroneTaskInput = z.input<typeof DroneTaskSchema>;
 
 export const AiGatewayConfigSchema = z.object({
-  accountId: z.string().min(1),
   gatewayId: z.string().min(1),
-  provider: z.enum(["anthropic", "openai"]),
+  /** Workers AI (`@cf/...`) or third-party (`anthropic/claude-opus-5-5`) model id. */
   model: z.string().min(1),
 });
 export type AiGatewayConfig = z.infer<typeof AiGatewayConfigSchema>;

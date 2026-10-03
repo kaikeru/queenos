@@ -16,6 +16,8 @@
       "class_name": "DroneWorkflow"
     }
   ],
+  // Workers AI binding: LLM calls go through AI Gateway "queenos" (pre-authenticated, no token).
+  "ai": { "binding": "AI" },
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
   "durable_objects": {
     "bindings": [
@@ -25,16 +27,14 @@
     ]
   },
   "vars": {
-    // "live" calls the LLM through AI Gateway; "scripted" returns a deterministic
+    // "live" calls the LLM via the AI binding through AI Gateway; "scripted" returns a deterministic
     // change set (demo video, tests). Git + Artifacts run for real in both.
     "DRONE_LLM_MODE": "scripted",
     // Artificial "thinking" time in scripted mode (durable step.sleep).
     "DRONE_SCRIPTED_DELAY_MS": "4000",
-    "AI_GATEWAY_ACCOUNT_ID": "",
     "AI_GATEWAY_ID": "queenos",
-    "AI_PROVIDER": "anthropic",
-    "AI_MODEL": "claude-opus-5-5"
-    // Secret (wrangler secret put CF_AIG_TOKEN): CF_AIG_TOKEN. See .dev.vars.example.
+    // Per-role model: Workers AI ("@cf/...") or third-party ("anthropic/claude-opus-5-5").
+    "MODEL_BUILDER": "anthropic/claude-opus-5-5"
   },
   "env": {
     // Used only by vitest (see vitest.config.ts). Named envs do not inherit
@@ -45,10 +45,8 @@
       "vars": {
         "DRONE_LLM_MODE": "scripted",
         "DRONE_SCRIPTED_DELAY_MS": "0",
-        "AI_GATEWAY_ACCOUNT_ID": "",
         "AI_GATEWAY_ID": "queenos",
-        "AI_PROVIDER": "anthropic",
-        "AI_MODEL": "claude-opus-5-5"
+        "MODEL_BUILDER": "anthropic/claude-opus-5-5"
       }
     }
   }

@@ -172,6 +172,7 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
         log: rawLog,
         ...(inspection.failingCheck ? { failingCheck: inspection.failingCheck } : {}),
         llm: ports.llm,
+        model: ctx.config.aiGateway.model,
         metadata: { trainId: train.trainId, promptId: train.promptId, role: "SCRIBE" },
       }).catch((e) => Promise.reject(toStepError(e))),
     );

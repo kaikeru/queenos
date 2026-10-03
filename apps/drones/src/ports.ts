@@ -10,7 +10,8 @@ import type {
   TrainResult,
 } from "@queenos/queen-types";
 import {
-  AiGatewayClient,
+  createAiClient,
+  type AiRunner,
   cloneRepo,
   type CompletionRequest,
   type CompletionResult,
@@ -118,8 +119,14 @@ export interface DronePorts {
 }
 
 export interface DroneEnvBindings {
+  AI?: Ai;
   ARTIFACTS?: Artifacts;
   QUEEN?: DurableObjectNamespace;
+}
+
+function liveLlm(ai: Ai | undefined, config: DroneConfig): LlmPort {
+  if (!ai) throw new Error("UNAVAILABLE: AI binding is not configured");
+  return createAiClient({ ai: ai as unknown as AiRunner, gatewayId: config.aiGateway.gatewayId });
 }
 
 export function createProdPorts(env: DroneEnvBindings, config: DroneConfig): DronePorts {
@@ -127,9 +134,6 @@ export function createProdPorts(env: DroneEnvBindings, config: DroneConfig): Dro
     artifacts: new BindingArtifactsPort(env.ARTIFACTS),
     git: isomorphicGitPort,
     queen: (namespace) => queenRpc(env.QUEEN, namespace),
-    llm:
-      config.llmMode === "live"
-        ? new AiGatewayClient({ config: config.aiGateway, token: config.aiGatewayToken })
-        : null,
+    llm: config.llmMode === "live" ? liveLlm(env.AI, config) : null,
   };
 }

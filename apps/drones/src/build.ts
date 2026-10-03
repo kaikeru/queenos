@@ -27,14 +27,15 @@ export async function generateChangeSet(task: DroneTask, ports: Pick<DronePorts,
   }
   if (!ports.llm) throw new Error("UNAVAILABLE: no LLM port in live mode");
   const res = await ports.llm.complete({
+    model: config.aiGateway.model,
     system: BUILDER_SYSTEM_PROMPT,
     messages: buildBuilderMessages(task),
     maxTokens: 16_000,
     ...(config.sendTemperature ? { temperature: config.temperature } : {}),
     metadata: { promptId: task.promptId, trainId: task.trainId, action: task.action },
   });
-  if (res.stopReason === "max_tokens") throw new ChangeSetError("model output was truncated (max_tokens)");
-  return { changeSet: parseChangeSet(res.text), model: res.model, temperature: config.temperature, usage: res.usage };
+  if (res.finishReason === "length" || res.finishReason === "max_tokens") throw new ChangeSetError("model output was truncated (max_tokens)");
+  return { changeSet: parseChangeSet(res.text), model: res.model, temperature: config.temperature, usage: res.usage ?? { inputTokens: 0, outputTokens: 0 } };
 }
 
 /** Marks every commit a drone makes, so a retried step can recognise its own pushed work. */
