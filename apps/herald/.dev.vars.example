@@ -1,6 +1,4 @@
-# Copy to .dev.vars for `wrangler dev`. In production: `wrangler secret put CLOUDFLARE_API_TOKEN`.
-#
-# P1 only: an account-owned Cloudflare API token for the account in
-# CLOUDFLARE_ACCOUNT_ID (wrangler.jsonc vars), with "Workers Scripts: Edit".
-# P2 moves it into the Vault DO.
-CLOUDFLARE_API_TOKEN=
+# The Herald has no secrets of its own. Deploy credentials (Cloudflare account id
+# and API token) are read per hive from the Vault over the VAULT_READER service
+# binding (apps/vault, entrypoint VaultReader). For `wrangler dev`, run
+# apps/vault's `wrangler dev` too so the dev registry can resolve the binding.

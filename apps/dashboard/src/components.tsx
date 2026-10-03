@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { Link } from "./router";
 import {
   PHASE_FLOW,
   excerpt,
@@ -49,7 +50,7 @@ const short = (sha: string) => sha.slice(0, 7);
 
 // ── top bar ───────────────────────────────────────────────────────────────
 
-export function TopBar(props: { hive: string; status: ConnStatus; latencyMs: number | null; retryAt: number | null; state: State }) {
+export function TopBar(props: { hive: string; status: ConnStatus; latencyMs: number | null; retryAt: number | null; state: State; backTo?: string }) {
   const now = useNow();
   const { state } = props;
   const prompts = Object.values(state.prompts);
@@ -64,6 +65,7 @@ export function TopBar(props: { hive: string; status: ConnStatus; latencyMs: num
   return (
     <header className="topbar">
       <div className="brand">
+        {props.backTo && <Link to={props.backTo} className="backlink" aria-label="Back to projects">← Projects</Link>}
         <span className="brand__mark">♛</span>
         <div>
           <h1>QUEENOS</h1>

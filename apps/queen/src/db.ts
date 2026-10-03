@@ -114,6 +114,18 @@ const MIGRATIONS: readonly string[] = [
   CREATE INDEX deployments_train ON deployments(train_id);
   CREATE INDEX deployments_updated ON deployments(updated_at);
   `,
+  `
+  -- v3: command watchdog. When each kind's current command was issued (its id
+  -- assigned) or the current drone dispatched; the alarm re-issues anything
+  -- unreported after COMMAND_TIMEOUT_MS under a new id. NULL = no clock.
+  ALTER TABLE merge_trains ADD COLUMN fork_issued_at INTEGER;
+  ALTER TABLE merge_trains ADD COLUMN delete_issued_at INTEGER;
+  ALTER TABLE merge_trains ADD COLUMN deploy_issued_at INTEGER;
+  ALTER TABLE merge_trains ADD COLUMN teardown_issued_at INTEGER;
+  ALTER TABLE merge_trains ADD COLUMN drone_issued_at INTEGER;
+  -- Attempt of the current phase's drone (Workflow instance id suffix when > 1).
+  ALTER TABLE merge_trains ADD COLUMN drone_attempt INTEGER NOT NULL DEFAULT 1;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -138,6 +150,7 @@ export function migrate(storage: DurableObjectStorage): number {
 type Row = Record<string, SqlStorageValue>;
 
 const str = (v: SqlStorageValue): string | null => (v === null ? null : String(v));
+const num = (v: SqlStorageValue | undefined): number | null => (v === null || v === undefined ? null : Number(v));
 
 export function rowToPrompt(r: Row): PromptRecord {
   const base = PromptRunSchema.parse({
@@ -184,6 +197,12 @@ export function rowToTrain(r: Row): TrainRecord {
     deployCommandId: str(r.deploy_command_id),
     teardownCommandId: str(r.teardown_command_id),
     previewUrl: str(r.preview_url),
+    forkIssuedAt: num(r.fork_issued_at),
+    deleteIssuedAt: num(r.delete_issued_at),
+    deployIssuedAt: num(r.deploy_issued_at),
+    teardownIssuedAt: num(r.teardown_issued_at),
+    droneIssuedAt: num(r.drone_issued_at),
+    droneAttempt: num(r.drone_attempt) ?? 1,
   };
 }
 
@@ -254,8 +273,9 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
   sql.exec(
     `INSERT INTO merge_trains (train_id, base_sha, included_prompts, artifact_repo, status, created_at, seq, prompt_id,
        phase, fork_state, fork_source, head_sha, landed_sha, summary, reason, action, dispatched,
-       fork_command_id, delete_command_id, deploy_state, deploy_command_id, teardown_command_id, preview_url)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       fork_command_id, delete_command_id, deploy_state, deploy_command_id, teardown_command_id, preview_url,
+       fork_issued_at, delete_issued_at, deploy_issued_at, teardown_issued_at, drone_issued_at, drone_attempt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
        status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
@@ -263,7 +283,10 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        dispatched = excluded.dispatched, fork_command_id = excluded.fork_command_id,
        delete_command_id = excluded.delete_command_id, deploy_state = excluded.deploy_state,
        deploy_command_id = excluded.deploy_command_id, teardown_command_id = excluded.teardown_command_id,
-       preview_url = excluded.preview_url`,
+       preview_url = excluded.preview_url, fork_issued_at = excluded.fork_issued_at,
+       delete_issued_at = excluded.delete_issued_at, deploy_issued_at = excluded.deploy_issued_at,
+       teardown_issued_at = excluded.teardown_issued_at, drone_issued_at = excluded.drone_issued_at,
+       drone_attempt = excluded.drone_attempt`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -287,5 +310,11 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     t.deployCommandId,
     t.teardownCommandId,
     t.previewUrl,
+    t.forkIssuedAt,
+    t.deleteIssuedAt,
+    t.deployIssuedAt,
+    t.teardownIssuedAt,
+    t.droneIssuedAt,
+    t.droneAttempt,
   );
 }

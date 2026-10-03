@@ -24,19 +24,17 @@
       { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" }
     ]
   },
-  "vars": {
-    // P1: the user's account. P2 moves the token into the Vault and the account id
-    // into the hive's deploy credentials (CredentialsPort).
-    "CLOUDFLARE_ACCOUNT_ID": "4773fbabdff038e3b907b14cd212c062"
-    // Secret (wrangler secret put CLOUDFLARE_API_TOKEN): CLOUDFLARE_API_TOKEN. See .dev.vars.example.
-  },
+  // Deploy credentials come from the Vault, per hive: no Cloudflare token or
+  // account id in this Worker's config or secrets (docs/deploy-discovery.md §6).
+  // VaultReader is the Vault's read entrypoint; only the Herald binds it.
+  "services": [{ "binding": "VAULT_READER", "service": "queenos-vault", "entrypoint": "VaultReader" }],
   "env": {
     // Used only by vitest (see vitest.config.ts). Named envs do not inherit
     // bindings: no ARTIFACTS (remote-only) and no cross-script QUEEN DO (the pool
     // has no dev registry). Tests inject fake ports via test/worker.ts.
     "test": {
-      "workflows": [{ "name": "herald-workflow", "binding": "HERALD_WORKFLOW", "class_name": "HeraldWorkflow" }],
-      "vars": { "CLOUDFLARE_ACCOUNT_ID": "acct-test" }
+      // No VAULT_READER either: tests inject fake credentials.
+      "workflows": [{ "name": "herald-workflow", "binding": "HERALD_WORKFLOW", "class_name": "HeraldWorkflow" }]
     }
   }
 }

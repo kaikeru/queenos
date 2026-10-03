@@ -30,7 +30,27 @@ export const ProvisionCommandSchema = z.discriminatedUnion("op", [
     trainId: z.string().min(1),
     repo: z.string().min(1),
   }),
+  z.object({
+    /** Genesis: create the hive repo, seed templates/<template> plus .queen/charter.json, push main. */
+    op: z.literal("CREATE_HIVE"),
+    commandId: CommandId,
+    hive: z.string().min(1),
+    template: z.literal("worker-starter"),
+    /** Serialized Charter JSON, committed as .queen/charter.json. */
+    charterJson: z.string().min(2).max(64_000),
+  }),
 ]);
+
+/** CREATE_HIVE outcome. The Provisioner reports it to Genesis (GenesisNode RPC `reportHiveCreated`), not to the Queen. */
+export const HiveCreatedResultSchema = z.object({
+  commandId: CommandId,
+  hive: z.string().min(1),
+  ok: z.boolean(),
+  /** HEAD of main after the seed commit. */
+  mainSha: z.string().optional(),
+  summary: Summary.optional(),
+});
+export type HiveCreatedResult = z.infer<typeof HiveCreatedResultSchema>;
 export type ProvisionCommand = z.infer<typeof ProvisionCommandSchema>;
 
 export const ProvisionResultSchema = z.object({

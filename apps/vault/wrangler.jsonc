@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // apps/edge binds the VaultWriter entrypoint and apps/herald the VaultReader
+  // entrypoint of this Worker by name ("service": "queenos-vault"). The Queen
+  // must never bind it.
+  "name": "queenos-vault",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  // No public HTTP surface: reached only over service bindings
+  // (docs/deploy-discovery.md §8: workers.dev would bypass Access).
+  "workers_dev": false,
+  "preview_urls": false,
+  "durable_objects": {
+    // One VaultNode per hive: VAULT_NODE.idFromName(hive). Bound only here.
+    "bindings": [{ "name": "VAULT_NODE", "class_name": "VaultNode" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VaultNode"] }],
+  // Secrets (not in this file; see .dev.vars.example):
+  //   VAULT_KEK           base64 32-byte AES-KW key-encryption key. `wrangler secret put VAULT_KEK`.
+  //   VAULT_KEK_PREVIOUS  optional; the KEK being rotated out (unwrap only, re-wrapped lazily).
+  "env": {
+    // Used only by vitest (see vitest.config.ts). Named envs do not inherit
+    // bindings. The KEKs here are fixed, public test values.
+    "test": {
+      "workers_dev": false,
+      "vars": {
+        "VAULT_KEK": "aDa34S694+tlkxHCVBK4v/2ch8QuPU6yaLv97FcAGxk=",
+        "VAULT_KEK_PREVIOUS": ""
+      },
+      "durable_objects": {
+        "bindings": [{ "name": "VAULT_NODE", "class_name": "VaultNode" }]
+      },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VaultNode"] }]
+    }
+  }
+}

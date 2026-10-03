@@ -1,8 +1,9 @@
 /** In-memory stand-ins for Artifacts and the Queen. */
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowStepConfig } from "cloudflare:workers";
-import type { ProvisionCommand, ProvisionResult } from "@queenos/queen-types";
-import type { ArtifactsPort, ForkResult, ProvisionerPorts, QueenPort } from "../src/ports";
+import { initRepo, type RemoteSpec } from "@queenos/hive-kit";
+import type { HiveCreatedResult, ProvisionCommand, ProvisionResult } from "@queenos/queen-types";
+import type { ArtifactsPort, ForkResult, GenesisPort, GitPort, ProvisionerPorts, QueenPort, RepoAccess, SeedSession } from "../src/ports";
 import type { StepRunner } from "../src/orchestrate";
 
 export const artifactsError = (code: string) => Object.assign(new Error(code), { name: "ArtifactsError", code });
@@ -28,6 +29,73 @@ export class FakeArtifactsPort implements ArtifactsPort {
     this.calls.push(`delete:${name}`);
     return this.existing.delete(name);
   }
+
+  /** hive -> commits pushed to main (newest first), as the fake remote sees them. */
+  readonly mains = new Map<string, { hash: string; message: string }[]>();
+  /** Fail the first N ensureRepo attempts (transient). */
+  ensureFailures = 0;
+
+  async ensureRepo(name: string): Promise<void> {
+    this.calls.push(`ensure:${name}`);
+    if (this.ensureFailures > 0) {
+      this.ensureFailures--;
+      throw new Error("socket hang up");
+    }
+    if (this.existing.has(name)) return; // ALREADY_EXISTS is success
+    this.existing.add(name);
+  }
+
+  async access(repo: string, scope: "read" | "write"): Promise<RepoAccess> {
+    this.calls.push(`access:${repo}:${scope}`);
+    return { remote: `https://fake.artifacts/git/${repo}.git`, token: "art_v2_x_FAKE" };
+  }
+
+  async findSeed(repo: string): Promise<string | null> {
+    this.calls.push(`findSeed:${repo}`);
+    return this.mains.get(repo)?.find((c) => /^Queen-Genesis: \S+/m.test(c.message))?.hash ?? null;
+  }
+}
+
+/** Real isomorphic-git over MemFS; only the network push is replaced by a record on the fake remote. */
+export class FakeGitPort implements GitPort {
+  readonly pushes: { url: string; oid: string }[] = [];
+  readonly files: Record<string, string>[] = [];
+  /** Fail the first N pushes (transient). */
+  pushFailures = 0;
+  constructor(private readonly artifacts: FakeArtifactsPort) {}
+
+  async init(remote: RemoteSpec): Promise<SeedSession> {
+    const repo = await initRepo({ remote, defaultBranch: "main" });
+    return {
+      writeFiles: (c) => repo.writeFiles(c),
+      commitAll: async (i) => {
+        const oid = await repo.commitAll(i);
+        this.files.push(await repo.readFiles());
+        return oid;
+      },
+      push: async (i) => {
+        if (this.pushFailures > 0) {
+          this.pushFailures--;
+          throw new Error("socket hang up");
+        }
+        const head = (await repo.head())!;
+        const hive = remote.url.split("/").pop()!.replace(/\.git$/, "");
+        this.pushes.push({ url: remote.url, oid: head.oid });
+        this.artifacts.mains.set(hive, [{ hash: head.oid, message: head.message }, ...(this.artifacts.mains.get(hive) ?? [])]);
+        return { ref: i.ref, remoteRef: i.remoteRef ?? i.ref, oid: head.oid };
+      },
+    };
+  }
+}
+
+export class FakeGenesis implements GenesisPort {
+  readonly results: HiveCreatedResult[] = [];
+  error: Error | null = null;
+  async reportHiveCreated(input: HiveCreatedResult) {
+    if (this.error) throw this.error;
+    this.results.push(input);
+    return { outcome: "applied" };
+  }
 }
 
 export class FakeQueen implements QueenPort {
@@ -44,6 +112,8 @@ export class FakeQueen implements QueenPort {
 export class FakeWorld {
   readonly artifacts = new FakeArtifactsPort();
   readonly queen = new FakeQueen();
+  readonly git = new FakeGitPort(this.artifacts);
+  readonly genesis = new FakeGenesis();
   readonly queenHives: string[] = [];
   ports(): ProvisionerPorts {
     return {
@@ -52,6 +122,8 @@ export class FakeWorld {
         this.queenHives.push(hive);
         return this.queen;
       },
+      git: this.git,
+      genesis: () => this.genesis,
     };
   }
 }
@@ -102,3 +174,12 @@ export function currentWorld(): FakeWorld {
   if (!current) throw new Error("no fake world installed (setWorld)");
   return current;
 }
+
+export const createHive = (o: Partial<Extract<ProvisionCommand, { op: "CREATE_HIVE" }>> = {}): ProvisionCommand => ({
+  op: "CREATE_HIVE",
+  commandId: "cmd-3",
+  hive: "my-hive",
+  template: "worker-starter",
+  charterJson: JSON.stringify({ version: 1, hive: "my-hive", name: "My Hive" }),
+  ...o,
+});

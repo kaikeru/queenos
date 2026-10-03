@@ -63,6 +63,14 @@ export type TrainAction = "BUILD" | "REWORK";
 
 /** Fork attempts (each a new Provisioner instance) before the train fails. */
 export const MAX_FORK_ATTEMPTS = 3;
+/**
+ * Watchdog cap for every other command kind (DEPLOY, TEARDOWN, DELETE, drone
+ * tasks): attempts, each under a new command / instance id, before the same
+ * failure path as an `ok:false` result. Same value as the fork cap.
+ */
+export const MAX_COMMAND_ATTEMPTS = MAX_FORK_ATTEMPTS;
+/** Default for COMMAND_TIMEOUT_MS: how long a dispatched command may stay unreported. */
+export const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
 
 export interface TrainRecord extends MergeTrain {
   seq: number;
@@ -91,6 +99,18 @@ export interface TrainRecord extends MergeTrain {
   /** Current Herald TEARDOWN (preview) command. */
   teardownCommandId: string | null;
   previewUrl: string | null;
+  /**
+   * Watchdog clocks: when the current command of each kind was issued (its
+   * command id assigned), or when the current drone was dispatched. Null when
+   * none is outstanding. Stamped by setTrain whenever the id changes.
+   */
+  forkIssuedAt: number | null;
+  deleteIssuedAt: number | null;
+  deployIssuedAt: number | null;
+  teardownIssuedAt: number | null;
+  droneIssuedAt: number | null;
+  /** Attempt number of the current phase's drone (instance id suffix when > 1). */
+  droneAttempt: number;
 }
 
 export interface PromptRecord extends PromptRun {
@@ -115,12 +135,14 @@ export interface PlannerContext {
   newId: () => string;
   /** Rework attempts allowed before a prompt is FAILED. Default 2. */
   maxReworks?: number;
+  /** Watchdog: an outstanding command older than this is re-issued. Default 10 min. */
+  commandTimeoutMs?: number;
 }
 
 export type Effect =
   | { type: "provision"; trainId: string; command: ProvisionCommand }
   | { type: "deploy"; trainId: string; command: DeployCommand }
-  | { type: "dispatchDrone"; trainId: string; task: DroneTask }
+  | { type: "dispatchDrone"; trainId: string; task: DroneTask; attempt: number }
   | { type: "broadcast"; message: QueenServerMessage };
 
 export type Outcome =
@@ -179,6 +201,44 @@ export function commandAttempt(commandId: string | null): number {
   return commandId ? Number(/-(\d+)$/.exec(commandId)?.[1] ?? 0) : 0;
 }
 
+/** Command-id field -> its watchdog clock (setTrain stamps the clock when the id changes). */
+const ISSUED_AT = {
+  forkCommandId: "forkIssuedAt",
+  deleteCommandId: "deleteIssuedAt",
+  deployCommandId: "deployIssuedAt",
+  teardownCommandId: "teardownIssuedAt",
+} as const;
+
+/** Whether the train's current-phase drone is out (dispatched, not yet reported). */
+function droneOutstanding(t: TrainRecord): boolean {
+  return isActive(t) && t.dispatched && ((t.phase === "BUILDING" && t.forkState === "READY") || t.phase === "LANDING");
+}
+
+/**
+ * Issue times of every command the train is waiting on (executor or drone).
+ * A command without a clock (a row from before the watchdog) reports `now`.
+ */
+export function outstandingSince(t: TrainRecord, now: number): number[] {
+  const out: (number | null)[] = [];
+  if (t.forkState === "DELETING") out.push(t.deleteIssuedAt);
+  if (t.deployState === "TEARING_DOWN") out.push(t.teardownIssuedAt);
+  if (isActive(t)) {
+    if (t.forkState === "PENDING") out.push(t.forkIssuedAt);
+    if (t.phase === "DEPLOYING" && t.deployState === "PENDING") out.push(t.deployIssuedAt);
+    if (droneOutstanding(t)) out.push(t.droneIssuedAt);
+  }
+  return out.map((x) => x ?? now);
+}
+
+/**
+ * When the DO alarm must next run for the watchdog: the earliest
+ * `issuedAt + timeout` over every outstanding command, or null if none.
+ */
+export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: number, now: number): number | null {
+  const all = trains.flatMap((t) => outstandingSince(t, now));
+  return all.length ? Math.min(...all) + timeoutMs : null;
+}
+
 export function previewDeploymentId(trainId: string): string {
   return `preview-${trainId}`;
 }
@@ -216,6 +276,7 @@ export class TrainPlanner {
   private maxTrainSeq: number;
   private maxPromptSeq: number;
   private readonly maxReworks: number;
+  private readonly timeoutMs: number;
   private readonly dirtyPrompts = new Map<string, boolean>(); // id -> broadcast?
   private readonly dirtyTrains = new Map<string, boolean>();
   private readonly deployments = new Map<string, Deployment>();
@@ -232,6 +293,7 @@ export class TrainPlanner {
     this.maxTrainSeq = state.maxTrainSeq;
     this.maxPromptSeq = state.maxPromptSeq;
     this.maxReworks = ctx.maxReworks ?? 2;
+    this.timeoutMs = ctx.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
   }
 
   // ── public transitions ────────────────────────────────────────────────
@@ -270,15 +332,7 @@ export class TrainPlanner {
     }
     if (t.forkState !== "PENDING") return this.finish("ignored:duplicate");
     if (!r.ok) {
-      const summary = r.summary || `Provisioner could not fork ${t.forkSource ?? "the hive repo"}`;
-      if (commandAttempt(t.forkCommandId) < MAX_FORK_ATTEMPTS) {
-        // Retry with a new command (Workflow instance ids are single-use).
-        this.setTrain(t, { phase: "WAITING_PARENT", forkState: "NONE" }, false);
-        this.scheduleFork(t);
-      } else {
-        this.setPromptSummary(t.promptId, summary);
-        this.fail(t, `fork failed: ${summary}`);
-      }
+      this.forkFailed(t, r.summary || `Provisioner could not fork ${t.forkSource ?? "the hive repo"}`);
       return this.finish("applied");
     }
     this.setTrain(t, {
@@ -286,10 +340,23 @@ export class TrainPlanner {
       baseSha: r.baseSha ?? t.baseSha,
       artifactRepo: r.artifactRepo ?? t.artifactRepo,
       dispatched: false,
+      droneAttempt: 1,
     });
     this.setPromptStatus(t.promptId, "BUILDING");
     this.dispatchBuilder(t);
     return this.finish("applied");
+  }
+
+  /** A fork attempt failed (ok:false or timed out): retry under a new command id, or fail the train. */
+  private forkFailed(t: TrainRecord, summary: string): void {
+    if (commandAttempt(t.forkCommandId) < MAX_FORK_ATTEMPTS) {
+      // Retry with a new command (Workflow instance ids are single-use).
+      this.setTrain(t, { phase: "WAITING_PARENT", forkState: "NONE" }, false);
+      this.scheduleFork(t);
+    } else {
+      this.setPromptSummary(t.promptId, summary);
+      this.fail(t, `fork failed: ${summary}`);
+    }
   }
 
   private deleteResult(t: TrainRecord, r: ProvisionResult): PlanResult {
@@ -327,16 +394,20 @@ export class TrainPlanner {
     if (t.phase !== "DEPLOYING") return this.finish("ignored:premature");
     const commitSha = r.commitSha ?? t.headSha;
     if (!r.ok || !r.url) {
-      const summary = r.summary || (r.ok ? "Herald reported a deploy without a preview URL." : "Preview deploy failed.");
-      this.setTrain(t, { deployState: "FAILED" }, false);
-      this.setDeployment(t, { status: "FAILED", summary, commitSha, versionId: r.versionId ?? null });
-      this.setPromptSummary(t.promptId, summary);
-      this.fail(t, `preview deploy failed: ${summary}`);
+      this.previewFailed(t, r.summary || (r.ok ? "Herald reported a deploy without a preview URL." : "Preview deploy failed."), commitSha, r.versionId ?? null);
       return this.finish("applied");
     }
     this.setTrain(t, { deployState: "LIVE", previewUrl: r.url, phase: "TESTING" });
     this.setDeployment(t, { status: "LIVE", url: r.url, versionId: r.versionId ?? null, commitSha, summary: r.summary ?? null });
     return this.finish("applied");
+  }
+
+  /** A preview deploy failed (ok:false, no URL, or timed out for the last time). */
+  private previewFailed(t: TrainRecord, summary: string, commitSha: string | null, versionId: string | null): void {
+    this.setTrain(t, { deployState: "FAILED" }, false);
+    this.setDeployment(t, { status: "FAILED", summary, commitSha, versionId });
+    this.setPromptSummary(t.promptId, summary);
+    this.fail(t, `preview deploy failed: ${summary}`);
   }
 
   private previewTornDown(t: TrainRecord, r: DeployResult): PlanResult {
@@ -346,10 +417,14 @@ export class TrainPlanner {
       this.setTrain(t, { deployState: "TORN_DOWN" }, false);
       this.setDeployment(t, { status: "TORN_DOWN" });
     } else {
-      this.setTrain(t, { deployState: "TEARDOWN_FAILED" }, false);
-      this.setDeployment(t, { status: "FAILED", summary: `teardown failed: ${r.summary ?? "unknown error"}`.slice(0, 500) });
+      this.teardownFailed(t, r.summary ?? "unknown error");
     }
     return this.finish("applied");
+  }
+
+  private teardownFailed(t: TrainRecord, summary: string): void {
+    this.setTrain(t, { deployState: "TEARDOWN_FAILED" }, false);
+    this.setDeployment(t, { status: "FAILED", summary: `teardown failed: ${summary}`.slice(0, 500) });
   }
 
   /** The DO dispatched the drone for the train's current phase. Internal only. */
@@ -411,9 +486,7 @@ export class TrainPlanner {
     if (!isActive(t)) return this.finish("ignored:stale");
     if (t.phase !== "LANDING") return this.finish("ignored:premature");
     if (!r.landed) {
-      const summary = r.summary || "lander could not push the train head to main";
-      this.setPromptSummary(t.promptId, summary);
-      this.fail(t, summary);
+      this.landFailed(t, r.summary || "lander could not push the train head to main");
       return this.finish("applied");
     }
     this.setTrain(t, { phase: "MERGED", landedSha: r.mainSha ?? null });
@@ -425,12 +498,19 @@ export class TrainPlanner {
     return this.finish("applied");
   }
 
+  private landFailed(t: TrainRecord, summary: string): void {
+    this.setPromptSummary(t.promptId, summary);
+    this.fail(t, summary);
+  }
+
   /**
-   * Crash / failure recovery (DO alarm): re-dispatch every pending command
-   * (same command id, so a command that did start is not started twice),
-   * re-deriving a pending fork's source, plus undispatched drones.
+   * Crash / failure recovery (DO alarm). First the watchdog (see watchdog()),
+   * then re-dispatch every pending command (same command id, so a command
+   * that did start is not started twice), re-deriving a pending fork's
+   * source, plus undispatched drones.
    */
   reconcile(): PlanResult {
+    this.watchdog();
     for (const t of this.trains) {
       if (t.forkState === "DELETING") {
         if (!t.deleteCommandId) this.setTrain(t, { deleteCommandId: nextCommandId(t.trainId, "delete", null) }, false);
@@ -468,6 +548,52 @@ export class TrainPlanner {
     }
     this.maybeLand();
     return this.finish("applied");
+  }
+
+  /**
+   * Executors can die without reporting (a crashed Workflow, a lost RPC).
+   * Any FORK / DELETE / DEPLOY / TEARDOWN command or drone task outstanding
+   * for `commandTimeoutMs` is re-issued under a NEW command id (new drone
+   * instance id), so a result for the old id is ignored as stale. After the
+   * attempt cap it takes the same path as an `ok:false` result.
+   */
+  private watchdog(): void {
+    const now = this.ctx.now;
+    const expired = (at: number | null) => at !== null && now - at >= this.timeoutMs;
+    const late = (what: string, id: string | null) =>
+      `${what}${id ? ` ${id}` : ""} did not report within ${Math.round(this.timeoutMs / 60_000)} min (executor lost?)`;
+    // Snapshot: fail() appends re-queued trains, which are fresh.
+    for (const t of [...this.trains]) {
+      if (t.forkState === "DELETING" && expired(t.deleteIssuedAt)) {
+        if (commandAttempt(t.deleteCommandId) < MAX_COMMAND_ATTEMPTS) this.deleteFork(t);
+        else this.setTrain(t, { forkState: "DELETE_FAILED", deleteIssuedAt: null }, false);
+      }
+      if (t.deployState === "TEARING_DOWN" && expired(t.teardownIssuedAt)) {
+        if (commandAttempt(t.teardownCommandId) < MAX_COMMAND_ATTEMPTS) this.teardownPreview(t, true);
+        else this.teardownFailed(t, late("Herald TEARDOWN", t.teardownCommandId));
+      }
+      if (!isActive(t)) continue;
+      if (t.forkState === "PENDING" && expired(t.forkIssuedAt)) {
+        this.forkFailed(t, late("Provisioner FORK", t.forkCommandId));
+      } else if (t.phase === "DEPLOYING" && t.deployState === "PENDING" && expired(t.deployIssuedAt)) {
+        if (commandAttempt(t.deployCommandId) < MAX_COMMAND_ATTEMPTS) this.deployPreview(t);
+        else this.previewFailed(t, late("Herald DEPLOY", t.deployCommandId), t.headSha, null);
+      } else if (droneOutstanding(t) && expired(t.droneIssuedAt)) {
+        const lander = t.phase === "LANDING";
+        const summary = late(lander ? "LANDER drone" : "BUILDER drone", null);
+        if (t.droneAttempt < MAX_COMMAND_ATTEMPTS) {
+          this.setTrain(t, { dispatched: false, droneAttempt: t.droneAttempt + 1 }, false);
+          if (lander) this.dispatchLander(t);
+          else this.dispatchBuilder(t);
+        } else if (lander) {
+          this.landFailed(t, summary);
+        } else {
+          // Same path as a builder giving up (a failed trainResult).
+          this.setPromptSummary(t.promptId, summary);
+          this.fail(t, summary);
+        }
+      }
+    }
   }
 
   // ── internals ─────────────────────────────────────────────────────────
@@ -520,6 +646,12 @@ export class TrainPlanner {
       deployCommandId: null,
       teardownCommandId: null,
       previewUrl: null,
+      forkIssuedAt: null,
+      deleteIssuedAt: null,
+      deployIssuedAt: null,
+      teardownIssuedAt: null,
+      droneIssuedAt: null,
+      droneAttempt: 1,
     };
     this.trains.push(train);
     this.markTrain(train);
@@ -634,7 +766,7 @@ export class TrainPlanner {
   private maybeLand(): void {
     const head = this.active()[0];
     if (head?.phase !== "PASSED") return;
-    this.setTrain(head, { phase: "LANDING", dispatched: false });
+    this.setTrain(head, { phase: "LANDING", dispatched: false, droneAttempt: 1 });
     this.dispatchLander(head);
   }
 
@@ -688,6 +820,7 @@ export class TrainPlanner {
     this.effects.push({
       type: "dispatchDrone",
       trainId: t.trainId,
+      attempt: t.droneAttempt,
       task: {
         promptId: p.promptId,
         trainId: t.trainId,
@@ -708,6 +841,7 @@ export class TrainPlanner {
     this.effects.push({
       type: "dispatchDrone",
       trainId: t.trainId,
+      attempt: t.droneAttempt,
       task: {
         promptId: t.promptId,
         trainId: t.trainId,
@@ -723,7 +857,15 @@ export class TrainPlanner {
   }
 
   private setTrain(t: TrainRecord, patch: Partial<TrainRecord>, visible = true): void {
-    Object.assign(t, patch);
+    // Watchdog clocks: a new command id (or a confirmed drone dispatch) starts one.
+    const stamped: Partial<TrainRecord> = {};
+    for (const [idField, clock] of Object.entries(ISSUED_AT) as [keyof typeof ISSUED_AT, (typeof ISSUED_AT)[keyof typeof ISSUED_AT]][]) {
+      if (idField in patch && patch[idField] !== t[idField] && !(clock in patch)) stamped[clock] = patch[idField] ? this.ctx.now : null;
+    }
+    if ("dispatched" in patch && patch.dispatched !== t.dispatched && !("droneIssuedAt" in patch)) {
+      stamped.droneIssuedAt = patch.dispatched ? this.ctx.now : null;
+    }
+    Object.assign(t, patch, stamped);
     t.status = statusOf(t.phase);
     this.markTrain(t, visible);
   }
@@ -766,7 +908,21 @@ export class TrainPlanner {
         .map((t): Effect => ({ type: "broadcast", message: { type: "train.updated", train: toMergeTrain(t) } })),
       ...deployments.map((d): Effect => ({ type: "broadcast", message: { type: "deployment.updated", deployment: d } })),
     ];
-    const result: PlanResult = { outcome, prompts, trains, deployments, effects: [...this.effects, ...broadcasts] };
+    // The watchdog may re-issue a command that reconcile then re-emits: one dispatch each.
+    const seen = new Set<string>();
+    const effects = this.effects.filter((e) => {
+      const key =
+        e.type === "provision" || e.type === "deploy"
+          ? `cmd:${e.command.commandId}`
+          : e.type === "dispatchDrone"
+            ? `drone:${e.trainId}:${e.task.action}:${e.attempt}`
+            : null;
+      if (key === null) return true;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    const result: PlanResult = { outcome, prompts, trains, deployments, effects: [...effects, ...broadcasts] };
     this.dirtyPrompts.clear();
     this.dirtyTrains.clear();
     this.dirtyDeployments.clear();

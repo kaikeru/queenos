@@ -1,0 +1,2 @@
+# Intentionally empty. Wrangler picks .dev.vars.<env> over .dev.vars, so a developer's local
+# .dev.vars (real KEK, VAULT_DEV_CF_BASE) cannot leak into the vitest "test" env.

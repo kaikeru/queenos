@@ -1,0 +1,14 @@
+# Copy to .dev.vars for `wrangler dev`. In production:
+#   wrangler secret put VAULT_KEK          (paste: openssl rand -base64 32)
+#
+# VAULT_KEK: base64 of 32 random bytes; the AES-KW key-encryption key that wraps
+# each hive's data key. It lives ONLY on this Worker. Losing it loses every
+# stored credential; leaking it exposes them (with a copy of the DO storage).
+#
+# DEV ONLY: this example value is public. Never deploy it.
+VAULT_KEK=7cNXlGnhom3ZPllYKB7BmuCHxhje+ZBCvlF5nANjIqo=
+
+# Rotation: set VAULT_KEK_PREVIOUS to the old KEK and VAULT_KEK to a new one.
+# Data keys wrapped by the old KEK are re-wrapped under the new one on next use;
+# remove VAULT_KEK_PREVIOUS once every hive has been touched.
+# VAULT_KEK_PREVIOUS=

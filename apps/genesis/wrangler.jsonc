@@ -1,0 +1,43 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Reached only through the edge Worker (service binding): no routes, no workers.dev.
+  "name": "queenos-genesis",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  "workers_dev": false,
+  "preview_urls": false,
+  // Workers AI binding: interview calls go through AI Gateway "queenos" (pre-authenticated, no token).
+  "ai": { "binding": "AI" },
+  "durable_objects": {
+    "bindings": [
+      // This Worker's own DO (the fetch handler and the Provisioner reach it by hive name).
+      { "name": "GENESIS", "class_name": "GenesisNode" },
+      // Project registry (apps/edge, "queenos-edge"): idFromName("registry").
+      { "name": "REGISTRY", "class_name": "HiveRegistry", "script_name": "queenos-edge" },
+      // The Queen (apps/queen, "queen"): idFromName(hive).
+      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GenesisNode"] }],
+  // Vault: status only. Genesis never sees the Cloudflare token.
+  "services": [{ "binding": "VAULT", "service": "queenos-vault", "entrypoint": "VaultWriter" }],
+  "workflows": [
+    // Starts CREATE_HIVE (instance id = commandId).
+    { "name": "provisioner-workflow", "binding": "PROVISIONER", "class_name": "ProvisionerWorkflow", "script_name": "queenos-provisioner" }
+  ],
+  "vars": {
+    // "scripted" is a deterministic two-turn interview (demo video, tests); "live" calls the model.
+    "GENESIS_LLM_MODE": "scripted",
+    "MODEL_GENESIS": "anthropic/claude-sonnet-5-5",
+    "AI_GATEWAY_ID": "queenos"
+  },
+  "env": {
+    // Used only by vitest (see vitest.config.ts). Named envs do not inherit bindings: only the
+    // local GenesisNode. Registry / Vault / Queen / Provisioner / LLM are fakes via test/worker.ts.
+    "test": {
+      "durable_objects": { "bindings": [{ "name": "GENESIS", "class_name": "GenesisNode" }] },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GenesisNode"] }],
+      "vars": { "GENESIS_LLM_MODE": "scripted", "MODEL_GENESIS": "anthropic/claude-sonnet-5-5", "AI_GATEWAY_ID": "queenos" }
+    }
+  }
+}

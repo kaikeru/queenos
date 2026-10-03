@@ -101,38 +101,67 @@ pnpm turbo run build typecheck lint test   # the full gate
 | `apps/dashboard` (vitest, node) | The War Room reducer: snapshots, train lanes, audit cards, rework attempts. |
 | `packages/hive-kit`, `packages/queen-types` | Git on isomorphic-git + in-memory fs, ledger payloads, AI Gateway client, Zod schemas. |
 
+## Full stack locally (no Cloudflare calls)
+
+Runs the edge (dev auth), Genesis (scripted LLM, fake provisioner), the Vault (against a local fake Cloudflare API) and the Queen (sim) together.
+
+One-time setup (both files are gitignored):
+- `apps/vault/.dev.vars`: `VAULT_KEK=<openssl rand -base64 32>` and `VAULT_DEV_CF_BASE=http://127.0.0.1:8799`
+- `apps/genesis/.dev.vars`: `GENESIS_DEV_FAKE_PROVISIONER=1`
+
+```bash
+pnpm --filter @queenos/dashboard build
+node scripts/dev/fake-cloudflare.mjs &
+(cd apps/vault   && pnpm exec wrangler dev --port 8791 --inspector-port 9291) &
+(cd apps/queen   && pnpm exec wrangler dev --env sim --port 8792 --inspector-port 9292) &
+sleep 12
+(cd apps/genesis && pnpm exec wrangler dev --port 8793 --inspector-port 9293) &
+(cd apps/edge    && pnpm exec wrangler dev --env dev --port 8787 --inspector-port 9294) &
+```
+
+Open http://localhost:8787. Any 32-hex account id and any fake token work. The edge's `dev` env and the Queen's `sim` env refuse non-localhost requests, so deploying them by mistake can't bypass Access.
+
 ## Deploy to Cloudflare
 
 Needs a Workers Paid account (Artifacts) and wrangler 4.145+. Steps marked **(unverified)** have not been run against a real account; [docs/day1-verification.md](docs/day1-verification.md) is the runbook for resolving them.
 
-1. **Create resources.**
-   - Artifacts namespace `queenos` is referenced by the bindings; create the hive repo named after the hive namespace (e.g. `demo`) with `env.ARTIFACTS.create("demo")` from any Worker, or the Artifacts REST API **(unverified: no wrangler subcommand is assumed; the runbook has a snippet)**. It must have an initial commit on `main`.
-   - Vectorize index for failure memory: `wrangler vectorize create queenos-failures --dimensions=768 --metric=cosine`. This matches the gatekeepers' binding and the 768-dim `@cf/baai/bge-base-en-v1.5` embeddings.
-   - AI Gateway named `queenos` (authenticated), with your provider key stored via BYOK in the dashboard.
-2. **Deploy order.** The Workers bind to each other in a cycle, and wrangler rejects a binding to a script that doesn't exist yet (code 10061, verified in `docs/day1-results.md`):
-   - the Queen binds the drones, provisioner and herald Workflows;
-   - every executor binds the Queen's Durable Object.
-   
-   Bootstrap it in three passes:
-   1. Deploy the Queen **without** its cross-script `workflows` bindings, so the DO class exists.
-   2. Deploy `queenos-drones`, `queenos-provisioner`, `queenos-herald` and `queenos-gatekeepers`.
-   3. Redeploy the Queen with the full config.
-   
-   A scripted bootstrap is planned for P2. Until then, temporarily comment out the Queen's `workflows` array for the first pass.
-   Deploy scripts pass `--env=""` so wrangler targets the top-level config. The `sim` and `test` envs are not for deployment.
-3. **Secrets.**
+The public front door is one Worker, `queenos-edge`, at **https://queenos.kaikeru.com**, behind Cloudflare Access. It verifies the Access JWT, serves the dashboard, hosts the project registry, and forwards to `queenos-vault`, `queenos-genesis` and the `queen` over service bindings. The queen has `workers_dev: false`, so it is reachable only through the edge.
+
+### One-time resources
+
+- Vectorize index for failure memory: `wrangler vectorize create queenos-failures --dimensions=768 --metric=cosine` (matches the gatekeepers' binding and the 768-dim `@cf/baai/bge-base-en-v1.5` embeddings).
+- AI Gateway named `queenos` (authenticated). Optional: add your Anthropic key under AI Gateway > `queenos` > Provider Keys with alias `default`; without it third-party models fall back to Unified Billing. LLM calls use the Workers AI `AI` binding through the gateway, so there are no tokens. Per-role models are wrangler vars `MODEL_BUILDER` (default `anthropic/claude-opus-5-5`) and `MODEL_SCRIBE` (default `anthropic/claude-haiku-4-5`); `DRONE_LLM_MODE` is `scripted` (deterministic, good for the demo video) or `live`.
+- Event subscription: `cf.artifacts.repo.pushed` to the gatekeepers Workflow via `triggers.events` **(unverified: payload shape and filter syntax, see the runbook)**.
+
+### Deploy
+
+```bash
+scripts/deploy.sh              # bootstrap pass if needed, then full pass
+scripts/deploy.sh --bootstrap  # force the bootstrap pass
+scripts/deploy.sh --dry-run    # build every bundle into .deploy-dryrun/, deploy nothing
+```
+
+The Workers bind to each other in cycles (queen and the executors, genesis and the provisioner, the edge to everything), and wrangler rejects a binding to a script that does not exist yet (code 10061, `docs/day1-results.md`). The script therefore runs two passes over queen, provisioner, herald, drones, gatekeepers, vault, genesis and edge:
+
+1. **Bootstrap pass** (automatic when any script has never been deployed, or forced with `--bootstrap`): deploy every Worker from a temporary config with its cross-script bindings stripped (DO and Workflow bindings that have `script_name`, and all `services`). Own DOs, Workflows, migrations, assets and routes are kept. The real config files are untouched.
+2. **Full pass:** deploy every Worker with its full config.
+
+The provisioner's template generator runs before it deploys, and the dashboard is built before the edge. It deploys with `--env=""` (the `sim`, `dev` and `test` envs are not for deployment) and prints the manual steps below when it finishes. `--only <app>` limits a pass to one app dir (e.g. `--only edge`).
+
+### One-time setup (after the first deploy)
+
+Your Zero Trust team is `kaikeru` (team domain `kaikeru.cloudflareaccess.com`).
+
+1. **Access application.** Zero Trust > Access > Applications > Add > Self-hosted. Domain `queenos.kaikeru.com`, all paths. Add a policy: Action Allow, Include emails ending in `@kaikeru.com`. The edge repeats the domain check on the verified JWT as a second layer.
+2. **AUD.** Copy the application's "Application Audience (AUD) Tag" into `ACCESS_AUD` in `apps/edge/wrangler.jsonc` and redeploy the edge (`pnpm --filter @queenos/edge deploy`). While `ACCESS_AUD` is empty the edge fails closed: every route except `/health` returns 503.
+3. **Vault key.** Generate and store the key-encryption key on the vault Worker:
    ```bash
-   openssl rand -hex 32                                    # generate a token
-   pnpm --filter @queenos/queen exec wrangler secret put QUEEN_INTERNAL_TOKEN
+   openssl rand -base64 32 | pnpm --filter @queenos/vault exec wrangler secret put VAULT_KEK --env=""
    ```
-   `QUEEN_INTERNAL_TOKEN` guards the Queen's machine-only HTTP routes. Without it those routes return 503. The LLM needs no token (see AI Gateway below).
-4. **AI Gateway.** LLM calls use the Workers AI `AI` binding through the gateway `queenos`, pre-authenticated within the account, so there are no tokens or secrets.
-   - The gateway `queenos` must exist (it does on the dev account).
-   - Optional: add your Anthropic key in the dashboard under AI Gateway > `queenos` > Provider Keys with alias `default`. Without it, third-party models fall back to Unified Billing.
-   - Per-role models are wrangler vars: `MODEL_BUILDER` (drones, default `anthropic/claude-opus-5-5`) and `MODEL_SCRIBE` (gatekeepers, default `anthropic/claude-haiku-4-5`). Use `anthropic/...` or a Workers AI `@cf/...` model.
-   - `DRONE_LLM_MODE` is `scripted` (deterministic change sets, good for the demo video) or `live`.
-5. **Event subscription.** Subscribe `cf.artifacts.repo.pushed` to the gatekeepers Workflow via `triggers.events` in its wrangler config **(unverified: payload shape and filter syntax, see the runbook)**.
-6. **Dashboard.** Build with `VITE_QUEEN_URL=https://<queen>.workers.dev pnpm --filter @queenos/dashboard build` and host `apps/dashboard/dist` on any static host **(not set up in this repo)**.
+4. **Queen machine token.** `openssl rand -hex 32 | pnpm --filter @queenos/queen exec wrangler secret put QUEEN_INTERNAL_TOKEN --env=""`. It guards the Queen's machine-only HTTP routes, which return 503 without it.
+5. Open https://queenos.kaikeru.com, sign in, and confirm the War Room connects.
+
+Local development: `pnpm --filter @queenos/edge exec wrangler dev --env dev` skips Access verification and acts as `DEV_USER_EMAIL`. Never deploy the `dev` env.
 
 ## Repo layout
 

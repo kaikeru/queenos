@@ -50,8 +50,10 @@ import { WorkflowDroneDispatcher, type DroneDispatcher } from "./drones";
 import { WorkflowCommandDispatcher, type DeployDispatcher, type ProvisionerDispatcher } from "./executors";
 import { QueenError, asQueenError, parseOrThrow } from "./errors";
 import {
+  DEFAULT_COMMAND_TIMEOUT_MS,
   TrainPlanner,
   toMergeTrain,
+  watchdogDeadline,
   toPromptRun,
   type Effect,
   type HiveState,
@@ -73,6 +75,14 @@ export const MAX_PROMPT_CHARS = 16_000;
 /** Ledger entries are compact reasoning, not logs. */
 export const MAX_GIT_NOTES_BYTES = 16 * 1024;
 export const RECONCILE_DELAY_MS = 15_000;
+/** Fire the watchdog alarm a little after the deadline so the command has surely expired. */
+export const WATCHDOG_SLACK_MS = 1_000;
+
+/** COMMAND_TIMEOUT_MS (wrangler var, milliseconds); default 10 min. */
+export function commandTimeoutMs(env: { COMMAND_TIMEOUT_MS?: string | number }): number {
+  const v = Number(env.COMMAND_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_COMMAND_TIMEOUT_MS;
+}
 const SNAPSHOT_LIMIT = 200;
 const AUDIT_SNAPSHOT_LIMIT = 50;
 
@@ -119,6 +129,11 @@ export class QueenNode extends DurableObject<Env> {
     // Heartbeats are answered by the runtime without waking the DO.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.ports = this.createPorts(env);
+  }
+
+  /** Seam for tests: the clock used for planning and the watchdog. */
+  protected now(): number {
+    return Date.now();
   }
 
   /** Seam for tests and sim: override to inject fake executor / drone ports. */
@@ -267,7 +282,11 @@ export class QueenNode extends DurableObject<Env> {
       .map(rowToDeployment);
   }
 
-  /** Reconcile fork/delete/dispatch intents that failed or were interrupted. */
+  /**
+   * Reconcile fork/delete/dispatch intents that failed or were interrupted,
+   * and run the command watchdog (TrainPlanner.reconcile). apply() re-arms
+   * the alarm while any command is still outstanding.
+   */
   override async alarm(): Promise<void> {
     const hive = this.hiveNamespace();
     if (hive === null) return;
@@ -423,8 +442,9 @@ export class QueenNode extends DurableObject<Env> {
   private plan(namespace: string, trainIds: string[], fn: (p: TrainPlanner) => PlanResult): PlanResult {
     const planner = new TrainPlanner(this.loadState(trainIds), {
       namespace,
-      now: Date.now(),
+      now: this.now(),
       newId: () => crypto.randomUUID(),
+      commandTimeoutMs: commandTimeoutMs(this.env),
     });
     return fn(planner);
   }
@@ -454,6 +474,23 @@ export class QueenNode extends DurableObject<Env> {
     }
     for (const e of plan.effects) if (e.type === "broadcast") this.broadcast(e.message);
     for (const e of plan.effects) if (e.type !== "broadcast") await this.execute(e);
+    await this.armWatchdog();
+  }
+
+  /**
+   * Keep the alarm armed while any command is outstanding: at the earliest
+   * watchdog deadline (issuedAt + COMMAND_TIMEOUT_MS). Only ever moves an
+   * existing alarm earlier (the reconcile retry and the sim share it).
+   */
+  private async armWatchdog(): Promise<void> {
+    if (this.hiveNamespace() === null) return;
+    const now = this.now();
+    const due = watchdogDeadline(this.loadState([]).trains, commandTimeoutMs(this.env), now);
+    if (due === null) return;
+    // Real time for the alarm itself; `now()` may be skewed by tests.
+    const at = Date.now() + Math.max(0, due - now) + WATCHDOG_SLACK_MS;
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || at < current) await this.ctx.storage.setAlarm(at);
   }
 
   private async execute(e: Exclude<Effect, { type: "broadcast" }>): Promise<void> {
@@ -478,7 +515,7 @@ export class QueenNode extends DurableObject<Env> {
       }
       case "dispatchDrone": {
         try {
-          await this.ports.dispatcher.dispatch(e.task);
+          await this.ports.dispatcher.dispatch(e.task, e.attempt);
         } catch (err) {
           return this.ioFailed(e, err);
         }

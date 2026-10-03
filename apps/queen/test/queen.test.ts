@@ -379,6 +379,78 @@ describe("executor results", () => {
   });
 });
 
+describe("command watchdog (alarm)", () => {
+  const T = 600_000; // wrangler.jsonc env.test COMMAND_TIMEOUT_MS
+  const skew = (ns: string, ms: number) =>
+    runInDurableObject(stubFor(ns), (q: QueenNode) => {
+      (q as unknown as { clockOffset: number }).clockOffset = ms;
+    });
+  const alarmAt = (ns: string) => runInDurableObject(stubFor(ns), (_q: QueenNode, state) => state.storage.getAlarm());
+
+  it("arms the alarm while a command is outstanding; a stuck fork is retried, a late old-id result is stale, then the train is ejected", async () => {
+    const ns = newHive();
+    const t0 = Date.now();
+    await submit(ns, "A");
+    const [t] = (await inspect(ns)).trains;
+    const id = t!.train_id;
+    // Armed at the watchdog deadline (issue time + COMMAND_TIMEOUT_MS + slack).
+    const armed = await alarmAt(ns);
+    expect(armed).not.toBeNull();
+    expect(armed!).toBeGreaterThanOrEqual(t0 + T);
+    expect(armed!).toBeLessThanOrEqual(Date.now() + T + 2_000);
+
+    // Executor died: nothing reported. Ten minutes later the alarm re-issues under a new id.
+    await skew(ns, T + 2_000);
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    expect((await inspect(ns)).forks.map((f) => f.commandId)).toEqual([`${id}-fork-1`, `${id}-fork-2`]);
+    expect(await alarmAt(ns)).not.toBeNull(); // still outstanding: re-armed
+
+    // The first Provisioner's late report is ignored as stale.
+    const late = await post(ns, "/internal/webhook/provision-result", { commandId: `${id}-fork-1`, op: "FORK", trainId: id, ok: true, artifactRepo: t!.artifact_repo });
+    expect(await late.json()).toMatchObject({ outcome: "ignored:stale", train: { phase: "BUILDING" } });
+    expect((await inspect(ns)).trains[0]).toMatchObject({ fork_state: "PENDING", fork_command_id: `${id}-fork-2` });
+
+    await skew(ns, 2 * (T + 2_000));
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    expect((await inspect(ns)).forks.map((f) => f.commandId).at(-1)).toBe(`${id}-fork-3`);
+
+    // Attempt cap reached: the same path as an ok:false fork (EJECTED, re-queued as REWORK).
+    await skew(ns, 3 * (T + 2_000));
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    const s = await inspect(ns);
+    expect(s.trains[0]).toMatchObject({ train_id: id, phase: "EJECTED", fork_state: "DELETING" });
+    expect(String((s.trains[0] as unknown as { reason: string }).reason)).toMatch(/^failed: fork failed: Provisioner FORK .*-fork-3 did not report/);
+    expect(s.trains[1]).toMatchObject({ phase: "BUILDING", fork_state: "PENDING" });
+    expect(s.prompts[0]).toMatchObject({ status: "QUEUED", attempts: 1 });
+    expect(s.provisions.filter((c) => c.op === "DELETE").map((c) => c.commandId)).toEqual([`${id}-delete-1`]);
+    expect(await alarmAt(ns)).not.toBeNull(); // the rework's fork and the delete are outstanding
+  });
+
+  it("a drone that never reports is re-dispatched under a new instance id", async () => {
+    const ns = newHive();
+    await submit(ns, "A");
+    await settle(ns, new Set());
+    await skew(ns, T + 2_000);
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    const ids = await runInDurableObject(stubFor(ns), (q: QueenNode) => [...(q.ports.dispatcher as RecordingDispatcher).instanceIds]);
+    const [t] = (await inspect(ns)).trains;
+    expect(ids).toEqual([`${t!.train_id}-build`, `${t!.train_id}-build-2`]);
+  });
+
+  it("no alarm when nothing is outstanding; re-armed as soon as a command is issued", async () => {
+    const ns = newHive();
+    const { trainId } = await oneTrain(ns, { live: true });
+    // TESTING with a live preview: waiting on gatekeepers, not on an executor command.
+    await runInDurableObject(stubFor(ns), (_q: QueenNode, state) => state.storage.deleteAlarm());
+    const dup = await post(ns, "/internal/webhook/deploy-result", { commandId: `${trainId}-deploy-1`, op: "DEPLOY", environment: "preview", trainId, ok: true, url: previewUrl(trainId) });
+    expect(await dup.json()).toMatchObject({ outcome: "ignored:duplicate", train: { phase: "TESTING" } });
+    expect(await alarmAt(ns)).toBeNull();
+    await post(ns, "/internal/webhook/train-result", { trainId, passed: false, summary: "smoke failed" });
+    // Ejection issues DELETE + TEARDOWN (and a rework fork): armed again.
+    expect(await alarmAt(ns)).not.toBeNull();
+  });
+});
+
 describe("validation", () => {
   it("rejects invalid payloads with 400 / 404", async () => {
     const ns = newHive();
@@ -516,7 +588,7 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([2, 2, 2]);
+    expect([state.before, state.after, state.version]).toEqual([3, 3, 3]);
     expect(state.tables).toEqual(["audit_trail", "deployments", "merge_trains", "prompt_runs"]);
     ws.close(1000, "done");
   });

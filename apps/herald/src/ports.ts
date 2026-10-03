@@ -56,27 +56,31 @@ export interface CloudflareCredentials {
 }
 
 /**
- * Where deploy credentials come from. P1: wrangler secret + var
- * (EnvCredentialsPort). P2: the Vault DO (`vault.reveal(hive, ref)`), with the
- * same call pattern: reveal inside the step that uses it.
+ * Where deploy credentials come from: the Vault, per hive (apps/vault,
+ * docs/deploy-discovery.md §6). Call it inside the step that uses the
+ * credential; never return, log or persist the value.
  */
 export interface CredentialsPort {
-  cloudflare(hive: string): Promise<CloudflareCredentials>;
+  /** `purpose` is recorded in the Vault's audit trail (e.g. the command id). */
+  cloudflare(hive: string, purpose?: string): Promise<CloudflareCredentials>;
 }
 
-export interface CredentialEnv {
-  CLOUDFLARE_ACCOUNT_ID?: string;
-  CLOUDFLARE_API_TOKEN?: string;
+/** RPC surface of the `VaultReader` entrypoint of queenos-vault. */
+export interface VaultReaderRpc {
+  getCloudflareCredential(hive: string, purpose?: string): Promise<{ accountId: string; apiToken: string }>;
 }
 
-export class EnvCredentialsPort implements CredentialsPort {
-  constructor(private readonly env: CredentialEnv) {}
-  async cloudflare(): Promise<CloudflareCredentials> {
-    const accountId = this.env.CLOUDFLARE_ACCOUNT_ID?.trim();
-    const token = this.env.CLOUDFLARE_API_TOKEN?.trim();
-    if (!accountId) throw new Error("UNAVAILABLE: CLOUDFLARE_ACCOUNT_ID is not configured");
-    if (!token) throw new Error("UNAVAILABLE: the CLOUDFLARE_API_TOKEN secret is not configured");
-    return { accountId, token };
+/**
+ * Reads the hive's Cloudflare credential from the Vault over the VAULT_READER
+ * service binding (service "queenos-vault", entrypoint "VaultReader"). Each
+ * call is audited by the Vault; nothing is cached here.
+ */
+export class VaultCredentialsPort implements CredentialsPort {
+  constructor(private readonly vault: VaultReaderRpc | undefined) {}
+  async cloudflare(hive: string, purpose?: string): Promise<CloudflareCredentials> {
+    if (!this.vault) throw new Error("UNAVAILABLE: VAULT_READER binding is not configured");
+    const c = await this.vault.getCloudflareCredential(hive, purpose);
+    return { accountId: c.accountId, token: c.apiToken };
   }
 }
 
@@ -108,16 +112,18 @@ export interface HeraldPorts {
   queen(hive: string): QueenPort;
 }
 
-export interface HeraldEnvBindings extends CredentialEnv {
+export interface HeraldEnvBindings {
   ARTIFACTS?: Artifacts;
   QUEEN?: DurableObjectNamespace;
+  /** Service binding to queenos-vault's VaultReader entrypoint. */
+  VAULT_READER?: Fetcher | VaultReaderRpc;
 }
 
 export function createProdPorts(env: HeraldEnvBindings): HeraldPorts {
   return {
     artifacts: new BindingArtifactsPort(env.ARTIFACTS),
     git: isomorphicGitPort,
-    credentials: new EnvCredentialsPort(env),
+    credentials: new VaultCredentialsPort(env.VAULT_READER as VaultReaderRpc | undefined),
     cloudflare: (creds) => new CloudflareClient({ accountId: creds.accountId, token: creds.token }),
     queen: (hive) => queenRpc(env.QUEEN, hive),
   };

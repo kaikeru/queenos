@@ -117,7 +117,7 @@ export function simPreviewUrl(trainId: string): string {
 }
 
 export class SimExecutors {
-  readonly drones: DroneDispatcher = { dispatch: (task) => this.dispatchDrone(task) };
+  readonly drones: DroneDispatcher = { dispatch: (task, attempt) => this.dispatchDrone(task, attempt) };
   readonly provisioner: ProvisionerDispatcher = {
     dispatch: (command) =>
       this.enqueue({ id: command.commandId, kind: "provision", due: this.now() + (command.op === "FORK" ? this.delays.fork : this.delays.delete), command }),
@@ -165,8 +165,8 @@ export class SimExecutors {
 
   // ── dispatch ──────────────────────────────────────────────────────────
 
-  private async dispatchDrone(task: DroneTask): Promise<{ instanceId: string }> {
-    const id = droneInstanceId(task);
+  private async dispatchDrone(task: DroneTask, attempt?: number): Promise<{ instanceId: string }> {
+    const id = droneInstanceId(task, attempt);
     const kind = task.action === "LAND" ? "land" : "build";
     if (!(await this.add({ id, kind, due: this.now() + this.delays[kind], task }))) return { instanceId: id };
     // The drone "starts": its first card pulses yellow immediately.
@@ -219,9 +219,10 @@ export class SimExecutors {
         artifactRepo: c.forkName,
         baseSha: fakeSha(`base:${c.sourceRepo}`),
       });
-    } else {
+    } else if (c.op === "DELETE") {
       await this.queen().reportProvisionResult({ commandId: c.commandId, op: "DELETE", trainId: c.trainId, ok: true });
     }
+    // CREATE_HIVE is Genesis's command (reported to GenesisNode); the Queen never issues it.
   }
 
   private async runDeploy(c: DeployCommand): Promise<void> {

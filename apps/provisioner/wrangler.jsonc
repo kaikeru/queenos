@@ -18,7 +18,10 @@
     "bindings": [
       // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen").
       // One QueenNode per hive: QUEEN.idFromName(hive).
-      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" }
+      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" },
+      // Cross-script DO RPC to Genesis (apps/genesis, "queenos-genesis"): reportHiveCreated.
+      // One GenesisNode per hive: GENESIS.idFromName(hive).
+      { "name": "GENESIS", "class_name": "GenesisNode", "script_name": "queenos-genesis" }
     ]
   },
   "env": {

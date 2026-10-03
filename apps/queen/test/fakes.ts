@@ -1,5 +1,5 @@
 import type { DeployCommand, DroneTask, ProvisionCommand } from "@queenos/queen-types";
-import type { DroneDispatcher } from "../src/drones";
+import { droneInstanceId, type DroneDispatcher } from "../src/drones";
 import type { CommandDispatcher } from "../src/executors";
 
 /** Records every dispatched executor command; results are reported by the test. */
@@ -23,9 +23,13 @@ export class RecordingHerald extends RecordingCommands<DeployCommand> {}
 
 export class RecordingDispatcher implements DroneDispatcher {
   readonly tasks: DroneTask[] = [];
+  /** Workflow instance ids, in dispatch order (attempts > 1 carry a suffix). */
+  readonly instanceIds: string[] = [];
 
-  async dispatch(task: DroneTask): Promise<{ instanceId: string }> {
+  async dispatch(task: DroneTask, attempt?: number): Promise<{ instanceId: string }> {
     this.tasks.push(task);
-    return { instanceId: `${task.trainId}-${task.action}` };
+    const instanceId = droneInstanceId(task, attempt);
+    this.instanceIds.push(instanceId);
+    return { instanceId };
   }
 }

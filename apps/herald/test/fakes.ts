@@ -45,8 +45,10 @@ export class FakeGit implements GitPort {
 
 export class FakeCredentials implements CredentialsPort {
   calls = 0;
-  async cloudflare(): Promise<CloudflareCredentials> {
+  readonly requests: { hive: string; purpose?: string }[] = [];
+  async cloudflare(hive: string, purpose?: string): Promise<CloudflareCredentials> {
     this.calls++;
+    this.requests.push({ hive, ...(purpose ? { purpose } : {}) });
     return { accountId: "acct-test", token: TOKEN };
   }
 }

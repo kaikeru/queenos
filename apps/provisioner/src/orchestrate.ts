@@ -11,8 +11,14 @@
  */
 import type { WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import { ProvisionCommandSchema, type ProvisionCommand, type ProvisionResult } from "@queenos/queen-types";
-import { errorCode, type ProvisionerPorts } from "./ports";
+import {
+  ProvisionCommandSchema,
+  type HiveCreatedResult,
+  type ProvisionCommand,
+  type ProvisionResult,
+} from "@queenos/queen-types";
+import { errorCode, SEED_TRAILER, type ProvisionerPorts } from "./ports";
+import { TEMPLATES } from "./templates.generated";
 
 export interface StepRunner {
   do<T>(name: string, config: WorkflowStepConfig, fn: () => Promise<T>): Promise<T>;
@@ -56,6 +62,7 @@ export async function runProvision(payload: unknown, step: StepRunner, ports: Pr
     throw new ProvisionFailedError(`invalid ProvisionCommand: ${parsed.error.issues.map((i) => i.path.join(".")).join(", ")}`);
   }
   const cmd = parsed.data;
+  if (cmd.op === "CREATE_HIVE") return runCreateHive(cmd, step, ports);
 
   let work: Work;
   try {
@@ -96,4 +103,96 @@ export async function runProvision(payload: unknown, step: StepRunner, ports: Pr
   });
 
   return { commandId: cmd.commandId, op: cmd.op, ok: work.ok, summary: result.summary ?? "", queenOutcome };
+}
+
+// ── CREATE_HIVE ──────────────────────────────────────────────────────────
+
+const SEED_IDENTITY = { name: "QueenOS Genesis", email: "genesis@queenos.dev" };
+
+/** Reported to Genesis, never to the Queen. Genesis RPC errors that mean "do not retry". */
+function isPermanentGenesisError(e: unknown): boolean {
+  return /^(INVALID_INPUT|NOT_FOUND|CONFLICT): /.test(messageOf(e));
+}
+
+/** The seed commit message. The trailer makes a retried or re-dispatched command find its own work. */
+export function seedMessage(commandId: string): string {
+  return `Seed hive from worker-starter\n\n${SEED_TRAILER}: ${commandId}\n`;
+}
+
+/**
+ * CREATE_HIVE: create the repo (ALREADY_EXISTS is success), write the template
+ * plus .queen/charter.json, commit on main with a step-fixed timestamp, push,
+ * and report to Genesis. A repo whose main already carries a seed commit is
+ * reported as is, so retries and re-launches converge.
+ */
+async function runCreateHive(
+  cmd: Extract<ProvisionCommand, { op: "CREATE_HIVE" }>,
+  step: StepRunner,
+  ports: ProvisionerPorts,
+): Promise<ProvisionRunResult> {
+  let work: { ok: true; mainSha: string; summary: string } | { ok: false; summary: string };
+  try {
+    const files = TEMPLATES[cmd.template];
+    if (!files) throw new NonRetryableError(`INVALID_INPUT: unknown template ${cmd.template}`);
+    let charterPretty: string;
+    try {
+      charterPretty = `${JSON.stringify(JSON.parse(cmd.charterJson), null, 2)}\n`;
+    } catch {
+      throw new NonRetryableError("INVALID_INPUT: charterJson is not valid JSON");
+    }
+
+    await step.do("create repo", PROVISION_STEP, async () => {
+      try {
+        await ports.artifacts.ensureRepo(cmd.hive);
+        return true;
+      } catch (e) {
+        throw toStepError(e);
+      }
+    });
+    // Fixed once so a retried seed step rebuilds the identical commit.
+    const timestamp = await step.do("seed timestamp", PROVISION_STEP, async () => Math.floor(Date.now() / 1000));
+    const mainSha = await step.do("seed main", PROVISION_STEP, async () => {
+      try {
+        const existing = await ports.artifacts.findSeed(cmd.hive);
+        if (existing) return existing;
+        const access = await ports.artifacts.access(cmd.hive, "write");
+        const repo = await ports.git.init({ url: access.remote, token: access.token });
+        await repo.writeFiles([
+          ...Object.entries(files).map(([path, content]) => ({ path, content })),
+          { path: ".queen/charter.json", content: charterPretty },
+        ]);
+        const oid = await repo.commitAll({
+          message: seedMessage(cmd.commandId),
+          timestamp,
+          author: SEED_IDENTITY,
+          committer: SEED_IDENTITY,
+        });
+        await repo.push({ ref: "main" });
+        return oid;
+      } catch (e) {
+        throw toStepError(e);
+      }
+    });
+    work = { ok: true, mainSha, summary: `Seeded ${cmd.hive} from ${cmd.template} at ${mainSha.slice(0, 12)}.` };
+  } catch (e) {
+    work = { ok: false, summary: clip(`Create hive failed: ${messageOf(e)}`) };
+  }
+
+  const result: HiveCreatedResult = {
+    commandId: cmd.commandId,
+    hive: cmd.hive,
+    ok: work.ok,
+    ...(work.ok ? { mainSha: work.mainSha } : {}),
+    summary: clip(work.summary),
+  };
+  const outcome = await step.do("report: hive created", REPORT_STEP, async () => {
+    try {
+      const r = (await ports.genesis(cmd.hive).reportHiveCreated(result)) as { outcome?: unknown } | null | undefined;
+      return String(r?.outcome ?? "reported");
+    } catch (e) {
+      if (!isPermanentGenesisError(e)) throw e;
+      return `rejected: ${clip(messageOf(e), 200)}`;
+    }
+  });
+  return { commandId: cmd.commandId, op: cmd.op, ok: work.ok, summary: result.summary ?? "", queenOutcome: outcome };
 }

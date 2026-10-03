@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { DeployCommand, Deployment, ProvisionCommand } from "@queenos/queen-types";
 import {
+  DEFAULT_COMMAND_TIMEOUT_MS,
+  MAX_COMMAND_ATTEMPTS,
   MAX_FORK_ATTEMPTS,
+  watchdogDeadline,
   TrainPlanner,
   nextCommandId,
   type Effect,
@@ -21,6 +24,8 @@ class Sim {
   trains = new Map<string, TrainRecord>();
   deployments = new Map<string, Deployment>();
   effects: Effect[] = [];
+  /** Planner clock (the watchdog compares command issue times against it). */
+  now = 1000;
   private ids = 0;
   private maxTrainSeq = 0;
   private maxPromptSeq = 0;
@@ -34,7 +39,7 @@ class Sim {
         maxTrainSeq: this.maxTrainSeq,
         maxPromptSeq: this.maxPromptSeq,
       },
-      { namespace: "hive", now: 1000, newId: () => `t${++this.ids}` },
+      { namespace: "hive", now: this.now, newId: () => `t${++this.ids}` },
     );
     const r = fn(planner);
     for (const p of r.prompts) {
@@ -655,5 +660,150 @@ describe("planner: preview deploys", () => {
   it("nextCommandId numbers attempts", () => {
     expect(nextCommandId("t1", "fork", null)).toBe("t1-fork-1");
     expect(nextCommandId("t1", "fork", "t1-fork-9")).toBe("t1-fork-10");
+  });
+});
+
+describe("planner: command watchdog", () => {
+  const T = DEFAULT_COMMAND_TIMEOUT_MS;
+  const forkIds = (r: PlanResult) => r.effects.flatMap((e) => (e.type === "provision" && e.command.op === "FORK" ? [e.command.commandId] : []));
+
+  it("a stuck fork is re-issued under a new command id, a late result for the old id is stale, then the train is ejected", () => {
+    const s = new Sim();
+    s.submit("A");
+    expect(s.takeOp("FORK").map((c) => c.commandId)).toEqual(["t1-fork-1"]);
+    expect(s.trains.get("t1")!.forkIssuedAt).toBe(1000);
+
+    // Not yet expired: the reconcile re-sends the same id and keeps the clock.
+    s.now += T - 1;
+    expect(forkIds(s.run((p) => p.reconcile()))).toEqual(["t1-fork-1"]);
+    expect(s.trains.get("t1")!.forkIssuedAt).toBe(1000);
+
+    // Expired: a new attempt (dispatched once, not twice), clock restarted.
+    s.now += 1;
+    expect(forkIds(s.run((p) => p.reconcile()))).toEqual(["t1-fork-2"]);
+    expect(s.trains.get("t1")).toMatchObject({ phase: "BUILDING", forkState: "PENDING", forkCommandId: "t1-fork-2", forkIssuedAt: s.now });
+
+    // The original Provisioner finally answers: stale, nothing changes.
+    const late = s.run((p) => p.provisionResult({ commandId: "t1-fork-1", op: "FORK", trainId: "t1", ok: true, artifactRepo: "hive-train-t1" }));
+    expect(late.outcome).toBe("ignored:stale");
+    expect(s.trains.get("t1")!.forkState).toBe("PENDING");
+
+    s.now += T;
+    expect(forkIds(s.run((p) => p.reconcile()))).toEqual([`t1-fork-${MAX_FORK_ATTEMPTS}`]);
+    s.effects = [];
+    s.now += T;
+    s.run((p) => p.reconcile());
+    expect(s.trains.get("t1")).toMatchObject({
+      phase: "EJECTED",
+      reason: `failed: fork failed: Provisioner FORK t1-fork-${MAX_FORK_ATTEMPTS} did not report within 10 min (executor lost?)`,
+    });
+    // Same path as ok:false: the prompt is re-queued as a rework with a fresh fork.
+    expect(s.trainOf("A")).toMatchObject({ trainId: "t2", action: "REWORK", forkCommandId: "t2-fork-1" });
+    expect(s.prompts.get("A")).toMatchObject({ attempts: 1, status: "QUEUED" });
+    expect(s.takeOp("DELETE").map((c) => c.commandId)).toEqual(["t1-delete-1"]);
+  });
+
+  it("a stuck preview DEPLOY is re-issued, then fails the train like ok:false", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.build("A", false);
+    expect(s.takeOp("DEPLOY").map((c) => c.commandId)).toEqual(["t1-deploy-1"]);
+    for (let n = 2; n <= MAX_COMMAND_ATTEMPTS; n++) {
+      s.now += T;
+      s.run((p) => p.reconcile());
+      expect(s.takeOp("DEPLOY").map((c) => c.commandId)).toEqual([`t1-deploy-${n}`]);
+    }
+    const stale = s.run((p) => p.deployResult({ commandId: "t1-deploy-1", op: "DEPLOY", environment: "preview", trainId: "t1", ok: true, url: url("t1") }));
+    expect(stale.outcome).toBe("ignored:stale");
+    s.now += T;
+    s.run((p) => p.reconcile());
+    expect(s.trains.get("t1")).toMatchObject({ phase: "EJECTED", deployState: "TEARING_DOWN" });
+    expect(s.trains.get("t1")!.reason).toMatch(/^failed: preview deploy failed: Herald DEPLOY t1-deploy-3 did not report/);
+    expect(s.deployments.get("preview-t1")).toMatchObject({ status: "FAILED" });
+    expect(s.takeOp("TEARDOWN").map((c) => c.commandId)).toEqual(["t1-teardown-1"]);
+  });
+
+  it("a builder drone that never reports is re-dispatched as a new attempt, then the train fails", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    const first = s.take("dispatchDrone");
+    expect(first.map((e) => e.attempt)).toEqual([1]);
+    s.run((p) => p.dispatched("t1", "BUILDING"));
+    expect(s.trains.get("t1")).toMatchObject({ dispatched: true, droneIssuedAt: s.now, droneAttempt: 1 });
+
+    s.now += T;
+    const retry = s.run((p) => p.reconcile()).effects.filter((e) => e.type === "dispatchDrone");
+    expect(retry).toHaveLength(1);
+    expect(retry[0]).toMatchObject({ attempt: 2, task: { role: "BUILDER", action: "BUILD" } });
+    expect(s.trains.get("t1")).toMatchObject({ dispatched: false, droneAttempt: 2 });
+    s.run((p) => p.dispatched("t1", "BUILDING"));
+    s.now += T;
+    s.run((p) => p.reconcile());
+    s.run((p) => p.dispatched("t1", "BUILDING"));
+    expect(s.trains.get("t1")!.droneAttempt).toBe(MAX_COMMAND_ATTEMPTS);
+    s.effects = [];
+    s.now += T;
+    s.run((p) => p.reconcile());
+    expect(s.trains.get("t1")).toMatchObject({ phase: "EJECTED" });
+    expect(s.trains.get("t1")!.reason).toMatch(/BUILDER drone did not report within 10 min/);
+    expect(s.trainOf("A").action).toBe("REWORK");
+  });
+
+  it("a lander that never reports is retried, then fails like a failed landing", () => {
+    const s = Sim.abc();
+    s.result("A", true);
+    expect(s.trains.get("t1")!.phase).toBe("LANDING");
+    s.run((p) => p.dispatched("t1", "LANDING"));
+    s.now += T;
+    const retry = s.run((p) => p.reconcile()).effects.filter((e) => e.type === "dispatchDrone");
+    expect(retry).toEqual([expect.objectContaining({ attempt: 2, task: expect.objectContaining({ role: "LANDER", action: "LAND" }) })]);
+    for (let i = 0; i < MAX_COMMAND_ATTEMPTS - 1; i++) {
+      s.run((p) => p.dispatched("t1", "LANDING"));
+      s.now += T;
+      s.run((p) => p.reconcile());
+    }
+    expect(s.trains.get("t1")).toMatchObject({ phase: "EJECTED" });
+    expect(s.trains.get("t1")!.reason).toMatch(/LANDER drone did not report/);
+  });
+
+  it("stuck TEARDOWN and DELETE commands are re-issued, then recorded as failed (never looped)", () => {
+    const s = Sim.abc();
+    s.result("A", true);
+    s.land("A");
+    expect(s.takeOp("DELETE").map((c) => c.commandId)).toEqual(["t1-delete-1"]);
+    expect(s.takeOp("TEARDOWN").map((c) => c.commandId)).toEqual(["t1-teardown-1"]);
+    for (let n = 2; n <= MAX_COMMAND_ATTEMPTS; n++) {
+      s.now += T;
+      s.run((p) => p.reconcile());
+      expect(s.takeOp("DELETE").map((c) => c.commandId)).toEqual([`t1-delete-${n}`]);
+      expect(s.takeOp("TEARDOWN").map((c) => c.commandId)).toEqual([`t1-teardown-${n}`]);
+    }
+    s.now += T;
+    s.run((p) => p.reconcile());
+    expect(s.trains.get("t1")).toMatchObject({ forkState: "DELETE_FAILED", deployState: "TEARDOWN_FAILED" });
+    expect(s.deployments.get("preview-t1")).toMatchObject({ status: "FAILED" });
+    s.now += T;
+    s.run((p) => p.reconcile());
+    expect(s.takeOp("DELETE")).toEqual([]);
+    expect(s.takeOp("TEARDOWN")).toEqual([]);
+  });
+
+  it("watchdogDeadline: earliest issue time + timeout over outstanding commands; null when idle", () => {
+    const s = new Sim();
+    expect(watchdogDeadline([], T, 0)).toBeNull();
+    s.submit("A");
+    s.now = 5000;
+    s.submit("B"); // waits for A's push: nothing outstanding for t2 yet
+    expect(watchdogDeadline([...s.trains.values()], T, 9999)).toBe(1000 + T);
+    s.completeForks();
+    s.run((p) => p.dispatched("t1", "BUILDING"));
+    expect(watchdogDeadline([...s.trains.values()], T, 9999)).toBe(5000 + T);
+    // A row from before the watchdog (no clock) counts from now.
+    const legacy = { ...s.trains.get("t1")!, droneIssuedAt: null };
+    expect(watchdogDeadline([legacy], T, 7777)).toBe(7777 + T);
+    const merged = { ...legacy, phase: "MERGED" as const, forkState: "DELETED" as const };
+    expect(watchdogDeadline([merged], T, 7777)).toBeNull();
   });
 });

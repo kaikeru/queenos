@@ -116,7 +116,7 @@ async function deployPreview(cmd: Extract<DeployCommand, { op: "DEPLOY" }>, step
     // 1. The parent Worker (`<hive>-app`) must exist before it can have Previews.
     await step.do("ensure parent worker", REST_STEP, async () => {
       try {
-        const creds = await ports.credentials.cloudflare(cmd.hive);
+        const creds = await ports.credentials.cloudflare(cmd.hive, `herald ${cmd.op} ${cmd.commandId}`);
         const r = await ports.cloudflare(creds).ensureWorker(worker);
         return { created: r.created };
       } catch (e) {
@@ -137,7 +137,7 @@ async function deployPreview(cmd: Extract<DeployCommand, { op: "DEPLOY" }>, step
         }
         const source = await readWorkerSource(repo);
 
-        const creds = await ports.credentials.cloudflare(cmd.hive);
+        const creds = await ports.credentials.cloudflare(cmd.hive, `herald ${cmd.op} ${cmd.commandId}`);
         const cf = ports.cloudflare(creds);
         const existing = await cf.getPreview(worker, preview);
         const info = existing ?? (await cf.createPreview(worker, preview));
@@ -176,7 +176,7 @@ async function teardownPreview(cmd: Extract<DeployCommand, { op: "TEARDOWN" }>, 
   try {
     const existed = await step.do("delete preview", REST_STEP, async () => {
       try {
-        const creds = await ports.credentials.cloudflare(cmd.hive);
+        const creds = await ports.credentials.cloudflare(cmd.hive, `herald ${cmd.op} ${cmd.commandId}`);
         return await ports.cloudflare(creds).deletePreview(worker, preview);
       } catch (e) {
         throw toStepError(e);

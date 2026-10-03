@@ -8,6 +8,13 @@ import { RecordingDispatcher, RecordingHerald, RecordingProvisioner } from "./fa
 export { default } from "../src/index";
 
 export class QueenNode extends ProdQueenNode {
+  /** Skews the planner/watchdog clock (tests set it via runInDurableObject). */
+  clockOffset = 0;
+
+  protected override now(): number {
+    return Date.now() + this.clockOffset;
+  }
+
   protected override createPorts(): QueenPorts {
     return { provisioner: new RecordingProvisioner(), herald: new RecordingHerald(), dispatcher: new RecordingDispatcher() };
   }

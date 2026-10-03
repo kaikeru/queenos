@@ -4,17 +4,20 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy --env=\"\"",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
+    "dev": "node scripts/gen-templates.mjs && wrangler dev",
+    "deploy": "node scripts/gen-templates.mjs && wrangler deploy --env=\"\"",
+    "typecheck": "node scripts/gen-templates.mjs && tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
     "lint": "eslint .",
     "cf-typegen": "wrangler types --include-runtime=false",
-    "test": "vitest run"
+    "test": "node scripts/gen-templates.mjs && vitest run",
+    "gen": "node scripts/gen-templates.mjs",
+    "build": "node scripts/gen-templates.mjs"
   },
   "dependencies": {
     "@queenos/queen-types": "workspace:*",
     "hono": "^4.13.12",
-    "zod": "^4.6.5"
+    "zod": "^4.6.5",
+    "@queenos/hive-kit": "workspace:*"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.22.0",

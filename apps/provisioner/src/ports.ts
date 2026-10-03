@@ -2,7 +2,8 @@
  * Provisioner ports: every side effect goes through this object (mirrors
  * apps/drones). Tests swap in fakes via ProvisionerWorkflow.createPorts().
  */
-import type { ProvisionResult } from "@queenos/queen-types";
+import type { HiveCreatedResult, ProvisionResult } from "@queenos/queen-types";
+import { initRepo, type GitRepo, type RemoteSpec } from "@queenos/hive-kit";
 
 // ── Artifacts ────────────────────────────────────────────────────────────
 
@@ -21,7 +22,28 @@ export interface ArtifactsPort {
   forkTrain(sourceRepo: string, forkName: string): Promise<ForkResult>;
   /** Delete a repo. Returns false when it did not exist. */
   deleteRepo(name: string): Promise<boolean>;
+  /** Create an empty hive repo (default branch main). An existing repo is success. */
+  ensureRepo(name: string): Promise<void>;
+  /** Mint a short-lived repo token and return the remote. */
+  access(repo: string, scope: "read" | "write"): Promise<RepoAccess>;
+  /**
+   * SHA of the newest commit on `main` carrying a `Queen-Genesis:` trailer (a
+   * seed from an earlier attempt or command), or null when there is none.
+   */
+  findSeed(repo: string): Promise<string | null>;
 }
+
+export interface RepoAccess {
+  remote: string;
+  /** Never leaves the step that minted it. */
+  token: string;
+}
+
+/** Token TTL: long enough for init + push, short enough to be disposable (min 60). */
+export const TOKEN_TTL_SECONDS = 15 * 60;
+
+/** Commit trailer that marks the Genesis seed commit. */
+export const SEED_TRAILER = "Queen-Genesis";
 
 /** Codes that mean "the repo is still being created; try again shortly". */
 const IN_PROGRESS = new Set(["FORK_IN_PROGRESS", "CREATE_IN_PROGRESS", "IMPORT_IN_PROGRESS"]);
@@ -87,6 +109,41 @@ export class BindingArtifactsPort implements ArtifactsPort {
     return this.retry(() => artifacts.delete(name));
   }
 
+  async ensureRepo(name: string): Promise<void> {
+    const artifacts = this.binding();
+    try {
+      await artifacts.create(name, { setDefaultBranch: "main", description: "QueenOS hive" });
+    } catch (e) {
+      if (errorCode(e) !== "ALREADY_EXISTS") throw e;
+    }
+  }
+
+  async access(repo: string, scope: "read" | "write"): Promise<RepoAccess> {
+    const artifacts = this.binding();
+    return this.retry(async () => {
+      using handle = await artifacts.get(repo);
+      const [{ remote }, { plaintext }] = await Promise.all([handle.info(), handle.createToken(scope, TOKEN_TTL_SECONDS)]);
+      return { remote, token: plaintext };
+    });
+  }
+
+  async findSeed(repo: string): Promise<string | null> {
+    const artifacts = this.binding();
+    return this.retry(async () => {
+      using handle = await artifacts.get(repo);
+      let commits: { hash: string; message: string }[];
+      try {
+        commits = await handle.log({ ref: this.branch, limit: 20 });
+      } catch (e) {
+        // A repo that has never been pushed has no main yet.
+        if (errorCode(e) === "NOT_FOUND" || errorCode(e) === "REF_NOT_FOUND") return null;
+        throw e;
+      }
+      const seed = commits.find((c) => new RegExp(`^${SEED_TRAILER}: \\S+`, "m").test(c.message));
+      return seed?.hash ?? null;
+    });
+  }
+
   private binding(): Artifacts {
     if (!this.artifacts) throw new Error("UNAVAILABLE: ARTIFACTS binding is not configured");
     return this.artifacts;
@@ -118,21 +175,53 @@ export function queenRpc(ns: DurableObjectNamespace | undefined, hive: string): 
   return ns.get(ns.idFromName(hive)) as unknown as QueenPort;
 }
 
+// ── git (seeding a new hive) ─────────────────────────────────────────────
+
+/** The subset of hive-kit's GitRepo CREATE_HIVE uses. */
+export type SeedSession = Pick<GitRepo, "writeFiles" | "commitAll" | "push">;
+
+export interface GitPort {
+  /** A fresh, empty working copy (default branch main) wired to `remote`. */
+  init(remote: RemoteSpec): Promise<SeedSession>;
+}
+
+export const isomorphicGitPort: GitPort = {
+  init: (remote) => initRepo({ remote, defaultBranch: "main" }),
+};
+
+// ── Genesis ──────────────────────────────────────────────────────────────
+
+/** RPC surface of apps/genesis's GenesisNode used by the provisioner. */
+export interface GenesisPort {
+  reportHiveCreated(input: HiveCreatedResult): Promise<unknown>;
+}
+
+/** Cross-script DO binding to GenesisNode; one DO per hive, `idFromName(hive)`. */
+export function genesisRpc(ns: DurableObjectNamespace | undefined, hive: string): GenesisPort {
+  if (!ns) throw new Error("UNAVAILABLE: GENESIS binding is not configured");
+  return ns.get(ns.idFromName(hive)) as unknown as GenesisPort;
+}
+
 // ── bundle ───────────────────────────────────────────────────────────────
 
 export interface ProvisionerPorts {
   artifacts: ArtifactsPort;
   queen(hive: string): QueenPort;
+  git: GitPort;
+  genesis(hive: string): GenesisPort;
 }
 
 export interface ProvisionerEnvBindings {
   ARTIFACTS?: Artifacts;
   QUEEN?: DurableObjectNamespace;
+  GENESIS?: DurableObjectNamespace;
 }
 
 export function createProdPorts(env: ProvisionerEnvBindings): ProvisionerPorts {
   return {
     artifacts: new BindingArtifactsPort(env.ARTIFACTS),
     queen: (hive) => queenRpc(env.QUEEN, hive),
+    git: isomorphicGitPort,
+    genesis: (hive) => genesisRpc(env.GENESIS, hive),
   };
 }

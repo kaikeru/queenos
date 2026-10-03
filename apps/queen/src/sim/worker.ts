@@ -9,7 +9,22 @@
 import { QueenNode as ProdQueenNode, type QueenPorts } from "../queen-node";
 import { SimExecutors } from "./sim-ports";
 
-export { default } from "../index";
+import app from "../index";
+
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * env.sim shares the production Worker name (for the local dev registry) and disables
+ * internal auth, so an accidental `wrangler deploy --env sim` must refuse real traffic.
+ */
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    if (!LOCAL_HOSTS.has(new URL(request.url).hostname)) {
+      return Response.json({ error: "sim mode is localhost-only" }, { status: 403 });
+    }
+    return app.fetch(request, env, ctx);
+  },
+} satisfies ExportedHandler<Env>;
 
 export class QueenNode extends ProdQueenNode {
   // `declare`: no field initializer. createPorts() runs inside the base constructor,

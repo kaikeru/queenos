@@ -1,0 +1,74 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // The single public front door: queenos.kaikeru.com, behind Cloudflare Access.
+  // Every other Worker has workers_dev:false and is reachable only through here.
+  "name": "queenos-edge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  // *.workers.dev would bypass the Access app (docs/deploy-discovery.md section 8).
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "queenos.kaikeru.com", "custom_domain": true }],
+  "assets": {
+    // The War Room SPA. Build it first: pnpm --filter @queenos/dashboard build.
+    "directory": "../dashboard/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // Everything else is served straight from assets (Access already gates the host).
+    "run_worker_first": ["/api/*", "/hives/*", "/health"]
+  },
+  "durable_objects": { "bindings": [{ "name": "REGISTRY", "class_name": "HiveRegistry" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HiveRegistry"] }],
+  "services": [
+    { "binding": "VAULT", "service": "queenos-vault", "entrypoint": "VaultWriter" },
+    { "binding": "GENESIS", "service": "queenos-genesis" },
+    { "binding": "QUEEN", "service": "queen" }
+  ],
+  "vars": {
+    "ACCESS_TEAM": "kaikeru",
+    "ALLOWED_EMAIL_DOMAINS": "kaikeru.com",
+    // Application Audience (AUD) tag of the Access app. Empty fails closed (503).
+    "ACCESS_AUD": ""
+  },
+  "env": {
+    // Local dev (`wrangler dev --env dev`): skips Access verification. Never deploy.
+    "dev": {
+      // Keep the unsuffixed name: Genesis binds this Worker's HiveRegistry by script_name
+      // "queenos-edge", and wrangler would otherwise name it "queenos-edge-dev".
+      "name": "queenos-edge",
+      "workers_dev": false,
+      "routes": [],
+      "assets": {
+        "directory": "../dashboard/dist",
+        "binding": "ASSETS",
+        "not_found_handling": "single-page-application",
+        "run_worker_first": ["/api/*", "/hives/*", "/health"]
+      },
+      "durable_objects": { "bindings": [{ "name": "REGISTRY", "class_name": "HiveRegistry" }] },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HiveRegistry"] }],
+      "services": [
+        { "binding": "VAULT", "service": "queenos-vault", "entrypoint": "VaultWriter" },
+        { "binding": "GENESIS", "service": "queenos-genesis" },
+        { "binding": "QUEEN", "service": "queen" }
+      ],
+      "vars": {
+        "ACCESS_TEAM": "kaikeru",
+        "ALLOWED_EMAIL_DOMAINS": "kaikeru.com",
+        "ACCESS_AUD": "",
+        "ACCESS_MODE": "dev",
+        "DEV_USER_EMAIL": "dev@kaikeru.com"
+      }
+    },
+    // Used only by vitest. No service bindings or assets: tests inject fakes.
+    "test": {
+      "routes": [],
+      "durable_objects": { "bindings": [{ "name": "REGISTRY", "class_name": "HiveRegistry" }] },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HiveRegistry"] }],
+      "vars": {
+        "ACCESS_TEAM": "kaikeru",
+        "ALLOWED_EMAIL_DOMAINS": "kaikeru.com",
+        "ACCESS_AUD": "test-aud"
+      }
+    }
+  }
+}
