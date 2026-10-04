@@ -5,6 +5,8 @@
   "main": "src/index.ts",
   // Implies nodejs_compat (+v2). Do not add nodejs_compat.
   "compatibility_date": "2026-10-02",
+  "workers_dev": false,
+  "preview_urls": false,
   "workflows": [
     {
       // apps/queen's PROVISIONER binding names this workflow + class.

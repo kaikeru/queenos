@@ -5,6 +5,8 @@
   // Implies nodejs_compat (+v2): isomorphic-git's bare `Buffer` global works
   // with no flags (docs/discovery.md §2). Do not add nodejs_compat.
   "compatibility_date": "2026-10-02",
+  "workers_dev": false,
+  "preview_urls": false,
   // Clone + AST scan of a whole tree is CPU-heavy; Workflow steps may use up to 5 min.
   "limits": { "cpu_ms": 300000 },
   "workflows": [
