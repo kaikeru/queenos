@@ -57,7 +57,10 @@ import type {
   DroneTask,
   GitNotesPayload,
   LandResultInput,
+  MergeResultInput,
   MergeTrain,
+  OracleCommand,
+  OracleResultInput,
   ProvisionCommand,
   ProvisionResult,
   RecalledMemory,
@@ -67,7 +70,37 @@ import type {
 import { MAX_MEMORY_TEXT, MODEL_CATALOG, MAX_RECALLED_MEMORIES, MIN_RECALL_SCORE } from "@queenos/queen-types";
 import type { DroneDispatcher } from "../drones";
 import { droneInstanceId } from "../drones";
-import type { DeployDispatcher, ProvisionerDispatcher, SentinelDispatcher } from "../executors";
+import type { CommandDispatcher, DeployDispatcher, ProvisionerDispatcher, SentinelDispatcher } from "../executors";
+import {
+  BATCH_FAIL_KEY,
+  BATCH_FAIL_MARKER,
+  CAR_KEY,
+  DECOMPOSE_FAIL_MARKER,
+  FORK_KEY,
+  GATE_SPOT_MARKER,
+  INCONCLUSIVE_MARKER,
+  PATHS_KEY,
+  SPOT_BUG_MARKER,
+  findSimilar,
+  gateSpotFollowUp,
+  hashInt,
+  jitteredBuildMs,
+  isMergeConflictRework,
+  loadMain,
+  saveMain,
+  simChangedPaths,
+  simDecompose,
+  simLand,
+  simMerge,
+  spotBugFollowUp,
+  SIM_BUILD_JITTER_MS,
+  type SimCarRecord,
+} from "./sim-v2";
+
+export * from "./sim-v2";
+
+/** Judges the Oracle's commands (Phase 2 adds this alias beside the other dispatchers in executors.ts). */
+export type OracleDispatcher = CommandDispatcher<OracleCommand>;
 
 /** The slice of QueenNode the simulated executors call (its public RPC surface). */
 export interface SimQueen {
@@ -79,6 +112,15 @@ export interface SimQueen {
   reportProvisionResult(r: ProvisionResult): Promise<{ outcome: string }>;
   reportDeployResult(r: DeployResult): Promise<{ outcome: string }>;
   reportSentinelVerdict(v: SentinelVerdict): Promise<{ outcome: string }>;
+  /**
+   * v2: the Oracle's DECOMPOSE / TRIAGE answer (idempotent by commandId).
+   * Optional only until Phase 2 adds it to QueenNode (the sim fails loudly if it is missing).
+   */
+  reportOracleResult?(r: OracleResultInput): Promise<{ outcome: string }>;
+  /** v2: the MERGE drone's report for a car (optional until Phase 2, like reportOracleResult). */
+  reportMergeResult?(r: MergeResultInput): Promise<{ outcome: string }>;
+  /** v2: open work items, for the TRIAGE duplicate check (absent: TRIAGE finds no duplicates). */
+  listOpenItems?(): { itemId: string; title: string; status: string }[] | Promise<{ itemId: string; title: string; status: string }[]>;
   getSnapshot(): SimSnapshot | Promise<SimSnapshot>;
 }
 
@@ -105,6 +147,12 @@ export interface SimDelays {
   test: number;
   land: number;
   sentinel: number;
+  /** v2 (optional so older harnesses keep working): MERGE 1.5 s, Oracle DECOMPOSE 0.8 s / TRIAGE 0.3 s. */
+  merge?: number;
+  oracleDecompose?: number;
+  oracleTriage?: number;
+  /** v2: when set, BUILD/REWORK time is jittered in this window from a hash of the trainId instead of `build`. */
+  buildJitter?: { min: number; max: number };
 }
 
 export const DEFAULT_SIM_DELAYS: SimDelays = {
@@ -116,6 +164,10 @@ export const DEFAULT_SIM_DELAYS: SimDelays = {
   test: 3000,
   land: 2000,
   sentinel: 2000,
+  merge: 1500,
+  oracleDecompose: 800,
+  oracleTriage: 300,
+  buildJitter: SIM_BUILD_JITTER_MS,
 };
 
 export const FAIL_MARKER = "[fail]";
@@ -132,11 +184,12 @@ export const CANARY_FAIL_PERCENT = 10;
 export const TEST_RETRY_MS = 500;
 export const TEST_MAX_TRIES = 40;
 
-type DroneJob = { id: string; kind: "build" | "test" | "land"; due: number; task: DroneTask; tries?: number };
+type DroneJob = { id: string; kind: "build" | "test" | "land" | "merge"; due: number; task: DroneTask; tries?: number };
 type ProvisionJob = { id: string; kind: "provision"; due: number; command: ProvisionCommand };
 type DeployJob = { id: string; kind: "deploy"; due: number; command: DeployCommand };
 type SentinelJob = { id: string; kind: "sentinel"; due: number; command: SentinelCommand };
-type Job = DroneJob | ProvisionJob | DeployJob | SentinelJob;
+type OracleJob = { id: string; kind: "oracle"; due: number; command: OracleCommand };
+type Job = DroneJob | ProvisionJob | DeployJob | SentinelJob | OracleJob;
 
 const JOBS_KEY = "sim:jobs";
 const DONE_KEY = "sim:done";
@@ -199,6 +252,15 @@ export class SimExecutors {
     dispatch: (command) =>
       this.enqueue({ id: command.commandId, kind: "deploy", due: this.now() + (command.op === "DEPLOY" ? this.delays.deploy : this.delays.teardown), command }),
   };
+  readonly oracle: OracleDispatcher = {
+    dispatch: (command) =>
+      this.enqueue({
+        id: command.commandId,
+        kind: "oracle",
+        due: this.now() + (command.op === "DECOMPOSE" ? (this.delays.oracleDecompose ?? 800) : (this.delays.oracleTriage ?? 300)),
+        command,
+      }),
+  };
   readonly sentinel: SentinelDispatcher = {
     dispatch: (command) => this.enqueue({ id: command.commandId, kind: "sentinel", due: this.now() + this.delays.sentinel, command }),
   };
@@ -243,21 +305,23 @@ export class SimExecutors {
 
   private async dispatchDrone(task: DroneTask, attempt?: number): Promise<{ instanceId: string }> {
     const id = droneInstanceId(task, attempt);
-    const kind = task.action === "LAND" ? "land" : "build";
+    const kind = task.action === "LAND" ? "land" : task.action === "MERGE" ? "merge" : "build";
     if (!(await this.add({ id, kind, due: this.now() + this.droneDelay(task), task }))) return { instanceId: id };
-    // The drone "starts": its first card pulses yellow immediately.
+    // The drone "starts": its first card pulses yellow immediately (the MERGE drone has no card).
     if (kind === "build") await this.audit(task, "BUILDER", "RUNNING", null);
-    else await this.audit(task, "LANDER", "RUNNING", null);
+    else if (kind === "land") await this.audit(task, "LANDER", "RUNNING", null);
     return { instanceId: id };
   }
 
   /** Builds take longer on bigger models (and once more for a fallback after bad output). */
   private droneDelay(task: DroneTask): number {
     if (task.action === "LAND") return this.delays.land;
+    if (task.action === "MERGE") return this.delays.merge ?? 1500;
+    const build = this.delays.buildJitter ? jitteredBuildMs(task.trainId, this.delays.buildJitter) : this.delays.build;
     const choice = task.modelChoice;
-    if (!choice) return this.delays.build;
-    const base = Math.round(this.delays.build * TIER_BUILD_FACTOR[choice.tier]);
-    return badJson(task) ? base + Math.round(this.delays.build * 0.5) : base;
+    if (!choice) return build;
+    const base = Math.round(build * TIER_BUILD_FACTOR[choice.tier]);
+    return badJson(task) ? base + Math.round(build * 0.5) : base;
   }
 
   private async enqueue(job: Job): Promise<{ instanceId: string }> {
@@ -291,6 +355,8 @@ export class SimExecutors {
         return this.runDeploy(job.command);
       case "sentinel":
         return this.runSentinel(job.command);
+      case "oracle":
+        return this.runOracle(job.command);
       default:
         return this.runDrone(job);
     }
@@ -298,6 +364,8 @@ export class SimExecutors {
 
   private async runProvision(c: ProvisionCommand): Promise<void> {
     if (c.op === "FORK") {
+      // The member's fork point: how much of the hive's history its fork already contains.
+      await this.store.put(FORK_KEY(c.trainId), (await loadMain(this.store, c.hive)).next);
       const memories = c.recallQuery ? simRecall(await this.queen().getSnapshot(), c.trainId, c.recallQuery) : [];
       await this.queen().reportProvisionResult({
         commandId: c.commandId,
@@ -399,6 +467,18 @@ export class SimExecutors {
 
   private async runSentinel(c: SentinelCommand): Promise<void> {
     const fail = c.environment === "canary" && c.canaryPercent === CANARY_FAIL_PERCENT && (await this.releaseHasMarker(c.releaseId, CANARY_FAIL_MARKER));
+    if (c.environment === "staging" && (await this.releaseHasMarker(c.releaseId, INCONCLUSIVE_MARKER))) {
+      await this.queen().reportSentinelVerdict({
+        commandId: c.commandId,
+        releaseId: c.releaseId,
+        environment: c.environment,
+        verdict: "ROLLBACK",
+        inconclusive: true,
+        metrics: { requests: 0, errorRate: 0, p99Ms: null, baselineErrorRate: null },
+        summary: `${c.scriptName} (staging): never became ready, so there is no evidence either way. Treating the release as inconclusive and rolling back.`,
+      });
+      return;
+    }
     const requests = c.minRequests + 37;
     const where = c.environment === "staging" ? `${c.scriptName} (staging)` : `${c.scriptName} at ${c.canaryPercent}%`;
     await this.queen().reportSentinelVerdict({
@@ -438,7 +518,20 @@ export class SimExecutors {
       case "build": {
         const headSha = fakeSha(`head:${task.trainId}`);
         const build = simBuild(task, this.droneDelay(task));
-        const res = await this.queen().reportBuildResult({ trainId: task.trainId, headSha, ...build });
+        const train = await this.trainPhase(task.trainId);
+        const candidate0 = (train?.candidate ?? 0) === 0;
+        const changedPaths = simChangedPaths(task.promptText, { dropShared: isMergeConflictRework(task.scribeSummary) });
+        await this.store.put(PATHS_KEY(task.trainId), changedPaths);
+        const raceFail = !!train?.raceId && candidate0 && task.action === "BUILD" && task.promptText.includes(FAIL_MARKER);
+        const res = await this.queen().reportBuildResult({
+          trainId: task.trainId,
+          headSha,
+          ...build,
+          usage: simUsage(task),
+          verified: !raceFail,
+          changedPaths,
+          ...(task.action === "BUILD" && candidate0 && task.promptText.includes(SPOT_BUG_MARKER) ? { followUps: [spotBugFollowUp()] } : {}),
+        });
         if (res.outcome !== "applied") {
           // Superseded while building: close the pulsing card instead of leaving it yellow.
           await this.audit(task, "BUILDER", "REJECTED", {
@@ -463,8 +556,11 @@ export class SimExecutors {
           await this.schedule({ ...job, due: this.now() + TEST_RETRY_MS, tries: tries + 1 });
           return;
         }
-        const shouldFail = task.promptText.includes(FAIL_MARKER) && task.action === "BUILD";
-        const reviewFail = !shouldFail && task.promptText.includes(REVIEW_FAIL_MARKER) && task.action === "BUILD";
+        if (task.action === "MERGE") return this.runCarGate(task, train);
+        // In a race only candidate 0 fails or is rejected, so the others can win on score.
+        const candidate0 = (train?.candidate ?? 0) === 0;
+        const shouldFail = task.promptText.includes(FAIL_MARKER) && task.action === "BUILD" && candidate0;
+        const reviewFail = !shouldFail && task.promptText.includes(REVIEW_FAIL_MARKER) && task.action === "BUILD" && candidate0;
         const url = train?.previewUrl ?? simPreviewUrl(task.trainId);
         await this.audit(task, "GATEKEEPER", "PASSED", smokeNote(task, url));
         await this.audit(task, "POLICY", "PASSED", reviewNote(task, "policy", true));
@@ -485,21 +581,187 @@ export class SimExecutors {
           ? "Security scan rejected the change: an unbounded retry loop swallows errors. Rework should add a retry cap and surface the failure."
           : "Policy and security checks passed and the preview answered its smoke test; the change is scoped to the requested module with tests. The reviewer approved the change.";
         await this.audit(task, "SCRIBE", "PASSED", scribeNote(task, summary));
-        await this.queen().reportTrainResult({ trainId: task.trainId, passed: !shouldFail, summary, commitSha });
+        const paths = (await this.store.get<string[]>(PATHS_KEY(task.trainId))) ?? simChangedPaths(task.promptText);
+        await this.queen().reportTrainResult({
+          trainId: task.trainId,
+          passed: !shouldFail,
+          summary,
+          commitSha,
+          ...(shouldFail
+            ? {}
+            : {
+                score: { review: "approved" as const, satisfied: 3, missing: 0, changedFiles: paths.length, changedBytes: simChangedBytes(task.trainId), checks: 4 },
+                ...(task.action === "BUILD" && task.promptText.includes(GATE_SPOT_MARKER) ? { followUps: [gateSpotFollowUp()] } : {}),
+              }),
+        });
         return;
       }
+      case "merge":
+        return this.runMerge(task);
       case "land": {
+        if (task.members?.length) {
+          const main = await loadMain(this.store, task.namespace);
+          simLand(main, task.members.map((m) => m.trainId));
+          await saveMain(this.store, task.namespace, main);
+        }
         const res = await this.queen().reportLandResult({
           trainId: task.trainId,
           landed: true,
           mainSha: fakeSha(`main:${task.baseRef}`),
-          summary: "Landed on main via fast-forward push.",
+          summary: task.members?.length
+            ? `Landed ${task.members.length} members on main with one fast-forward push.`
+            : "Landed on main via fast-forward push.",
         });
         const ok = res.outcome === "applied";
         await this.audit(task, "LANDER", ok ? "PASSED" : "REJECTED", landerNote(task, ok));
         return;
       }
     }
+  }
+
+  // ── v2: Oracle, MERGE and the car gate ────────────────────────────────
+
+  private oracleReport(r: OracleResultInput) {
+    const q = this.queen();
+    if (!q.reportOracleResult) throw new Error("sim: the Queen has no reportOracleResult yet (Phase 2)");
+    return q.reportOracleResult(r);
+  }
+
+  private mergeReport(r: MergeResultInput) {
+    const q = this.queen();
+    if (!q.reportMergeResult) throw new Error("sim: the Queen has no reportMergeResult yet (Phase 2)");
+    return q.reportMergeResult(r);
+  }
+
+  private async runOracle(c: OracleCommand): Promise<void> {
+    if (c.op === "TRIAGE") {
+      const items = (await this.queen().listOpenItems?.()) ?? [];
+      const similar = findSimilar(c.title, items, 5, c.itemId);
+      await this.oracleReport({
+        commandId: c.commandId,
+        op: "TRIAGE",
+        itemId: c.itemId,
+        ok: true,
+        similar,
+        summary: similar.length ? `Looks like a duplicate of ${similar[0]!.itemId}.` : "No similar open items.",
+      });
+      return;
+    }
+    if (c.promptText.includes(DECOMPOSE_FAIL_MARKER)) {
+      await this.oracleReport({
+        commandId: c.commandId,
+        op: "DECOMPOSE",
+        itemId: c.itemId,
+        ok: false,
+        model: c.model.model,
+        summary: "Sim planner returned unusable output; the Queen falls back to one item.",
+      });
+      return;
+    }
+    const children = simDecompose(c.promptText, c.openItems, c.limits.maxChildren);
+    await this.oracleReport({
+      commandId: c.commandId,
+      op: "DECOMPOSE",
+      itemId: c.itemId,
+      ok: true,
+      children,
+      model: c.model.model,
+      usage: { inputTokens: 1000, outputTokens: 200 },
+      summary: `Split the goal into ${children.length} item${children.length === 1 ? "" : "s"}.`,
+    });
+  }
+
+  /** The MERGE drone: 3-way merge the car's members, in order, over the sim main. */
+  private async runMerge(task: DroneTask): Promise<void> {
+    const members = task.members ?? [];
+    const hive = task.namespace;
+    const main = await loadMain(this.store, hive);
+    const snap = await this.queen().getSnapshot();
+    const ejectedCars = new Set(snap.trains.filter((t) => t.phase === "EJECTED" || t.status === "EJECTED").map((t) => t.trainId));
+    const forks = new Map<string, number>();
+    const paths = new Map<string, string[]>();
+    for (const m of members) {
+      const f = await this.store.get<number>(FORK_KEY(m.trainId));
+      if (f !== undefined) forks.set(m.trainId, f);
+      const p = await this.store.get<string[]>(PATHS_KEY(m.trainId));
+      if (p) paths.set(m.trainId, p);
+    }
+    const out = simMerge(main, {
+      carId: task.trainId,
+      members: members.map((m) => ({ trainId: m.trainId, promptId: m.promptId, title: m.title })),
+      forkSeq: (id) => forks.get(id),
+      paths: (id) => paths.get(id),
+      ejectedCars,
+    });
+    await saveMain(this.store, hive, main);
+    await this.store.put(CAR_KEY(task.trainId), out.car);
+    const headSha = fakeSha(`head:${task.trainId}`);
+    const n = out.merged.length;
+    await this.mergeReport({
+      trainId: task.trainId,
+      ok: true,
+      headSha,
+      baseSha: fakeSha(`base:${task.baseRef}`),
+      merged: out.merged,
+      conflicts: out.conflicts,
+      fastForward: out.fastForward,
+      mergeMs: this.delays.merge ?? 1500,
+      summary: out.conflicts.length
+        ? `Merged ${n} of ${members.length} members; ${out.conflicts.length} conflicted (${out.conflicts.map((c) => c.trainId).join(", ")}).`
+        : out.fastForward
+          ? "Fast-forwarded one member: its tree was already gated."
+          : `Merged ${n} member${n === 1 ? "" : "s"} onto the speculative tip.`,
+    });
+    // The integration gate runs on pushed cars that need one.
+    if (n > 0 && !out.fastForward) {
+      await this.audit(task, "GATEKEEPER", "RUNNING", null);
+      await this.schedule({ id: `${task.trainId}-test`, kind: "test", due: this.now() + this.delays.test, task });
+    }
+  }
+
+  /**
+   * The integration gate for a car (no reviewer). A `[batch-fail]` member that
+   * was merged on top of changes it did not fork from fails it; each such
+   * item fails at most twice (in a batch, then as a singleton on a moved
+   * main), so its rework always gets through.
+   */
+  private async runCarGate(task: DroneTask, train: MergeTrain | undefined): Promise<void> {
+    const car = await this.store.get<SimCarRecord>(CAR_KEY(task.trainId));
+    const snap = await this.queen().getSnapshot();
+    const texts = new Map((snap.promptRuns ?? []).map((p) => [p.promptId, p.promptText]));
+    let culprit: SimCarRecord["members"][number] | undefined;
+    for (const m of car?.members ?? []) {
+      if (!m.onTop || !(texts.get(m.promptId) ?? m.title).includes(BATCH_FAIL_MARKER)) continue;
+      const fails = (await this.store.get<number>(BATCH_FAIL_KEY(m.promptId))) ?? 0;
+      if (fails >= 2) continue;
+      await this.store.put(BATCH_FAIL_KEY(m.promptId), fails + 1);
+      culprit = m;
+      break;
+    }
+    const url = train?.previewUrl ?? simPreviewUrl(task.trainId);
+    const commitSha = fakeSha(`head:${task.trainId}`);
+    const summary = culprit
+      ? `Integration gate failed: "${culprit.title.slice(0, 80)}" passed alone but breaks when merged on top of other changes.`
+      : `Integration gate passed: ${car?.members.length ?? 0} members merged cleanly and the car preview answered its smoke test.`;
+    await this.audit(task, "GATEKEEPER", culprit ? "REJECTED" : "PASSED", smokeNote(task, url));
+    await this.queen().reportTrainResult({
+      trainId: task.trainId,
+      passed: !culprit,
+      summary,
+      commitSha,
+      ...(culprit
+        ? {}
+        : {
+            score: {
+              review: "skipped" as const,
+              satisfied: 0,
+              missing: 0,
+              changedFiles: (car?.members.length ?? 1) * 2,
+              changedBytes: simChangedBytes(task.trainId),
+              checks: 3,
+            },
+          }),
+    });
   }
 
   /** Queue or replace a follow-up job (same id). */
@@ -563,6 +825,20 @@ export function simRecall(snap: SimSnapshot, trainId: string, query: string): Re
 }
 
 // ── plausible Cognitive Ledger payloads ──────────────────────────────────
+
+/** Deterministic 2–12 KB change size from the train id (race winner = smallest). */
+export const simChangedBytes = (trainId: string) => 2048 + (hashInt(`bytes:${trainId}`) % 10_241);
+
+/** Synthetic token usage, scaled by the model tier (the tool loop re-sends its transcript, so input dominates). */
+export function simUsage(task: DroneTask): NonNullable<BuildResult["usage"]> {
+  const f = TIER_BUILD_FACTOR[task.modelChoice?.tier ?? "fast"];
+  const h = hashInt(`usage:${task.trainId}`);
+  return {
+    inputTokens: Math.round(24_000 * f * (0.9 + (h % 21) / 100)),
+    outputTokens: Math.round(2_400 * f * (0.9 + ((h >>> 5) % 21) / 100)),
+    steps: 6 + (h % 5),
+  };
+}
 
 const subject = (task: DroneTask) => task.promptText.replace(FAIL_MARKER, "").replace(REVIEW_FAIL_MARKER, "").replace(BAD_JSON_MARKER, "").trim().slice(0, 80);
 

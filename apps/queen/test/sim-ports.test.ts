@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { MODEL_CATALOG } from "@queenos/queen-types";
-import type { AppendAuditInput, BuildResult, DeployResult, ModelChoice, DroneTask, MergeTrain, PromptRun, ProvisionResult, Release, SentinelCommand, SentinelVerdict } from "@queenos/queen-types";
+import type { AppendAuditInput, MergeResultInput, OracleResultInput, TrainResult, BuildResult, DeployResult, ModelChoice, DroneTask, MergeTrain, PromptRun, ProvisionResult, Release, SentinelCommand, SentinelVerdict } from "@queenos/queen-types";
 import {
+  BATCH_FAIL_MARKER,
+  COLLIDE_MARKER,
+  SIM_BUILD_JITTER_MS,
+  DEFAULT_SIM_DELAYS,
   SimExecutors,
+  demoSwarmPrompt,
+  jitteredBuildMs,
+  simChangedPaths,
+  simDecompose,
   TEST_RETRY_MS,
   fakeSha,
   simPreviewUrl,
@@ -14,7 +22,9 @@ import {
   type SimStore,
 } from "../src/sim/sim-ports";
 
-function harness() {
+const harnessDelays = { fork: 300, delete: 50, deploy: 1500, teardown: 50, build: 100, test: 100, land: 100, sentinel: 2000, merge: 1500 };
+
+function harness(delays: typeof harnessDelays & { buildJitter?: { min: number; max: number } } = harnessDelays) {
   const kv = new Map<string, unknown>();
   let alarm: number | null = null;
   let clock = 1_000;
@@ -24,6 +34,10 @@ function harness() {
   const deploys: DeployResult[] = [];
   const verdicts: SentinelVerdict[] = [];
   const builds: BuildResult[] = [];
+  const trainResults: TrainResult[] = [];
+  const oracle: OracleResultInput[] = [];
+  const merges: MergeResultInput[] = [];
+  const openItems: { itemId: string; title: string; status: string }[] = [];
   const scribes: { promptId?: string | undefined; trainId?: string | undefined; summary: string }[] = [];
   /** What the fake Queen's snapshot says about releases and prompts (for the sim Sentinel). */
   const world: { releases: Release[]; promptRuns: PromptRun[]; trains: MergeTrain[] } = { releases: [], promptRuns: [], trains: [] };
@@ -41,7 +55,10 @@ function harness() {
       return { eventId: "e", promptId: a.promptId, droneRole: a.droneRole, status: a.status, gitNotesPayload: a.gitNotesPayload ? { discardedPaths: [], ...a.gitNotesPayload } : null, createdAt: clock };
     },
     reportBuildResult: async (r) => (builds.push(r), calls.push(`build:${r.trainId}`), { outcome: "applied" }),
-    reportTrainResult: async (r) => (calls.push(`test:${r.trainId}:${r.passed}`), { outcome: "applied" }),
+    reportOracleResult: async (r) => (oracle.push(r), { outcome: "applied" }),
+    reportMergeResult: async (r) => (merges.push(r), { outcome: "applied" }),
+    listOpenItems: () => openItems,
+    reportTrainResult: async (r) => (trainResults.push(r), calls.push(`test:${r.trainId}:${r.passed}`), { outcome: "applied" }),
     recordScribeSummary: async (x) => (scribes.push(x), null),
     reportLandResult: async (r) => (calls.push(`land:${r.trainId}:${r.landed}`), { outcome: "applied" }),
     reportProvisionResult: async (r) => (provisions.push(r), calls.push(`provision:${r.op}:${r.commandId}`), { outcome: "applied" }),
@@ -56,13 +73,12 @@ function harness() {
       promptRuns: world.promptRuns,
     }),
   };
-  const delays = { fork: 300, delete: 50, deploy: 1500, teardown: 50, build: 100, test: 100, land: 100, sentinel: 2000 };
   const sim = new SimExecutors(() => queen, store, delays, () => clock);
   const advance = async (ms: number) => {
     clock += ms;
     return sim.runDue();
   };
-  return { sim, scribes, advance, calls, audits, provisions, deploys, verdicts, builds, world, phase, alarm: () => alarm };
+  return { sim, trainResults, oracle, merges, openItems, store, scribes, advance, calls, audits, provisions, deploys, verdicts, builds, world, phase, alarm: () => alarm };
 }
 
 const task = (over: Partial<DroneTask>): DroneTask => ({
@@ -427,7 +443,10 @@ describe("sim drones: models", () => {
     const h = harness();
     await h.sim.drones.dispatch(task({}));
     await h.advance(100);
-    expect(h.builds[0]).toEqual({ trainId: "t1", headSha: fakeSha("head:t1") });
+    expect(h.builds[0]).toMatchObject({ trainId: "t1", headSha: fakeSha("head:t1") });
+    expect(h.builds[0]).not.toHaveProperty("model");
+    expect(h.builds[0]).not.toHaveProperty("failedModels");
+    expect(h.builds[0]).not.toHaveProperty("buildMs");
   });
 
   it("builder notes name the routed model, else the catalog's default builder", async () => {
@@ -438,5 +457,348 @@ describe("sim drones: models", () => {
     const notes = h.audits.filter((a) => a.droneRole === "BUILDER" && a.gitNotesPayload);
     expect(notes[0]!.gitNotesPayload!.model).toBe(fast.model);
     expect(notes[1]!.gitNotesPayload!.model).toBe(MODEL_CATALOG.find((m) => m.roles.includes("builder"))!.id);
+  });
+});
+
+// ── v2 ───────────────────────────────────────────────────────────────────
+
+const decompose = (promptText: string, over: Record<string, unknown> = {}) => ({
+  op: "DECOMPOSE" as const,
+  commandId: "i1-decompose-1",
+  hive: "n",
+  itemId: "i1",
+  promptText,
+  model: { model: "@cf/zai-org/glm-4.7-flash", tier: "fast" as const, role: "planner" as const, reason: "", fallbacks: [] },
+  openItems: [],
+  limits: { maxChildren: 12 },
+  ...over,
+});
+
+describe("sim paths", () => {
+  it("every build changes its feature file plus the generated index; [touch:] is predicted, [collide] is not", () => {
+    const plain = simChangedPaths("Add a /health endpoint");
+    expect(plain).toHaveLength(2);
+    expect(plain[0]).toMatch(/^src\/features\/.+\.js$/);
+    expect(plain[1]).toBe("src/features/index.js");
+    expect(simChangedPaths("Add theme [touch:src/lib/theme.js] [touch:src/a.js]")).toEqual(expect.arrayContaining(["src/lib/theme.js", "src/a.js"]));
+    expect(simChangedPaths("Add x [collide]")).toContain("src/lib/shared.js");
+    expect(simChangedPaths("Add x [collide]", { dropShared: true })).not.toContain("src/lib/shared.js");
+    expect(simChangedPaths("Add x")[0]).not.toBe(simChangedPaths("Add y")[0]);
+  });
+
+  it("BUILD reports changedPaths, usage (tier-scaled) and verified", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({ promptText: "add a thing [touch:src/lib/theme.js] [collide]" }));
+    await h.advance(100);
+    const b = h.builds[0]!;
+    expect(b.changedPaths).toEqual(expect.arrayContaining(["src/lib/theme.js", "src/lib/shared.js", "src/features/index.js"]));
+    expect(b.verified).toBe(true);
+    const fast = b.usage!.inputTokens;
+    const h2 = harness();
+    await h2.sim.drones.dispatch(task({ promptText: "add a thing", modelChoice: { model: "m", tier: "frontier", role: "builder", reason: "r", fallbacks: [] } }));
+    await h2.advance(1000);
+    expect(h2.builds[0]!.usage!.inputTokens).toBeGreaterThan(fast);
+  });
+
+  it("a REWORK after a merge conflict drops src/lib/shared.js", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({ action: "REWORK", promptText: "x [collide]", scribeSummary: "Merge conflict in src/lib/shared.js: rebase." }));
+    await h.advance(100);
+    expect(h.builds[0]!.changedPaths).not.toContain("src/lib/shared.js");
+  });
+
+  it("[spot-bug] reports one follow-up on the first BUILD only", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({ promptText: "x [spot-bug]" }));
+    await h.sim.drones.dispatch(task({ trainId: "t2", action: "REWORK", promptText: "x [spot-bug]" }));
+    await h.advance(100);
+    expect(h.builds[0]!.followUps).toEqual([expect.objectContaining({ kind: "bug", title: "Spotted: README badge link 404s" })]);
+    expect(h.builds[1]!.followUps).toBeUndefined();
+  });
+});
+
+describe("build jitter", () => {
+  it("is 4-12 s, stable per train id, and differs across trains", () => {
+    const ms = Array.from({ length: 40 }, (_, i) => jitteredBuildMs(`train-${i}`));
+    for (const m of ms) {
+      expect(m).toBeGreaterThanOrEqual(SIM_BUILD_JITTER_MS.min);
+      expect(m).toBeLessThanOrEqual(SIM_BUILD_JITTER_MS.max);
+    }
+    expect(new Set(ms).size).toBeGreaterThan(20);
+    expect(jitteredBuildMs("a")).toBe(jitteredBuildMs("a"));
+  });
+
+  it("default delays jitter the build job's due time; the harness's plain delays do not", async () => {
+    const h = harness({ ...harnessDelays, buildJitter: SIM_BUILD_JITTER_MS });
+    await h.sim.drones.dispatch(task({ trainId: "tj" }));
+    expect(h.alarm()).toBe(1_000 + jitteredBuildMs("tj"));
+    expect(DEFAULT_SIM_DELAYS.buildJitter).toEqual(SIM_BUILD_JITTER_MS);
+    const plain = harness();
+    await plain.sim.drones.dispatch(task({ trainId: "tj" }));
+    expect(plain.alarm()).toBe(1_100);
+  });
+});
+
+describe("sim oracle", () => {
+  it("DECOMPOSE splits bullets, assigns kinds, markers, dependencies and paths", () => {
+    const kids = simDecompose(demoGoals, [], 12);
+    expect(kids.map((k) => k.key)).toEqual(["c1", "c2", "c3", "c4"]);
+    expect(kids[0]).toMatchObject({ difficulty: "hard", paths: ["src/lib/theme.js"], kind: "feature", acceptance: ["Add a dark theme toggle is visible at /"] });
+    expect(kids[0]!.title).not.toContain("[hard]");
+    expect(kids[2]!.paths).toEqual(["src/lib/theme.js"]);
+    expect(kids[3]).toMatchObject({ kind: "bug", dependsOn: ["c2"] });
+    expect(kids[1]!.dependsOn).toEqual([]);
+  });
+
+  it("splits on ; and numbered lists, one part gives one child, kinds by keyword", () => {
+    expect(simDecompose("fix the footer; rename the module; add a page", [], 12).map((k) => k.kind)).toEqual(["bug", "chore", "feature"]);
+    expect(simDecompose("1. one thing\n2. two thing", [], 12)).toHaveLength(2);
+    expect(simDecompose("• a thing\n• b thing", [], 12)).toHaveLength(2);
+    expect(simDecompose("just one thing", [], 12)).toHaveLength(1);
+    expect(simDecompose(demoSwarmPrompt(24), [], 5)).toHaveLength(5);
+  });
+
+  it("keeps [collide] / [race] in the child so the build and filing logic see them", () => {
+    const [k] = simDecompose("- Add thing [race] [collide]", [], 12);
+    expect(k!.title).toContain("[race]");
+    expect(k!.title).toContain("[collide]");
+  });
+
+  it("dedupes against open items by Jaccard >= 0.8 (closed items ignored)", () => {
+    const open = [
+      { itemId: "dup", title: "Add a health endpoint", status: "ACTIVE" },
+      { itemId: "done", title: "Add a health endpoint", status: "SHIPPED" },
+    ];
+    const [k] = simDecompose("Add a health endpoint", open, 12);
+    expect(k!.similar).toEqual([{ itemId: "dup", score: 0.95 }]);
+    expect(simDecompose("Add a totally different page", open, 12)[0]!.similar).toEqual([]);
+  });
+
+  it("dispatches DECOMPOSE (800 ms) and reports ok with children, model and usage", async () => {
+    const h = harness();
+    expect(await h.sim.oracle.dispatch(decompose(demoGoals))).toEqual({ instanceId: "i1-decompose-1" });
+    expect(await h.advance(799)).toBe(0);
+    await h.advance(1);
+    expect(h.oracle[0]).toMatchObject({ commandId: "i1-decompose-1", op: "DECOMPOSE", itemId: "i1", ok: true, usage: { inputTokens: 1000, outputTokens: 200 } });
+    expect(h.oracle[0]!.children).toHaveLength(4);
+    await h.sim.oracle.dispatch(decompose(demoGoals)); // idempotent
+    await h.advance(1000);
+    expect(h.oracle).toHaveLength(1);
+  });
+
+  it("[decompose-fail] reports ok: false", async () => {
+    const h = harness();
+    await h.sim.oracle.dispatch(decompose("do it [decompose-fail]"));
+    await h.advance(800);
+    expect(h.oracle[0]).toMatchObject({ ok: false });
+    expect(h.oracle[0]!.children).toBeUndefined();
+  });
+
+  it("TRIAGE finds duplicates among open items after 300 ms", async () => {
+    const h = harness();
+    h.openItems.push({ itemId: "x1", title: "README badge link 404s", status: "READY" }, { itemId: "i9", title: "README badge link 404s", status: "READY" });
+    await h.sim.oracle.dispatch({ op: "TRIAGE", commandId: "i9-triage-1", hive: "n", itemId: "i9", kind: "bug", title: "README badge link 404s", body: "" });
+    expect(await h.advance(300)).toBe(1);
+    expect(h.oracle[0]).toMatchObject({ op: "TRIAGE", ok: true, similar: [{ itemId: "x1", score: 0.95 }] });
+  });
+});
+
+const demoGoals = [
+  "- Add a dark theme toggle [hard] [touch:src/lib/theme.js]",
+  "- Add a /health JSON endpoint",
+  "- Add theme tokens for the status page [touch:src/lib/theme.js]",
+  "- Fix the hardcoded footer year (after 2)",
+].join("\n");
+
+describe("demoSwarmPrompt", () => {
+  it("n bullets, distinct words, two [collide], one [batch-fail], one [race]", () => {
+    const text = demoSwarmPrompt(24);
+    const lines = text.split("\n");
+    expect(lines).toHaveLength(24);
+    expect(lines.every((l) => /^- Add a \/features\/(\w+) endpoint returning \1 facts/.test(l))).toBe(true);
+    expect(new Set(lines.map((l) => l.split(" ")[3])).size).toBe(24);
+    expect(text.match(/\[collide\]/g)).toHaveLength(2);
+    expect(text.match(/\[batch-fail\]/g)).toHaveLength(1);
+    expect(text.match(/\[race\]/g)).toHaveLength(1);
+    expect(demoSwarmPrompt(40).split("\n")).toHaveLength(40);
+    expect(demoSwarmPrompt(6).match(/\[(collide|batch-fail|race)\]/g)).toHaveLength(4);
+  });
+});
+
+// A car of members in the harness: FORK each member, BUILD it (records paths), then MERGE.
+const member = (id: string, promptId = `p-${id}`) => ({ trainId: id, promptId, artifactRepo: `n-train-${id}`, headSha: fakeSha(`head:${id}`), title: id });
+const carTask = (carId: string, ids: string[], action: "MERGE" | "LAND" = "MERGE"): DroneTask =>
+  task({ trainId: carId, promptId: `p-${ids[0]}`, action, promptText: `queue car ${carId}: ${ids.length} members`, members: ids.map((i) => member(i)), role: action === "LAND" ? "LANDER" : "GATEKEEPER" });
+
+async function forkAndBuild(h: ReturnType<typeof harness>, id: string, text: string, extra: Partial<DroneTask> = {}) {
+  await h.sim.provisioner.dispatch({ ...fork, commandId: `${id}-fork-1`, trainId: id, forkName: `n-train-${id}` });
+  await h.advance(300);
+  await h.sim.drones.dispatch(task({ trainId: id, promptId: `p-${id}`, promptText: text, ...extra }));
+  await h.advance(100);
+}
+
+describe("sim MERGE", () => {
+  it("[collide]: two members in ONE car yield exactly one conflict", async () => {
+    const h = harness();
+    await forkAndBuild(h, "ma", `a ${COLLIDE_MARKER}`);
+    await forkAndBuild(h, "mb", `b ${COLLIDE_MARKER}`);
+    await forkAndBuild(h, "mc", "c plain");
+    await h.sim.drones.dispatch(carTask("car1", ["ma", "mb", "mc"]));
+    await h.advance(1500);
+    expect(h.merges).toHaveLength(1);
+    const r = h.merges[0]!;
+    expect(r.ok).toBe(true);
+    expect(r.merged).toEqual(["ma", "mc"]);
+    expect(r.conflicts).toHaveLength(1);
+    expect(r.conflicts![0]).toMatchObject({ trainId: "mb", kind: "content", paths: ["src/lib/shared.js"] });
+    expect(r.fastForward).toBe(false);
+  });
+
+  it("the conflicting member's rework (shared.js dropped, forked later) merges cleanly after the car it hit", async () => {
+    const h = harness();
+    await forkAndBuild(h, "ma", `a ${COLLIDE_MARKER}`);
+    await forkAndBuild(h, "mb", `b ${COLLIDE_MARKER}`);
+    await h.sim.drones.dispatch(carTask("car1", ["ma", "mb"]));
+    await h.advance(1500);
+    expect(h.merges[0]!.conflicts).toHaveLength(1);
+    await forkAndBuild(h, "mb2", `b ${COLLIDE_MARKER}`, { action: "REWORK", promptId: "p-mb", scribeSummary: "Merge conflict in src/lib/shared.js" });
+    await h.sim.drones.dispatch({ ...carTask("car2", ["mb2"]), members: [member("mb2", "p-mb")] });
+    await h.advance(1500);
+    expect(h.merges[1]).toMatchObject({ merged: ["mb2"], conflicts: [] });
+  });
+
+  it("a member that forked after the other merged does not conflict; a single member on an unmoved main fast-forwards", async () => {
+    const h = harness();
+    await forkAndBuild(h, "ma", `a ${COLLIDE_MARKER}`);
+    await h.sim.drones.dispatch(carTask("car1", ["ma"]));
+    await h.advance(1500);
+    expect(h.merges[0]).toMatchObject({ merged: ["ma"], fastForward: true });
+    await forkAndBuild(h, "mb", `b ${COLLIDE_MARKER}`); // forks after ma merged
+    await h.sim.drones.dispatch(carTask("car2", ["mb"]));
+    await h.advance(1500);
+    expect(h.merges[1]).toMatchObject({ merged: ["mb"], conflicts: [], fastForward: true });
+  });
+
+  it("[touch:] predicted paths also conflict; generated index never does", async () => {
+    const h = harness();
+    await forkAndBuild(h, "ma", "a [touch:src/lib/theme.js]");
+    await forkAndBuild(h, "mb", "b [touch:src/lib/theme.js]");
+    await forkAndBuild(h, "mc", "c");
+    await h.sim.drones.dispatch(carTask("car1", ["ma", "mb", "mc"]));
+    await h.advance(1500);
+    expect(h.merges[0]!.merged).toEqual(["ma", "mc"]);
+    expect(h.merges[0]!.conflicts![0]).toMatchObject({ trainId: "mb", paths: ["src/lib/theme.js"] });
+  });
+
+  it("a multi-member clean car is not a fast-forward and schedules the integration gate (no reviewer)", async () => {
+    const h = harness();
+    await forkAndBuild(h, "ma", "a");
+    await forkAndBuild(h, "mb", "b");
+    await h.sim.drones.dispatch(carTask("car1", ["ma", "mb"]));
+    await h.advance(1500);
+    expect(h.merges[0]).toMatchObject({ merged: ["ma", "mb"], conflicts: [], fastForward: false });
+    await h.advance(100);
+    const r = h.trainResults.find((t) => t.trainId === "car1")!;
+    expect(r).toMatchObject({ passed: true, score: { review: "skipped", satisfied: 0, missing: 0 } });
+  });
+
+  it("LAND of a car lands its members in the sim main (landed entries survive an ejected car)", async () => {
+    const h = harness();
+    await forkAndBuild(h, "ma", "a");
+    await forkAndBuild(h, "mb", "b");
+    await h.sim.drones.dispatch(carTask("car1", ["ma", "mb"]));
+    await h.advance(1500);
+    await h.sim.drones.dispatch(carTask("car1", ["ma", "mb"], "LAND"));
+    await h.advance(100);
+    expect(h.calls).toContain("land:car1:true");
+    const main = (await h.store.get<{ entries: { trainId: string; landed: boolean }[] }>("sim:main:n"))!;
+    expect(main.entries.map((e) => [e.trainId, e.landed])).toEqual([["ma", true], ["mb", true]]);
+  });
+});
+
+describe("sim gate: [batch-fail] and races", () => {
+  it("passes alone; fails in a batch; fails again as a singleton on a moved main; its rework fast-forwards and lands", async () => {
+    const h = harness();
+    await forkAndBuild(h, "ma", "a plain");
+    await forkAndBuild(h, "mb", `b ${BATCH_FAIL_MARKER}`);
+    h.world.promptRuns.push({ promptId: "p-mb", namespace: "n", promptText: `b ${BATCH_FAIL_MARKER}`, status: "BUILDING", createdAt: 1 });
+    // In a batch: fails the integration gate.
+    await h.sim.drones.dispatch(carTask("car1", ["ma", "mb"]));
+    await h.advance(1500);
+    await h.advance(100);
+    expect(h.trainResults.find((t) => t.trainId === "car1")).toMatchObject({ passed: false });
+    // Bisect: the car is ejected, a and b become singleton cars; a lands, so main moves past b's fork.
+    h.world.trains.push({ trainId: "car1", baseSha: "", includedPrompts: [], artifactRepo: "r", status: "EJECTED", createdAt: 0, phase: "EJECTED" });
+    await h.sim.drones.dispatch(carTask("carA", ["ma"]));
+    await h.advance(1500);
+    expect(h.merges.at(-1)).toMatchObject({ fastForward: true });
+    await h.sim.drones.dispatch(carTask("carA", ["ma"], "LAND"));
+    await h.advance(100);
+    await h.sim.drones.dispatch(carTask("carB", ["mb"]));
+    await h.advance(1500);
+    expect(h.merges.at(-1)).toMatchObject({ merged: ["mb"], fastForward: false }); // moved main: not a fast-forward
+    await h.advance(100);
+    expect(h.trainResults.find((t) => t.trainId === "carB")).toMatchObject({ passed: false });
+    // Rework forked from the new main: fast path, lands.
+    await forkAndBuild(h, "mb2", `b ${BATCH_FAIL_MARKER}`, { action: "REWORK", promptId: "p-mb" });
+    h.world.trains.push({ trainId: "carB", baseSha: "", includedPrompts: [], artifactRepo: "r", status: "EJECTED", createdAt: 0, phase: "EJECTED" });
+    await h.sim.drones.dispatch({ ...carTask("carC", ["mb2"]), members: [member("mb2", "p-mb")] });
+    await h.advance(1500);
+    expect(h.merges.at(-1)).toMatchObject({ merged: ["mb2"], fastForward: true });
+  });
+
+  it("[batch-fail] alone passes (fast-forward, no gate run)", async () => {
+    const h = harness();
+    await forkAndBuild(h, "mb", `b ${BATCH_FAIL_MARKER}`);
+    await h.sim.drones.dispatch(carTask("car1", ["mb"]));
+    await h.advance(1500);
+    await h.advance(1000);
+    expect(h.merges[0]).toMatchObject({ fastForward: true });
+    expect(h.trainResults.find((t) => t.trainId === "car1")).toBeUndefined();
+  });
+
+  it("BUILD gate reports a score with 2-12 KB changedBytes, satisfied 3, missing 0", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({}));
+    await h.advance(100 + 100);
+    await h.advance(200);
+    const r = h.trainResults[0]!;
+    expect(r.score).toMatchObject({ review: "approved", satisfied: 3, missing: 0 });
+    expect(r.score!.changedBytes).toBeGreaterThanOrEqual(2048);
+    expect(r.score!.changedBytes).toBeLessThanOrEqual(12_288);
+  });
+
+  it("race: [fail] fails candidate 0 only (and its build is unverified); [review-fail] rejects candidate 0 only", async () => {
+    const h = harness();
+    const t = (id: string, candidate: number) => ({ trainId: id, baseSha: "", includedPrompts: [], artifactRepo: "r", status: "TESTING" as const, createdAt: 0, phase: "TESTING" as const, raceId: "race1", candidate });
+    h.world.trains.push(t("c0", 0), t("c1", 1), t("c2", 2));
+    for (const [i, id] of ["c0", "c1", "c2"].entries()) {
+      void i;
+      await h.sim.drones.dispatch(task({ trainId: id, promptText: "x [fail] [gate-spot]" }));
+    }
+    await h.advance(100);
+    await h.advance(200);
+    expect(h.builds.map((b) => [b.trainId, b.verified])).toEqual([["c0", false], ["c1", true], ["c2", true]]);
+    expect(h.trainResults.map((r) => [r.trainId, r.passed])).toEqual([["c0", false], ["c1", true], ["c2", true]]);
+    expect(h.trainResults[1]!.followUps).toEqual([expect.objectContaining({ kind: "bug", paths: ["src/legacy/search.js"] })]);
+
+    const h2 = harness();
+    h2.world.trains.push(t("c0", 0), t("c1", 1));
+    for (const id of ["c0", "c1"]) await h2.sim.drones.dispatch(task({ trainId: id, promptText: "x [review-fail]" }));
+    await h2.advance(100);
+    await h2.advance(200);
+    expect(h2.trainResults.map((r) => [r.trainId, r.passed])).toEqual([["c0", false], ["c1", true]]);
+  });
+});
+
+describe("sim sentinel: [inconclusive]", () => {
+  it("staging verdict is ROLLBACK with inconclusive: true", async () => {
+    const h = harness();
+    h.world.trains.push({ trainId: "tr", baseSha: "", includedPrompts: ["pi"], artifactRepo: "r", status: "MERGED", createdAt: 0 });
+    h.world.promptRuns.push({ promptId: "pi", namespace: "n", promptText: "ship it [inconclusive]", status: "MERGED", createdAt: 0 });
+    h.world.releases.push({ releaseId: "r1", hive: "n", headSha: "h", trainIds: ["tr"], phase: "STAGING", canaryPercent: 0, stagingUrl: null, prodUrl: null, candidateVersionId: null, stableVersionId: null, tappedBy: null, tappedAt: null, summary: null, createdAt: 0, updatedAt: 0 } as Release);
+    await h.sim.sentinel.dispatch({ commandId: "r1-sentinel-staging", hive: "n", releaseId: "r1", environment: "staging", scriptName: "n-staging", url: "https://n-staging.example", paths: ["/"], minRequests: 100, windowSeconds: 60 });
+    await h.advance(2000);
+    expect(h.verdicts[0]).toMatchObject({ verdict: "ROLLBACK", inconclusive: true });
   });
 });
