@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { AiGatewayError } from "@queenos/hive-kit";
+import { memoryIdFor } from "@queenos/hive-kit";
+import type { AuditEvent } from "@queenos/queen-types";
 import { chunkLog, runGate } from "../src/orchestrate";
 import { FakeLlm, FakeWorld, HIVE, InlineSteps, REPO, config, gateTask } from "./fakes";
 
@@ -38,6 +40,7 @@ describe("runGate: pass path", () => {
       "inspect: clone, scan, test",
       "audit: policy result",
       "audit: security result",
+      "memory: remember",
       "report: train result",
     ]);
     // Read token for the fork, shallow clone of the pushed branch.
@@ -276,6 +279,85 @@ describe("runGate: infrastructure failures", () => {
     const out = await runGate(gateTask(after), steps, w.ports(), config({ GATE_TEST_MODE: "sandbox" }));
     expect(out).toMatchObject({ passed: false, summary: expect.stringContaining("not implemented") });
     expect(steps.log.find((l) => l.name === "inspect: clone, scan, test")).toMatchObject({ attempts: 1, ok: false });
+  });
+});
+
+const builderEvent = (id: string, createdAt: number, steps: string[], promptId = "prompt-1"): AuditEvent => ({
+  eventId: id,
+  promptId,
+  droneRole: "BUILDER",
+  status: "PASSED",
+  createdAt,
+  gitNotesPayload: { taskPrompt: "p", model: "m", temperature: 0, reasoningSteps: steps, result: "success", executionTimeMs: 1, discardedPaths: [] },
+});
+
+describe("runGate: hive memory", () => {
+  it("remembers a pass with the builder's reasoning, changed files and the memory id", async () => {
+    const { w, base, after } = await setup();
+    w.queen.recentAudit = [
+      builderEvent("e3", 30, ["newest step 1", "newest step 2", "s3", "s4", "s5", "s6", "s7-dropped"]),
+      builderEvent("e2", 20, ["older"]),
+      builderEvent("e9", 99, ["other prompt"], "prompt-0"),
+      { ...builderEvent("e8", 90, []), gitNotesPayload: null },
+    ];
+    const before = Date.now();
+    await runGate(gateTask(after, { before: base }), new InlineSteps(), w.ports(), config());
+    expect(w.memory.records).toHaveLength(1);
+    const r = w.memory.records[0]!;
+    expect(r).toMatchObject({
+      memoryId: memoryIdFor("train-1", after),
+      namespace: HIVE,
+      trainId: "train-1",
+      promptId: "prompt-1",
+      commitSha: after,
+      outcome: "PASSED",
+      promptText: prompt,
+    });
+    expect(r.createdAt).toBeGreaterThanOrEqual(before);
+    expect(r.text).toContain(`Prompt: ${prompt}`);
+    expect(r.text).toContain("Changed: ");
+    expect(r.text).toContain("features/dark-mode.md");
+    expect(r.text).toContain("Builder: newest step 1; newest step 2; s3; s4; s5; s6");
+    expect(r.text).not.toContain("s7-dropped");
+    expect(r.text).not.toContain("older");
+    expect(r.text).toContain("Outcome: passed the gate. Gate passed");
+  });
+
+  it("remembers a test failure with the Scribe summary", async () => {
+    const p = "Fix the flaky retry logic in the webhook sender [fail]";
+    const { w, after } = await setup({ prompt: p, files: { ...CLEAN, "features/fix.md": `# ${p}\n\n## Request\n\n${p}\n` } });
+    const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), config());
+    if (out.status !== "gated") throw new Error("unreachable");
+    expect(w.memory.records).toHaveLength(1);
+    const r = w.memory.records[0]!;
+    expect(r).toMatchObject({ outcome: "FAILED", memoryId: memoryIdFor("train-1", after) });
+    expect(r.text).toContain("failed the gate");
+    expect(r.text).toContain("[fail] marker found in changed file features/fix.md");
+  });
+
+  it("remembers a static-scan failure too", async () => {
+    const { w, after } = await setup({ files: { "src/k.ts": 'export const k = "AKIAABCDEFGHIJKLMNOP";\n' } });
+    await runGate(gateTask(after), new InlineSteps(), w.ports(), config());
+    expect(w.memory.records.map((r) => r.outcome)).toEqual(["FAILED"]);
+  });
+
+  it("does not remember infra failures", async () => {
+    const { w, after } = await setup();
+    w.artifacts.failWith = new Error("artifacts is unreachable");
+    const steps = new InlineSteps();
+    await runGate(gateTask(after), steps, w.ports(), config());
+    expect(w.memory.records).toEqual([]);
+    expect(steps.names()).not.toContain("memory: remember");
+  });
+
+  it("never fails the gate when remember throws", async () => {
+    const { w, after } = await setup();
+    w.memory.error = new Error("vectorize is down");
+    const steps = new InlineSteps();
+    const out = await runGate(gateTask(after), steps, w.ports(), config());
+    expect(out).toMatchObject({ status: "gated", passed: true, queenOutcome: "applied" });
+    expect(w.queen.reports()).toHaveLength(1);
+    expect(steps.log.find((l) => l.name === "memory: remember")).toMatchObject({ ok: false });
   });
 });
 

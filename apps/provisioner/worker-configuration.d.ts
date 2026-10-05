@@ -3,6 +3,8 @@
 interface __BaseEnv_Env {
 	PROVISIONER_WORKFLOW: Workflow<Parameters<import("./src/index").ProvisionerWorkflow['run']>[0]['payload']>;
 	ARTIFACTS?: Artifacts;
+	MEMORY?: VectorizeIndex;
+	AI?: Ai;
 	QUEEN?: DurableObjectNamespace /* QueenNode from queen */;
 	GENESIS?: DurableObjectNamespace /* GenesisNode from queenos-genesis */;
 }

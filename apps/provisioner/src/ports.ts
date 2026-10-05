@@ -2,8 +2,8 @@
  * Provisioner ports: every side effect goes through this object (mirrors
  * apps/drones). Tests swap in fakes via ProvisionerWorkflow.createPorts().
  */
-import type { HiveCreatedResult, ProvisionResult } from "@queenos/queen-types";
-import { initRepo, type GitRepo, type RemoteSpec } from "@queenos/hive-kit";
+import type { HiveCreatedResult, ProvisionResult, RecalledMemory } from "@queenos/queen-types";
+import { HiveMemory, initRepo, type GitRepo, type RemoteSpec } from "@queenos/hive-kit";
 
 // ── Artifacts ────────────────────────────────────────────────────────────
 
@@ -204,8 +204,14 @@ export function genesisRpc(ns: DurableObjectNamespace | undefined, hive: string)
 
 // ── bundle ───────────────────────────────────────────────────────────────
 
+/** Hive memory recall (HiveMemory over Vectorize). Throws on trouble; the caller is best effort. */
+export interface RecallPort {
+  recall(namespace: string, query: string, opts?: { excludeTrainId?: string }): Promise<RecalledMemory[]>;
+}
+
 export interface ProvisionerPorts {
   artifacts: ArtifactsPort;
+  recall: RecallPort;
   queen(hive: string): QueenPort;
   git: GitPort;
   genesis(hive: string): GenesisPort;
@@ -215,11 +221,14 @@ export interface ProvisionerEnvBindings {
   ARTIFACTS?: Artifacts;
   QUEEN?: DurableObjectNamespace;
   GENESIS?: DurableObjectNamespace;
+  AI?: Ai;
+  MEMORY?: VectorizeIndex;
 }
 
 export function createProdPorts(env: ProvisionerEnvBindings): ProvisionerPorts {
   return {
     artifacts: new BindingArtifactsPort(env.ARTIFACTS),
+    recall: new HiveMemory(env.AI, env.MEMORY),
     queen: (hive) => queenRpc(env.QUEEN, hive),
     git: isomorphicGitPort,
     genesis: (hive) => genesisRpc(env.GENESIS, hive),

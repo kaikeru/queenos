@@ -2,8 +2,8 @@
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowStepConfig } from "cloudflare:workers";
 import { initRepo, type RemoteSpec } from "@queenos/hive-kit";
-import type { HiveCreatedResult, ProvisionCommand, ProvisionResult } from "@queenos/queen-types";
-import type { ArtifactsPort, ForkResult, GenesisPort, GitPort, ProvisionerPorts, QueenPort, RepoAccess, SeedSession } from "../src/ports";
+import type { HiveCreatedResult, ProvisionCommand, ProvisionResult, RecalledMemory } from "@queenos/queen-types";
+import type { ArtifactsPort, RecallPort, ForkResult, GenesisPort, GitPort, ProvisionerPorts, QueenPort, RepoAccess, SeedSession } from "../src/ports";
 import type { StepRunner } from "../src/orchestrate";
 
 export const artifactsError = (code: string) => Object.assign(new Error(code), { name: "ArtifactsError", code });
@@ -109,7 +109,19 @@ export class FakeQueen implements QueenPort {
   }
 }
 
+export class FakeRecall implements RecallPort {
+  readonly calls: { namespace: string; query: string; excludeTrainId?: string }[] = [];
+  memories: RecalledMemory[] = [];
+  error: Error | null = null;
+  async recall(namespace: string, query: string, opts: { excludeTrainId?: string } = {}) {
+    this.calls.push({ namespace, query, ...opts });
+    if (this.error) throw this.error;
+    return this.memories;
+  }
+}
+
 export class FakeWorld {
+  readonly recall = new FakeRecall();
   readonly artifacts = new FakeArtifactsPort();
   readonly queen = new FakeQueen();
   readonly git = new FakeGitPort(this.artifacts);
@@ -118,6 +130,7 @@ export class FakeWorld {
   ports(): ProvisionerPorts {
     return {
       artifacts: this.artifacts,
+      recall: this.recall,
       queen: (hive) => {
         this.queenHives.push(hive);
         return this.queen;

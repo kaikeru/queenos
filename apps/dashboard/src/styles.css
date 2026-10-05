@@ -100,6 +100,19 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .chip--ejected, .chip--failed, .chip--rejected { color: var(--red); border-color: rgba(255, 77, 99, 0.5); background: rgba(255, 77, 99, 0.08); }
 
 /* train cars */
+.memories { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.memories__chip { font: 700 12px var(--mono); letter-spacing: 0.08em; padding: 5px 12px; border-radius: 999px; cursor: pointer; color: var(--violet); border: 1px solid rgba(167, 139, 250, 0.5); background: rgba(167, 139, 250, 0.1); }
+.memories__chip:hover { background: rgba(167, 139, 250, 0.18); }
+.memories__list { list-style: none; margin: 0; padding: 0; width: 100%; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 10px; }
+.memory { background: var(--bg-2); border: 1px solid var(--line-2); border-left: 3px solid var(--faint); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.memory--passed { border-left-color: var(--green); } .memory--failed { border-left-color: var(--red); } .memory--rejected { border-left-color: var(--yellow); }
+.memory__top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.memory__outcome--rejected { color: var(--yellow); border-color: rgba(255, 210, 63, 0.5); background: rgba(255, 210, 63, 0.08); }
+.memory__score { font: 700 12px var(--mono); color: var(--cyan); white-space: nowrap; }
+.memory__prompt { font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
+.memory__text { font: 12px/1.5 var(--mono); color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px; }
+.memory__text--clamp { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.memory__more { margin-top: 4px; background: none; border: 0; padding: 4px 0; font: 12px var(--mono); color: var(--cyan); cursor: pointer; }
 .cars { display: flex; gap: 12px; flex-wrap: wrap; align-items: stretch; }
 .cars__empty, .cards__empty { font: 13px var(--mono); color: var(--faint); }
 .car { position: relative; min-width: 200px; background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px; transition: all 0.5s ease; }

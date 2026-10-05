@@ -6,7 +6,7 @@
  * Never imported in production builds (see useRoomSocket).
  */
 import type { Dispatch } from "react";
-import type { MergeTrain, ModelStats, RouterFloor, PromptRun, QueenServerMessage, Release, SentinelVerdict } from "@queenos/queen-types";
+import type { MergeTrain, RecalledMemory, ModelStats, RouterFloor, PromptRun, QueenServerMessage, Release, SentinelVerdict } from "@queenos/queen-types";
 import type { Action } from "./reducer";
 
 const STEP_MS = 2500;
@@ -39,6 +39,24 @@ const baseStats = (): ModelStats[] => [
   stat(KIMI, "rework", 4, 4, 58_900),
   stat(GLM, "builder", 2, 1, 71_200),
   stat(GRANITE, "scribe", 12, 11, 2_300),
+];
+
+const memory = (n: number, outcome: RecalledMemory["outcome"], promptText: string, text: string, score: number, ageMs: number): RecalledMemory => ({
+  memoryId: `t-old${n}:${n.toString(16).repeat(12)}`,
+  trainId: `t-old${n}`,
+  promptId: `p-old${n}`,
+  outcome,
+  promptText,
+  text,
+  score,
+  createdAt: Date.now() - ageMs,
+});
+
+/** What the Provisioner "recalled" for the CSV export build: one reviewer rejection, one pass, one failure. */
+const CSV_MEMORIES: RecalledMemory[] = [
+  memory(1, "REJECTED_BY_REVIEW", "Add a JSON export to the audit log view", "Builder added a new /features/status route and a button on it.\nReviewer: the prompt asked to change the audit log view at /, not to add a new route. Rejected.\nLesson: edit the existing view in place; do not add routes.", 0.91, 86_400_000),
+  memory(2, "PASSED", "Add CSV download to the settings page", "Builder read the loader, added exportCsv() beside the table and wired one button in the existing header.\nGate: build, typecheck and preview smoke test passed.", 0.84, 172_800_000),
+  memory(3, "FAILED", "Export audit rows as a spreadsheet", "Builder returned a change set with malformed JSON (unterminated string in a template literal).\nGate: change set rejected before apply.", 0.72, 259_200_000),
 ];
 
 export class MockQueen {
@@ -142,34 +160,34 @@ export class MockQueen {
       });
     this.later(2500, () => {
       prompt("BUILDING");
-      train({ trainId: "t5", status: "BUILDING", phase: "BUILDING", model: GLM_FLASH, modelReason: "best pass rate in fast tier" });
+      train({ trainId: "t5", status: "BUILDING", phase: "BUILDING", model: GLM_FLASH, modelReason: "best pass rate in fast tier", memories: CSV_MEMORIES });
       audit("m-e1", "RUNNING", GLM_FLASH, "success", 0);
     });
     this.later(6500, () => {
       this.bump(GLM_FLASH, "builder", false, 9_000);
-      train({ trainId: "t5", status: "BUILDING", phase: "BUILDING", model: DEEPSEEK_FLASH, modelReason: "GLM-5.3 Flash failed JSON → fell back to DeepSeek V4 Flash" });
+      train({ trainId: "t5", status: "BUILDING", phase: "BUILDING", model: DEEPSEEK_FLASH, modelReason: "GLM-5.3 Flash failed JSON → fell back to DeepSeek V4 Flash", memories: CSV_MEMORIES });
     });
     this.later(11_000, () => {
       this.bump(DEEPSEEK_FLASH, "builder", false, 24_000);
       this.setFloor({ tier: "frontier", streak: 0, probeIn: 3 });
       audit("m-e2", "REJECTED", DEEPSEEK_FLASH, "failure", 24_000);
-      train({ trainId: "t5", status: "EJECTED", phase: "TESTING", reason: "failed: preview smoke test", model: DEEPSEEK_FLASH, modelReason: "fallback after JSON failure" });
+      train({ trainId: "t5", status: "EJECTED", phase: "TESTING", reason: "failed: preview smoke test", model: DEEPSEEK_FLASH, modelReason: "fallback after JSON failure", memories: CSV_MEMORIES });
       prompt("EJECTED");
     });
     this.later(12_500, () => {
       prompt("BUILDING");
-      train({ trainId: "t6", status: "BUILDING", phase: "BUILDING", createdAt: now + 10_000, model: KIMI, modelReason: "rework → escalated to frontier" });
+      train({ trainId: "t6", status: "BUILDING", phase: "BUILDING", createdAt: now + 10_000, model: KIMI, modelReason: "rework → escalated to frontier", memories: CSV_MEMORIES });
       audit("m-e3", "RUNNING", KIMI, "success", 0);
     });
     this.later(18_000, () => {
       this.bump(KIMI, "rework", true, 52_000);
       this.setFloor({ streak: 1, probeIn: 2 });
       audit("m-e4", "PASSED", KIMI, "success", 52_000);
-      train({ trainId: "t6", status: "TESTING", phase: "TESTING", createdAt: now + 10_000, model: KIMI, modelReason: "rework → escalated to frontier" });
+      train({ trainId: "t6", status: "TESTING", phase: "TESTING", createdAt: now + 10_000, model: KIMI, modelReason: "rework → escalated to frontier", memories: CSV_MEMORIES });
       prompt("IN_TRAIN");
     });
     this.later(21_500, () => {
-      train({ trainId: "t6", status: "MERGED", phase: "MERGED", createdAt: now + 10_000, landedSha: "c0ffee1234567890c0ffee1234567890c0ffee12", model: KIMI, modelReason: "rework → escalated to frontier" });
+      train({ trainId: "t6", status: "MERGED", phase: "MERGED", createdAt: now + 10_000, landedSha: "c0ffee1234567890c0ffee1234567890c0ffee12", model: KIMI, modelReason: "rework → escalated to frontier", memories: CSV_MEMORIES });
       prompt("MERGED");
       this.setFloor({ streak: 2, probeIn: 1 });
     });

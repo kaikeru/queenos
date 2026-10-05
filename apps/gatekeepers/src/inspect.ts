@@ -39,6 +39,7 @@ export type Inspection =
       security: ScanReport;
       /** Null when static checks already failed (fail fast) . */
       tests: TestSummary | null;
+      /** Changed paths (sorted, capped at 30), for every outcome: hive memory and the review packet. */
       changedPaths: string[];
       /** Evidence for the REVIEWER; null when review is off or the code did not get as far as a working preview. */
       review: ReviewPacket | null;
@@ -211,7 +212,7 @@ export async function inspectPush(
     policy,
     security,
     tests,
-    changedPaths: [...changed].sort().slice(0, 50),
+    changedPaths: [...changed].sort().slice(0, 30),
     review,
     failureLog,
     failingCheck,

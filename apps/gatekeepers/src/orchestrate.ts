@@ -14,8 +14,8 @@
  */
 import type { WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import type { AppendAuditInput, AuditStatus, DroneRole, GitNotesPayload } from "@queenos/queen-types";
-import { AiGatewayError, LedgerError, buildGitNotesPayload } from "@queenos/hive-kit";
+import type { AppendAuditInput, AuditEvent, AuditStatus, DroneRole, GitNotesPayload, MemoryOutcome } from "@queenos/queen-types";
+import { AiGatewayError, LedgerError, buildGitNotesPayload, composeMemoryText, memoryIdFor } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import { classifyPush, gateInstanceId, parsePushEvent, type GateTask } from "./event";
 import { formatFinding, type ScanReport } from "./findings";
@@ -78,7 +78,7 @@ export async function handlePush(payload: unknown, step: StepRunner, ports: Gate
 // ── the gate ────────────────────────────────────────────────────────────────
 
 export type Lookup =
-  | { status: "ready"; trainId: string; promptId: string; promptText: string; /** Up to 4 KB, for the reviewer. */ promptFull: string; previewUrl: string | null }
+  | { status: "ready"; trainId: string; promptId: string; promptText: string; /** Up to 4 KB, for the reviewer. */ promptFull: string; previewUrl: string | null; /** The newest BUILDER ledger's first reasoning steps (small, for hive memory). */ builderReasoning: string[] }
   | { status: "waiting"; phase: string }
   | { status: "ignored"; reason: string };
 
@@ -98,7 +98,21 @@ export async function lookupTrain(queen: QueenPort, task: Pick<GateTask, "repo" 
   const promptText = snap.promptRuns.find((p) => p.promptId === promptId)?.promptText ?? promptId;
   // `previewUrl` is absent in sim mode and on trains from before the Herald existed.
   const previewUrl = (train as { previewUrl?: string | null }).previewUrl || null;
-  return { status: "ready", trainId: train.trainId, promptId, promptText: promptText.slice(0, 500), promptFull: promptText.slice(0, MAX_PROMPT_CHARS), previewUrl };
+  const builderReasoning = builderReasoningFor(snap.recentAudit, promptId);
+  return { status: "ready", trainId: train.trainId, promptId, promptText: promptText.slice(0, 500), promptFull: promptText.slice(0, MAX_PROMPT_CHARS), previewUrl, builderReasoning };
+}
+
+const MEMORY_REASONING_STEPS = 6;
+const MEMORY_REASONING_STEP_CHARS = 300;
+
+/** The newest BUILDER ledger entry for this prompt that has a payload: its first few steps. */
+function builderReasoningFor(audit: AuditEvent[] | undefined, promptId: string): string[] {
+  let best: AuditEvent | undefined;
+  for (const e of audit ?? []) {
+    if (e.promptId !== promptId || e.droneRole !== "BUILDER" || !e.gitNotesPayload) continue;
+    if (!best || e.createdAt > best.createdAt) best = e;
+  }
+  return (best?.gitNotesPayload?.reasoningSteps ?? []).slice(0, MEMORY_REASONING_STEPS).map((s) => clip(s, MEMORY_REASONING_STEP_CHARS));
 }
 
 export type GateRunResult =
@@ -161,7 +175,7 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   let reviewState: "approved" | "skipped" | undefined;
   if (inspection.review) {
     const r = await reviewGate(ctx, inspection.review);
-    if (r.rejected) return failReview(ctx, r.feedback, r.report);
+    if (r.rejected) return failReview(ctx, r.feedback, r.missing, r.report, inspection.changedPaths);
     reviewState = r.skipped ? "skipped" : "approved";
   }
 
@@ -171,6 +185,8 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
       `Gate passed: policy (${inspection.policy.filesScanned} files), security, tests (${inspection.tests?.checks ?? 0} checks) at ${task.after.slice(0, 12)}.`,
       MAX_SUMMARY_CHARS,
     );
+    const verdict = reviewState === "approved" ? `${summary} The reviewer approved the change.` : summary;
+    await remember(ctx, "PASSED", verdict, inspection.changedPaths);
     const queenOutcome = await report(ctx, true, summary);
     return { status: "gated", trainId: train.trainId, passed: true, summary, queenOutcome, ...(reviewState ? { review: reviewState } : {}) };
   }
@@ -206,13 +222,14 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   await audit(ctx, "audit: scribe result", "SCRIBE", "PASSED", ledgerFor(ctx, scribe.model ?? SCRIBE_EXTRACTIVE_MODEL, 0, [`method: ${scribe.method}`, summary], true));
 
   const vectorized = await vectorize(ctx, rawLog);
+  await remember(ctx, "FAILED", summary, inspection.changedPaths);
   const queenOutcome = await report(ctx, false, summary);
   return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, ...(reviewState ? { review: reviewState } : {}), scribe: scribe.method, vectorized };
 }
 
 // ── reviewer ──────────────────────────────────────────────────────────────
 
-type ReviewGate = { rejected: false; skipped: boolean } | { rejected: true; feedback: string; report: string };
+type ReviewGate = { rejected: false; skipped: boolean } | { rejected: true; feedback: string; missing: string[]; report: string };
 
 async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
   const { config, ports, step, train } = ctx;
@@ -259,11 +276,11 @@ async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
   }
   await audit(ctx, "audit: reviewer result", "REVIEWER", "REJECTED", ledgerFor(ctx, outcome.model, outcome.ms, reasoning, false));
   const report = [`REVIEWER rejected the change: it does not satisfy the prompt.`, `Prompt: ${train.promptFull}`, ...reasoning.slice(1)].join("\n");
-  return { rejected: true, feedback: v.feedback, report };
+  return { rejected: true, feedback: v.feedback, missing: v.missing, report };
 }
 
 /** The reviewer's feedback is the Scribe summary, so the Queen's REWORK carries it to the next builder. */
-async function failReview(ctx: Ctx, feedback: string, rawLog: string): Promise<GateRunResult> {
+async function failReview(ctx: Ctx, feedback: string, missing: string[], rawLog: string, changedPaths: string[]): Promise<GateRunResult> {
   const { task, train, ports } = ctx;
   const summary = clip(feedback, MAX_SUMMARY_CHARS);
   await ctx.step.do("scribe: record summary", REPORT_STEP, async () => {
@@ -276,6 +293,7 @@ async function failReview(ctx: Ctx, feedback: string, rawLog: string): Promise<G
     return { recorded: true };
   });
   const vectorized = await vectorize(ctx, rawLog);
+  await remember(ctx, "REJECTED_BY_REVIEW", missing.length ? `${feedback} Missing: ${missing.join("; ")}` : feedback, changedPaths);
   const queenOutcome = await report(ctx, false, summary);
   return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, review: "rejected", vectorized };
 }
@@ -371,5 +389,34 @@ async function vectorize(ctx: Ctx, rawLog: string): Promise<number> {
   } catch (e) {
     console.warn("gatekeeper: vectorize failed (ignored)", messageOf(e));
     return 0;
+  }
+}
+
+/** Best effort: one hive memory per gate verdict. Never fails the gate; never called for infra failures. */
+async function remember(ctx: Ctx, outcome: MemoryOutcome, verdict: string, changedPaths: string[]): Promise<void> {
+  const { task, train } = ctx;
+  try {
+    await ctx.step.do("memory: remember", BEST_EFFORT_STEP, async () => {
+      await ctx.ports.memory.remember({
+        memoryId: memoryIdFor(train.trainId, task.after),
+        namespace: task.hive,
+        trainId: train.trainId,
+        promptId: train.promptId,
+        commitSha: task.after,
+        outcome,
+        promptText: train.promptFull.slice(0, 300),
+        text: composeMemoryText({
+          promptText: train.promptFull,
+          outcome,
+          verdict,
+          reasoning: train.builderReasoning,
+          changedFiles: changedPaths.slice(0, 30),
+        }),
+        createdAt: Date.now(),
+      });
+      return { remembered: true };
+    });
+  } catch (e) {
+    console.warn("gatekeeper: memory failed (ignored)", messageOf(e));
   }
 }

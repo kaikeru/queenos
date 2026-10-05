@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AiGatewayError, type CompletionRequest, type CompletionResult } from "@queenos/hive-kit";
+import { AiGatewayError, memoryIdFor, type CompletionRequest, type CompletionResult } from "@queenos/hive-kit";
 import { runGate } from "../src/orchestrate";
 import { MAX_REVIEW_INPUT_CHARS, parseReview, renderReviewInput, scriptedReview } from "../src/review";
 import type { ScribeLlm } from "../src/scribe";
@@ -55,6 +55,8 @@ describe("reviewer: llm mode", () => {
     expect(ledger).toMatchObject({ model: "@cf/deepseek-ai/deepseek-v4-flash-0731", result: "success" });
     expect(ledger.reasoningSteps).toEqual(["verdict: APPROVE", "satisfied: / serves HTML", "feedback: Looks right."]);
     expect(steps.names()).toContain("review: llm");
+    expect(w.memory.records.map((r) => r.outcome)).toEqual(["PASSED"]);
+    expect(w.memory.records[0]!.text).toContain("The reviewer approved the change.");
 
     expect(llm.requests).toHaveLength(1);
     const req = llm.requests[0]!;
@@ -85,6 +87,13 @@ describe("reviewer: llm mode", () => {
     expect(w.queen.scribes()).toEqual([{ promptId: "prompt-1", trainId: "train-1", summary: feedback }]);
     expect(w.queen.reports()).toEqual([{ trainId: "train-1", passed: false, summary: feedback, commitSha: after }]);
     expect(w.failures.stored[0]![0]!.text).toContain("/ still returns JSON");
+
+    // Hive memory: one REJECTED_BY_REVIEW record with feedback + missing items.
+    expect(w.memory.records).toHaveLength(1);
+    expect(w.memory.records[0]!).toMatchObject({ outcome: "REJECTED_BY_REVIEW", memoryId: memoryIdFor("train-1", after), namespace: "hive" });
+    expect(w.memory.records[0]!.text).toContain("was rejected by the reviewer");
+    expect(w.memory.records[0]!.text).toContain("Make GET / return HTML.");
+    expect(w.memory.records[0]!.text).toContain("Missing: / still returns JSON");
   });
 
   it("clips feedback to 400 chars and tolerates fences and a lower-case verdict", async () => {

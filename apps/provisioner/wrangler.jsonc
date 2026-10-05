@@ -16,6 +16,12 @@
     }
   ],
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
+  // Hive memory (recall at FORK). Written by the gatekeepers. Create once:
+  //   wrangler vectorize create queenos-memory --dimensions=768 --metric=cosine
+  //   wrangler vectorize create-metadata-index queenos-memory --property-name=namespace --type=string
+  // Best effort: a missing/failed recall never fails a fork.
+  "vectorize": [{ "binding": "MEMORY", "index_name": "queenos-memory" }],
+  "ai": { "binding": "AI" },
   "durable_objects": {
     "bindings": [
       // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen").
@@ -28,7 +34,7 @@
   },
   "env": {
     // Used only by vitest (see vitest.config.ts). Named envs do not inherit
-    // bindings: no ARTIFACTS (remote-only) and no cross-script QUEEN DO (the pool
+    // bindings: no ARTIFACTS / AI / MEMORY (remote-only) and no cross-script QUEEN DO (the pool
     // has no dev registry). Tests inject fake ports via test/worker.ts.
     "test": {
       "workflows": [{ "name": "provisioner-workflow", "binding": "PROVISIONER_WORKFLOW", "class_name": "ProvisionerWorkflow" }]

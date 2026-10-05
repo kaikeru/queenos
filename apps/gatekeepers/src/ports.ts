@@ -2,8 +2,8 @@
  * Gatekeeper ports: every side effect the gate performs goes through this
  * object (mirrors apps/drones). Tests swap in fakes via GatekeeperWorkflow.createPorts().
  */
-import type { AppendAuditInput, AuditEvent, QueenServerMessage, ScribeSummary, TrainResult } from "@queenos/queen-types";
-import { cloneRepo, createAiClient, type AiRunner, type GitRepo } from "@queenos/hive-kit";
+import type { AppendAuditInput, AuditEvent, MemoryRecord, QueenServerMessage, ScribeSummary, TrainResult } from "@queenos/queen-types";
+import { HiveMemory, cloneRepo, createAiClient, type AiRunner, type GitRepo } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import type { GateTask } from "./event";
 import type { ReviewLlm } from "./review";
@@ -153,6 +153,8 @@ export interface GatekeeperPorts {
   /** `GET <previewUrl>/` against the train's Worker Preview. */
   smoke: SmokeProbe;
   failures: FailureStore;
+  /** Hive memory: one record per gate verdict, recalled by future builders. Best effort. */
+  memory: { remember(r: MemoryRecord): Promise<void> };
   dispatcher: GateDispatcher;
 }
 
@@ -161,6 +163,8 @@ export interface GateEnvBindings {
   QUEEN?: DurableObjectNamespace;
   AI?: Ai;
   VECTORIZE?: VectorizeIndex;
+  /** Hive memory index `queenos-memory`. */
+  MEMORY?: VectorizeIndex;
   GATEKEEPER_WORKFLOW?: Workflow;
 }
 
@@ -176,6 +180,7 @@ export function createProdPorts(env: GateEnvBindings, config: GateConfig): Gatek
     tests: createTestRunner(config.testMode),
     smoke: new FetchSmokeProbe(),
     failures: new VectorizeFailureStore(env.AI, env.VECTORIZE),
+    memory: new HiveMemory(env.AI as unknown as AiRunner | undefined, env.MEMORY),
     dispatcher: new WorkflowGateDispatcher(env.GATEKEEPER_WORKFLOW),
   };
 }

@@ -16,6 +16,7 @@ import {
   type HiveCreatedResult,
   type ProvisionCommand,
   type ProvisionResult,
+  type RecalledMemory,
 } from "@queenos/queen-types";
 import { errorCode, SEED_TRAILER, type ProvisionerPorts } from "./ports";
 import { TEMPLATES } from "./templates.generated";
@@ -27,6 +28,9 @@ export interface StepRunner {
 
 export const PROVISION_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" }, timeout: "3 minutes" };
 export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
+
+/** Best effort: one retry, short timeout; the caller turns a final failure into []. */
+export const RECALL_STEP: WorkflowStepConfig = { retries: { limit: 1, delay: "2 seconds", backoff: "constant" }, timeout: "30 seconds" };
 
 const MAX_SUMMARY = 500;
 const clip = (s: string, n = MAX_SUMMARY) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
@@ -82,6 +86,18 @@ export async function runProvision(payload: unknown, step: StepRunner, ports: Pr
     work = { ok: false, summary: clip(`${cmd.op === "FORK" ? "Fork" : "Delete"} failed: ${messageOf(e)}`) };
   }
 
+  // Best effort, after the fork succeeded: any failure is [] and never fails the fork.
+  let memories: RecalledMemory[] | undefined;
+  if (cmd.op === "FORK" && work.ok && cmd.recallQuery?.trim()) {
+    const { hive, trainId, recallQuery } = cmd;
+    try {
+      memories = await step.do("memory: recall", RECALL_STEP, () => ports.recall.recall(hive, recallQuery, { excludeTrainId: trainId }));
+    } catch (e) {
+      console.warn(`memory recall failed for ${hive}: ${messageOf(e)}`);
+      memories = [];
+    }
+  }
+
   const result: ProvisionResult = {
     commandId: cmd.commandId,
     op: cmd.op,
@@ -89,6 +105,7 @@ export async function runProvision(payload: unknown, step: StepRunner, ports: Pr
     ok: work.ok,
     ...(work.ok && work.artifactRepo ? { artifactRepo: work.artifactRepo } : {}),
     ...(work.ok && work.baseSha ? { baseSha: work.baseSha } : {}),
+    ...(memories ? { memories } : {}),
     summary: clip(work.summary),
   };
 

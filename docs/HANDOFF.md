@@ -17,7 +17,7 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 - **Orchestrate.** Dispatch right-sized subagents (Opus for research and subtle core logic, Sonnet for implementation, Haiku for trivial work). Verify their work yourself before reporting. See memory `orchestration-style`.
 - **Before parallel dispatch:** write the shared contract in `packages/queen-types` first, give agents disjoint file ownership, and keep the lockfile with one writer (pre-install deps yourself).
 - **Always verify** with `pnpm turbo run build typecheck lint test --force --continue` (**40/40 tasks** green at handoff). Use **Node 24**: `export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH`, because wrangler needs ≥22.
-- **Commit** after each verified milestone; there's no remote, so never push. End messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Before committing, scan for the token: `grep -rlF -- "$CLOUDFLARE_API_TOKEN" --exclude-dir=node_modules --exclude-dir=.wrangler --exclude-dir=.git .`
+- **Commit** after each verified milestone; there's no remote, so never push. End messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Before committing, scan for the token: `/usr/bin/grep -rlF --exclude-dir=node_modules --exclude-dir=.wrangler --exclude-dir=.git -e "$CLOUDFLARE_API_TOKEN" .` (exit 1 means clean; `grep` is aliased to ugrep in this shell, and a `--` before the excludes makes grep read them as filenames)
 - **Prefer Cloudflare-native tech** ("a boon"), and keep things simple. The user makes product calls fast; give a recommendation, not a menu.
 - **The Queen is an orchestrator ONLY.** It decides, records and dispatches; executors do all external I/O.
 

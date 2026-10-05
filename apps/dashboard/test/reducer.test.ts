@@ -325,3 +325,62 @@ test("router floor tier changes add one ticker line each way; same tier adds non
   const down = reducer(same, server({ type: "models.updated", stats: [], floor: floorOf("fast") }));
   expect(down.ticker[0]!.text).toBe("Router: backed off to fast");
 });
+
+// ── hive memory ───────────────────────────────────────────────────────────
+
+import { laneMemories, memoryChipLabel, scorePercent, OUTCOME_META } from "../src/memory";
+
+const mem = (id: string, outcome: string, score = 0.9) => ({
+  memoryId: id,
+  trainId: `old-${id}`,
+  promptId: `p-${id}`,
+  outcome,
+  promptText: "past prompt",
+  text: "what happened",
+  createdAt: 1,
+  score,
+});
+
+function lanesWith(memories?: unknown[]) {
+  const msg = QueenServerMessageSchema.parse({
+    type: "snapshot",
+    promptRuns: [prompt("p1", 1)],
+    trains: [train("t1", ["p1"], "BUILDING", memories ? { memories } : {})],
+    recentAudit: [],
+  });
+  return buildLanes(reducer(initialState, { type: "server", message: msg, at: 0 } as Action));
+}
+
+test("a train's recalled memories survive the snapshot and reach the lane", () => {
+  const lanes = lanesWith([mem("a", "REJECTED_BY_REVIEW", 0.91), mem("b", "PASSED", 0.84)]);
+  expect(laneMemories(lanes[0]!.trains).map((m) => m.memoryId)).toEqual(["a", "b"]);
+});
+
+test("trains without memories (absent or empty) show nothing", () => {
+  expect(laneMemories(lanesWith()[0]!.trains)).toEqual([]);
+  expect(laneMemories(lanesWith([])[0]!.trains)).toEqual([]);
+});
+
+test("train.updated carries memories into state", () => {
+  let s = reducer(initialState, {
+    type: "server",
+    message: QueenServerMessageSchema.parse({ type: "snapshot", promptRuns: [prompt("p1", 1)], trains: [train("t1", ["p1"])], recentAudit: [] }),
+    at: 0,
+  } as Action);
+  expect(laneMemories(buildLanes(s)[0]!.trains)).toEqual([]);
+  s = reducer(s, {
+    type: "server",
+    message: QueenServerMessageSchema.parse({ type: "train.updated", train: train("t1", ["p1"], "BUILDING", { memories: [mem("a", "FAILED")] }) }),
+    at: 1,
+  } as Action);
+  expect(laneMemories(buildLanes(s)[0]!.trains)).toHaveLength(1);
+});
+
+test("memory presentation helpers", () => {
+  expect(scorePercent(0.914)).toBe(91);
+  expect(scorePercent(1.2)).toBe(100);
+  expect(memoryChipLabel(1)).toBe("1 memory recalled");
+  expect(memoryChipLabel(3)).toBe("3 memories recalled");
+  expect(OUTCOME_META.REJECTED_BY_REVIEW.label).toBe("rejected by review");
+  expect(OUTCOME_META.PASSED.cls).toBe("passed");
+});

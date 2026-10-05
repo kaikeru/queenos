@@ -86,3 +86,47 @@ describe("reporting", () => {
     expect(steps.log).toEqual([]);
   });
 });
+
+describe("runProvision hive memory recall", () => {
+  const mem = { memoryId: "t0:abc", trainId: "t0", promptId: "p0", outcome: "PASSED" as const, promptText: "add x", text: "Prompt: add x", createdAt: 1, score: 0.9 };
+
+  it("recalls after the fork and puts memories on the result", async () => {
+    const w = new FakeWorld();
+    w.recall.memories = [mem];
+    const steps = new InlineSteps();
+    await runProvision(fork({ recallQuery: "add a health route" }), steps, w.ports());
+    expect(w.recall.calls).toEqual([{ namespace: "hive", query: "add a health route", excludeTrainId: "train-1" }]);
+    expect(steps.log.map((l) => l.name)).toEqual(["fork", "memory: recall", "report: provision result"]);
+    const r = ProvisionResultSchema.parse(w.queen.results[0]);
+    expect(r.ok).toBe(true);
+    expect(r.memories).toEqual([mem]);
+  });
+
+  it("a recall error still gives an ok fork with memories: []", async () => {
+    const w = new FakeWorld();
+    w.recall.error = new Error("vectorize down");
+    const out = await runProvision(fork({ recallQuery: "q" }), new InlineSteps(), w.ports());
+    expect(out.ok).toBe(true);
+    expect(w.queen.results[0]).toMatchObject({ ok: true, artifactRepo: "hive-train-aaaaaaaaaaaa", memories: [] });
+  });
+
+  it("does not recall without a recallQuery", async () => {
+    const w = new FakeWorld();
+    const steps = new InlineSteps();
+    await runProvision(fork(), steps, w.ports());
+    await runProvision(fork({ recallQuery: "  " }), steps, w.ports());
+    expect(w.recall.calls).toEqual([]);
+    expect(steps.log.map((l) => l.name)).not.toContain("memory: recall");
+    expect(w.queen.results[0]!.memories).toBeUndefined();
+  });
+
+  it("does not recall on DELETE or a failed fork", async () => {
+    const w = new FakeWorld();
+    await runProvision({ ...del(), recallQuery: "q" }, new InlineSteps(), w.ports());
+    w.artifacts.forkError = artifactsError("NOT_FOUND");
+    await runProvision(fork({ recallQuery: "q" }), new InlineSteps(), w.ports());
+    expect(w.recall.calls).toEqual([]);
+    expect(w.queen.results[1]).toMatchObject({ ok: false });
+    expect(w.queen.results[1]!.memories).toBeUndefined();
+  });
+});

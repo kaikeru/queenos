@@ -3,7 +3,7 @@ import { Link } from "./router";
 import { ApiError, api, errorMessage } from "./api";
 import { useEscape } from "./hooks";
 import { phaseHeadline, shortVersion, tapButtonState, tapErrorMessage, timelineSteps, type SiteReleaseView } from "./releases";
-import { CANARY_STEPS, type ModelStats, type ModelTier, type Release, type RouterFloor, type SentinelVerdict } from "@queenos/queen-types";
+import { CANARY_STEPS, type ModelStats, type RecalledMemory, type ModelTier, type Release, type RouterFloor, type SentinelVerdict } from "@queenos/queen-types";
 import {
   PHASE_FLOW,
   excerpt,
@@ -19,6 +19,7 @@ import {
   type TickerItem,
 } from "./reducer";
 import { DEMO_PROMPTS } from "./demo";
+import { OUTCOME_META, laneMemories, memoryChipLabel, scorePercent } from "./memory";
 import { TIER_META, tierRank, buildModelBoard, formatDuration, modelLabel, tierClass, tierOf, type TierGroup } from "./models";
 import type { ConnStatus } from "./useQueenSocket";
 
@@ -177,6 +178,8 @@ function LaneRow({ lane, selected, onSelect }: { lane: Lane; selected: string | 
         ))}
       </div>
 
+      <MemoryRecall memories={laneMemories(lane.trains)} />
+
       <div className="cards">
         {lane.cards.length === 0 && <span className="cards__empty">no drones dispatched</span>}
         {[...cardsByAttempt.entries()].map(([attempt, cards]) => (
@@ -191,6 +194,43 @@ function LaneRow({ lane, selected, onSelect }: { lane: Lane; selected: string | 
         ))}
       </div>
     </section>
+  );
+}
+
+/** "🧠 N memories recalled" chip that expands into the hive memories fed to the builder. */
+export function MemoryRecall({ memories }: { memories: RecalledMemory[] }) {
+  const [open, setOpen] = useState(false);
+  const [full, setFull] = useState<Record<string, boolean>>({});
+  if (memories.length === 0) return null;
+  return (
+    <div className="memories">
+      <button type="button" className="memories__chip" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        <span aria-hidden="true">🧠</span> {memoryChipLabel(memories.length)} <span aria-hidden="true">{open ? "▴" : "▾"}</span>
+      </button>
+      {open && (
+        <ul className="memories__list">
+          {memories.map((m) => {
+            const meta = OUTCOME_META[m.outcome];
+            const expanded = !!full[m.memoryId];
+            return (
+              <li key={m.memoryId} className={`memory memory--${meta.cls}`}>
+                <div className="memory__top">
+                  <span className={`chip memory__outcome memory__outcome--${meta.cls}`}>{meta.label}</span>
+                  <span className="memory__score" title="cosine similarity to this prompt">
+                    {scorePercent(m.score)}% match
+                  </span>
+                </div>
+                <p className="memory__prompt">{m.promptText}</p>
+                <p className={`memory__text${expanded ? "" : " memory__text--clamp"}`}>{m.text}</p>
+                <button type="button" className="memory__more" onClick={() => setFull((f) => ({ ...f, [m.memoryId]: !expanded }))}>
+                  {expanded ? "show less" : "show more"}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
   );
 }
 

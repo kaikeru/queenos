@@ -4,7 +4,7 @@
  */
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowStepConfig } from "cloudflare:workers";
-import type { AppendAuditInput, AuditEvent, ScribeSummary, TrainResult } from "@queenos/queen-types";
+import type { AppendAuditInput, AuditEvent, MemoryRecord, ScribeSummary, TrainResult } from "@queenos/queen-types";
 import { GitRepo, initRepo, type CompletionRequest, type CompletionResult } from "@queenos/hive-kit";
 import { readConfig, type GateConfig, type GateVars } from "../src/config";
 import type { GateTask } from "../src/event";
@@ -103,6 +103,7 @@ export class FakeQueen implements QueenPort {
   train: FakeTrain = { trainId: "train-1", artifactRepo: REPO, phase: "TESTING", headSha: null, includedPrompts: ["prompt-0", "prompt-1"] };
   promptText = "Add a dark mode toggle to settings";
   extraTrains: FakeTrain[] = [];
+  recentAudit: AuditEvent[] = [];
   reportError: Error | null = null;
 
   async getSnapshot(): Promise<QueenSnapshot> {
@@ -123,7 +124,7 @@ export class FakeQueen implements QueenPort {
       type: "snapshot",
       promptRuns: [{ promptId: "prompt-1", namespace: HIVE, promptText: this.promptText, status: "IN_TRAIN", createdAt: T0 }],
       trains: [...this.extraTrains, this.train].map(toTrain),
-      recentAudit: [],
+      recentAudit: this.recentAudit,
     };
   }
   async appendAudit(input: AppendAuditInput): Promise<Pick<AuditEvent, "eventId">> {
@@ -168,6 +169,15 @@ export class FakeFailureStore implements FailureStore {
   }
 }
 
+export class FakeMemory {
+  readonly records: MemoryRecord[] = [];
+  error: Error | null = null;
+  async remember(r: MemoryRecord): Promise<void> {
+    if (this.error) throw this.error;
+    this.records.push(r);
+  }
+}
+
 export class FakeLlm implements ScribeLlm {
   readonly requests: CompletionRequest[] = [];
   constructor(private readonly reply: string | Error) {}
@@ -201,6 +211,7 @@ export class FakeWorld {
   readonly git = new FakeGitHost();
   readonly queen = new FakeQueen();
   readonly failures = new FakeFailureStore();
+  readonly memory = new FakeMemory();
   readonly dispatcher = new FakeDispatcher();
   readonly smoke = new FakeSmoke();
   llm: ScribeLlm | null = null;
@@ -217,6 +228,7 @@ export class FakeWorld {
       tests: this.tests,
       smoke: this.smoke,
       failures: this.failures,
+      memory: this.memory,
       dispatcher: this.dispatcher,
     };
   }

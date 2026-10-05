@@ -14,6 +14,7 @@ interface __BaseEnv_Env {
 	MODEL_REVIEWER: "@cf/deepseek-ai/deepseek-v4-flash-0731";
 	GATEKEEPER_WORKFLOW: Workflow<Parameters<import("./src/index").GatekeeperWorkflow['run']>[0]['payload']>;
 	VECTORIZE?: VectorizeIndex;
+	MEMORY?: VectorizeIndex;
 	ARTIFACTS?: Artifacts;
 	AI?: Ai;
 	QUEEN?: DurableObjectNamespace /* QueenNode from queen */;

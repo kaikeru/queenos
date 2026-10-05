@@ -39,7 +39,14 @@
   // Failure memory for RAG. Create once:
   //   wrangler vectorize create queenos-failures --dimensions=768 --metric=cosine
   // (768 = @cf/baai/bge-base-en-v1.5). Best effort: the gate never fails on Vectorize.
-  "vectorize": [{ "binding": "VECTORIZE", "index_name": "queenos-failures" }],
+  // Hive memory: one record per gate verdict, recalled by the Provisioner. Create once:
+  //   wrangler vectorize create queenos-memory --dimensions=768 --metric=cosine
+  //   wrangler vectorize create-metadata-index queenos-memory --property-name=namespace --type=string
+  // Best effort: the gate never fails on memory.
+  "vectorize": [
+    { "binding": "VECTORIZE", "index_name": "queenos-failures" },
+    { "binding": "MEMORY", "index_name": "queenos-memory" }
+  ],
   "ai": { "binding": "AI" },
   "vars": {
     // "scripted": deterministic tests (fail on the [fail] marker) + extractive Scribe.
