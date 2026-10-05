@@ -1,5 +1,6 @@
 /** Sentinel ports: every side effect goes through this object. Tests swap in fakes. */
-import type { SentinelVerdict } from "@queenos/queen-types";
+import type { AnalyticsPoint, SentinelVerdict } from "@queenos/queen-types";
+import { structuredLog, writeMetric, type DataPointWriter, type LogFields } from "@queenos/hive-kit";
 
 /** One timed GET. `status` is null for a network error or timeout. */
 export interface ProbeResult {
@@ -38,12 +39,38 @@ export function queenRpc(ns: DurableObjectNamespace | undefined, hive: string): 
 export interface SentinelPorts {
   probe: Probe;
   queen(hive: string): QueenPort;
+  /** One JSON log line per step (WP1.4's `structuredLog`); never throws. Optional: tests may omit it. */
+  log?: (fields: LogFields) => void;
+  /** Fire-and-forget Analytics Engine point (`queenos_events`); never throws. Optional. */
+  metric?: (point: AnalyticsPoint) => void;
 }
 
 export interface SentinelEnvBindings {
   QUEEN?: DurableObjectNamespace;
+  /** Analytics Engine dataset `queenos_events`. */
+  ANALYTICS?: DataPointWriter;
 }
 
+// hive-kit's log/metric helpers are stubs until WP1.4 lands, and telemetry must never fail a verdict.
+const safeLog = (f: LogFields): void => {
+  try {
+    structuredLog(f);
+  } catch {
+    /* best effort */
+  }
+};
+
 export function createProdPorts(env: SentinelEnvBindings): SentinelPorts {
-  return { probe: makeProbe(), queen: (hive) => queenRpc(env.QUEEN, hive) };
+  return {
+    probe: makeProbe(),
+    queen: (hive) => queenRpc(env.QUEEN, hive),
+    log: safeLog,
+    metric: (p) => {
+      try {
+        writeMetric(env.ANALYTICS, p);
+      } catch {
+        /* best effort */
+      }
+    },
+  };
 }

@@ -4,8 +4,8 @@
  */
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowStepConfig } from "cloudflare:workers";
-import type { AppendAuditInput, AuditEvent, MemoryRecord, ScribeSummary, TrainResult } from "@queenos/queen-types";
-import { GitRepo, initRepo, type CompletionRequest, type CompletionResult } from "@queenos/hive-kit";
+import type { AppendAuditInput, AuditEvent, GateTarget, MemoryRecord, ScribeSummary, TrainResult } from "@queenos/queen-types";
+import { GitRepo, initRepo, type CompletionRequest, type CompletionResult, type LogFields } from "@queenos/hive-kit";
 import { readConfig, type GateConfig, type GateVars } from "../src/config";
 import type { GateTask } from "../src/event";
 import type { StepRunner } from "../src/orchestrate";
@@ -92,6 +92,7 @@ export interface FakeTrain {
 
 type QueenCall =
   | { method: "getSnapshot" }
+  | { method: "getGateTarget"; repo: string }
   | { method: "appendAudit"; input: AppendAuditInput }
   | { method: "recordScribeSummary"; input: ScribeSummary }
   | { method: "reportTrainResult"; input: TrainResult };
@@ -103,8 +104,19 @@ export class FakeQueen implements QueenPort {
   train: FakeTrain = { trainId: "train-1", artifactRepo: REPO, phase: "TESTING", headSha: null, includedPrompts: ["prompt-0", "prompt-1"] };
   promptText = "Add a dark mode toggle to settings";
   extraTrains: FakeTrain[] = [];
+  /** Absent by default (an older Queen: the gate scans the snapshot). `serveTarget` installs it (a v2 Queen). */
+  getGateTarget?: (repo: string) => Promise<GateTarget | null>;
   recentAudit: AuditEvent[] = [];
   reportError: Error | null = null;
+
+  /** Install `getGateTarget`: answers `answer` (or throws it, when an Error). */
+  serveTarget(answer: GateTarget | null | Error): void {
+    this.getGateTarget = async (repo) => {
+      this.calls.push({ method: "getGateTarget", repo });
+      if (answer instanceof Error) throw answer;
+      return answer;
+    };
+  }
 
   async getSnapshot(): Promise<QueenSnapshot> {
     this.calls.push({ method: "getSnapshot" });
@@ -199,10 +211,15 @@ export class FakeDispatcher implements GateDispatcher {
 
 export class FakeSmoke implements SmokeProbe {
   readonly urls: string[] = [];
+  /** `<path>` per call (default `/`). */
+  readonly paths: string[] = [];
   result: SmokeResult = { passed: true, status: 200, log: "smoke: ok" };
-  async check(url: string): Promise<SmokeResult> {
+  /** Per-path overrides (the integration gate probes several routes). */
+  byPath = new Map<string, SmokeResult>();
+  async check(url: string, path = "/"): Promise<SmokeResult> {
     this.urls.push(url);
-    return this.result;
+    this.paths.push(path);
+    return this.byPath.get(path) ?? this.result;
   }
 }
 
@@ -213,6 +230,7 @@ export class FakeWorld {
   readonly failures = new FakeFailureStore();
   readonly memory = new FakeMemory();
   readonly dispatcher = new FakeDispatcher();
+  readonly logs: LogFields[] = [];
   readonly smoke = new FakeSmoke();
   llm: ScribeLlm | null = null;
   reviewLlm: ScribeLlm | null = null;
@@ -230,6 +248,7 @@ export class FakeWorld {
       failures: this.failures,
       memory: this.memory,
       dispatcher: this.dispatcher,
+      log: (f) => void this.logs.push(f),
     };
   }
 }

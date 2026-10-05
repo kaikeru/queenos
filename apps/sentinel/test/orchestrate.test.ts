@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { SentinelVerdictSchema } from "@queenos/queen-types";
 import { BASELINE_PER_BATCH, CANARY_SETTLE_MS, READY_POLL_MS, READY_TIMEOUT_DEFAULT_SECONDS, CANDIDATE_PER_BATCH, MAX_BATCHES, OVERRIDES_HEADER, planBatches, runSentinel } from "../src/orchestrate";
-import { percentile } from "../src/verdict";
+import { decide, percentile } from "../src/verdict";
 import { FakeWorld, InlineSteps, canary, staging } from "./fakes";
 
 const HEADER = OVERRIDES_HEADER;
@@ -177,6 +177,8 @@ describe("readiness gate", () => {
     const v = SentinelVerdictSchema.parse(w.verdicts[0]);
     expect(v.summary).toBe("Staging: never became reachable within 20s (last status 503) → rollback");
     expect(v.metrics.requests).toBe(0);
+    expect(v.inconclusive).toBe(true);
+    expect(out).toMatchObject({ inconclusive: true });
     // only the gate probed "/": no measured traffic
     expect(w.calls.every((c) => c.url.endsWith("/"))).toBe(true);
   });
@@ -281,5 +283,62 @@ describe("percentile", () => {
     expect(percentile([], 99)).toBeNull();
     expect(percentile([5], 99)).toBe(5);
     expect(percentile(Array.from({ length: 100 }, (_, i) => i + 1), 99)).toBe(99);
+  });
+});
+
+describe("v2: inconclusive, AE window point, trace logs", () => {
+  const TRACE = "d".repeat(32);
+  const trace = { traceparent: `00-${TRACE}-${"e".repeat(16)}-01` };
+
+  it("a healthy verdict is not inconclusive, and writes one sentinel.window point", async () => {
+    const w = new FakeWorld();
+    const out = await runSentinel(staging({ trace }), new InlineSteps(), w.ports());
+    expect(out).toMatchObject({ verdict: "PROMOTE" });
+    expect(w.verdicts[0]!.inconclusive).toBeUndefined();
+    expect(w.points).toEqual([{ type: "sentinel.window", hive: "My Hive", kindOrRole: "sentinel", outcome: "PROMOTE", environment: "staging", traceId: TRACE, valueMs: 20, count: 60 }]);
+  });
+
+  it("a readiness timeout writes an INCONCLUSIVE point", async () => {
+    const w = new FakeWorld(() => ({ status: 503, ms: 100 }));
+    w.autoReady = false;
+    await runSentinel(staging({ readyTimeoutSeconds: 20 }), new InlineSteps(), w.ports());
+    expect(w.points[0]).toMatchObject({ outcome: "INCONCLUSIVE", count: 0 });
+    expect(w.points[0]).not.toHaveProperty("valueMs");
+  });
+
+  it("decide(): healthy but under half of minRequests is ROLLBACK + inconclusive; real failures are not", () => {
+    const cmd = { commandId: "c", releaseId: "r", environment: "staging" as const, minRequests: 100 };
+    const tally = (total: number, errors = 0) => ({ total, errors, smokeFailures: 0, latencies: Array(total).fill(10) as number[] });
+    const few = decide(cmd, tally(49), null);
+    expect(few).toMatchObject({ verdict: "ROLLBACK", inconclusive: true });
+    expect(few.summary).toContain("only 49 of 100");
+    expect(decide(cmd, tally(50), null)).toMatchObject({ verdict: "PROMOTE" });
+    const bad = decide(cmd, tally(10, 5), null);
+    expect(bad.verdict).toBe("ROLLBACK");
+    expect(bad.inconclusive).toBeUndefined();
+    expect(SentinelVerdictSchema.parse(few).inconclusive).toBe(true);
+  });
+
+  it("logs readiness and the verdict under the command's trace", async () => {
+    const w = new FakeWorld();
+    await runSentinel(staging({ trace }), new InlineSteps(), w.ports());
+    expect(w.logs.map((l) => [l.step, l.outcome])).toEqual([
+      ["sentinel: readiness", "ready"],
+      ["sentinel: verdict", "PROMOTE"],
+    ]);
+    expect(w.logs[0]).toMatchObject({ trace_id: TRACE, hive: "My Hive", command_id: "cmd-1", span_id: expect.stringMatching(/^[0-9a-f]{16}$/) });
+  });
+
+  it("telemetry that throws never fails the verdict", async () => {
+    const w = new FakeWorld();
+    const ports = w.ports();
+    ports.log = () => {
+      throw new Error("log down");
+    };
+    ports.metric = () => {
+      throw new Error("ae down");
+    };
+    const out = await runSentinel(staging(), new InlineSteps(), ports);
+    expect(out).toMatchObject({ verdict: "PROMOTE", queenOutcome: "applied" });
   });
 });

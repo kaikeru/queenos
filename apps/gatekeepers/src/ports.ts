@@ -2,8 +2,8 @@
  * Gatekeeper ports: every side effect the gate performs goes through this
  * object (mirrors apps/drones). Tests swap in fakes via GatekeeperWorkflow.createPorts().
  */
-import type { AppendAuditInput, AuditEvent, MemoryRecord, QueenServerMessage, ScribeSummary, TrainResult } from "@queenos/queen-types";
-import { HiveMemory, cloneRepo, createAiClient, type AiRunner, type GitRepo } from "@queenos/hive-kit";
+import type { AppendAuditInput, AuditEvent, GateTarget, MemoryRecord, QueenServerMessage, ScribeSummary, TrainResult } from "@queenos/queen-types";
+import { HiveMemory, cloneRepo, createAiClient, structuredLog, type AiRunner, type GitRepo, type LogFields } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import type { GateTask } from "./event";
 import type { ReviewLlm } from "./review";
@@ -37,7 +37,10 @@ export class BindingArtifactsPort implements ArtifactsPort {
 
 // ── git ──────────────────────────────────────────────────────────────────
 
-export type GitSession = Pick<GitRepo, "head" | "readCommit" | "listFiles" | "readFiles">;
+export type GitSession = Pick<GitRepo, "head" | "readCommit" | "listFiles" | "readFiles"> & {
+  /** WP1.12: paths changed between two commits. Optional so older hive-kit builds still work (inspect falls back to a commit walk). */
+  changedPaths?(from: string, to: string): Promise<string[]>;
+};
 
 export interface CloneRequest {
   remote: string;
@@ -61,6 +64,11 @@ export type QueenSnapshot = Extract<QueenServerMessage, { type: "snapshot" }>;
 /** RPC surface of apps/queen's QueenNode used by the gate. */
 export interface QueenPort {
   getSnapshot(): Promise<QueenSnapshot>;
+  /**
+   * v2 RPC (implemented by Phase 2): what a pushed repo is (lane, members, trace). Optional:
+   * an older Queen lacks it, and the gate then scans the snapshot (`lookupTrain`).
+   */
+  getGateTarget?(repo: string): Promise<GateTarget | null>;
   appendAudit(input: AppendAuditInput): Promise<Pick<AuditEvent, "eventId">>;
   recordScribeSummary(input: ScribeSummary): Promise<unknown>;
   reportTrainResult(input: TrainResult): Promise<{ outcome: string }>;
@@ -156,7 +164,18 @@ export interface GatekeeperPorts {
   /** Hive memory: one record per gate verdict, recalled by future builders. Best effort. */
   memory: { remember(r: MemoryRecord): Promise<void> };
   dispatcher: GateDispatcher;
+  /** One JSON log line per gate step (WP1.4's `structuredLog`); never throws. Tests collect the lines. */
+  log: (fields: LogFields) => void;
 }
+
+/** hive-kit's `structuredLog` is a stub until WP1.4 lands: a log line must never fail a gate. */
+export const safeLog = (fields: LogFields): void => {
+  try {
+    structuredLog(fields);
+  } catch {
+    /* logging is best effort */
+  }
+};
 
 export interface GateEnvBindings {
   ARTIFACTS?: Artifacts;
@@ -182,5 +201,6 @@ export function createProdPorts(env: GateEnvBindings, config: GateConfig): Gatek
     failures: new VectorizeFailureStore(env.AI, env.VECTORIZE),
     memory: new HiveMemory(env.AI as unknown as AiRunner | undefined, env.MEMORY),
     dispatcher: new WorkflowGateDispatcher(env.GATEKEEPER_WORKFLOW),
+    log: safeLog,
   };
 }

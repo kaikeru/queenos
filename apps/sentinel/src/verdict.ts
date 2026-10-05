@@ -39,7 +39,10 @@ export function percentile(samples: number[], p: number): number | null {
 const pct = (r: number) => `${Math.round(r * 1000) / 10}%`;
 const ms = (v: number | null) => (v === null ? "n/a" : `${Math.round(v)}ms`);
 
-export type VerdictInput = Pick<SentinelCommand, "commandId" | "releaseId" | "environment" | "canaryPercent">;
+export type VerdictInput = Pick<SentinelCommand, "commandId" | "releaseId" | "environment" | "canaryPercent"> & Partial<Pick<SentinelCommand, "minRequests">>;
+
+/** Fewer than half of `minRequests` answered: the sample is too small to promote on. */
+export const isTooFewRequests = (total: number, minRequests: number | undefined): boolean => minRequests !== undefined && total < Math.ceil(minRequests / 2);
 
 /** Whole seconds, for summaries. */
 const secs = (v: number) => `${Math.round(v / 1000)}s`;
@@ -55,6 +58,8 @@ export function gateTimeoutVerdict(cmd: VerdictInput, timeoutSeconds: number, la
     verdict: "ROLLBACK",
     metrics: { requests: 0, errorRate: 1, p99Ms: null, baselineErrorRate: null },
     summary: `${label}: never became reachable within ${timeoutSeconds}s (last status ${last}) → rollback`,
+    // Nothing was measured: the Queen parks staging for a human (SENTINEL_INCONCLUSIVE) instead of treating it as a bad build.
+    inconclusive: true,
   };
 }
 
@@ -72,6 +77,9 @@ export function decide(cmd: VerdictInput, candidate: Tally, baseline: Tally | nu
   const p99Limit = Math.max(P99_FLOOR_MS, P99_BASELINE_FACTOR * (baseP99 ?? 0));
   if (p99 !== null && p99 > p99Limit) reasons.push(`p99 ${ms(p99)} > ${ms(p99Limit)}`);
 
+  // Healthy but under-sampled: still ROLLBACK (old Queens stay safe), flagged inconclusive. Real failures are not.
+  const inconclusive = reasons.length === 0 && isTooFewRequests(candidate.total, cmd.minRequests);
+  if (inconclusive) reasons.push(`inconclusive: only ${candidate.total} of ${cmd.minRequests} requests answered`);
   const verdict = reasons.length > 0 ? "ROLLBACK" : "PROMOTE";
   const label = cmd.environment === "canary" ? `Canary ${cmd.canaryPercent ?? "?"}%` : "Staging";
   const base = hasBaseline ? ` vs baseline ${baseline.errors}/${baseline.total}` : "";
@@ -88,5 +96,6 @@ export function decide(cmd: VerdictInput, candidate: Tally, baseline: Tally | nu
     verdict,
     metrics: { requests: candidate.total, errorRate, p99Ms: p99, baselineErrorRate: baseRate },
     summary,
+    ...(inconclusive ? { inconclusive: true } : {}),
   };
 }

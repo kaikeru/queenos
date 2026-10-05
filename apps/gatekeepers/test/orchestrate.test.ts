@@ -26,7 +26,7 @@ describe("runGate: pass path", () => {
     const out = await runGate(gateTask(after, { before: base }), steps, w.ports(), config());
 
     expect(out).toMatchObject({ status: "gated", trainId: "train-1", passed: true, queenOutcome: "applied" });
-    expect(w.queen.reports()).toEqual([{ trainId: "train-1", passed: true, summary: expect.stringContaining("Gate passed"), commitSha: after }]);
+    expect(w.queen.reports()).toEqual([{ trainId: "train-1", passed: true, summary: expect.stringContaining("Gate passed"), commitSha: after, score: { review: "off", satisfied: 0, missing: 0, changedFiles: 2, changedBytes: expect.any(Number), checks: 19 } }]);
     expect(w.queen.auditSeq()).toEqual(["POLICY:RUNNING", "SECURITY:RUNNING", "POLICY:PASSED", "SECURITY:PASSED"]);
     // Audits are attached to the train's own prompt (tail of includedPrompts), not a predecessor's.
     expect(new Set(w.queen.audits().map((a) => a.promptId))).toEqual(new Set(["prompt-1"]));
@@ -73,7 +73,7 @@ describe("runGate: fail path ([fail] demo)", () => {
     expect(out.summary.length).toBeLessThanOrEqual(500);
     expect(out.summary).toContain("[fail] marker found in changed file features/fix.md");
     expect(w.queen.scribes()).toEqual([{ promptId: "prompt-1", trainId: "train-1", summary: out.summary }]);
-    expect(w.queen.reports()).toEqual([{ trainId: "train-1", passed: false, summary: out.summary, commitSha: after }]);
+    expect(w.queen.reports()).toEqual([{ trainId: "train-1", passed: false, summary: out.summary, commitSha: after, score: expect.objectContaining({ review: "off" }) }]);
 
     // Raw logs go to Vectorize (never to the Queen).
     const chunks = w.failures.stored[0]!;

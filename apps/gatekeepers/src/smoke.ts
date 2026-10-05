@@ -23,7 +23,8 @@ export interface SmokeResult {
 }
 
 export interface SmokeProbe {
-  check(previewUrl: string): Promise<SmokeResult>;
+  /** `GET <previewUrl><path>` (default `/`) must answer 2xx. */
+  check(previewUrl: string, path?: string): Promise<SmokeResult>;
 }
 
 export interface SmokeOptions {
@@ -38,6 +39,8 @@ export interface SmokeOptions {
 }
 
 export const SMOKE_CHECK = "preview smoke > GET / returns 2xx";
+/** The check name for one route (the Scribe quotes it). `/` keeps the v1 name. */
+export const smokeCheckName = (path: string) => (path === "/" ? SMOKE_CHECK : `preview smoke > GET ${path} returns 2xx`);
 const BODY_SNIPPET_CHARS = 500;
 export const EVIDENCE_BODY_CHARS = 1_024;
 
@@ -56,8 +59,9 @@ export class FetchSmokeProbe implements SmokeProbe {
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
-  async check(previewUrl: string): Promise<SmokeResult> {
-    const url = `${previewUrl.replace(/\/+$/, "")}/`;
+  async check(previewUrl: string, path = "/"): Promise<SmokeResult> {
+    const route = path.startsWith("/") ? path : `/${path}`;
+    const url = `${previewUrl.replace(/\/+$/, "")}${route}`;
     const lines = [`> smoke: GET ${url} (timeout ${this.timeoutMs}ms, up to ${this.attempts} attempts)`];
     let status: number | undefined;
     let body = "";
@@ -87,9 +91,9 @@ export class FetchSmokeProbe implements SmokeProbe {
 
     const firstError =
       status !== undefined
-        ? `AssertionError: preview smoke failed: GET / returned HTTP ${status} (expected 2xx)`
-        : `AssertionError: preview smoke failed: GET / unreachable after ${this.attempts} attempts (${networkError})`;
-    lines.push("", ` FAIL  ${SMOKE_CHECK}`, firstError);
+        ? `AssertionError: preview smoke failed: GET ${route} returned HTTP ${status} (expected 2xx)`
+        : `AssertionError: preview smoke failed: GET ${route} unreachable after ${this.attempts} attempts (${networkError})`;
+    lines.push("", ` FAIL  ${smokeCheckName(route)}`, firstError);
     if (status !== undefined) lines.push(`response body: ${oneLine(body.slice(0, BODY_SNIPPET_CHARS)) || "(empty)"}`);
     return { passed: false, ...(status !== undefined ? { status } : {}), log: lines.join("\n"), firstError };
   }

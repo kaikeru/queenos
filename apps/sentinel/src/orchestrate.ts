@@ -8,7 +8,7 @@
  * only counts and a latency sample, never bodies.
  */
 import type { WorkflowStepConfig } from "cloudflare:workers";
-import { SentinelCommandSchema, type SentinelCommand, type SentinelVerdict } from "@queenos/queen-types";
+import { SentinelCommandSchema, spanIdFor, type AnalyticsPoint, type SentinelCommand, type SentinelVerdict } from "@queenos/queen-types";
 import type { SentinelPorts } from "./ports";
 import { decide, emptyTally, gateTimeoutVerdict, mergeTallies, type Tally } from "./verdict";
 
@@ -40,7 +40,44 @@ export class SentinelFailedError extends Error {
   override readonly name = "SentinelFailedError";
 }
 
-export type SentinelRunResult = { commandId: string; verdict: SentinelVerdict["verdict"]; summary: string; queenOutcome: string };
+export type SentinelRunResult = { commandId: string; verdict: SentinelVerdict["verdict"]; summary: string; queenOutcome: string; inconclusive?: boolean };
+
+/** Trace id out of a W3C traceparent (`00-<32 hex>-<16 hex>-<flags>`). */
+export function traceIdOf(cmd: Pick<SentinelCommand, "trace">): string | null {
+  return /^00-([0-9a-f]{32})-/.exec(cmd.trace?.traceparent ?? "")?.[1] ?? null;
+}
+
+/** The AE point for one window: type `sentinel.window`; value = p99 ms, count = requests. */
+export function windowPoint(cmd: SentinelCommand, v: SentinelVerdict): AnalyticsPoint {
+  return {
+    type: "sentinel.window",
+    hive: cmd.hive,
+    kindOrRole: "sentinel",
+    outcome: v.inconclusive ? "INCONCLUSIVE" : v.verdict,
+    environment: cmd.environment,
+    ...(traceIdOf(cmd) ? { traceId: traceIdOf(cmd)! } : {}),
+    ...(v.metrics.p99Ms !== null ? { valueMs: v.metrics.p99Ms } : {}),
+    count: v.metrics.requests,
+  };
+}
+
+function slog(ports: SentinelPorts, cmd: SentinelCommand, step: string, outcome: string, extra: Record<string, unknown> = {}): void {
+  try {
+    ports.log?.({
+      trace_id: traceIdOf(cmd),
+      span_id: spanIdFor(`${cmd.commandId}/${step}`),
+      parent_span_id: spanIdFor(cmd.commandId),
+      hive: cmd.hive,
+      command_id: cmd.commandId,
+      step: `sentinel: ${step}`,
+      outcome,
+      environment: cmd.environment,
+      ...extra,
+    });
+  } catch {
+    /* logging never fails a verdict */
+  }
+}
 
 export interface BatchPlan {
   /** Candidate requests per batch (sums to ~minRequests). */
@@ -124,6 +161,7 @@ export async function runSentinel(payload: unknown, step: StepRunner, ports: Sen
   const timeoutSeconds = cmd.readyTimeoutSeconds ?? READY_TIMEOUT_DEFAULT_SECONDS;
 
   const gate = await readinessGate(ports, step, cmd.url, candHeaders, timeoutSeconds);
+  slog(ports, cmd, "readiness", gate.ready ? "ready" : "timeout", gate.ready ? { ms: gate.readyMs } : { last_status: gate.lastStatus });
   let verdict: SentinelVerdict;
   if (!gate.ready) {
     verdict = gateTimeoutVerdict(cmd, timeoutSeconds, gate.lastStatus);
@@ -151,6 +189,13 @@ export async function runSentinel(payload: unknown, step: StepRunner, ports: Sen
     }
     verdict = decide(cmd, mergeTallies(candidate), withBaseline ? mergeTallies(baseline) : null, gate.readyMs);
   }
+  slog(ports, cmd, "verdict", verdict.inconclusive ? "inconclusive" : verdict.verdict, { requests: verdict.metrics.requests, error_rate: verdict.metrics.errorRate, p99_ms: verdict.metrics.p99Ms });
+  // One AE point per window (never awaited, never fails the verdict).
+  try {
+    ports.metric?.(windowPoint(cmd, verdict));
+  } catch {
+    /* telemetry is best effort */
+  }
 
   const queenOutcome = await step.do("report: sentinel verdict", REPORT_STEP, async () => {
     try {
@@ -162,5 +207,5 @@ export async function runSentinel(payload: unknown, step: StepRunner, ports: Sen
     }
   });
 
-  return { commandId: cmd.commandId, verdict: verdict.verdict, summary: verdict.summary, queenOutcome };
+  return { commandId: cmd.commandId, verdict: verdict.verdict, summary: verdict.summary, queenOutcome, ...(verdict.inconclusive ? { inconclusive: true } : {}) };
 }

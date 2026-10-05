@@ -1,5 +1,6 @@
 import type { WorkflowStepConfig } from "cloudflare:workers";
-import type { SentinelCommandInput, SentinelVerdict } from "@queenos/queen-types";
+import type { LogFields } from "@queenos/hive-kit";
+import type { AnalyticsPoint, SentinelCommandInput, SentinelVerdict } from "@queenos/queen-types";
 import type { StepRunner } from "../src/orchestrate";
 import type { QueenPort, SentinelPorts } from "../src/ports";
 
@@ -23,6 +24,8 @@ export class FakeWorld {
   autoReady = true;
   readonly verdicts: SentinelVerdict[] = [];
   readonly hives: string[] = [];
+  readonly logs: LogFields[] = [];
+  readonly points: AnalyticsPoint[] = [];
   queenError: Error | null = null;
   queenFailures = 0;
   constructor(public responder: Responder = () => ({ status: 200, ms: 20 })) {}
@@ -41,6 +44,8 @@ export class FakeWorld {
 
   ports(): SentinelPorts {
     return {
+      log: (f) => void this.logs.push(f),
+      metric: (p) => void this.points.push(p),
       probe: async (url, headers) => {
         const call = { url, headers };
         if (this.autoReady && this.gateCalls.length < 3 && this.calls.length === 0) {

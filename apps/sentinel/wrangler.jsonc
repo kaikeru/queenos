@@ -14,6 +14,8 @@
       "class_name": "SentinelWorkflow"
     }
   ],
+  // Analytics Engine: one `sentinel.window` point per verdict (v2 design §2.8).
+  "analytics_engine_datasets": [{ "binding": "ANALYTICS", "dataset": "queenos_events" }],
   "durable_objects": {
     "bindings": [
       // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen").

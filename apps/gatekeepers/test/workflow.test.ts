@@ -20,7 +20,7 @@ describe("GatekeeperWorkflow (Workflows runtime, scripted mode, fake ports)", ()
     await instance.waitForStatus("complete");
 
     expect(await instance.getOutput()).toMatchObject({ status: "gated", passed: true, queenOutcome: "applied" });
-    expect(w.queen.reports()).toEqual([{ trainId: "train-1", passed: true, summary: expect.any(String), commitSha: after }]);
+    expect(w.queen.reports()).toEqual([{ trainId: "train-1", passed: true, summary: expect.any(String), commitSha: after, score: expect.objectContaining({ review: "approved" }) }]);
     expect(w.queen.auditSeq()).toEqual(["POLICY:RUNNING", "SECURITY:RUNNING", "POLICY:PASSED", "SECURITY:PASSED", "REVIEWER:RUNNING", "REVIEWER:PASSED"]);
   });
 

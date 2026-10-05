@@ -14,13 +14,13 @@
  */
 import type { WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import type { AppendAuditInput, AuditEvent, AuditStatus, DroneRole, GitNotesPayload, MemoryOutcome } from "@queenos/queen-types";
+import { spanIdFor, type AppendAuditInput, type AuditEvent, type AuditStatus, type DroneRole, type FollowUp, type GateScore, type GateTarget, type GitNotesPayload, type MemoryOutcome, type TrainLane } from "@queenos/queen-types";
 import { AiGatewayError, LedgerError, buildGitNotesPayload, composeMemoryText, memoryIdFor } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import { classifyPush, gateInstanceId, parsePushEvent, type GateTask } from "./event";
 import { formatFinding, type ScanReport } from "./findings";
-import { inspectPush, type Inspection } from "./inspect";
-import type { FailureChunk, GatekeeperPorts, QueenPort } from "./ports";
+import { integrationRoutes, inspectPush, type Inspection, type IntegrationSpec } from "./inspect";
+import type { FailureChunk, GatekeeperPorts, QueenPort, QueenSnapshot } from "./ports";
 import { MAX_PROMPT_CHARS, SCRIPTED_REVIEW_MODEL, runReview, scriptedReview, type ReviewOutcome, type ReviewPacket } from "./review";
 import { MAX_SUMMARY_CHARS, clip, extractiveSummary, summarizeFailure, type ScribeResult } from "./scribe";
 import { NotImplementedError } from "./test-runner";
@@ -77,29 +77,104 @@ export async function handlePush(payload: unknown, step: StepRunner, ports: Gate
 
 // ── the gate ────────────────────────────────────────────────────────────────
 
-export type Lookup =
-  | { status: "ready"; trainId: string; promptId: string; promptText: string; /** Up to 4 KB, for the reviewer. */ promptFull: string; previewUrl: string | null; /** The newest BUILDER ledger's first reasoning steps (small, for hive memory). */ builderReasoning: string[] }
-  | { status: "waiting"; phase: string }
-  | { status: "ignored"; reason: string };
+export type ReadyLookup = {
+  status: "ready";
+  trainId: string;
+  promptId: string;
+  promptText: string;
+  /** Up to 4 KB, for the reviewer. */
+  promptFull: string;
+  previewUrl: string | null;
+  /** The newest BUILDER ledger's first reasoning steps (small, for hive memory). */
+  builderReasoning: string[];
+  /** BUILD: the full gate. QUEUE: the integration gate. */
+  lane: TrainLane;
+  /** The car's base (QUEUE: the integration gate scans `baseSha..head`). */
+  baseSha: string | null;
+  /** The train's trace id (a car's members each have their own: `memberTraces`). */
+  traceId: string | null;
+  /** QUEUE: smoke routes (`/`, `/health`, every member's smokePaths) and the members' trace ids. */
+  routes: IntegrationSpec["routes"];
+  memberTraces: string[];
+};
+export type Lookup = ReadyLookup | { status: "waiting"; phase: string } | { status: "ignored"; reason: string };
 
-/** Which train does this push belong to, and is it ready to be gated? */
-export async function lookupTrain(queen: QueenPort, task: Pick<GateTask, "repo" | "after">): Promise<Lookup> {
-  // No lookup-by-repo RPC exists yet: scan the snapshot (see report: proposed getTrainByRepo).
-  const snap = await queen.getSnapshot();
+const WAITING_PHASES = new Set(["BUILDING", "WAITING_PARENT", "DEPLOYING"]);
+
+/** `GateTarget` (Queen RPC) to a lookup. The member list is the integration gate's smoke-route source. */
+export function lookupFromTarget(t: GateTarget, builderReasoning: string[]): Lookup {
+  // DEPLOYING: the Herald is putting the train on a Worker Preview; TESTING follows with `previewUrl` set.
+  if (WAITING_PHASES.has(t.phase)) return { status: "waiting", phase: t.phase };
+  if (t.phase !== "TESTING") return { status: "ignored", reason: `phase-${t.phase}` };
+  if (!t.promptId) return { status: "ignored", reason: "train-without-prompt" };
+  const members = t.lane === "QUEUE" ? (t.members ?? []) : [];
+  return {
+    status: "ready",
+    trainId: t.trainId,
+    promptId: t.promptId,
+    promptText: t.promptText.slice(0, 500),
+    promptFull: t.promptText.slice(0, MAX_PROMPT_CHARS),
+    previewUrl: t.previewUrl || null,
+    builderReasoning,
+    lane: t.lane,
+    baseSha: t.baseSha,
+    traceId: t.traceId,
+    routes: t.lane === "QUEUE" ? integrationRoutes(members) : [],
+    memberTraces: [...new Set(members.flatMap((m) => (m.traceId ? [m.traceId] : [])))],
+  };
+}
+
+/** The pre-v2 path, kept as the fallback: find the train in the Queen's snapshot by repo. */
+export function lookupFromSnapshot(snap: QueenSnapshot, task: Pick<GateTask, "repo" | "after">): Lookup {
   const train = snap.trains.find((t) => t.artifactRepo === task.repo);
   if (!train) return { status: "ignored", reason: "unknown-train" };
   const phase = train.phase ?? train.status;
-  // DEPLOYING: the Herald is putting the train on a Worker Preview; TESTING follows with `previewUrl` set.
-  if (phase === "BUILDING" || phase === "WAITING_PARENT" || phase === "DEPLOYING") return { status: "waiting", phase };
+  if (WAITING_PHASES.has(phase)) return { status: "waiting", phase };
   if (phase !== "TESTING") return { status: "ignored", reason: `phase-${phase}` };
   if (train.headSha && train.headSha !== task.after) return { status: "ignored", reason: "not-train-head" };
   const promptId = train.includedPrompts.at(-1) ?? "";
   if (!promptId) return { status: "ignored", reason: "train-without-prompt" };
   const promptText = snap.promptRuns.find((p) => p.promptId === promptId)?.promptText ?? promptId;
-  // `previewUrl` is absent in sim mode and on trains from before the Herald existed.
-  const previewUrl = (train as { previewUrl?: string | null }).previewUrl || null;
-  const builderReasoning = builderReasoningFor(snap.recentAudit, promptId);
-  return { status: "ready", trainId: train.trainId, promptId, promptText: promptText.slice(0, 500), promptFull: promptText.slice(0, MAX_PROMPT_CHARS), previewUrl, builderReasoning };
+  const lane: TrainLane = train.lane ?? "BUILD";
+  // A v2 Queen's snapshot knows a car's member ids; smoke paths and titles are not in it (getGateTarget has them).
+  const memberTrains = lane === "QUEUE" ? (train.members ?? []).flatMap((id) => snap.trains.filter((m) => m.trainId === id)) : [];
+  return {
+    status: "ready",
+    trainId: train.trainId,
+    promptId,
+    promptText: promptText.slice(0, 500),
+    promptFull: promptText.slice(0, MAX_PROMPT_CHARS),
+    // `previewUrl` is absent in sim mode and on trains from before the Herald existed.
+    previewUrl: train.previewUrl || null,
+    builderReasoning: builderReasoningFor(snap.recentAudit, promptId),
+    lane,
+    baseSha: lane === "QUEUE" ? train.baseSha : null,
+    traceId: train.traceId ?? null,
+    routes: lane === "QUEUE" ? integrationRoutes([]) : [],
+    memberTraces: [...new Set(memberTrains.flatMap((m) => (m.traceId ? [m.traceId] : [])))],
+  };
+}
+
+/**
+ * Which train does this push belong to, and is it ready to be gated? Asks the Queen's
+ * `getGateTarget(repo)` RPC; when the Queen predates it (or the call fails) scans the snapshot instead.
+ */
+export async function lookupTrain(queen: QueenPort, task: Pick<GateTask, "repo" | "after">): Promise<Lookup> {
+  if (typeof queen.getGateTarget === "function") {
+    try {
+      const target = await queen.getGateTarget(task.repo);
+      if (!target) return { status: "ignored", reason: "unknown-train" };
+      // The BUILDER ledger (hive memory) is only in the snapshot's audit tail: best effort.
+      let reasoning: string[] = [];
+      if (target.lane === "BUILD" && target.phase === "TESTING") {
+        reasoning = await queen.getSnapshot().then((snap) => builderReasoningFor(snap.recentAudit, target.promptId)).catch(() => []);
+      }
+      return lookupFromTarget(target, reasoning);
+    } catch (e) {
+      console.warn("gatekeeper: getGateTarget unavailable; scanning the snapshot", messageOf(e));
+    }
+  }
+  return lookupFromSnapshot(await queen.getSnapshot(), task);
 }
 
 const MEMORY_REASONING_STEPS = 6;
@@ -125,6 +200,10 @@ export type GateRunResult =
       queenOutcome: string;
       /** REVIEWER outcome; absent when review is off or did not run. */
       review?: "approved" | "rejected" | "skipped";
+      lane?: TrainLane;
+      /** v2: what was reported with the verdict. */
+      score?: GateScore;
+      followUps?: FollowUp[];
       scribe?: ScribeResult["method"];
       vectorized?: number;
     };
@@ -134,12 +213,12 @@ interface Ctx {
   step: StepRunner;
   ports: GatekeeperPorts;
   config: GateConfig;
-  train: Extract<Lookup, { status: "ready" }>;
+  train: ReadyLookup;
 }
 
 export async function runGate(task: GateTask, step: StepRunner, ports: GatekeeperPorts, config: GateConfig): Promise<GateRunResult> {
   // 1. Wait for the Queen to process the builder's build-result (push event vs RPC race).
-  let train: Extract<Lookup, { status: "ready" }> | null = null;
+  let train: ReadyLookup | null = null;
   for (let i = 1; i <= config.phaseRetries; i++) {
     const look = await step.do(`lookup train #${i}`, LOOKUP_STEP, () => lookupTrain(ports.queen(task.hive), task));
     if (look.status === "ignored") return { status: "ignored", reason: look.reason };
@@ -152,17 +231,21 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   if (!train) return { status: "ignored", reason: "phase-timeout" };
 
   const ctx: Ctx = { task, step, ports, config, train };
+  const integration = train.lane === "QUEUE";
+  glog(ctx, "lookup", "ready", { phaseRetries: config.phaseRetries });
 
   // 2. POLICY + SECURITY run while the dashboard shows yellow.
   await audit(ctx, "audit: policy running", "POLICY", "RUNNING", null);
   await audit(ctx, "audit: security running", "SECURITY", "RUNNING", null);
 
   let inspection: Inspection;
+  const spec: IntegrationSpec | undefined = integration ? { baseSha: train.baseSha, routes: train.routes } : undefined;
   try {
     inspection = await step.do("inspect: clone, scan, test", INSPECT_STEP, () =>
-      inspectPush(ports, task, config, train.trainId, train.previewUrl, train.promptFull).catch((e) => Promise.reject(toStepError(e))),
+      inspectPush(ports, task, config, train.trainId, train.previewUrl, train.promptFull, spec).catch((e) => Promise.reject(toStepError(e))),
     );
   } catch (e) {
+    glog(ctx, "inspect", "infra-failure", { error: clip(messageOf(e), 200) });
     return failInfra(ctx, e);
   }
   if (inspection.status === "stale") return { status: "ignored", reason: "stale-head" };
@@ -172,23 +255,29 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   await audit(ctx, "audit: security result", "SECURITY", inspection.security.passed ? "PASSED" : "REJECTED", ledgerFor(ctx, SECURITY_MODEL, ms, scanSteps("security", inspection.security), inspection.security.passed));
 
   // 2b. REVIEWER: does the change satisfy the prompt? Only for working code (policy, security, smoke passed).
+  // The integration gate (a QUEUE car) has no reviewer: every member was reviewed on its own build.
   let reviewState: "approved" | "skipped" | undefined;
-  if (inspection.review) {
+  let counts = { satisfied: 0, missing: 0 };
+  if (inspection.review && !integration) {
     const r = await reviewGate(ctx, inspection.review);
-    if (r.rejected) return failReview(ctx, r.feedback, r.missing, r.report, inspection.changedPaths);
+    if (r.rejected) return failReview(ctx, r.feedback, r.missing, r.report, inspection.changedPaths, inspection);
     reviewState = r.skipped ? "skipped" : "approved";
+    counts = r.counts;
   }
+  const extras = reportExtras(ctx, inspection, reviewState, counts);
+  glog(ctx, "inspect", inspection.policy.passed && inspection.security.passed ? "scanned" : "scan-failed", { ms, followUps: inspection.followUps.length, changedFiles: inspection.changedFiles });
 
   const passed = inspection.policy.passed && inspection.security.passed && (inspection.tests?.passed ?? false);
   if (passed) {
     const summary = clip(
-      `Gate passed: policy (${inspection.policy.filesScanned} files), security, tests (${inspection.tests?.checks ?? 0} checks) at ${task.after.slice(0, 12)}.`,
+      `${integration ? "Integration gate" : "Gate"} passed: policy (${inspection.policy.filesScanned} files), security, tests (${inspection.tests?.checks ?? 0} checks) at ${task.after.slice(0, 12)}.`,
       MAX_SUMMARY_CHARS,
     );
     const verdict = reviewState === "approved" ? `${summary} The reviewer approved the change.` : summary;
     await remember(ctx, "PASSED", verdict, inspection.changedPaths);
-    const queenOutcome = await report(ctx, true, summary);
-    return { status: "gated", trainId: train.trainId, passed: true, summary, queenOutcome, ...(reviewState ? { review: reviewState } : {}) };
+    const queenOutcome = await report(ctx, true, summary, extras);
+    glog(ctx, "gate", "passed", { ms: Math.max(0, Date.now() - inspection.startedAtMs) });
+    return { status: "gated", trainId: train.trainId, passed: true, summary, queenOutcome, lane: train.lane, ...extras, ...(reviewState ? { review: reviewState } : {}) };
   }
 
   // 3. Failure: the Scribe compacts the raw log; the Queen only ever sees the summary.
@@ -209,7 +298,13 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
     console.warn("gatekeeper: scribe LLM failed; using extractive summary", messageOf(e));
     scribe = { summary: extractiveSummary(rawLog, inspection.failingCheck ?? undefined), method: "extractive" };
   }
-  const summary = clip(scribe.summary, MAX_SUMMARY_CHARS);
+  let summary = clip(scribe.summary, MAX_SUMMARY_CHARS);
+  // The integration gate's Scribe summary must name the failing member's route (the LLM may drop it).
+  const route = inspection.failedRoute;
+  if (route && !summary.includes(route.path)) {
+    const who = route.trainId ? ` (member ${route.title ? `"${route.title}" ` : ""}${route.trainId})` : "";
+    summary = clip(`Integration gate: GET ${route.path}${who} failed. ${summary}`, MAX_SUMMARY_CHARS);
+  }
   await step.do("scribe: record summary", REPORT_STEP, async () => {
     try {
       await ports.queen(task.hive).recordScribeSummary({ promptId: train.promptId, trainId: train.trainId, summary });
@@ -223,13 +318,14 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
 
   const vectorized = await vectorize(ctx, rawLog);
   await remember(ctx, "FAILED", summary, inspection.changedPaths);
-  const queenOutcome = await report(ctx, false, summary);
-  return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, ...(reviewState ? { review: reviewState } : {}), scribe: scribe.method, vectorized };
+  const queenOutcome = await report(ctx, false, summary, extras);
+  glog(ctx, "gate", "failed", { ms: Math.max(0, Date.now() - inspection.startedAtMs), check: inspection.failingCheck ?? undefined });
+  return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, lane: train.lane, ...extras, ...(reviewState ? { review: reviewState } : {}), scribe: scribe.method, vectorized };
 }
 
 // ── reviewer ──────────────────────────────────────────────────────────────
 
-type ReviewGate = { rejected: false; skipped: boolean } | { rejected: true; feedback: string; missing: string[]; report: string };
+type ReviewGate = { rejected: false; skipped: boolean; counts: { satisfied: number; missing: number } } | { rejected: true; feedback: string; missing: string[]; report: string };
 
 async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
   const { config, ports, step, train } = ctx;
@@ -260,7 +356,7 @@ async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
     // Fail open: infrastructure hiccups must not eject trains.
     console.warn("gatekeeper: reviewer unavailable; continuing", outcome.reason);
     await audit(ctx, "audit: reviewer result", "REVIEWER", "PASSED", ledgerFor(ctx, outcome.model, outcome.ms, [`warning: reviewer unavailable, failing open: ${outcome.reason}`], true));
-    return { rejected: false, skipped: true };
+    return { rejected: false, skipped: true, counts: { satisfied: 0, missing: 0 } };
   }
 
   const v = outcome.verdict;
@@ -272,7 +368,7 @@ async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
   ];
   if (v.verdict === "APPROVE") {
     await audit(ctx, "audit: reviewer result", "REVIEWER", "PASSED", ledgerFor(ctx, outcome.model, outcome.ms, reasoning, true));
-    return { rejected: false, skipped: false };
+    return { rejected: false, skipped: false, counts: { satisfied: v.satisfied.length, missing: v.missing.length } };
   }
   await audit(ctx, "audit: reviewer result", "REVIEWER", "REJECTED", ledgerFor(ctx, outcome.model, outcome.ms, reasoning, false));
   const report = [`REVIEWER rejected the change: it does not satisfy the prompt.`, `Prompt: ${train.promptFull}`, ...reasoning.slice(1)].join("\n");
@@ -280,7 +376,7 @@ async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
 }
 
 /** The reviewer's feedback is the Scribe summary, so the Queen's REWORK carries it to the next builder. */
-async function failReview(ctx: Ctx, feedback: string, missing: string[], rawLog: string, changedPaths: string[]): Promise<GateRunResult> {
+async function failReview(ctx: Ctx, feedback: string, missing: string[], rawLog: string, changedPaths: string[], inspection: Extract<Inspection, { status: "done" }>): Promise<GateRunResult> {
   const { task, train, ports } = ctx;
   const summary = clip(feedback, MAX_SUMMARY_CHARS);
   await ctx.step.do("scribe: record summary", REPORT_STEP, async () => {
@@ -294,8 +390,11 @@ async function failReview(ctx: Ctx, feedback: string, missing: string[], rawLog:
   });
   const vectorized = await vectorize(ctx, rawLog);
   await remember(ctx, "REJECTED_BY_REVIEW", missing.length ? `${feedback} Missing: ${missing.join("; ")}` : feedback, changedPaths);
-  const queenOutcome = await report(ctx, false, summary);
-  return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, review: "rejected", vectorized };
+  // No score on a rejection (GateScore.review has no "rejected"); out-of-diff findings are still filed.
+  const followUps = inspection.followUps.length ? { followUps: inspection.followUps } : {};
+  const queenOutcome = await report(ctx, false, summary, followUps);
+  glog(ctx, "gate", "rejected-by-review", {});
+  return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, lane: train.lane, review: "rejected", vectorized, ...followUps };
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -336,10 +435,31 @@ async function audit(ctx: Ctx, name: string, role: DroneRole, status: AuditStatu
   });
 }
 
-async function report(ctx: Ctx, passed: boolean, summary: string): Promise<string> {
+/** The v2 fields of `TrainResult`: the gate score, and out-of-diff findings as follow-ups. */
+function reportExtras(ctx: Ctx, inspection: Extract<Inspection, { status: "done" }>, reviewState: "approved" | "skipped" | undefined, counts: { satisfied: number; missing: number }): { score: GateScore; followUps?: FollowUp[] } {
+  const review: GateScore["review"] = ctx.train.lane === "QUEUE" ? "skipped" : ctx.config.reviewMode === "off" ? "off" : (reviewState ?? "skipped");
+  return {
+    score: { review, satisfied: counts.satisfied, missing: counts.missing, changedFiles: inspection.changedFiles, changedBytes: inspection.changedBytes, checks: inspection.tests?.checks ?? 0 },
+    ...(inspection.followUps.length ? { followUps: inspection.followUps } : {}),
+  };
+}
+
+/** One structured log line per trace: the train's, and for a car each member's (§2.6). Never throws. */
+function glog(ctx: Ctx, step: string, outcome: string, extra: Record<string, unknown>): void {
+  const { train, task } = ctx;
+  const traces = [...new Set([...(train.traceId ? [train.traceId] : []), ...train.memberTraces])];
+  const base = { hive: task.hive, step: `gate: ${step}`, outcome, lane: train.lane, train_id: train.trainId, commit_sha: task.after, span_id: spanIdFor(`gate:${train.trainId}:${task.after}`), parent_span_id: spanIdFor(train.trainId), ...extra };
+  try {
+    for (const trace_id of traces.length ? traces : [null]) ctx.ports.log({ ...base, trace_id });
+  } catch {
+    /* logging never fails a gate */
+  }
+}
+
+async function report(ctx: Ctx, passed: boolean, summary: string, extras: { score?: GateScore; followUps?: FollowUp[] } = {}): Promise<string> {
   return ctx.step.do("report: train result", REPORT_STEP, async () => {
     try {
-      const r = await ctx.ports.queen(ctx.task.hive).reportTrainResult({ trainId: ctx.train.trainId, passed, summary, commitSha: ctx.task.after });
+      const r = await ctx.ports.queen(ctx.task.hive).reportTrainResult({ trainId: ctx.train.trainId, passed, summary, commitSha: ctx.task.after, ...extras });
       return String(r.outcome);
     } catch (e) {
       if (!isPermanentQueenError(e)) throw e;
@@ -363,7 +483,7 @@ async function failInfra(ctx: Ctx, err: unknown): Promise<GateRunResult> {
     return { recorded: true };
   });
   const queenOutcome = await report(ctx, false, summary);
-  return { status: "gated", trainId: ctx.train.trainId, passed: false, summary, queenOutcome };
+  return { status: "gated", trainId: ctx.train.trainId, passed: false, summary, queenOutcome, lane: ctx.train.lane };
 }
 
 export const CHUNK_CHARS = 1_500;
@@ -395,6 +515,8 @@ async function vectorize(ctx: Ctx, rawLog: string): Promise<number> {
 /** Best effort: one hive memory per gate verdict. Never fails the gate; never called for infra failures. */
 async function remember(ctx: Ctx, outcome: MemoryOutcome, verdict: string, changedPaths: string[]): Promise<void> {
   const { task, train } = ctx;
+  // A car's verdict is about a merge of already-remembered members, not a prompt: no memory.
+  if (train.lane === "QUEUE") return;
   try {
     await ctx.step.do("memory: remember", BEST_EFFORT_STEP, async () => {
       await ctx.ports.memory.remember({
