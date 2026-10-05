@@ -7,9 +7,11 @@
  * - Commits take explicit author/committer timestamps so a retried Workflow
  *   step produces the same SHA (the push then becomes a no-op).
  */
-import git from "isomorphic-git";
+import git, { type MergeDriverCallback } from "isomorphic-git";
 import webHttp from "isomorphic-git/http/web";
+import type { MergeConflictKind } from "@queenos/queen-types";
 import { MemFS } from "./memfs.js";
+import { registryMergeDriver } from "./merge-driver.js";
 
 export type HttpClient = typeof webHttp;
 
@@ -24,6 +26,12 @@ export interface GitIdentity {
 }
 
 export const DRONE_IDENTITY: GitIdentity = { name: "QueenOS Drone", email: "drone@queenos.dev" };
+/** Author/committer of the merge queue's merge commits (v2 design §2.3.4). */
+export const QUEEN_MERGE_IDENTITY: GitIdentity = { name: "QueenOS Merge Queue", email: "queue@queenos.dev" };
+/** `deepen` default: git's `--unshallow` depth (the whole history). */
+export const FULL_DEPTH = 0x7fffffff;
+const SHA_RE = /^[0-9a-f]{40}$/;
+const MERGE_THEIRS_REF = "refs/queen/merge-theirs";
 
 /** A file to write (content) or delete (`delete: true`), relative to the repo root. */
 export type FileChange = { path: string; content: string | Uint8Array } | { path: string; delete: true };
@@ -56,6 +64,43 @@ export type GitErrorCode =
   | "NO_REMOTE"
   | "AUTH"
   | "UNKNOWN";
+
+export interface MergeInput {
+  /** Branch or SHA to merge in. */
+  theirs: string;
+  /** Branch receiving the merge (default: the current branch). */
+  ours?: string;
+  message: string;
+  /** Unix seconds for author and committer: a replay makes the same SHA. */
+  timestamp: number;
+  author?: GitIdentity;
+  committer?: GitIdentity;
+  /** Default `registryMergeDriver` (union of the feature registry, diff3 elsewhere). */
+  mergeDriver?: MergeDriverCallback;
+  /** Allow a fast-forward (default true). */
+  fastForward?: boolean;
+}
+
+/**
+ * Why a merge did not happen. `content` = overlapping edits (isomorphic-git
+ * MergeConflictError); `unsupported` = add/add of a path with different
+ * content, a type change (MergeNotSupportedError), no merge base (shallow or
+ * unrelated history), or several bases (criss-cross: no recursive strategy).
+ */
+export interface GitMergeConflict {
+  kind: Exclude<MergeConflictKind, "missing">;
+  reason: "conflict" | "add-add" | "not-supported" | "no-merge-base" | "criss-cross";
+  /** Conflicting paths (best effort for `unsupported`), sorted. */
+  paths: string[];
+  ours: string;
+  theirs: string;
+  /** Merge bases found (0 or ≥2 for the base errors). */
+  bases: string[];
+}
+
+export type MergeOutcome =
+  | { oid: string; fastForward: boolean; alreadyMerged: boolean; mergeCommit: boolean; base: string }
+  | { conflict: GitMergeConflict };
 
 export class GitError extends Error {
   override readonly name = "GitError";
@@ -110,6 +155,14 @@ function pushError(e: unknown, target: string): GitError {
     return reason === "not-fast-forward"
       ? new GitError("NOT_FAST_FORWARD", `push to ${target} is not a fast-forward`, e)
       : new GitError("PUSH_REJECTED", `push to ${target} rejected (${reason || "unknown"})`, e);
+  }
+  if (name === "GitPushError") {
+    // A ref the server refused (`ng <ref> <why>`): a moved ref ("fetch first",
+    // "non-fast-forward") is a clean NOT_FAST_FORWARD, anything else a rejection.
+    const details = String((e as { data?: { prettyDetails?: unknown } }).data?.prettyDetails ?? (e as Error).message);
+    return /non-fast-forward|fetch first|not a fast forward|stale info/i.test(details)
+      ? new GitError("NOT_FAST_FORWARD", `push to ${target} is not a fast-forward (${details.trim()})`, e)
+      : new GitError("PUSH_REJECTED", `push to ${target} rejected: ${details.trim()}`, e);
   }
   if (name === "HttpError") {
     const status = Number((e as { data?: { statusCode?: unknown } }).data?.statusCode ?? 0);
@@ -376,6 +429,135 @@ export class GitRepo {
     return (await git.currentBranch({ ...this.base, fullname: false })) ?? undefined;
   }
 
+  /**
+   * Three-way merge `theirs` into `ours` (default: the current branch) with
+   * `abortOnConflict`: on a conflict nothing moves (ref, index, worktree) and
+   * `{conflict}` is returned. On success the branch moves (fast-forward or a
+   * merge commit at `timestamp`) and, when it is the checked-out branch, the
+   * worktree is checked out to match.
+   */
+  async merge(input: MergeInput): Promise<MergeOutcome> {
+    const ours = input.ours ?? (await this.currentBranch());
+    if (!ours) throw new GitError("NOT_FOUND", "merge: no current branch and no `ours`");
+    const ourOid = await this.resolveRef(ours);
+    let theirsRef = input.theirs;
+    if (SHA_RE.test(input.theirs)) {
+      if (!(await this.readCommit(input.theirs))) throw new GitError("NOT_FOUND", `merge: commit ${input.theirs} not present`);
+      await this.writeRef(MERGE_THEIRS_REF, input.theirs);
+      theirsRef = MERGE_THEIRS_REF;
+    }
+    const theirOid = await this.resolveRef(theirsRef);
+    const bases = await this.findMergeBase([ourOid, theirOid]);
+    const conflict = (c: Omit<GitMergeConflict, "ours" | "theirs" | "bases">): MergeOutcome => ({
+      conflict: { ...c, paths: [...new Set(c.paths)].sort(), ours: ourOid, theirs: theirOid, bases },
+    });
+    if (bases.length === 0) return conflict({ kind: "unsupported", reason: "no-merge-base", paths: [] });
+    if (bases.length > 1) return conflict({ kind: "unsupported", reason: "criss-cross", paths: [] });
+    const base = bases[0]!;
+    if (base === theirOid) return { oid: ourOid, fastForward: false, alreadyMerged: true, mergeCommit: false, base };
+
+    const author = this.signature(input.author ?? QUEEN_MERGE_IDENTITY, input);
+    const committer = this.signature(input.committer ?? input.author ?? QUEEN_MERGE_IDENTITY, input);
+    let res: Awaited<ReturnType<typeof git.merge>>;
+    try {
+      res = await git.merge({
+        ...this.base,
+        ours,
+        theirs: theirsRef,
+        fastForward: input.fastForward ?? true,
+        abortOnConflict: true,
+        message: input.message,
+        author,
+        committer,
+        mergeDriver: input.mergeDriver ?? registryMergeDriver,
+      });
+    } catch (e) {
+      const name = errName(e);
+      if (name === "MergeConflictError") {
+        const data = (e as { data?: { filepaths?: string[]; bothModified?: string[] } }).data ?? {};
+        const paths = data.filepaths ?? [];
+        const baseFiles = new Set(await this.listFiles(base));
+        const addAdd = (data.bothModified ?? []).filter((p) => !baseFiles.has(p));
+        const onlyAddAdd = paths.length > 0 && paths.every((p) => addAdd.includes(p));
+        return conflict({ kind: onlyAddAdd ? "unsupported" : "content", reason: onlyAddAdd ? "add-add" : "conflict", paths });
+      }
+      if (name === "MergeNotSupportedError") {
+        const mine = new Set(await this.changedPaths(base, ourOid));
+        const paths = (await this.changedPaths(base, theirOid)).filter((p) => mine.has(p));
+        return conflict({ kind: "unsupported", reason: "not-supported", paths });
+      }
+      throw e;
+    } finally {
+      if (theirsRef === MERGE_THEIRS_REF) await git.deleteRef({ ...this.base, ref: MERGE_THEIRS_REF }).catch(() => undefined);
+    }
+    const oid = res.oid ?? (await this.resolveRef(ours));
+    const current = await this.currentBranch();
+    if (current && (ours === current || ours === `refs/heads/${current}`)) {
+      // Best effort: the merge itself is done (the ref moved). A worktree
+      // that cannot be checked out (e.g. a leftover directory where a file
+      // now lives) stays stale; callers that commit afterwards must check out.
+      await git.checkout({ ...this.base, ref: current, force: true }).catch(() => undefined);
+    }
+    return { oid, fastForward: res.fastForward === true, alreadyMerged: res.alreadyMerged === true, mergeCommit: res.mergeCommit === true, base };
+  }
+
+  /**
+   * Best common ancestors of `refs` (branches or SHAs), as `git merge-base
+   * --all --octopus`. Shallow boundaries count as roots, so a shallow clone
+   * may return [] where `deepen` would find one.
+   */
+  async findMergeBase(refs: string[]): Promise<string[]> {
+    const oids = await Promise.all(refs.map((r) => (SHA_RE.test(r) ? r : this.resolveRef(r))));
+    return git.findMergeBase({ ...this.base, oids });
+  }
+
+  /** Paths whose blob or mode differs between two commits (`from` null = the empty tree), sorted. */
+  async changedPaths(from: string | null, to: string): Promise<string[]> {
+    const [a, b] = await Promise.all([from && from !== ZERO_OID ? this.treeEntries(from) : new Map<string, string>(), this.treeEntries(to)]);
+    const out = new Set<string>();
+    for (const [p, v] of a) if (b.get(p) !== v) out.add(p);
+    for (const p of b.keys()) if (!a.has(p)) out.add(p);
+    return [...out].sort();
+  }
+
+  /**
+   * Fetch more history of a remote ref (default: the whole history), clearing
+   * shallow boundaries the server unshallows. Returns the fetched SHA.
+   */
+  async deepen(input: { remoteRef?: string; localRef?: string; remote?: RemoteSpec; depth?: number } = {}): Promise<string | null> {
+    const remoteRef = input.remoteRef ?? "refs/heads/main";
+    return this.fetchRef({
+      remoteRef,
+      localRef: input.localRef ?? `refs/queen/deepen/${remoteRef.replace(/^refs\//, "")}`,
+      ...(input.remote ? { remote: input.remote } : {}),
+      depth: input.depth ?? FULL_DEPTH,
+    });
+  }
+
+  /** Commits recorded as shallow boundaries (`.git/shallow`); [] for a full clone. */
+  async shallowCommits(): Promise<string[]> {
+    const path = `${this.dir}/.git/shallow`;
+    if (!this.fs.exists(path)) return [];
+    return (this.fs.readFileSync(path, "utf8") as string).split("\n").filter((l) => SHA_RE.test(l));
+  }
+
+  /** `path → mode:oid` for every blob in a commit's tree. */
+  private async treeEntries(ref: string): Promise<Map<string, string>> {
+    const oid = SHA_RE.test(ref) ? ref : await this.resolveRef(ref);
+    const out = new Map<string, string>();
+    const walkTree = async (treeOid: string, prefix: string): Promise<void> => {
+      const { tree } = await git.readTree({ ...this.base, oid: treeOid });
+      for (const e of tree) {
+        const p = prefix ? `${prefix}/${e.path}` : e.path;
+        if (e.type === "tree") await walkTree(e.oid, p);
+        else if (e.type === "blob") out.set(p, `${e.mode}:${e.oid}`);
+      }
+    };
+    const { commit } = await git.readCommit({ ...this.base, oid });
+    await walkTree(commit.tree, "");
+    return out;
+  }
+
   private signature(id: GitIdentity, input: { timestamp: number; timezoneOffset?: number }) {
     return { name: id.name, email: id.email, timestamp: Math.floor(input.timestamp), timezoneOffset: input.timezoneOffset ?? 0 };
   }
@@ -433,4 +615,208 @@ export async function initRepo(opts: GitRepoOptions & { defaultBranch?: string }
   const repo = new GitRepo(opts);
   await repo.init(opts.defaultBranch);
   return repo;
+}
+
+// ── in-memory git remote (tests and sim) ───────────────────────────────────
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+function pkt(line: string | Uint8Array): Uint8Array {
+  const body = typeof line === "string" ? enc.encode(line) : line;
+  const out = new Uint8Array(body.length + 4);
+  out.set(enc.encode((body.length + 4).toString(16).padStart(4, "0")));
+  out.set(body, 4);
+  return out;
+}
+const FLUSH = enc.encode("0000");
+
+function concat(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+
+/** pkt-lines up to the first flush; returns the lines and the offset after the flush. */
+function readPktLines(buf: Uint8Array, from = 0): { lines: string[]; next: number } {
+  const lines: string[] = [];
+  let o = from;
+  while (o + 4 <= buf.length) {
+    const len = parseInt(dec.decode(buf.subarray(o, o + 4)), 16);
+    if (len === 0) return { lines, next: o + 4 };
+    lines.push(dec.decode(buf.subarray(o + 4, o + len)));
+    o += len;
+  }
+  return { lines, next: o };
+}
+
+/** Wrap `data` in side-band-64k channel `band` packets. */
+function sideBand(band: number, data: Uint8Array): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  for (let o = 0; o < data.length; o += 65515) out.push(pkt(concat([new Uint8Array([band]), data.subarray(o, o + 65515)])));
+  return out;
+}
+
+/**
+ * Git smart-HTTP (protocol v1) remotes held in memory, for tests and sim mode:
+ * `http` is an isomorphic-git HttpClient that serves upload-pack (clone,
+ * fetch, shallow `deepen`) and receive-pack (push, compare-and-swap on the old
+ * SHA: a moved ref is rejected as "fetch first", i.e. NOT_FAST_FORWARD) from
+ * `GitRepo`s keyed by URL. No Node built-ins: everything lives on MemFS.
+ */
+export class MemoryGitServer {
+  readonly repos = new Map<string, GitRepo>();
+  /** Every accepted ref update, in order. */
+  readonly pushes: { url: string; ref: string; oid: string }[] = [];
+  /** Return a reason to reject an update of `ref` on `url` (e.g. deny refs/notes/*). */
+  deny: ((url: string, ref: string) => string | undefined) | undefined;
+
+  readonly http: HttpClient = {
+    request: async (req) => this.handle(req.url, req.method ?? "GET", req.body),
+  } as HttpClient;
+
+  /** Create an empty repo served at `url`. */
+  async create(url: string, defaultBranch = "main"): Promise<GitRepo> {
+    const repo = await initRepo({ defaultBranch });
+    this.repos.set(url, repo);
+    return repo;
+  }
+
+  repo(url: string): GitRepo {
+    const r = this.repos.get(url);
+    if (!r) throw new GitError("NOT_FOUND", `no in-memory remote ${url}`);
+    return r;
+  }
+
+  private async handle(url: string, method: string, body: AsyncIterable<Uint8Array> | Iterable<Uint8Array> | undefined) {
+    const u = new URL(url);
+    const m = /^(.*?)\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(`${u.origin}${u.pathname}`);
+    const repo = m ? this.repos.get(m[1]!) : undefined;
+    const respond = (statusCode: number, contentType: string, parts: Uint8Array[]) => ({
+      url,
+      method,
+      statusCode,
+      statusMessage: statusCode === 200 ? "OK" : "Not Found",
+      headers: { "content-type": contentType },
+      body: [concat(parts)] as unknown as AsyncIterableIterator<Uint8Array>,
+    });
+    if (!m || !repo) return respond(404, "text/plain", [enc.encode("not found")]);
+    const kind = m[2]!;
+    if (kind === "info/refs") {
+      const service = u.searchParams.get("service") ?? "git-upload-pack";
+      return respond(200, `application/x-${service}-advertisement`, await this.advertise(repo, service));
+    }
+    const chunks: Uint8Array[] = [];
+    if (body) for await (const c of body as AsyncIterable<Uint8Array>) chunks.push(c);
+    const input = concat(chunks);
+    const out = kind === "git-upload-pack" ? await this.uploadPack(repo, input) : await this.receivePack(m[1]!, repo, input);
+    return respond(200, `application/x-${kind}-result`, out);
+  }
+
+  private async refs(repo: GitRepo): Promise<[string, string][]> {
+    const fs = repo.fs;
+    const root = `${repo.dir}/.git/`;
+    const names = fs.walkFiles(`${root}refs`).map((p) => p.slice(root.length));
+    const out: [string, string][] = [];
+    for (const name of names.sort()) out.push([name, await repo.resolveRef(name)]);
+    return out;
+  }
+
+  private async advertise(repo: GitRepo, service: string): Promise<Uint8Array[]> {
+    const refs = await this.refs(repo);
+    const branch = await repo.currentBranch();
+    const caps =
+      service === "git-receive-pack"
+        ? "report-status side-band-64k delete-refs"
+        : `side-band-64k shallow${branch ? ` symref=HEAD:refs/heads/${branch}` : ""}`;
+    const head = branch ? refs.find(([n]) => n === `refs/heads/${branch}`) : undefined;
+    const all: [string, string][] = service === "git-upload-pack" && head ? [["HEAD", head[1]], ...refs] : refs;
+    const lines = all.length
+      ? all.map(([name, oid], i) => pkt(`${oid} ${name}${i === 0 ? `\0${caps}` : ""}\n`))
+      : [pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`)];
+    return [pkt(`# service=${service}\n`), FLUSH, ...lines, FLUSH];
+  }
+
+  private async uploadPack(repo: GitRepo, input: Uint8Array): Promise<Uint8Array[]> {
+    const { lines } = readPktLines(input);
+    const wants: string[] = [];
+    const clientShallow = new Set<string>();
+    let depth = Infinity;
+    for (const l of lines) {
+      const [cmd, arg] = l.trim().split(/\s+/);
+      if (cmd === "want" && arg) wants.push(arg);
+      else if (cmd === "shallow" && arg) clientShallow.add(arg);
+      else if (cmd === "deepen" && arg) depth = Number(arg) >= FULL_DEPTH ? Infinity : Number(arg);
+    }
+    const base = { fs: repo.fs, dir: repo.dir };
+    // Breadth-first from the wants, each commit at its shortest depth.
+    const seen = new Map<string, number>();
+    const boundary = new Set<string>();
+    let frontier: (readonly [string, number])[] = wants.map((oid) => [oid, 1] as const);
+    const objects = new Set<string>();
+    const addTree = async (oid: string): Promise<void> => {
+      if (objects.has(oid)) return;
+      objects.add(oid);
+      for (const e of (await git.readTree({ ...base, oid })).tree) {
+        if (e.type === "tree") await addTree(e.oid);
+        else if (e.type === "blob") objects.add(e.oid);
+      }
+    };
+    while (frontier.length) {
+      const next: (readonly [string, number])[] = [];
+      for (const [oid, d] of frontier) {
+        if (seen.has(oid)) continue;
+        seen.set(oid, d);
+        const { commit } = await git.readCommit({ ...base, oid });
+        objects.add(oid);
+        await addTree(commit.tree);
+        if (d >= depth) {
+          if (commit.parent.length) boundary.add(oid);
+        } else for (const p of commit.parent) next.push([p, d + 1]);
+      }
+      frontier = next;
+    }
+    const out: Uint8Array[] = [];
+    if (Number.isFinite(depth) || clientShallow.size) {
+      for (const oid of boundary) if (!clientShallow.has(oid)) out.push(pkt(`shallow ${oid}\n`));
+      for (const oid of clientShallow) if (seen.has(oid) && !boundary.has(oid)) out.push(pkt(`unshallow ${oid}\n`));
+      out.push(FLUSH);
+    }
+    out.push(pkt("NAK\n"));
+    const { packfile } = await git.packObjects({ ...base, oids: [...objects] });
+    out.push(...sideBand(1, packfile!), FLUSH);
+    return out;
+  }
+
+  private async receivePack(url: string, repo: GitRepo, input: Uint8Array): Promise<Uint8Array[]> {
+    const { lines, next } = readPktLines(input);
+    const pack = input.subarray(next);
+    const base = { fs: repo.fs, dir: repo.dir };
+    if (pack.length > 32) {
+      const name = `pack-${Array.from(pack.subarray(pack.length - 20), (b) => b.toString(16).padStart(2, "0")).join("")}`;
+      const filepath = `.git/objects/pack/${name}.pack`;
+      repo.fs.writeFileDeep(`${repo.dir}/${filepath}`, pack);
+      await git.indexPack({ ...base, filepath });
+    }
+    const report: Uint8Array[] = [pkt("unpack ok\n")];
+    for (const l of lines) {
+      const [oldOid, newOid, ref] = l.split("\0")[0]!.trim().split(" ") as [string, string, string];
+      const current = await repo.resolveRef(ref).catch(() => ZERO_OID);
+      const denied = this.deny?.(url, ref);
+      if (denied) report.push(pkt(`ng ${ref} ${denied}\n`));
+      else if (current !== oldOid) report.push(pkt(`ng ${ref} fetch first\n`));
+      else {
+        if (newOid === ZERO_OID) await git.deleteRef({ ...base, ref });
+        else await repo.writeRef(ref, newOid);
+        this.pushes.push({ url, ref, oid: newOid });
+        report.push(pkt(`ok ${ref}\n`));
+      }
+    }
+    report.push(FLUSH);
+    return [...sideBand(1, concat(report)), FLUSH];
+  }
 }

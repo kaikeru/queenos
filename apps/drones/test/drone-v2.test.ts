@@ -211,10 +211,10 @@ describe("MERGE", () => {
     expect(q.audits().at(-1)).toMatchObject({ droneRole: "LANDER", status: "REJECTED", gitNotesPayload: { model: MERGE_MODEL, result: "failure" } });
   });
 
-  it("the default adapter fails fast (ok:false) until merge.ts is wired", async () => {
-    const w = new FakeWorld();
+  it("the default adapter is WP1.12's mergeCar: an unreachable car fork reports ok:false", async () => {
+    const w = new FakeWorld(); // no repos: the real mergeCar's clone fails, retries run out
     const out = await runDrone(mergeTask(), new InlineSteps(), w.ports(), scriptedCfg);
-    expect(out).toMatchObject({ status: "failed", summary: expect.stringContaining("not wired") });
+    expect(out).toMatchObject({ status: "failed", summary: expect.stringContaining("Merge drone failed") });
   });
 });
 
