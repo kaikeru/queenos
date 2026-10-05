@@ -6,5 +6,5 @@
 # Optional overrides of wrangler.jsonc vars:
 # GATE_TEST_MODE=scripted
 # SCRIBE_MODE=llm
-# MODEL_SCRIBE=anthropic/claude-haiku-4-5   # or an @cf/... Workers AI model
+# MODEL_SCRIBE=@cf/zai-org/glm-4.7-flash
 # POLICY_ALLOWED_DEPS=hono,zod,@queenos/*

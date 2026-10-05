@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AppendAuditInput, DeployResult, DroneTask, MergeTrain, PromptRun, ProvisionResult, Release, SentinelCommand, SentinelVerdict } from "@queenos/queen-types";
+import type { AppendAuditInput, BuildResult, DeployResult, ModelChoice, DroneTask, MergeTrain, PromptRun, ProvisionResult, Release, SentinelCommand, SentinelVerdict } from "@queenos/queen-types";
 import {
   SimExecutors,
   TEST_RETRY_MS,
@@ -21,6 +21,7 @@ function harness() {
   const provisions: ProvisionResult[] = [];
   const deploys: DeployResult[] = [];
   const verdicts: SentinelVerdict[] = [];
+  const builds: BuildResult[] = [];
   /** What the fake Queen's snapshot says about releases and prompts (for the sim Sentinel). */
   const world: { releases: Release[]; promptRuns: PromptRun[]; trains: MergeTrain[] } = { releases: [], promptRuns: [], trains: [] };
   /** Phase the fake Queen reports for every train (the sim gatekeeper waits for TESTING). */
@@ -36,7 +37,7 @@ function harness() {
       audits.push(a);
       return { eventId: "e", promptId: a.promptId, droneRole: a.droneRole, status: a.status, gitNotesPayload: a.gitNotesPayload ? { discardedPaths: [], ...a.gitNotesPayload } : null, createdAt: clock };
     },
-    reportBuildResult: async (r) => (calls.push(`build:${r.trainId}`), { outcome: "applied" }),
+    reportBuildResult: async (r) => (builds.push(r), calls.push(`build:${r.trainId}`), { outcome: "applied" }),
     reportTrainResult: async (r) => (calls.push(`test:${r.trainId}:${r.passed}`), { outcome: "applied" }),
     reportLandResult: async (r) => (calls.push(`land:${r.trainId}:${r.landed}`), { outcome: "applied" }),
     reportProvisionResult: async (r) => (provisions.push(r), calls.push(`provision:${r.op}:${r.commandId}`), { outcome: "applied" }),
@@ -57,7 +58,7 @@ function harness() {
     clock += ms;
     return sim.runDue();
   };
-  return { sim, advance, calls, audits, provisions, deploys, verdicts, world, phase, alarm: () => alarm };
+  return { sim, advance, calls, audits, provisions, deploys, verdicts, builds, world, phase, alarm: () => alarm };
 }
 
 const task = (over: Partial<DroneTask>): DroneTask => ({
@@ -275,5 +276,61 @@ describe("sim release executors", () => {
     await h.sim.sentinel.dispatch(canaryCmd({ commandId: "r2-verify10-1", releaseId: "r2", canaryPercent: 10 }));
     await h.advance(2000);
     expect(h.verdicts.at(-1)).toMatchObject({ commandId: "r2-verify10-1", verdict: "PROMOTE" });
+  });
+});
+
+describe("sim drones: models", () => {
+  const fast: ModelChoice = {
+    model: "@cf/qwen/qwen3.8-27b",
+    tier: "fast",
+    role: "builder",
+    reason: "fast tier · no track record yet; lowest cost · floor: fast",
+    fallbacks: ["@cf/zai-org/glm-5.3-flash", "@cf/deepseek-ai/deepseek-v4-flash-0731"],
+  };
+  const frontier: ModelChoice = { model: "@cf/moonshotai/kimi-k2.7-code", tier: "frontier", role: "rework", reason: "rework → escalated to frontier", fallbacks: ["@cf/zai-org/glm-5.3"] };
+
+  it("reports the Queen's chosen model with a plausible build time; the ledger names it", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({ modelChoice: fast }));
+    expect(h.alarm()).toBe(1_100); // fast: delays.build
+    await h.advance(100);
+    expect(h.builds[0]).toMatchObject({ trainId: "t1", model: fast.model });
+    expect(h.builds[0]!.failedModels).toBeUndefined();
+    expect(h.builds[0]!.buildMs).toBeGreaterThanOrEqual(100);
+    const note = h.audits.find((a) => a.droneRole === "BUILDER" && a.status === "PASSED")!.gitNotesPayload!;
+    expect(note.model).toBe(fast.model);
+    expect(note.reasoningSteps[0]).toContain(`Queen routed this build to ${fast.model}`);
+  });
+
+  it("frontier builds take longer", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({ action: "REWORK", modelChoice: frontier }));
+    expect(h.alarm()).toBe(1_160); // 1.6 x delays.build
+    await h.advance(159);
+    expect(h.builds).toEqual([]);
+    await h.advance(1);
+    expect(h.builds[0]).toMatchObject({ model: frontier.model });
+    expect(h.builds[0]!.buildMs).toBeGreaterThanOrEqual(160);
+  });
+
+  it("[bad-json]: the chosen model returns junk on the BUILD, the first fallback builds (failedModels); the REWORK is clean", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({ promptText: "parse config [bad-json]", modelChoice: fast }));
+    await h.advance(150); // the fallback costs another half build
+    expect(h.builds[0]).toMatchObject({ model: fast.fallbacks[0], failedModels: [fast.model] });
+    const note = h.audits.find((a) => a.droneRole === "BUILDER" && a.status === "PASSED")!.gitNotesPayload!;
+    expect(note.reasoningSteps.join(" ")).toContain("returned an unusable change set");
+
+    await h.sim.drones.dispatch(task({ trainId: "t2", action: "REWORK", promptText: "parse config [bad-json]", modelChoice: frontier }));
+    await h.advance(160);
+    expect(h.builds[1]).toMatchObject({ trainId: "t2", model: frontier.model });
+    expect(h.builds[1]!.failedModels).toBeUndefined();
+  });
+
+  it("tasks without a modelChoice report no model fields (pre-router drones)", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({}));
+    await h.advance(100);
+    expect(h.builds[0]).toEqual({ trainId: "t1", headSha: fakeSha("head:t1") });
   });
 });

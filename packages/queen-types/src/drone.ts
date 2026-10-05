@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DroneRoleSchema } from "./state.js";
+import { ModelChoiceSchema } from "./models.js";
 
 /** What a drone workflow instance must do with its train fork. */
 export const DroneActionSchema = z.enum(["BUILD", "LAND", "REWORK"]);
@@ -19,6 +20,8 @@ export const DroneTaskSchema = z.object({
   ragContext: z.array(z.string()).default([]),
   /** For REWORK: Scribe's compaction of why the previous attempt failed. */
   scribeSummary: z.string().max(500).optional(),
+  /** The Queen's model choice for this task (absent: the drone's env default). */
+  modelChoice: ModelChoiceSchema.optional(),
 });
 export type DroneTask = z.infer<typeof DroneTaskSchema>;
 export type DroneTaskInput = z.input<typeof DroneTaskSchema>;

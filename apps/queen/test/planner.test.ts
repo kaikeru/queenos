@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DeployCommand, Deployment, ProvisionCommand } from "@queenos/queen-types";
+import { INITIAL_FLOOR, type FloorState, type RouterPolicy, type RouterStats } from "../src/models/router";
 import {
   DEFAULT_COMMAND_TIMEOUT_MS,
   MAX_COMMAND_ATTEMPTS,
@@ -8,6 +9,7 @@ import {
   TrainPlanner,
   nextCommandId,
   type Effect,
+  type ModelStatDelta,
   type PlanResult,
   type PromptRecord,
   type TrainRecord,
@@ -26,6 +28,13 @@ class Sim {
   effects: Effect[] = [];
   /** Planner clock (the watchdog compares command issue times against it). */
   now = 1000;
+  /** Router state, persisted like the DO's model_stats / model_router tables. */
+  stats = new Map<string, RouterStats>();
+  deltas: ModelStatDelta[] = [];
+  routerDispatches = 0;
+  floor: FloorState = { ...INITIAL_FLOOR };
+  pin: string | null = null;
+  policy: RouterPolicy | undefined;
   private ids = 0;
   private maxTrainSeq = 0;
   private maxPromptSeq = 0;
@@ -38,8 +47,11 @@ class Sim {
         deployments: [...this.deployments.values()],
         maxTrainSeq: this.maxTrainSeq,
         maxPromptSeq: this.maxPromptSeq,
+        modelStats: [...this.stats.values()],
+        routerDispatches: this.routerDispatches,
+        routerFloor: this.floor,
       },
-      { namespace: "hive", now: this.now, newId: () => `t${++this.ids}` },
+      { namespace: "hive", now: this.now, newId: () => `t${++this.ids}`, modelPin: this.pin, routerPolicy: this.policy },
     );
     const r = fn(planner);
     for (const p of r.prompts) {
@@ -52,7 +64,31 @@ class Sim {
     }
     for (const d of r.deployments) this.deployments.set(d.deploymentId, d);
     this.effects.push(...r.effects);
+    for (const d of r.modelStats) this.applyDelta(d);
+    if (r.routerDispatches !== undefined) this.routerDispatches = r.routerDispatches;
+    if (r.routerFloor !== undefined) this.floor = r.routerFloor;
     return r;
+  }
+
+  /** Mirror of db.applyModelStatDelta. */
+  private applyDelta(d: ModelStatDelta): void {
+    this.deltas.push(d);
+    const key = `${d.model}|${d.role}`;
+    const s = this.stats.get(key) ?? { model: d.model, role: d.role, attempts: 0, passes: 0, failures: 0, avgBuildMs: null, updatedAt: 0, failStreak: 0 };
+    const timed = s.avgBuildMs === null ? 0 : 1; // tests only check single-build averages
+    this.stats.set(key, {
+      ...s,
+      attempts: s.attempts + d.attempts,
+      passes: s.passes + d.passes,
+      failures: s.failures + d.failures,
+      avgBuildMs: d.buildMs === undefined ? s.avgBuildMs : Math.round(((s.avgBuildMs ?? 0) * timed + d.buildMs) / (timed + 1)),
+      failStreak: d.streak === "pass" ? 0 : d.streak === "fail" ? (s.failStreak ?? 0) + 1 : s.failStreak,
+      updatedAt: this.now,
+    });
+  }
+
+  stat(model: string, role: "builder" | "rework" = "builder"): RouterStats | undefined {
+    return this.stats.get(`${model}|${role}`);
   }
 
   submit(...ids: string[]): void {
@@ -346,7 +382,7 @@ describe("planner: idempotency", () => {
     s.result("B", false);
     s.take("broadcast");
     const r = s.run((p) => p.trainResult({ trainId: "t3", passed: true, summary: "late" }));
-    expect(r).toEqual({ outcome: "ignored:stale", prompts: [], trains: [], deployments: [], effects: [] });
+    expect(r).toEqual({ outcome: "ignored:stale", prompts: [], trains: [], deployments: [], effects: [], modelStats: [] });
   });
 
   it("ignores duplicate, unknown and premature results", () => {
@@ -805,5 +841,185 @@ describe("planner: command watchdog", () => {
     expect(watchdogDeadline([legacy], T, 7777)).toBe(7777 + T);
     const merged = { ...legacy, phase: "MERGED" as const, forkState: "DELETED" as const };
     expect(watchdogDeadline([merged], T, 7777)).toBeNull();
+  });
+});
+
+describe("planner: model router", () => {
+  const QWEN = "@cf/qwen/qwen3.8-27b";
+  const GLM_FLASH = "@cf/zai-org/glm-5.3-flash";
+  const KIMI = "@cf/moonshotai/kimi-k2.7-code";
+  const dispatchOf = (s: Sim) => s.take("dispatchDrone").filter((e) => e.task.role === "BUILDER");
+
+  it("a dispatched BUILD carries the Queen's modelChoice; the train records model + reason and broadcasts them", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.take("broadcast");
+    s.completeForks();
+    const [d] = dispatchOf(s);
+    expect(d!.task.modelChoice).toMatchObject({ model: QWEN, tier: "fast", role: "builder", fallbacks: ["@cf/deepseek-ai/deepseek-v4-flash-0731", GLM_FLASH] });
+    expect(s.trains.get("t1")).toMatchObject({ model: QWEN, modelReason: d!.task.modelChoice!.reason, modelChoiceAttempt: 1, modelProbe: false });
+    const upd = s.take("broadcast").find((e) => e.message.type === "train.updated");
+    expect(upd?.message).toMatchObject({ train: { trainId: "t1", model: QWEN, modelReason: expect.stringContaining("fast tier") } });
+    expect(s.routerDispatches).toBe(1);
+  });
+
+  it("a reconcile re-dispatch of the same drone attempt reuses the persisted choice", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    const [first] = dispatchOf(s);
+    const [again] = s.run((p) => p.reconcile()).effects.filter((e) => e.type === "dispatchDrone");
+    expect(again).toMatchObject({ task: { modelChoice: first!.task.modelChoice } });
+    expect(s.routerDispatches).toBe(1);
+  });
+
+  it("build-result: attempts for the model used (with build time), failures for unusable models; the train shows the actual model", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.run((p) => p.buildResult({ trainId: "t1", headSha: "h", model: GLM_FLASH, failedModels: [QWEN], buildMs: 4200 }));
+    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, passes: 0, failures: 1, failStreak: 1 });
+    expect(s.stat(GLM_FLASH)).toMatchObject({ attempts: 1, passes: 0, failures: 0, avgBuildMs: 4200 });
+    expect(s.trains.get("t1")).toMatchObject({ model: GLM_FLASH, modelOutcome: "BUILT" });
+    expect(s.trains.get("t1")!.modelReason).toMatch(/^fell back to @cf\/zai-org\/glm-5.3-flash after 1 unusable · fast tier/);
+    // An unusable change set on a floor-routed build raises the hive's floor.
+    expect(s.floor).toMatchObject({ tier: "frontier", note: "raised to frontier after an unusable change set" });
+  });
+
+  it("a gate pass counts once: duplicate and stale results never double count", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.build("A"); // no model in the result: attributed to the router's choice
+    s.result("A", true);
+    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, passes: 1, failures: 0, failStreak: 0 });
+    expect(s.floor).toMatchObject({ tier: "fast", passStreak: 1 });
+    const n = s.deltas.length;
+    expect(s.run((p) => p.trainResult({ trainId: "t1", passed: true, summary: "again" })).outcome).toBe("ignored:duplicate");
+    expect(s.run((p) => p.buildResult({ trainId: "t1", headSha: "h", model: KIMI })).outcome).not.toBe("applied");
+    s.land("A");
+    expect(s.run((p) => p.trainResult({ trainId: "t1", passed: false, summary: "late" })).outcome).toBe("ignored:stale");
+    expect(s.deltas).toHaveLength(n);
+    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, passes: 1, failures: 0 });
+  });
+
+  it("a gate failure counts against the builder and raises the floor; the REWORK escalates to frontier under role rework and leaves the floor alone", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.build("A");
+    s.result("A", false, "security scan rejected");
+    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, passes: 0, failures: 1, failStreak: 1 });
+    expect(s.floor).toEqual({ tier: "frontier", passStreak: 0, aboveStreak: 0, note: "raised to frontier after a gate failure" });
+    const rework = dispatchOf(s).at(-1);
+    expect(rework!.task).toMatchObject({ action: "REWORK", scribeSummary: "security scan rejected" });
+    expect(rework!.task.modelChoice).toMatchObject({ model: KIMI, tier: "frontier", role: "rework" });
+    expect(rework!.task.modelChoice!.reason).toMatch(/^rework → escalated to frontier · frontier tier/);
+    s.build("A");
+    s.result("A", true);
+    expect(s.stat(KIMI, "rework")).toMatchObject({ attempts: 1, passes: 1 });
+    expect(s.stat(KIMI)).toBeUndefined();
+    // The floor neither consumed its note nor counted the rework pass.
+    expect(s.floor).toEqual({ tier: "frontier", passStreak: 0, aboveStreak: 0, note: "raised to frontier after a gate failure" });
+  });
+
+  it("non-catalog models (scripted drones) are excluded from stats and the floor", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.run((p) => p.buildResult({ trainId: "t1", headSha: "h", model: "queenos/scripted-drone-v1", failedModels: ["queenos/other"], buildMs: 10 }));
+    expect(s.trains.get("t1")!.model).toBe("queenos/scripted-drone-v1");
+    s.completeDeploys();
+    s.result("A", false);
+    expect(s.deltas).toEqual([]);
+    expect(s.floor).toEqual(INITIAL_FLOOR);
+  });
+
+  it("a builder that gives up before pushing counts an attempt and a failure for the chosen model", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.result("A", false, "no valid change set from any model");
+    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, failures: 1 });
+    expect(s.floor.tier).toBe("frontier");
+  });
+
+  it("a watchdog re-dispatch is a new attempt: escalated to frontier, floor untouched", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.take("dispatchDrone");
+    s.run((p) => p.dispatched("t1", "BUILDING"));
+    s.now += DEFAULT_COMMAND_TIMEOUT_MS;
+    const [retry] = s.run((p) => p.reconcile()).effects.filter((e) => e.type === "dispatchDrone");
+    expect(retry).toMatchObject({ attempt: 2, task: { modelChoice: { tier: "frontier", role: "builder" } } });
+    if (retry?.type === "dispatchDrone") expect(retry.task.modelChoice!.reason).toMatch(/^attempt 2 → escalated to frontier/);
+    expect(s.routerDispatches).toBe(2);
+    // Its outcome does not move the floor either.
+    s.build("A");
+    s.result("A", true);
+    expect(s.floor).toEqual(INITIAL_FLOOR);
+  });
+
+  it("at a frontier floor, 3 clean builds back off to fast; the next choice says why", () => {
+    const s = new Sim();
+    s.floor = { tier: "frontier", passStreak: 0, aboveStreak: 0, note: null };
+    s.submit("A", "B", "C");
+    s.completeForks();
+    s.build("A");
+    s.build("B");
+    s.build("C");
+    const tasks = dispatchOf(s);
+    expect(tasks.map((d) => d.task.modelChoice?.tier)).toEqual(["frontier", "frontier", "frontier"]);
+    expect(tasks[0]!.task.modelChoice!.reason).toContain("floor: frontier · 0/3 to back off · probe in 3");
+    s.result("A", true);
+    s.result("B", true);
+    expect(s.floor).toMatchObject({ tier: "frontier", passStreak: 2 });
+    s.result("C", true);
+    expect(s.floor).toEqual({ tier: "fast", passStreak: 0, aboveStreak: 0, note: "backed off to fast after 3 clean builds" });
+    s.submit("D");
+    s.completeForks();
+    const [d] = dispatchOf(s);
+    expect(d!.task.modelChoice).toMatchObject({ tier: "fast" });
+    expect(d!.task.modelChoice!.reason).toMatch(/^backed off to fast after 3 clean builds · fast tier/);
+    expect(s.floor.note).toBeNull();
+  });
+
+  it("probe-down: after 4 floor dispatches the next tries fast; its pass drops the floor at once", () => {
+    const s = new Sim();
+    s.floor = { tier: "frontier", passStreak: 1, aboveStreak: 4, note: null };
+    s.submit("A");
+    s.completeForks();
+    const [d] = dispatchOf(s);
+    expect(d!.task.modelChoice).toMatchObject({ model: QWEN, tier: "fast" });
+    expect(d!.task.modelChoice!.reason).toMatch(/^probe: trying fast tier again/);
+    expect(s.trains.get("t1")!.modelProbe).toBe(true);
+    s.build("A");
+    s.result("A", true);
+    expect(s.floor).toEqual({ tier: "fast", passStreak: 0, aboveStreak: 0, note: "dropped to fast after a probe passed" });
+  });
+
+  it("honours the pin and the policy from the context; every 5th decision explores", () => {
+    const s = new Sim();
+    s.pin = "@cf/zai-org/glm-5.3";
+    s.submit("A");
+    s.completeForks();
+    expect(dispatchOf(s)[0]!.task.modelChoice).toMatchObject({ model: "@cf/zai-org/glm-5.3", reason: "pinned by MODEL_ROUTER_PIN_BUILDER" });
+
+    const e = new Sim();
+    e.routerDispatches = 4;
+    e.stats.set(`${QWEN}|builder`, { model: QWEN, role: "builder", attempts: 3, passes: 3, failures: 0, avgBuildMs: null, updatedAt: 0 });
+    e.submit("A");
+    e.completeForks();
+    expect(dispatchOf(e)[0]!.task.modelChoice).toMatchObject({ model: "@cf/deepseek-ai/deepseek-v4-flash-0731", reason: expect.stringContaining("exploring least-tried") });
+
+    const k = new Sim();
+    k.policy = { backoffStreak: 1, probeAfter: 4 };
+    k.floor = { tier: "frontier", passStreak: 0, aboveStreak: 0, note: null };
+    k.submit("A");
+    k.completeForks();
+    k.build("A");
+    k.result("A", true);
+    expect(k.floor.tier).toBe("fast");
   });
 });

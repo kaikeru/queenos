@@ -6,7 +6,7 @@
  * Never imported in production builds (see useRoomSocket).
  */
 import type { Dispatch } from "react";
-import type { MergeTrain, PromptRun, QueenServerMessage, Release, SentinelVerdict } from "@queenos/queen-types";
+import type { MergeTrain, ModelStats, RouterFloor, PromptRun, QueenServerMessage, Release, SentinelVerdict } from "@queenos/queen-types";
 import type { Action } from "./reducer";
 
 const STEP_MS = 2500;
@@ -14,7 +14,36 @@ const USER = "kyle@kaikeru.com";
 
 const prompts = ["Add rate limiting middleware to the public API", "Add a dark mode toggle to the settings page", "Write a migration that indexes audit_trail by prompt", "Fix the flaky retry logic in the webhook sender"];
 
+const GLM_FLASH = "@cf/zai-org/glm-5.3-flash";
+const DEEPSEEK_FLASH = "@cf/deepseek-ai/deepseek-v4-flash-0731";
+const QWEN = "@cf/qwen/qwen3.8-27b";
+const KIMI = "@cf/moonshotai/kimi-k2.7-code";
+const GLM = "@cf/zai-org/glm-5.3";
+const GRANITE = "@cf/ibm-granite/granite-4.0-h-micro";
+
+const stat = (model: string, role: ModelStats["role"], attempts: number, passes: number, avgBuildMs: number | null): ModelStats => ({
+  model,
+  role,
+  attempts,
+  passes,
+  failures: attempts - passes,
+  avgBuildMs,
+  updatedAt: Date.now(),
+});
+
+/** Track record the mock Queen "has learned" before the scripted run starts. */
+const baseStats = (): ModelStats[] => [
+  stat(GLM_FLASH, "builder", 9, 6, 21_400),
+  stat(DEEPSEEK_FLASH, "builder", 5, 4, 26_800),
+  stat(QWEN, "builder", 3, 1, 33_100),
+  stat(KIMI, "rework", 4, 4, 58_900),
+  stat(GLM, "builder", 2, 1, 71_200),
+  stat(GRANITE, "scribe", 12, 11, 2_300),
+];
+
 export class MockQueen {
+  private stats: ModelStats[] = baseStats();
+  private floor: RouterFloor = { tier: "fast", streak: 1, backoffAfter: 3, probeIn: 4 };
   private timers = new Set<ReturnType<typeof setTimeout>>();
   private releases: Record<string, Release> = {};
   private stopped = false;
@@ -49,10 +78,105 @@ export class MockQueen {
           headSha: `${(i + 1).toString(16).repeat(40)}`.slice(0, 40),
           landedSha: `${(i + 1).toString(16).repeat(40)}`.slice(0, 40),
           createdAt: p.createdAt,
+          model: [GLM_FLASH, DEEPSEEK_FLASH, GLM_FLASH, KIMI][i],
+          modelReason: ["best pass rate in fast tier", "fast tier: GLM-5.3 Flash cooling down", "best pass rate in fast tier", "rework → escalated to frontier"][i],
         }) as MergeTrain,
     );
-    this.emit({ type: "snapshot", promptRuns, trains, recentAudit: [], releases: [] } as QueenServerMessage);
+    this.emit({ type: "snapshot", promptRuns, trains, recentAudit: [], releases: [], modelStats: this.stats, routerFloor: this.floor } as QueenServerMessage);
+    this.scriptBuild();
     this.later(1200, () => this.cut("rel-1", ["t1", "t2"], "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", "ver-aaaa1111", "ver-0000stbl", false));
+  }
+
+  private bump(model: string, role: ModelStats["role"], passed: boolean, ms: number) {
+    const cur = this.stats.find((x) => x.model === model && x.role === role) ?? stat(model, role, 0, 0, null);
+    const attempts = cur.attempts + 1;
+    const next: ModelStats = {
+      ...cur,
+      attempts,
+      passes: cur.passes + (passed ? 1 : 0),
+      failures: cur.failures + (passed ? 0 : 1),
+      avgBuildMs: Math.round(((cur.avgBuildMs ?? ms) * cur.attempts + ms) / attempts),
+      updatedAt: Date.now(),
+    };
+    this.stats = [...this.stats.filter((x) => x !== cur), next];
+    this.emit({ type: "models.updated", stats: this.stats, floor: this.floor });
+  }
+
+  private setFloor(patch: Partial<RouterFloor>) {
+    this.floor = { ...this.floor, ...patch };
+    this.emit({ type: "models.updated", stats: this.stats, floor: this.floor });
+  }
+
+  /** A build that falls back, fails, is rebuilt on a frontier model and lands; stats evolve along the way. */
+  private scriptBuild() {
+    const now = Date.now();
+    const prompt = (status: PromptRun["status"]) =>
+      this.emit({ type: "prompt.updated", promptRun: { promptId: "p5", namespace: this.hive, promptText: "Add CSV export to the audit log view", status, createdAt: now } });
+    const train = (patch: Partial<MergeTrain> & Pick<MergeTrain, "trainId" | "status">) =>
+      this.emit({
+        type: "train.updated",
+        train: { baseSha: "base", includedPrompts: ["p1", "p2", "p3", "p4", "p5"], artifactRepo: `${this.hive}-${patch.trainId}`, createdAt: now, ...patch } as MergeTrain,
+      });
+    const audit = (id: string, status: "RUNNING" | "PASSED" | "REJECTED", model: string, result: "success" | "failure", ms: number) =>
+      this.emit({
+        type: "audit.appended",
+        event: {
+          eventId: id,
+          promptId: "p5",
+          droneRole: "BUILDER",
+          status,
+          createdAt: Date.now(),
+          gitNotesPayload:
+            status === "RUNNING"
+              ? null
+              : {
+                  taskPrompt: "Add CSV export to the audit log view",
+                  model,
+                  temperature: 0.2,
+                  reasoningSteps: ["Read the audit view and its data loader", result === "success" ? "Added exportCsv() and a button" : "Model returned malformed JSON change set"],
+                  result,
+                  executionTimeMs: ms,
+                  discardedPaths: [],
+                },
+        },
+      });
+    this.later(2500, () => {
+      prompt("BUILDING");
+      train({ trainId: "t5", status: "BUILDING", phase: "BUILDING", model: GLM_FLASH, modelReason: "best pass rate in fast tier" });
+      audit("m-e1", "RUNNING", GLM_FLASH, "success", 0);
+    });
+    this.later(6500, () => {
+      this.bump(GLM_FLASH, "builder", false, 9_000);
+      train({ trainId: "t5", status: "BUILDING", phase: "BUILDING", model: DEEPSEEK_FLASH, modelReason: "GLM-5.3 Flash failed JSON → fell back to DeepSeek V4 Flash" });
+    });
+    this.later(11_000, () => {
+      this.bump(DEEPSEEK_FLASH, "builder", false, 24_000);
+      this.setFloor({ tier: "frontier", streak: 0, probeIn: 3 });
+      audit("m-e2", "REJECTED", DEEPSEEK_FLASH, "failure", 24_000);
+      train({ trainId: "t5", status: "EJECTED", phase: "TESTING", reason: "failed: preview smoke test", model: DEEPSEEK_FLASH, modelReason: "fallback after JSON failure" });
+      prompt("EJECTED");
+    });
+    this.later(12_500, () => {
+      prompt("BUILDING");
+      train({ trainId: "t6", status: "BUILDING", phase: "BUILDING", createdAt: now + 10_000, model: KIMI, modelReason: "rework → escalated to frontier" });
+      audit("m-e3", "RUNNING", KIMI, "success", 0);
+    });
+    this.later(18_000, () => {
+      this.bump(KIMI, "rework", true, 52_000);
+      this.setFloor({ streak: 1, probeIn: 2 });
+      audit("m-e4", "PASSED", KIMI, "success", 52_000);
+      train({ trainId: "t6", status: "TESTING", phase: "TESTING", createdAt: now + 10_000, model: KIMI, modelReason: "rework → escalated to frontier" });
+      prompt("IN_TRAIN");
+    });
+    this.later(21_500, () => {
+      train({ trainId: "t6", status: "MERGED", phase: "MERGED", createdAt: now + 10_000, landedSha: "c0ffee1234567890c0ffee1234567890c0ffee12", model: KIMI, modelReason: "rework → escalated to frontier" });
+      prompt("MERGED");
+      this.setFloor({ streak: 2, probeIn: 1 });
+    });
+    this.later(26_000, () => {
+      this.bump(KIMI, "builder", true, 49_000);
+      this.setFloor({ tier: "fast", streak: 0, probeIn: null });
+    });
   }
 
   stop() {

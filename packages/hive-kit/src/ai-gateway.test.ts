@@ -81,8 +81,44 @@ describe("AiClient", () => {
 
 describe("modelForRole", () => {
   it("uses MODEL_<ROLE> or the role default", () => {
-    expect(modelForRole("BUILDER", {})).toBe("anthropic/claude-opus-5-5");
-    expect(modelForRole("SCRIBE", { MODEL_SCRIBE: "" })).toBe("anthropic/claude-haiku-4-5");
+    expect(modelForRole("BUILDER", {})).toBe("@cf/zai-org/glm-5.3-flash");
+    expect(modelForRole("SCRIBE", { MODEL_SCRIBE: "" })).toBe("@cf/zai-org/glm-4.7-flash");
     expect(modelForRole("SCRIBE", { MODEL_SCRIBE: " @cf/meta/llama-3.1-8b-instruct " })).toBe("@cf/meta/llama-3.1-8b-instruct");
+  });
+});
+
+describe("output shapes and structured output", () => {
+  const complete = async (out: unknown, extra: Record<string, unknown> = {}) => {
+    const { ai, calls } = fake(out);
+    const res = await createAiClient({ ai, gatewayId: "g" }).complete({ model: "@cf/zai-org/glm-5.3-flash", messages: [{ role: "user", content: "x" }], ...extra });
+    return { res, calls };
+  };
+
+  it("ignores a separate reasoning_content field", async () => {
+    const { res } = await complete({ choices: [{ message: { content: "answer", reasoning_content: "long thinking" }, finish_reason: "stop" }] });
+    expect(res.text).toBe("answer");
+  });
+
+  it("returns empty text when the model only produced reasoning (ran out of tokens)", async () => {
+    const { res } = await complete({ choices: [{ message: { content: null, reasoning_content: "thinking..." }, finish_reason: "length" }] });
+    expect(res).toMatchObject({ text: "", finishReason: "length" });
+  });
+
+  it("strips inline <think> blocks, closed or truncated", async () => {
+    expect((await complete({ response: "<think>hmm</think>\n{\"a\":1}" })).res.text).toBe('{"a":1}');
+    expect((await complete({ response: "<think>never ends" })).res.text).toBe("");
+  });
+
+  it("accepts content parts and an already-parsed JSON-mode object", async () => {
+    expect((await complete({ choices: [{ message: { content: [{ type: "text", text: "he" }, { type: "text", text: "llo" }] } }] })).res.text).toBe("hello");
+    expect((await complete({ response: { files: [] } })).res.text).toBe('{"files":[]}');
+  });
+
+  it("sends response_format and extra params only when asked", async () => {
+    const fmt = { type: "json_schema", json_schema: { name: "x", schema: { type: "object" } } } as const;
+    const { calls } = await complete({ response: "{}" }, { responseFormat: fmt, extraParams: { reasoning_effort: "low" } });
+    expect(calls[0]!.input).toMatchObject({ response_format: fmt, reasoning_effort: "low" });
+    const plain = await complete({ response: "{}" });
+    expect(plain.calls[0]!.input).not.toHaveProperty("response_format");
   });
 });

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { DeploymentSchema } from "./executors.js";
 import { ReleaseSchema, SentinelVerdictSchema } from "./releases.js";
+import { ModelStatsSchema, RouterFloorSchema } from "./models.js";
 import { AuditEventSchema, MergeTrainSchema, PromptRunSchema } from "./state.js";
 import { SubmitPromptSchema } from "./train.js";
 
@@ -18,6 +19,9 @@ export const QueenServerMessageSchema = z.discriminatedUnion("type", [
     deployments: z.array(DeploymentSchema).optional(),
     /** Recent releases, newest first (P3). Optional for the same reason. */
     releases: z.array(ReleaseSchema).optional(),
+    /** Model router track record (optional for back-compat). */
+    modelStats: z.array(ModelStatsSchema).optional(),
+    routerFloor: RouterFloorSchema.optional(),
     /** Latest Sentinel verdict per (release, environment) for the snapshot's releases. Optional for back-compat. */
     verdicts: z.array(SentinelVerdictSchema).optional(),
   }),
@@ -26,6 +30,7 @@ export const QueenServerMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("audit.appended"), event: AuditEventSchema }),
   z.object({ type: z.literal("deployment.updated"), deployment: DeploymentSchema }),
   z.object({ type: z.literal("release.updated"), release: ReleaseSchema }),
+  z.object({ type: z.literal("models.updated"), stats: z.array(ModelStatsSchema), floor: RouterFloorSchema.optional() }),
   z.object({ type: z.literal("sentinel.verdict"), verdict: SentinelVerdictSchema }),
   z.object({ type: z.literal("error"), message: z.string(), code: z.string().optional() }),
   /** Reply to a JSON `{"type":"ping"}`. (The literal string "ping" is auto-answered with "pong".) */

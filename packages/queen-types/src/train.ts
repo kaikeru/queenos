@@ -56,6 +56,12 @@ export type TrainResult = z.infer<typeof TrainResultSchema>;
 export const BuildResultSchema = z.object({
   trainId: z.string().min(1),
   headSha: z.string().min(1),
+  /** Model that actually produced the change set (after any fallbacks). */
+  model: z.string().optional(),
+  /** Models tried before `model` that failed to produce a valid change set. */
+  failedModels: z.array(z.string()).max(5).optional(),
+  /** Wall time of generation + commit + push. */
+  buildMs: z.number().int().min(0).optional(),
 });
 export type BuildResult = z.infer<typeof BuildResultSchema>;
 

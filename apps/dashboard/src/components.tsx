@@ -3,7 +3,7 @@ import { Link } from "./router";
 import { ApiError, api, errorMessage } from "./api";
 import { useEscape } from "./hooks";
 import { phaseHeadline, shortVersion, tapButtonState, tapErrorMessage, timelineSteps, type SiteReleaseView } from "./releases";
-import { CANARY_STEPS, type Release, type SentinelVerdict } from "@queenos/queen-types";
+import { CANARY_STEPS, type ModelStats, type ModelTier, type Release, type RouterFloor, type SentinelVerdict } from "@queenos/queen-types";
 import {
   PHASE_FLOW,
   excerpt,
@@ -19,6 +19,7 @@ import {
   type TickerItem,
 } from "./reducer";
 import { DEMO_PROMPTS } from "./demo";
+import { TIER_META, tierRank, buildModelBoard, formatDuration, modelLabel, tierClass, tierOf, type TierGroup } from "./models";
 import type { ConnStatus } from "./useQueenSocket";
 
 const ROLE_LABEL: Record<AuditCard["role"], string> = {
@@ -210,6 +211,7 @@ function TrainCar({ lt }: { lt: LaneTrain }) {
         {lt.generation > 1 && <span className="car__gen">REBUILD #{lt.generation - 1}</span>}
         {lt.ejectKind && <span className="car__eject">{lt.ejectKind === "superseded" ? "SUPERSEDED" : "FAILED"}</span>}
       </div>
+      {train.model && <ModelChip model={train.model} reason={train.modelReason} escalated={lt.escalated} />}
       <div className="car__cars" title={`train ${train.trainId}`}>
         {lt.cars.map((letter, i) => (
           <span key={`${letter}${i}`} className={`car__unit${i === lt.cars.length - 1 ? " car__unit--tail" : ""}`}>
@@ -231,6 +233,29 @@ function TrainCar({ lt }: { lt: LaneTrain }) {
       <PreviewLink lt={lt} />
       {train.status === "EJECTED" && train.reason && <div className="car__reason">{excerpt(train.reason.replace(/prompt [0-9a-f-]{36}/, "a prompt"), 70)}</div>}
     </article>
+  );
+}
+
+export function TierBadge({ tier }: { tier: ModelTier }) {
+  return (
+    <span className={tierClass(tier)} title={TIER_META[tier].hint}>
+      {TIER_META[tier].label}
+    </span>
+  );
+}
+
+/** The router's pick for a train: model label, tier badge and (secondary line) why. */
+export function ModelChip({ model, reason, escalated }: { model: string; reason?: string | null; escalated?: boolean }) {
+  const tier = tierOf(model);
+  return (
+    <div className={`mchip${tier ? ` mchip--${tier}` : ""}${escalated ? " mchip--escalated" : ""}`} title={reason ? `${model}\n${reason}` : model}>
+      <div className="mchip__row">
+        <span className="mchip__name">{modelLabel(model)}</span>
+        {tier && <TierBadge tier={tier} />}
+        {escalated && <span className="mchip__esc">▲ ESCALATED</span>}
+      </div>
+      {reason && <div className="mchip__reason">{reason}</div>}
+    </div>
   );
 }
 
@@ -329,7 +354,10 @@ export function LedgerPanel({ card, lane, onClose }: { card: AuditCard; lane: La
           <dl className="kv">
             <div>
               <dt>MODEL</dt>
-              <dd>{p.model}</dd>
+              <dd className="kv__model" title={p.model}>
+                {modelLabel(p.model)}
+                {tierOf(p.model) && <TierBadge tier={tierOf(p.model) as ModelTier} />}
+              </dd>
             </div>
             <div>
               <dt>TEMPERATURE</dt>
@@ -720,11 +748,102 @@ export function Ticker({ items }: { items: TickerItem[] }) {
         {items.map((t) => (
           <li key={t.id} className={`tick tick--${t.kind}${t.tone ? ` tick--${t.tone}` : ""}`}>
             <time>{clock(t.at)}</time>
-            <span className="tick__kind">{t.kind === "scribe" ? "SCRIBE" : t.kind === "error" ? "ERR" : t.kind === "system" ? "SYS" : t.kind === "sentinel" ? "SENT" : "EVT"}</span>
+            <span className="tick__kind">{t.kind === "scribe" ? "SCRIBE" : t.kind === "error" ? "ERR" : t.kind === "system" ? "SYS" : t.kind === "sentinel" ? "SENT" : t.kind === "model" ? "MDL" : "EVT"}</span>
             <span className="tick__text">{t.text}</span>
           </li>
         ))}
       </ol>
+    </section>
+  );
+}
+
+// ── model board ───────────────────────────────────────────────────────────
+
+export function floorLine(f: RouterFloor): string {
+  const parts = [`${f.streak}/${f.backoffAfter} clean builds to back off`];
+  if (f.probeIn !== null) parts.push(`probe in ${f.probeIn}`);
+  return parts.join(" · ");
+}
+
+/** Compact router floor line; flashes red when raised, green when backed off. */
+function FloorLine({ floor }: { floor: RouterFloor }) {
+  const prev = useRef(floor.tier);
+  const [flash, setFlash] = useState<"up" | "down" | null>(null);
+  useEffect(() => {
+    if (prev.current === floor.tier) return;
+    setFlash(tierRank(floor.tier) > tierRank(prev.current) ? "up" : "down");
+    prev.current = floor.tier;
+    const t = setTimeout(() => setFlash(null), 1800);
+    return () => clearTimeout(t);
+  }, [floor.tier]);
+  return (
+    <p className={`models__floor${flash ? ` models__floor--${flash}` : ""}`} title="Cheapest tier the Queen will route builds to right now">
+      <span>Floor:</span> <TierBadge tier={floor.tier} /> <span className="models__floor-text">{floorLine(floor)}</span>
+    </p>
+  );
+}
+
+export function ModelBoard({ stats, floor }: { stats: ModelStats[]; floor?: RouterFloor | null }) {
+  const [open, setOpen] = useState(true);
+  const groups: TierGroup[] = buildModelBoard(stats);
+  const tried = groups.reduce((n, g) => n + g.rows.filter((r) => !r.untried).length, 0);
+  return (
+    <section className="models panel" aria-label="model board">
+      <button type="button" className="models__toggle" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        <span className="eyebrow">MODEL BOARD</span>
+        <span className="models__count">{tried} in play</span>
+        <span className="models__caret" aria-hidden>
+          {open ? "▾" : "▸"}
+        </span>
+      </button>
+      <p className="models__tag">Queen routes each build to the best model on AI Gateway</p>
+      {floor && <FloorLine floor={floor} />}
+      {open &&
+        groups.map((g) => (
+          <div className="mtier" key={g.tier}>
+            <div className="mtier__head">
+              <TierBadge tier={g.tier} />
+              <span>{TIER_META[g.tier].hint}</span>
+            </div>
+            <ul>
+              {g.rows.map((r) => (
+                <li key={r.model.id} className={`mrow${r.untried ? " mrow--untried" : ""}${r.leader ? " mrow--leader" : ""}`} title={r.model.id}>
+                  <span className="mrow__name">
+                    {r.leader && (
+                      <b className="mrow__crown" title="Leading its tier">
+                        ★
+                      </b>
+                    )}
+                    {r.model.label}
+                  </span>
+                  {r.untried ? (
+                    <span className="mrow__untried">untried</span>
+                  ) : (
+                    <>
+                      <span
+                        className="mrow__bar"
+                        role="meter"
+                        aria-label={`${r.model.label} pass rate`}
+                        aria-valuemin={0}
+                        aria-valuemax={r.attempts}
+                        aria-valuenow={r.passes}
+                      >
+                        <i style={{ width: `${Math.round((r.passRate ?? 0) * 100)}%` }} />
+                      </span>
+                      <span className="mrow__pct">{Math.round((r.passRate ?? 0) * 100)}%</span>
+                      <span className="mrow__n" title="passes / attempts">
+                        {r.passes}/{r.attempts}
+                      </span>
+                      <span className="mrow__ms" title="average build time">
+                        {formatDuration(r.avgBuildMs)}
+                      </span>
+                    </>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
     </section>
   );
 }

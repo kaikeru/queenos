@@ -4,7 +4,7 @@
  */
 import type { ChatMessage } from "@queenos/queen-types";
 
-export const DEFAULT_MODEL = "anthropic/claude-sonnet-5-5";
+export const DEFAULT_MODEL = "@cf/zai-org/glm-5.3-flash";
 /** Messages sent to the model (most recent), and the per-message clip. */
 export const HISTORY_LIMIT = 12;
 export const MESSAGE_CLIP = 2_000;

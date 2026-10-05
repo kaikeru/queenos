@@ -173,7 +173,7 @@ describe("secret guard", () => {
 describe("live interview", () => {
   it("calls the model with a capped history, merges the JSON draft and keeps fixed fields", async () => {
     const w = new FakeWorld();
-    w.config = { llmMode: "live", model: "anthropic/claude-sonnet-5-5" };
+    w.config = { llmMode: "live", model: "@cf/zai-org/glm-5.3-flash" };
     w.llm.reply = "```json\n" + JSON.stringify({
       reply: "Which hosts may it call?",
       charter: { name: "Todos", description: "A todo app", stack: { target: "evil" }, hive: "other", policy: { allowedHosts: ["api.example.com"] } },
@@ -182,7 +182,7 @@ describe("live interview", () => {
     let last!: Awaited<ReturnType<typeof call>>;
     for (let i = 0; i < 9; i++) last = await call("POST", `/api/genesis/${hive}/messages`, { text: `message ${i}` });
     const req = w.llm.requests.at(-1)!;
-    expect(req.model).toBe("anthropic/claude-sonnet-5-5");
+    expect(req.model).toBe("@cf/zai-org/glm-5.3-flash");
     expect(req.messages.length).toBeLessThanOrEqual(12);
     expect(req.messages.at(-1)).toEqual({ role: "user", content: "message 8" });
     expect(req.system).toMatch(/at most three short questions/);

@@ -7,3 +7,4 @@ export * from "./events.js";
 export * from "./executors.js";
 export * from "./onboarding.js";
 export * from "./releases.js";
+export * from "./models.js";

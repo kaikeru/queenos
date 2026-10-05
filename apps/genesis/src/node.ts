@@ -208,7 +208,8 @@ export class GenesisNode extends DurableObject<Env> {
         model: this.config.model,
         system: `${SYSTEM_PROMPT}\n\nProject name: ${r.name}\nCurrent charter draft: ${draftSoFar}`,
         messages: history,
-        maxTokens: 1_500,
+        // Reasoning models (GLM) think before answering; leave room for both.
+        maxTokens: 6_000,
         metadata: { app: "genesis", hive: r.hive },
       });
       return parseModelOutput(out.text);

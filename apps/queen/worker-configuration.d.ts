@@ -5,6 +5,9 @@ interface __BaseEnv_Env {
 	COMMAND_TIMEOUT_MS?: string;
 	SENTINEL_WINDOW_SECONDS?: string;
 	SENTINEL_MIN_REQUESTS?: string;
+	MODEL_ROUTER_PIN_BUILDER?: string;
+	ROUTER_BACKOFF_STREAK?: string;
+	ROUTER_PROBE_AFTER?: string;
 	QUEEN_NODE: DurableObjectNamespace<import("./src/index").QueenNode>;
 	DRONES?: Workflow /* DroneWorkflow from queenos-drones */;
 	PROVISIONER?: Workflow /* ProvisionerWorkflow from queenos-provisioner */;

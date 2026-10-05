@@ -15,6 +15,11 @@
  * supersedes, or queues behind a canary) a release. The Herald deploys it to
  * staging and canary, the Sentinel Workflow judges each step
  * (reportSentinelVerdict), and a human taps to ship (tapRelease).
+ *
+ * Model router (src/models/router.ts): the Queen picks each builder drone's
+ * model (role, attempt, the hive's track record in model_stats) and records
+ * why on the train; build results and gate verdicts feed the track record,
+ * broadcast as `models.updated`.
  */
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -45,13 +50,18 @@ import {
   type TrainResult,
 } from "@queenos/queen-types";
 import {
+  applyModelStatDelta,
+  listModelStats,
+  listRouterStats,
   listVerdicts,
   migrate,
   rowToAudit,
   rowToDeployment,
   rowToPrompt,
   rowToRelease,
+  loadRouter,
   rowToTrain,
+  saveRouter,
   upsertDeployment,
   upsertPrompt,
   upsertRelease,
@@ -61,6 +71,7 @@ import {
 import { WorkflowDroneDispatcher, type DroneDispatcher } from "./drones";
 import { WorkflowCommandDispatcher, type DeployDispatcher, type ProvisionerDispatcher, type SentinelDispatcher } from "./executors";
 import { QueenError, asQueenError, parseOrThrow } from "./errors";
+import { DEFAULT_POLICY, toRouterFloor, type FloorState, type RouterPolicy } from "./models/router";
 import {
   DEFAULT_COMMAND_TIMEOUT_MS,
   TrainPlanner,
@@ -69,6 +80,7 @@ import {
   toPromptRun,
   type Effect,
   type HiveState,
+  type ModelStatDelta,
   type Outcome,
   type PlanResult,
   type PromptRecord,
@@ -120,6 +132,22 @@ export function sentinelSettings(env: { SENTINEL_WINDOW_SECONDS?: string | numbe
     minRequests: int(env.SENTINEL_MIN_REQUESTS, 1, DEFAULT_SENTINEL.minRequests),
   };
 }
+/** MODEL_ROUTER_PIN_BUILDER (wrangler var): force one model for builder / rework drones; unset or blank = route. */
+export function modelPin(env: { MODEL_ROUTER_PIN_BUILDER?: string }): string | null {
+  const v = typeof env.MODEL_ROUTER_PIN_BUILDER === "string" ? env.MODEL_ROUTER_PIN_BUILDER.trim() : "";
+  return v || null;
+}
+/** ROUTER_BACKOFF_STREAK (K, default 3) / ROUTER_PROBE_AFTER (N, default 4) wrangler vars. */
+export function routerPolicy(env: { ROUTER_BACKOFF_STREAK?: string | number; ROUTER_PROBE_AFTER?: string | number }): RouterPolicy {
+  const int = (v: unknown, fallback: number) => {
+    const n = Number(v);
+    return v !== undefined && v !== "" && Number.isInteger(n) && n >= 1 ? n : fallback;
+  };
+  return {
+    backoffStreak: int(env.ROUTER_BACKOFF_STREAK, DEFAULT_POLICY.backoffStreak),
+    probeAfter: int(env.ROUTER_PROBE_AFTER, DEFAULT_POLICY.probeAfter),
+  };
+}
 /** Header the edge sets to the Cloudflare Access-verified user email (user routes only). */
 export const USER_HEADER = "x-queen-user";
 const SNAPSHOT_LIMIT = 200;
@@ -164,13 +192,21 @@ interface Persist {
   deployments: Deployment[];
   releases: ReleaseRecord[];
   effects: (Effect | ReleaseEffect)[];
+  modelStats: ModelStatDelta[];
+  routerDispatches?: number;
+  routerFloor?: FloorState;
 }
 
 function merged(...plans: (PlanResult | ReleasePlanResult | null)[]): Persist {
-  const out: Persist = { prompts: [], trains: [], deployments: [], releases: [], effects: [] };
+  const out: Persist = { prompts: [], trains: [], deployments: [], releases: [], effects: [], modelStats: [] };
   for (const p of plans) {
     if (!p) continue;
-    if ("prompts" in p) out.prompts.push(...p.prompts);
+    if ("prompts" in p) {
+      out.prompts.push(...p.prompts);
+      out.modelStats.push(...p.modelStats);
+      if (p.routerDispatches !== undefined) out.routerDispatches = p.routerDispatches;
+      if (p.routerFloor !== undefined) out.routerFloor = p.routerFloor;
+    }
     if ("trains" in p) out.trains.push(...p.trains);
     if ("releases" in p) out.releases.push(...p.releases);
     out.deployments.push(...p.deployments);
@@ -388,6 +424,8 @@ export class QueenNode extends DurableObject<Env> {
       deployments: this.listDeployments(),
       releases,
       verdicts: listVerdicts(this.sql, releases.map((r) => r.releaseId)),
+      modelStats: listModelStats(this.sql),
+      routerFloor: this.routerFloorView(),
     };
   }
 
@@ -517,6 +555,11 @@ export class QueenNode extends DurableObject<Env> {
 
   // ── internals ─────────────────────────────────────────────────────────
 
+  /** The persisted builder tier floor, as the War Room sees it. */
+  private routerFloorView() {
+    return toRouterFloor(loadRouter(this.sql).floor, routerPolicy(this.env));
+  }
+
   private hiveNamespace(): string | null {
     const row = this.sql.exec("SELECT namespace FROM prompt_runs LIMIT 1").toArray()[0];
     return row ? String(row.namespace) : null;
@@ -610,7 +653,17 @@ export class QueenNode extends DurableObject<Env> {
       .toArray()
       .map(rowToDeployment);
     const max = (table: string) => Number(this.sql.exec(`SELECT COALESCE(MAX(seq), 0) AS m FROM ${table}`).one().m);
-    return { prompts, trains, deployments, maxTrainSeq: max("merge_trains"), maxPromptSeq: max("prompt_runs") };
+    const router = loadRouter(this.sql);
+    return {
+      prompts,
+      trains,
+      deployments,
+      maxTrainSeq: max("merge_trains"),
+      maxPromptSeq: max("prompt_runs"),
+      modelStats: listRouterStats(this.sql),
+      routerDispatches: router.dispatches,
+      routerFloor: router.floor,
+    };
   }
 
   /** Load -> plan, synchronously (no await), so concurrent calls never interleave mid-plan. */
@@ -620,6 +673,8 @@ export class QueenNode extends DurableObject<Env> {
       now: this.now(),
       newId: () => crypto.randomUUID(),
       commandTimeoutMs: commandTimeoutMs(this.env),
+      modelPin: modelPin(this.env),
+      routerPolicy: routerPolicy(this.env),
     });
     return fn(planner);
   }
@@ -645,16 +700,24 @@ export class QueenNode extends DurableObject<Env> {
    * re-dispatch of the same command id is a no-op.
    */
   private async apply(plan: Persist): Promise<void> {
-    if (plan.prompts.length || plan.trains.length || plan.deployments.length || plan.releases.length) {
+    const stats = plan.modelStats.length > 0;
+    const router = plan.routerDispatches !== undefined || plan.routerFloor !== undefined;
+    if (plan.prompts.length || plan.trains.length || plan.deployments.length || plan.releases.length || stats || router) {
+      const now = this.now();
       this.ctx.storage.transactionSync(() => {
         for (const p of plan.prompts) upsertPrompt(this.sql, p);
         for (const t of plan.trains) upsertTrain(this.sql, t);
         for (const d of plan.deployments) upsertDeployment(this.sql, d);
         for (const r of plan.releases) upsertRelease(this.sql, r);
-        for (const e of plan.effects) if (e.type === "broadcast" && e.message.type === "sentinel.verdict") upsertVerdict(this.sql, e.message.verdict, this.now());
+        for (const e of plan.effects) if (e.type === "broadcast" && e.message.type === "sentinel.verdict") upsertVerdict(this.sql, e.message.verdict, now);
+        for (const d of plan.modelStats) applyModelStatDelta(this.sql, d, now);
+        if (router) saveRouter(this.sql, { dispatches: plan.routerDispatches, floor: plan.routerFloor });
       });
     }
     for (const e of plan.effects) if (e.type === "broadcast") this.broadcast(e.message);
+    if (stats || plan.routerFloor !== undefined) {
+      this.broadcast({ type: "models.updated", stats: listModelStats(this.sql), floor: this.routerFloorView() });
+    }
     for (const e of plan.effects) if (e.type !== "broadcast") await this.execute(e);
     await this.armWatchdog();
   }

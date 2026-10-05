@@ -3,5 +3,5 @@
 
 # Optional overrides of wrangler.jsonc vars:
 # DRONE_LLM_MODE=live
-# MODEL_BUILDER=anthropic/claude-opus-5-5   # or an @cf/... Workers AI model
+# MODEL_BUILDER=@cf/zai-org/glm-5.3-flash   # fallback; the Queen sends modelChoice per task
 # AI_TEMPERATURE=   # leave unset for claude-opus-5-5 (it rejects sampling params)

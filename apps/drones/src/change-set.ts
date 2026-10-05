@@ -61,22 +61,46 @@ export const ChangeSetSchema = z
 export type ChangeSet = z.infer<typeof ChangeSetSchema>;
 
 export class ChangeSetError extends Error {
-  override readonly name = "ChangeSetError";
+  override readonly name: string = "ChangeSetError";
 }
 
 /**
- * Pull the JSON object out of an LLM reply (tolerates ```json fences and
- * leading/trailing prose), then validate it.
+ * Pull the JSON object out of an LLM reply (tolerates ```json fences, leading/trailing prose,
+ * raw newlines inside strings, and `files` given as a path -> content map), then validate it.
  */
 export function parseChangeSet(text: string): ChangeSet {
-  const json = extractJsonObject(text);
-  let raw: unknown;
-  try {
-    raw = JSON.parse(json);
-  } catch (e) {
-    throw new ChangeSetError(`change set is not valid JSON: ${(e as Error).message}`);
+  if (!text.trim()) throw new ChangeSetError("empty model output (no text; the model may have spent its token budget on reasoning)");
+  let lastErr = "no JSON object in model output";
+  for (const candidate of jsonCandidates(text)) {
+    for (const attempt of [candidate, escapeControlCharsInStrings(candidate)]) {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(attempt);
+      } catch (e) {
+        lastErr = `change set is not valid JSON: ${(e as Error).message}`;
+        continue;
+      }
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      return validateChangeSet(normalizeRaw(raw as Record<string, unknown>));
+    }
   }
-  return validateChangeSet(raw);
+  throw new ChangeSetError(lastErr);
+}
+
+/** Common deviations: `files` as a { path: content } map, `contents`/`code` instead of `content`, `filename`/`file` instead of `path`. */
+function normalizeRaw(raw: Record<string, unknown>): unknown {
+  let files = raw.files;
+  if (files && typeof files === "object" && !Array.isArray(files)) {
+    files = Object.entries(files as Record<string, unknown>).map(([path, content]) => ({ path, content }));
+  }
+  if (Array.isArray(files)) {
+    files = files.map((f) => {
+      if (!f || typeof f !== "object") return f;
+      const o = f as Record<string, unknown>;
+      return { path: o.path ?? o.filename ?? o.file ?? o.name, content: o.content ?? o.contents ?? o.code };
+    });
+  }
+  return { ...raw, files };
 }
 
 export function validateChangeSet(raw: unknown): ChangeSet {
@@ -91,11 +115,124 @@ export function validateChangeSet(raw: unknown): ChangeSet {
   return r.data;
 }
 
-function extractJsonObject(text: string): string {
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
-  const body = (fenced?.[1] ?? text).trim();
-  const start = body.indexOf("{");
-  const end = body.lastIndexOf("}");
-  if (start === -1 || end <= start) throw new ChangeSetError("no JSON object in model output");
-  return body.slice(start, end + 1);
+/** Candidate JSON texts, best first: fenced blocks (last first), the whole reply, then balanced `{...}` spans. */
+export function jsonCandidates(text: string): string[] {
+  const out: string[] = [];
+  const fences = [...text.matchAll(/```(?:json|javascript|js)?[ \t]*\r?\n?([\s\S]*?)```/gi)].map((m) => m[1]!.trim());
+  out.push(...fences.reverse());
+  out.push(text.trim());
+  for (const body of [...out]) {
+    for (const span of balancedObjects(body)) out.push(span);
+  }
+  const seen = new Set<string>();
+  return out.filter((c) => c.startsWith("{") && !seen.has(c) && seen.add(c));
+}
+
+/** Top-level balanced `{...}` spans (string-aware), longest first. */
+function balancedObjects(text: string): string[] {
+  const spans: string[] = [];
+  for (let start = text.indexOf("{"); start !== -1 && spans.length < 5; ) {
+    let depth = 0;
+    let inStr = false;
+    let end = -1;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i]!;
+      if (inStr) {
+        if (c === "\\") i++;
+        else if (c === '"') inStr = false;
+      } else if (c === '"') inStr = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) {
+        end = i;
+        break;
+      }
+    }
+    if (end === -1) break;
+    spans.push(text.slice(start, end + 1));
+    start = text.indexOf("{", end + 1);
+  }
+  return spans.sort((a, b) => b.length - a.length);
+}
+
+/** Models often emit literal newlines/tabs inside JSON strings; escape them so JSON.parse accepts the text. */
+export function escapeControlCharsInStrings(json: string): string {
+  let out = "";
+  let inStr = false;
+  for (let i = 0; i < json.length; i++) {
+    const c = json[i]!;
+    if (inStr) {
+      if (c === "\\") {
+        out += c + (json[++i] ?? "");
+        continue;
+      }
+      if (c === '"') inStr = false;
+      else if (c === "\n") {
+        out += "\\n";
+        continue;
+      } else if (c === "\r") {
+        out += "\\r";
+        continue;
+      } else if (c === "\t") {
+        out += "\\t";
+        continue;
+      }
+    } else if (c === '"') inStr = true;
+    out += c;
+  }
+  return out;
+}
+
+// ── template fit (worker-starter, no build) ──────────────────────────────
+
+const IMPORT_SPEC_RE = /(?:^|[\n;])\s*(?:import\s+(?:[^"'\n]*?\s+from\s+)?|export\s+[^"'\n]*?\s+from\s+)["']([^"']+)["']/g;
+
+function dirname(p: string): string {
+  const i = p.lastIndexOf("/");
+  return i === -1 ? "" : p.slice(0, i);
+}
+
+function resolveRelative(fromFile: string, spec: string): string {
+  const parts = dirname(fromFile).split("/").filter(Boolean);
+  for (const seg of spec.split("/")) {
+    if (seg === "." || seg === "") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  return parts.join("/");
+}
+
+const exportsName = (code: string, name: string) =>
+  new RegExp(`export\\s+(?:async\\s+)?(?:const|let|var|function\\*?|class)\\s+${name}\\b`).test(code) ||
+  new RegExp(`export\\s*\\{[^}]*\\b${name}\\b[^}]*\\}`).test(code);
+
+/**
+ * Problems that would make the change set not run on the no-build template. Static and conservative:
+ * relative-only imports that resolve, no TypeScript/JSX, feature modules export `slug` and `handle`,
+ * and a rewritten router keeps `/health`. Returns human-readable messages (fed to the repair turn).
+ */
+export function templateFitProblems(cs: ChangeSet, repoFiles: Iterable<string> = []): string[] {
+  const known = new Set<string>([...repoFiles, ...cs.files.map((f) => f.path)]);
+  const problems: string[] = [];
+  for (const f of cs.files) {
+    if (/^src\/.*\.(?:ts|tsx|jsx|mts|cts)$/.test(f.path)) problems.push(`${f.path}: only plain .js files are allowed under src/ (no TypeScript/JSX, there is no build step)`);
+    if (!/^src\/.*\.js$/.test(f.path)) continue;
+    if (/\brequire\s*\(/.test(f.content) || /\bmodule\.exports\b/.test(f.content)) problems.push(`${f.path}: use ES modules (import/export), not require/module.exports`);
+    for (const m of f.content.matchAll(IMPORT_SPEC_RE)) {
+      const spec = m[1]!;
+      if (!spec.startsWith("./") && !spec.startsWith("../")) {
+        problems.push(`${f.path}: import "${spec}" is not allowed (relative imports with .js only; no npm packages or Node built-ins)`);
+      } else if (!known.has(resolveRelative(f.path, spec))) {
+        problems.push(`${f.path}: import "${spec}" does not exist in the repo or your change set (use the exact path with .js)`);
+      }
+    }
+    const isModule = /^src\/features\/(?!index\.js$)[^/]+\.js$/.test(f.path);
+    if (isModule) {
+      if (!exportsName(f.content, "slug")) problems.push(`${f.path}: feature modules must export const slug = "<slug>"`);
+      if (!exportsName(f.content, "handle")) problems.push(`${f.path}: feature modules must export function handle(request)`);
+    }
+    if (f.path === "src/index.js" && !(/\/health/.test(f.content) && /export\s+default/.test(f.content))) {
+      problems.push(`src/index.js: must keep "export default { fetch }" with the "/" and "/health" routes working`);
+    }
+  }
+  return problems;
 }

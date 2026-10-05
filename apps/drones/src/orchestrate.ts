@@ -21,6 +21,7 @@ import {
 import { AiGatewayError, LedgerError, buildGitNotesPayload } from "@queenos/hive-kit";
 import { commitAndPush, generateChangeSet, type CommitPushResult, type Generated, type LedgerStore } from "./build";
 import { ChangeSetError } from "./change-set";
+import { AllModelsFailedError } from "./generate";
 import { ConfigError, type DroneConfig } from "./config";
 import { landTrain, type LandOutcome } from "./land";
 import type { DronePorts, QueenPort } from "./ports";
@@ -76,7 +77,7 @@ export function toStepError(e: unknown, config: Pick<DroneConfig, "llmMode">): u
     (e instanceof AiGatewayError && !e.retryable) ||
     e instanceof ConfigError ||
     e instanceof LedgerError ||
-    (e instanceof ChangeSetError && config.llmMode === "scripted") ||
+    (e instanceof ChangeSetError && (config.llmMode === "scripted" || e instanceof AllModelsFailedError)) ||
     code === "NOTHING_TO_COMMIT" ||
     code === "INVALID_PATH" ||
     /^(INVALID_INPUT|NOT_FOUND|CONFLICT|UNAVAILABLE): /.test(messageOf(e));
@@ -154,14 +155,16 @@ async function report(ctx: RunCtx, name: string, call: (q: QueenPort) => Promise
 
 async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
   const { task, step, ports, config } = ctx;
-  let gen: Generated;
+  let gen: Generated & { genMs: number };
   try {
     if (config.llmMode === "scripted" && config.scriptedDelayMs > 0) {
       await step.sleep("scripted: thinking", config.scriptedDelayMs);
     }
-    gen = await step.do("generate change set", GENERATE_STEP, () =>
-      generateChangeSet(task, ports, config).catch((e) => Promise.reject(toStepError(e, config))),
-    );
+    gen = await step.do("generate change set", GENERATE_STEP, async () => {
+      const t0 = Date.now();
+      const g = await generateChangeSet(task, ports, config).catch((e) => Promise.reject(toStepError(e, config)));
+      return { ...g, genMs: Date.now() - t0 };
+    });
   } catch (e) {
     return failBuild(ctx, "generation", e);
   }
@@ -177,19 +180,28 @@ async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
     discardedPaths: gen.changeSet.discardedPaths,
   });
 
-  let pushed: CommitPushResult;
+  let pushed: CommitPushResult & { pushMs: number };
   try {
-    pushed = await step.do("clone, commit, note, push", GIT_STEP, () =>
-      commitAndPush(ports, { task, changeSet: gen.changeSet, ledger, timestamp: commitTimestamp(ctx) }).catch((e) =>
+    pushed = await step.do("clone, commit, note, push", GIT_STEP, async () => {
+      const t0 = Date.now();
+      const r = await commitAndPush(ports, { task, changeSet: gen.changeSet, ledger, timestamp: commitTimestamp(ctx) }).catch((e) =>
         Promise.reject(toStepError(e, config)),
-      ),
-    );
+      );
+      return { ...r, pushMs: Date.now() - t0 };
+    });
   } catch (e) {
     return failBuild(ctx, "commit/push", e, gen.model);
   }
 
+  const buildMs = Math.max(0, Math.round(gen.genMs + pushed.pushMs));
   const queenOutcome = await report(ctx, "report: build result", (q) =>
-    q.reportBuildResult({ trainId: task.trainId, headSha: pushed.headSha }),
+    q.reportBuildResult({
+      trainId: task.trainId,
+      headSha: pushed.headSha,
+      model: gen.model,
+      ...(gen.failedModels.length ? { failedModels: gen.failedModels.slice(0, 5) } : {}),
+      buildMs,
+    }),
   );
   await audit(ctx, "audit: passed", "PASSED", ledger);
   return {
@@ -211,7 +223,7 @@ async function failBuild(ctx: RunCtx, stage: string, err: unknown, model?: strin
   const executionTimeMs = await elapsed(ctx, "clock: failed");
   const ledger = buildGitNotesPayload({
     taskPrompt: task.promptText,
-    model: model ?? (config.llmMode === "scripted" ? SCRIPTED_MODEL : config.aiGateway.model),
+    model: model ?? (config.llmMode === "scripted" ? SCRIPTED_MODEL : (task.modelChoice?.model ?? config.aiGateway.model)),
     temperature: config.llmMode === "scripted" ? 0 : config.temperature,
     reasoningSteps: [summary],
     result: "failure",

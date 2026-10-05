@@ -145,3 +145,31 @@ The planner lives in `src/release/planner.ts` (pure, like the train planner) and
 - Vars: `SENTINEL_WINDOW_SECONDS` (default 60) and `SENTINEL_MIN_REQUESTS` (default 100).
 - Broadcasts `release.updated` (updatedAt strictly increases), `deployment.updated`, `sentinel.verdict`; the snapshot has `releases` (newest first, 20).
 - Sim: staging → AWAITING_TAP automatically; then `curl -XPOST localhost:8787/hives/<hive>/releases/<id>/tap -H 'x-queen-user: you@example.com'`. A prompt containing `[canary-fail]` makes the sim Sentinel roll back at 10%.
+
+## Model router
+
+The Queen picks each builder drone's model; `src/models/router.ts` is pure and unit-tested. Every LLM call goes through the Workers `ai` binding and AI Gateway, so any `MODEL_CATALOG` model (queen-types) is available.
+
+- **Who uses it:** BUILD and REWORK tasks carry `task.modelChoice` (`model`, `tier`, `role`, `reason`, `fallbacks`). LAND tasks don't use it (landers call no LLM), and neither does the Scribe, which keeps its env model in the gatekeepers.
+- **Tiers:**
+  - A first BUILD routes at the hive's **floor** (starts at `fast`).
+  - REWORK, or any attempt of 2 or more (including a watchdog re-dispatch), escalates to `frontier`. Escalation is local to that prompt and never moves the floor.
+- **Ranking:** candidates are the fitting models (`chars / 3` plus 64k tokens of headroom must fit the context window) in the tier or above. They are ranked by expected cost per success, `((passes + 1) / (attempts + 2) − 0.05 × min(failStreak, 3)) / cost`. A slow model scores ×0.8: GLM-5.3 by hint, or any model averaging over 120 s. Ties go to the lower cost, then catalog order.
+- **Exploration:** every 5th router decision tries the least-tried model in the chosen tier.
+- **Fallbacks:** up to 2. The rest of the chosen tier comes first, then the best model one tier up.
+- **Floor (AIMD with probing), persisted in `model_router`:**
+  - A gate failure, an unusable change set (`failedModels`), or a builder that gives up on a first-attempt BUILD raises the floor one tier.
+  - `ROUTER_BACKOFF_STREAK` (3) passes at the floor lower it one tier.
+  - While the floor is above `fast`, after `ROUTER_PROBE_AFTER` (4) floor dispatches the next one probes a tier lower. A probe that passes drops the floor at once.
+  - The War Room sees the floor as `snapshot.routerFloor` and in `models.updated.floor`.
+- **Stats:** kept in `model_stats`, keyed by `(model, role)`.
+  - `build-result`: attempts+1 for `model` (or the chosen model), which also feeds `avgBuildMs`. Each `failedModels` entry gets attempts+1 and failures+1. The train's `model` becomes the model actually used.
+  - Gate verdict: passes+1 on a pass, failures+1 on a fail.
+  - Each count happens once per train, guarded by `model_outcome`.
+  - Models outside the catalog (for example `queenos/scripted-drone-v1`) are never counted.
+  - After each change the Queen broadcasts `models.updated`, and the snapshot carries `modelStats`.
+- **Pin:** `MODEL_ROUTER_PIN_BUILDER=<model id>` forces one model for builder and rework tasks.
+- **Sim:**
+  - Sim drones report the chosen model. A frontier build takes 1.6× as long.
+  - `[fail]` fails the first BUILD at the gate, which raises the floor and shows the rework escalating.
+  - `[bad-json]` makes the chosen model "return junk" so the first fallback builds instead (`failedModels`).

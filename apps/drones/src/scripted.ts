@@ -56,9 +56,15 @@ export function renderRegistry(modules: readonly string[]): string {
   ].join("\n");
 }
 
-/** Module files (`<name>.js`) a registry imports. */
+/** Module files (`<name>.js`) a registry imports (any quote style, namespace/default/named imports). */
 export function registryModules(registry: string): string[] {
-  return [...registry.matchAll(/from "\.\/([A-Za-z0-9._-]+\.js)"/g)].map((m) => m[1]!);
+  return [...registry.matchAll(/from\s*["']\.\/([A-Za-z0-9._-]+\.js)["']/g)].map((m) => m[1]!).filter((f) => f !== "index.js");
+}
+
+/** `<name>.js` for a feature module path (`src/features/<name>.js`, not the registry), else null. */
+export function featureModuleName(path: string): string | null {
+  const m = /^src\/features\/([A-Za-z0-9._-]+\.js)$/.exec(path);
+  return m && m[1] !== "index.js" ? m[1]! : null;
 }
 
 /**

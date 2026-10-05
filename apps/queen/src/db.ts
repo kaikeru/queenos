@@ -6,15 +6,21 @@ import {
   AuditEventSchema,
   DeploymentSchema,
   MergeTrainSchema,
+  ModelChoiceSchema,
+  ModelRoleSchema,
+  ModelTierSchema,
   PromptRunSchema,
   ReleaseSchema,
   SentinelVerdictSchema,
   type AuditEvent,
   type Deployment,
+  type ModelChoice,
+  type ModelStats,
   type SentinelVerdict,
 } from "@queenos/queen-types";
+import { INITIAL_FLOOR, type FloorState, type RouterStats } from "./models/router";
 import type { ReleasePending, ReleaseRecord } from "./release/planner";
-import type { DeployState, ForkState, PromptRecord, TrainAction, TrainPhase, TrainRecord } from "./train/planner";
+import type { DeployState, ForkState, ModelOutcome, ModelStatDelta, PromptRecord, TrainAction, TrainPhase, TrainRecord } from "./train/planner";
 
 /**
  * Append-only migration list. Version N is `MIGRATIONS[N - 1]`.
@@ -177,6 +183,45 @@ const MIGRATIONS: readonly string[] = [
     PRIMARY KEY (release_id, environment)
   );
   `,
+  `
+  -- v6: model router. The builder model chosen per train (and why), and the
+  -- hive's track record per (model, role) that the router learns from.
+  ALTER TABLE merge_trains ADD COLUMN model TEXT;
+  ALTER TABLE merge_trains ADD COLUMN model_reason TEXT;
+  -- Internal: the full ModelChoice JSON, the drone attempt it was made for, and
+  -- stats bookkeeping (NULL / BUILT / PASSED / FAILED) so results count once.
+  ALTER TABLE merge_trains ADD COLUMN model_choice TEXT;
+  ALTER TABLE merge_trains ADD COLUMN model_choice_attempt INTEGER;
+  ALTER TABLE merge_trains ADD COLUMN model_outcome TEXT;
+  ALTER TABLE merge_trains ADD COLUMN model_probe INTEGER NOT NULL DEFAULT 0;
+
+  CREATE TABLE model_stats (
+    model TEXT NOT NULL,
+    role TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    passes INTEGER NOT NULL DEFAULT 0,
+    failures INTEGER NOT NULL DEFAULT 0,
+    -- Consecutive failures since the last pass (router penalty).
+    fail_streak INTEGER NOT NULL DEFAULT 0,
+    -- avgBuildMs = build_ms_total / timed_builds.
+    build_ms_total INTEGER NOT NULL DEFAULT 0,
+    timed_builds INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (model, role)
+  );
+
+  -- Router state, single row: decisions so far (exploration cadence) and the
+  -- builder tier floor (AIMD): tier, passes at the floor, floor dispatches
+  -- since the last probe, and the note shown on the next floor-routed choice.
+  CREATE TABLE model_router (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    dispatches INTEGER NOT NULL DEFAULT 0,
+    floor_tier TEXT NOT NULL DEFAULT 'fast',
+    pass_streak INTEGER NOT NULL DEFAULT 0,
+    above_streak INTEGER NOT NULL DEFAULT 0,
+    floor_note TEXT
+  );
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -228,6 +273,8 @@ export function rowToTrain(r: Row): TrainRecord {
     headSha: str(r.head_sha),
     landedSha: str(r.landed_sha),
     previewUrl: str(r.preview_url),
+    model: str(r.model ?? null),
+    modelReason: str(r.model_reason ?? null),
   });
   return {
     ...base,
@@ -254,7 +301,23 @@ export function rowToTrain(r: Row): TrainRecord {
     teardownIssuedAt: num(r.teardown_issued_at),
     droneIssuedAt: num(r.drone_issued_at),
     droneAttempt: num(r.drone_attempt) ?? 1,
+    model: str(r.model ?? null),
+    modelReason: str(r.model_reason ?? null),
+    modelChoice: parseChoice(r.model_choice ?? null),
+    modelChoiceAttempt: num(r.model_choice_attempt),
+    modelOutcome: str(r.model_outcome ?? null) as ModelOutcome | null,
+    modelProbe: Number(r.model_probe ?? 0) === 1,
   };
+}
+
+function parseChoice(v: SqlStorageValue): ModelChoice | null {
+  if (v === null) return null;
+  try {
+    const parsed = ModelChoiceSchema.safeParse(JSON.parse(String(v)));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
 }
 
 export function rowToDeployment(r: Row): Deployment {
@@ -325,8 +388,9 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     `INSERT INTO merge_trains (train_id, base_sha, included_prompts, artifact_repo, status, created_at, seq, prompt_id,
        phase, fork_state, fork_source, head_sha, landed_sha, summary, reason, action, dispatched,
        fork_command_id, delete_command_id, deploy_state, deploy_command_id, teardown_command_id, preview_url,
-       fork_issued_at, delete_issued_at, deploy_issued_at, teardown_issued_at, drone_issued_at, drone_attempt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       fork_issued_at, delete_issued_at, deploy_issued_at, teardown_issued_at, drone_issued_at, drone_attempt,
+       model, model_reason, model_choice, model_choice_attempt, model_outcome, model_probe)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
        status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
@@ -337,7 +401,9 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        preview_url = excluded.preview_url, fork_issued_at = excluded.fork_issued_at,
        delete_issued_at = excluded.delete_issued_at, deploy_issued_at = excluded.deploy_issued_at,
        teardown_issued_at = excluded.teardown_issued_at, drone_issued_at = excluded.drone_issued_at,
-       drone_attempt = excluded.drone_attempt`,
+       drone_attempt = excluded.drone_attempt, model = excluded.model, model_reason = excluded.model_reason,
+       model_choice = excluded.model_choice, model_choice_attempt = excluded.model_choice_attempt,
+       model_outcome = excluded.model_outcome, model_probe = excluded.model_probe`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -367,6 +433,111 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     t.teardownIssuedAt,
     t.droneIssuedAt,
     t.droneAttempt,
+    t.model,
+    t.modelReason,
+    t.modelChoice ? JSON.stringify(t.modelChoice) : null,
+    t.modelChoiceAttempt,
+    t.modelOutcome,
+    t.modelProbe ? 1 : 0,
+  );
+}
+
+// ── model router ────────────────────────────────────────────────────────
+
+/** The hive's track record, with the internal failure streak (router input). */
+export function listRouterStats(sql: SqlStorage): RouterStats[] {
+  return sql
+    .exec("SELECT * FROM model_stats ORDER BY role, model")
+    .toArray()
+    .flatMap((r) => {
+      const role = ModelRoleSchema.safeParse(r.role);
+      if (!role.success) return [];
+      const timed = Number(r.timed_builds);
+      return [
+        {
+          model: String(r.model),
+          role: role.data,
+          attempts: Number(r.attempts),
+          passes: Number(r.passes),
+          failures: Number(r.failures),
+          avgBuildMs: timed > 0 ? Math.round(Number(r.build_ms_total) / timed) : null,
+          updatedAt: Number(r.updated_at),
+          failStreak: Number(r.fail_streak),
+        },
+      ];
+    });
+}
+
+/** ModelStats rows for the War Room (snapshot / models.updated). */
+export function listModelStats(sql: SqlStorage): ModelStats[] {
+  return listRouterStats(sql).map((s) => ({
+    model: s.model,
+    role: s.role,
+    attempts: s.attempts,
+    passes: s.passes,
+    failures: s.failures,
+    avgBuildMs: s.avgBuildMs,
+    updatedAt: s.updatedAt,
+  }));
+}
+
+export function applyModelStatDelta(sql: SqlStorage, d: ModelStatDelta, now: number): void {
+  const timed = d.buildMs !== undefined ? 1 : 0;
+  const ms = d.buildMs ?? 0;
+  const streak = d.streak === "fail" ? 1 : 0;
+  sql.exec(
+    `INSERT INTO model_stats (model, role, attempts, passes, failures, fail_streak, build_ms_total, timed_builds, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(model, role) DO UPDATE SET attempts = attempts + excluded.attempts, passes = passes + excluded.passes,
+       failures = failures + excluded.failures,
+       fail_streak = CASE ? WHEN 'pass' THEN 0 WHEN 'fail' THEN fail_streak + 1 ELSE fail_streak END,
+       build_ms_total = build_ms_total + excluded.build_ms_total, timed_builds = timed_builds + excluded.timed_builds,
+       updated_at = excluded.updated_at`,
+    d.model,
+    d.role,
+    d.attempts,
+    d.passes,
+    d.failures,
+    streak,
+    ms,
+    timed,
+    now,
+    d.streak ?? "",
+  );
+}
+
+export interface RouterRow {
+  dispatches: number;
+  floor: FloorState;
+}
+
+export function loadRouter(sql: SqlStorage): RouterRow {
+  const r = sql.exec("SELECT * FROM model_router WHERE id = 1").toArray()[0];
+  if (!r) return { dispatches: 0, floor: { ...INITIAL_FLOOR } };
+  const tier = ModelTierSchema.safeParse(r.floor_tier);
+  return {
+    dispatches: Number(r.dispatches),
+    floor: {
+      tier: tier.success ? tier.data : INITIAL_FLOOR.tier,
+      passStreak: Number(r.pass_streak),
+      aboveStreak: Number(r.above_streak),
+      note: str(r.floor_note),
+    },
+  };
+}
+
+export function saveRouter(sql: SqlStorage, patch: { dispatches?: number; floor?: FloorState }): void {
+  const cur = loadRouter(sql);
+  const next = { dispatches: patch.dispatches ?? cur.dispatches, floor: patch.floor ?? cur.floor };
+  sql.exec(
+    `INSERT INTO model_router (id, dispatches, floor_tier, pass_streak, above_streak, floor_note) VALUES (1, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET dispatches = excluded.dispatches, floor_tier = excluded.floor_tier,
+       pass_streak = excluded.pass_streak, above_streak = excluded.above_streak, floor_note = excluded.floor_note`,
+    next.dispatches,
+    next.floor.tier,
+    next.floor.passStreak,
+    next.floor.aboveStreak,
+    next.floor.note,
   );
 }
 

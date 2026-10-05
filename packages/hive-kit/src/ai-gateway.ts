@@ -21,6 +21,11 @@ export interface ChatMessage {
   content: string;
 }
 
+/** OpenAI-style structured output request (`response_format`); Workers AI chat models accept both forms. */
+export type ResponseFormat =
+  | { type: "json_object" }
+  | { type: "json_schema"; json_schema: { name: string; description?: string; schema: Record<string, unknown>; strict?: boolean } };
+
 export interface CompletionRequest {
   /** Workers AI (`@cf/...`) or third-party (`anthropic/claude-opus-5-5`) model id. */
   model: string;
@@ -29,6 +34,10 @@ export interface CompletionRequest {
   maxTokens?: number;
   /** Sent only when set (Claude Opus 5.5 rejects sampling parameters). */
   temperature?: number;
+  /** JSON mode / JSON schema. Sent only when set; models that reject it make `complete` throw a 4xx. */
+  responseFormat?: ResponseFormat;
+  /** Extra model-specific body parameters (e.g. `reasoning_effort`). Never overrides messages/max_tokens. */
+  extraParams?: Record<string, unknown>;
   /** Gateway log annotations. */
   metadata?: Record<string, string | number | boolean>;
 }
@@ -58,8 +67,8 @@ export class AiGatewayError extends Error {
 // --- role -> model -------------------------------------------------------
 
 export const ROLE_MODEL_DEFAULTS = {
-  BUILDER: "anthropic/claude-opus-5-5",
-  SCRIBE: "anthropic/claude-haiku-4-5",
+  BUILDER: "@cf/zai-org/glm-5.3-flash",
+  SCRIBE: "@cf/zai-org/glm-4.7-flash",
 } as const;
 export type AiRole = keyof typeof ROLE_MODEL_DEFAULTS;
 
@@ -73,24 +82,55 @@ export function modelForRole(role: AiRole, env: object): string {
 
 export function buildInput(req: CompletionRequest): Record<string, unknown> {
   return {
+    ...(req.extraParams ?? {}),
     messages: [...(req.system ? [{ role: "system", content: req.system }] : []), ...req.messages],
     max_tokens: req.maxTokens ?? 16_000,
     ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
+    ...(req.responseFormat ? { response_format: req.responseFormat } : {}),
   };
 }
 
 interface RunOutput {
   response?: unknown;
-  choices?: { message?: { content?: unknown; refusal?: string | null }; finish_reason?: string | null }[];
+  result?: { response?: unknown };
+  choices?: {
+    message?: { content?: unknown; refusal?: string | null; reasoning_content?: unknown; reasoning?: unknown };
+    text?: unknown;
+    finish_reason?: string | null;
+  }[];
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
+/** Chat content as text: a string, an array of `{type:"text",text}` parts, or (JSON mode) an already-parsed object. */
+function textOf(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) {
+    return v
+      .map((p) => (typeof p === "string" ? p : p && typeof p === "object" && (p as { type?: string }).type !== "reasoning" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
+      .join("");
+  }
+  if (v && typeof v === "object") return JSON.stringify(v);
+  return "";
+}
+
+/** Drop inline chain-of-thought some models emit in the content itself (`<think>...</think>`). */
+export function stripThinking(text: string): string {
+  const closed = text.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "");
+  // An unclosed block means the model ran out of tokens while thinking: nothing usable follows it.
+  return closed.replace(/<think(?:ing)?>[\s\S]*$/i, "").trim();
+}
+
+/**
+ * Both response shapes: OpenAI-style `choices[0].message.content` and Workers AI `response`.
+ * Reasoning models put chain-of-thought in `reasoning_content` / `reasoning`; it is ignored,
+ * so a reply that only ever "thought" yields empty text (callers treat that as unusable output).
+ */
 export function parseOutput(model: string, out: unknown): CompletionResult {
   const r = (out ?? {}) as RunOutput;
   const choice = r.choices?.[0];
   if (choice?.message?.refusal) throw new AiGatewayError("model refused the request", 200, false);
-  const content = choice?.message?.content;
-  const text = typeof content === "string" ? content : typeof r.response === "string" ? r.response : "";
+  const raw = choice?.message?.content ?? choice?.text ?? r.response ?? r.result?.response;
+  const text = stripThinking(textOf(raw));
   return {
     text,
     model,

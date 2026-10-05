@@ -247,3 +247,81 @@ test("genuine malformed frames are not classed as outdated", () => {
   expect(s.outdated).toBe(false);
   expect(s.ticker[0]).toMatchObject({ kind: "error" });
 });
+
+// ── model routing ─────────────────────────────────────────────────────────
+
+const mstat = (model: string, attempts: number, passes: number) => ({ model, role: "builder", attempts, passes, failures: attempts - passes, avgBuildMs: 1000, updatedAt: 1 });
+const FLASH = "@cf/zai-org/glm-5.3-flash";
+const DEEP = "@cf/deepseek-ai/deepseek-v4-flash-0731";
+const KIMI = "@cf/moonshotai/kimi-k2.7-code";
+
+test("models.updated replaces the stats wholesale", () => {
+  const a = run(server({ type: "models.updated", stats: [mstat(FLASH, 2, 1), mstat(DEEP, 1, 1)] }));
+  expect(a.modelStats).toHaveLength(2);
+  const b = reducer(a, server({ type: "models.updated", stats: [mstat(KIMI, 1, 1)] }));
+  expect(b.modelStats.map((s) => s.model)).toEqual([KIMI]);
+});
+
+test("snapshot.modelStats hydrates; a snapshot without them keeps live stats", () => {
+  const withStats = run(server({ type: "snapshot", promptRuns: [], trains: [], recentAudit: [], modelStats: [mstat(FLASH, 3, 2)] }));
+  expect(withStats.modelStats[0]!.attempts).toBe(3);
+  const old = reducer(withStats, server({ type: "snapshot", promptRuns: [], trains: [], recentAudit: [] }));
+  expect(old.modelStats).toHaveLength(1);
+});
+
+test("train model change adds a fallback ticker line; escalation says escalated", () => {
+  const base = run(
+    server({ type: "prompt.updated", promptRun: prompt("p1", 10) }),
+    server({ type: "train.updated", train: train("t1", ["p1"], "BUILDING", { model: FLASH, modelReason: "best in tier" }) }),
+  );
+  expect(base.ticker.some((t) => t.kind === "model")).toBe(false);
+  const fell = reducer(base, server({ type: "train.updated", train: train("t1", ["p1"], "BUILDING", { model: DEEP, modelReason: "GLM-5.3 Flash failed JSON" }) }));
+  expect(fell.ticker[0]).toMatchObject({ kind: "model" });
+  expect(fell.ticker[0]!.text).toBe("A: GLM-5.3 Flash → fell back to DeepSeek V4 Flash (GLM-5.3 Flash failed JSON)");
+  const esc = reducer(fell, server({ type: "train.updated", train: train("t1", ["p1"], "BUILDING", { model: KIMI }) }));
+  expect(esc.ticker[0]!.text).toBe("A: DeepSeek V4 Flash → escalated to Kimi K2.7 Code");
+  // unchanged model: no extra line
+  const same = reducer(esc, server({ type: "train.updated", train: train("t1", ["p1"], "TESTING", { model: KIMI }) }));
+  expect(same.ticker.filter((t) => t.kind === "model")).toHaveLength(2);
+});
+
+test("a rebuilt train on a higher tier is flagged escalated", () => {
+  const s = run(
+    server({ type: "prompt.updated", promptRun: prompt("p1", 10) }),
+    server({ type: "train.updated", train: train("t1", ["p1"], "EJECTED", { createdAt: 11, model: FLASH }) }),
+    server({ type: "train.updated", train: train("t2", ["p1"], "BUILDING", { createdAt: 12, model: KIMI, modelReason: "rework → escalated to frontier" }) }),
+  );
+  const [t1, t2] = buildLanes(s)[0]!.trains;
+  expect(t1!.escalated).toBe(false);
+  expect(t2!.escalated).toBe(true);
+});
+
+test("model fields round-trip through the shared schema", () => {
+  const parsed = QueenServerMessageSchema.safeParse({ type: "models.updated", stats: [mstat(FLASH, 1, 1)] });
+  expect(parsed.success).toBe(true);
+});
+
+const floorOf = (tier: string, streak = 0, probeIn: number | null = 2) => ({ tier, streak, backoffAfter: 3, probeIn });
+
+test("router floor: stored from snapshot and models.updated, kept when absent", () => {
+  const a = run(server({ type: "snapshot", promptRuns: [], trains: [], recentAudit: [], routerFloor: floorOf("fast", 1) }));
+  expect(a.routerFloor).toMatchObject({ tier: "fast", streak: 1 });
+  expect(a.ticker.some((t) => t.kind === "model")).toBe(false);
+  const b = reducer(a, server({ type: "models.updated", stats: [], floor: floorOf("fast", 2, null) }));
+  expect(b.routerFloor).toMatchObject({ streak: 2, probeIn: null });
+  const c = reducer(b, server({ type: "models.updated", stats: [mstat(FLASH, 1, 1)] }));
+  expect(c.routerFloor).toEqual(b.routerFloor);
+  const d = reducer(c, server({ type: "snapshot", promptRuns: [], trains: [], recentAudit: [] }));
+  expect(d.routerFloor).toEqual(b.routerFloor);
+});
+
+test("router floor tier changes add one ticker line each way; same tier adds none", () => {
+  const s0 = run(server({ type: "models.updated", stats: [], floor: floorOf("fast") }));
+  expect(s0.ticker).toHaveLength(0);
+  const up = reducer(s0, server({ type: "models.updated", stats: [], floor: floorOf("frontier") }));
+  expect(up.ticker[0]).toMatchObject({ kind: "model", text: "Router: floor raised to frontier" });
+  const same = reducer(up, server({ type: "models.updated", stats: [], floor: floorOf("frontier", 1) }));
+  expect(same.ticker).toHaveLength(1);
+  const down = reducer(same, server({ type: "models.updated", stats: [], floor: floorOf("fast") }));
+  expect(down.ticker[0]!.text).toBe("Router: backed off to fast");
+});

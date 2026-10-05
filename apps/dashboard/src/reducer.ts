@@ -14,13 +14,17 @@ import type {
   DroneRole,
   GitNotesPayload,
   MergeTrain,
+  ModelStats,
   PromptRun,
   QueenServerMessage,
+  RouterFloor,
   Release,
   SentinelVerdict,
 } from "@queenos/queen-types";
 
-export type TickerKind = "scribe" | "status" | "error" | "system" | "sentinel";
+import { isEscalation, modelLabel, tierRank } from "./models";
+
+export type TickerKind = "scribe" | "status" | "error" | "system" | "sentinel" | "model";
 
 export interface TickerItem {
   id: number;
@@ -55,6 +59,10 @@ export interface State {
   verdicts: Record<string, Partial<Record<SentinelVerdict["environment"], SentinelVerdict>>>;
   /** Highest canary percent ever seen per release (a rollback may reset `canaryPercent`). */
   canaryPeak: Record<string, number>;
+  /** Model router track record (per model and role), replaced wholesale on each update. */
+  modelStats: ModelStats[];
+  /** Hive-wide builder tier floor (AIMD); null until the Queen reports one. */
+  routerFloor: RouterFloor | null;
   audit: AuditEvent[];
   /** Newest first. */
   ticker: TickerItem[];
@@ -84,6 +92,8 @@ export const initialState: State = {
   releaseOrder: [],
   verdicts: {},
   canaryPeak: {},
+  modelStats: [],
+  routerFloor: null,
   audit: [],
   ticker: [],
   landed: [],
@@ -214,6 +224,9 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
         releaseOrder: [...(msg.releases ?? [])].sort((a, b) => b.createdAt - a.createdAt).map((r) => r.releaseId),
         canaryPeak: Object.fromEntries((msg.releases ?? []).map((r) => [r.releaseId, Math.max(state.canaryPeak[r.releaseId] ?? 0, r.canaryPercent ?? 0)])),
         audit: msg.recentAudit.slice(-AUDIT_LIMIT),
+        // Older Queens omit modelStats: keep whatever live frames gave us.
+        modelStats: msg.modelStats ?? state.modelStats,
+        routerFloor: msg.routerFloor ?? state.routerFloor,
         landed: [],
         // Older Queens omit verdicts: keep whatever live frames gave us.
         verdicts: msg.verdicts ? hydrateVerdicts(msg.verdicts) : state.verdicts,
@@ -260,9 +273,25 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
               : `${t.status}${t.phase ? ` / ${t.phase}` : ""}`;
         next = pushTicker(next, "status", `Train ${cars} ${verb}`, at);
       }
+      if (prev && t.model && prev.model !== t.model) {
+        const who = tail ? `${letterOf(next, tail)}: ` : "";
+        const from = prev.model ? `${modelLabel(prev.model)} → ` : "";
+        const verb = !prev.model ? "routed to" : isEscalation(prev.model, t.model) ? "escalated to" : "fell back to";
+        next = pushTicker(next, "model", `${who}${from}${verb} ${modelLabel(t.model)}${t.modelReason ? ` (${excerpt(t.modelReason, 90)})` : ""}`, at);
+      }
       if (t.summary && t.summary !== prev?.summary) {
         const who = tail ? `[${letterOf(next, tail)}] ` : "";
         next = pushTicker(next, "scribe", `${who}${t.summary}`, at);
+      }
+      return next;
+    }
+    case "models.updated": {
+      const prev = state.routerFloor;
+      const floor = msg.floor ?? prev;
+      let next: State = { ...state, modelStats: msg.stats, routerFloor: floor };
+      if (prev && floor && prev.tier !== floor.tier) {
+        const raised = tierRank(floor.tier) > tierRank(prev.tier);
+        next = pushTicker(next, "model", `Router: ${raised ? "floor raised to" : "backed off to"} ${floor.tier}`, at);
       }
       return next;
     }
@@ -399,6 +428,8 @@ export interface LaneTrain {
   ejectKind: "failed" | "superseded" | null;
   /** The train's Worker Preview row, if it was ever deployed. */
   preview: Deployment | null;
+  /** A rebuild routed to a higher model tier than the previous attempt. */
+  escalated: boolean;
 }
 
 export interface Lane {
@@ -431,6 +462,7 @@ export function buildLanes(state: State): Lane[] {
         ejectKind:
           train.status !== "EJECTED" ? null : train.reason?.startsWith("superseded") ? "superseded" : "failed",
         preview: state.deployments[`preview-${train.trainId}`] ?? null,
+        escalated: k > 0 && isEscalation(trains[k - 1]!.model, train.model),
       })),
     };
   });

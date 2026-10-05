@@ -12,7 +12,7 @@ export interface DroneConfig {
   aiGateway: AiGatewayConfig;
   /**
    * Recorded in the ledger. Only sent to the provider when AI_TEMPERATURE is
-   * set: Claude Opus 5.5 rejects sampling params, so the default is "unset"
+   * set: some models reject sampling params, so the default is "unset"
    * and the ledger records the provider default (1).
    */
   temperature: number;

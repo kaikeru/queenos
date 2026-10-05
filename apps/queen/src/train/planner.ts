@@ -40,6 +40,7 @@ import type {
   DroneTask,
   LandResult,
   MergeTrain,
+  ModelChoice,
   PromptRun,
   PromptStatus,
   ProvisionCommand,
@@ -49,6 +50,7 @@ import type {
   TrainResult,
   TrainState,
 } from "@queenos/queen-types";
+import { DEFAULT_POLICY, INITIAL_FLOOR, floorAfter, isCatalogModel, route, type FloorOutcome, type FloorState, type RouterPolicy, type RouterRole, type RouterStats } from "../models/router";
 
 /**
  * Planner-internal train lifecycle (TrainPhaseSchema in queen-types, exposed
@@ -111,6 +113,36 @@ export interface TrainRecord extends MergeTrain {
   droneIssuedAt: number | null;
   /** Attempt number of the current phase's drone (instance id suffix when > 1). */
   droneAttempt: number;
+  /** Router's choice, or (after the build) the model that actually built the head. */
+  model: string | null;
+  modelReason: string | null;
+  /** Full router decision for the current builder dispatch (fallbacks included). */
+  modelChoice: ModelChoice | null;
+  /** droneAttempt the choice was made for: a re-dispatch of the same attempt reuses it. */
+  modelChoiceAttempt: number | null;
+  /** Stats bookkeeping, so a result is counted once: BUILT (attempt counted), then PASSED / FAILED. */
+  modelOutcome: ModelOutcome | null;
+  /** The current choice was a probe one tier under the hive's floor. */
+  modelProbe: boolean;
+}
+
+export type ModelOutcome = "BUILT" | "PASSED" | "FAILED";
+
+/**
+ * A track-record change for one (model, role), applied by the DO in the same
+ * transaction as the train rows. Emitted only by applied transitions, guarded
+ * by the train's modelOutcome, so duplicate / stale results never count twice.
+ */
+export interface ModelStatDelta {
+  model: string;
+  role: RouterRole;
+  attempts: number;
+  passes: number;
+  failures: number;
+  /** A timed build (feeds avgBuildMs). */
+  buildMs?: number;
+  /** "pass" resets the consecutive-failure streak, "fail" extends it. */
+  streak?: "pass" | "fail";
 }
 
 export interface PromptRecord extends PromptRun {
@@ -127,6 +159,12 @@ export interface HiveState {
   deployments?: Deployment[];
   maxTrainSeq: number;
   maxPromptSeq: number;
+  /** Router track record for this hive (model_stats). */
+  modelStats?: RouterStats[];
+  /** Router decisions made so far in this hive (exploration cadence). */
+  routerDispatches?: number;
+  /** The hive's builder tier floor (AIMD + probes). */
+  routerFloor?: FloorState;
 }
 
 export interface PlannerContext {
@@ -137,6 +175,10 @@ export interface PlannerContext {
   maxReworks?: number;
   /** Watchdog: an outstanding command older than this is re-issued. Default 10 min. */
   commandTimeoutMs?: number;
+  /** MODEL_ROUTER_PIN_BUILDER: force this model for builder / rework drones. */
+  modelPin?: string | null;
+  /** ROUTER_BACKOFF_STREAK / ROUTER_PROBE_AFTER. */
+  routerPolicy?: RouterPolicy;
 }
 
 export type Effect =
@@ -158,6 +200,12 @@ export interface PlanResult {
   trains: TrainRecord[];
   deployments: Deployment[];
   effects: Effect[];
+  /** Track-record changes to apply (then broadcast models.updated). */
+  modelStats: ModelStatDelta[];
+  /** New router decision count, when this plan made a decision. */
+  routerDispatches?: number;
+  /** New floor state, when this plan moved it. */
+  routerFloor?: FloorState;
 }
 
 const TERMINAL: ReadonlySet<TrainPhase> = new Set(["MERGED", "EJECTED"]);
@@ -257,6 +305,8 @@ export function toMergeTrain(t: TrainRecord): MergeTrain {
     headSha: t.headSha,
     landedSha: t.landedSha,
     previewUrl: t.previewUrl,
+    model: t.model,
+    modelReason: t.modelReason,
   };
 }
 
@@ -282,6 +332,12 @@ export class TrainPlanner {
   private readonly deployments = new Map<string, Deployment>();
   private readonly dirtyDeployments = new Set<string>();
   private effects: Effect[] = [];
+  private modelDeltas: ModelStatDelta[] = [];
+  private readonly modelStats: RouterStats[];
+  private routerDispatches: number;
+  private routerDirty = false;
+  private floor: FloorState;
+  private floorDirty = false;
 
   constructor(
     state: HiveState,
@@ -292,6 +348,9 @@ export class TrainPlanner {
     for (const d of state.deployments ?? []) this.deployments.set(d.deploymentId, { ...d });
     this.maxTrainSeq = state.maxTrainSeq;
     this.maxPromptSeq = state.maxPromptSeq;
+    this.modelStats = state.modelStats ?? [];
+    this.routerDispatches = state.routerDispatches ?? 0;
+    this.floor = { ...(state.routerFloor ?? INITIAL_FLOOR) };
     this.maxReworks = ctx.maxReworks ?? 2;
     this.timeoutMs = ctx.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
   }
@@ -445,6 +504,7 @@ export class TrainPlanner {
     if (!isActive(t)) return this.finish("ignored:stale");
     if (t.phase !== "BUILDING") return this.finish("ignored:duplicate");
     if (t.forkState !== "READY") return this.finish("ignored:premature");
+    this.recordBuild(t, r);
     this.setTrain(t, { phase: "DEPLOYING", headSha: r.headSha });
     this.setPromptStatus(t.promptId, "IN_TRAIN");
     this.deployPreview(t);
@@ -465,6 +525,7 @@ export class TrainPlanner {
     // builder giving up) is honoured in any phase.
     if (r.passed && t.phase !== "TESTING") return this.finish("ignored:premature");
     this.setPromptSummary(t.promptId, r.summary);
+    this.recordVerdict(t, r.passed);
     if (!r.passed) {
       this.fail(t, r.summary);
       return this.finish("applied");
@@ -652,6 +713,12 @@ export class TrainPlanner {
       teardownIssuedAt: null,
       droneIssuedAt: null,
       droneAttempt: 1,
+      model: null,
+      modelReason: null,
+      modelChoice: null,
+      modelChoiceAttempt: null,
+      modelOutcome: null,
+      modelProbe: false,
     };
     this.trains.push(train);
     this.markTrain(train);
@@ -817,6 +884,7 @@ export class TrainPlanner {
   private dispatchBuilder(t: TrainRecord): void {
     const p = this.prompts.get(t.promptId);
     if (!p) return;
+    const modelChoice = this.routeBuilder(t, p);
     this.effects.push({
       type: "dispatchDrone",
       trainId: t.trainId,
@@ -832,8 +900,116 @@ export class TrainPlanner {
         action: t.action,
         ragContext: [],
         ...(t.action === "REWORK" && p.summary ? { scribeSummary: p.summary } : {}),
+        modelChoice,
       },
     });
+  }
+
+  // ── model router ──────────────────────────────────────────────────────
+
+  /**
+   * The builder's model for this dispatch. Chosen once per drone attempt and
+   * persisted on the train before dispatch, so a reconcile re-dispatch of the
+   * same Workflow instance carries the same choice. The attempt is the
+   * prompt's failed attempts plus the drone attempt: 1 for a first BUILD,
+   * >= 2 for a REWORK or a watchdog re-dispatch (escalation).
+   */
+  private routeBuilder(t: TrainRecord, p: PromptRecord): ModelChoice {
+    if (t.modelChoice && t.modelChoiceAttempt === t.droneAttempt) return t.modelChoice;
+    const role: RouterRole = t.action === "REWORK" ? "rework" : "builder";
+    const summary = t.action === "REWORK" ? (p.summary ?? "") : "";
+    this.routerDispatches += 1;
+    this.routerDirty = true;
+    const routed = route({
+      role,
+      attempt: p.attempts + t.droneAttempt,
+      promptChars: p.promptText.length + summary.length,
+      stats: this.modelStats,
+      pin: this.ctx.modelPin ?? null,
+      dispatchIndex: this.routerDispatches,
+      floor: this.floor,
+      policy: this.policy(),
+    });
+    if (routed.floorRouted) this.setFloor(routed.floor);
+    const choice = routed.choice;
+    this.setTrain(t, {
+      modelChoice: choice,
+      modelChoiceAttempt: t.droneAttempt,
+      model: choice.model,
+      modelReason: choice.reason,
+      modelProbe: routed.probe,
+    });
+    return choice;
+  }
+
+  private policy(): RouterPolicy {
+    return this.ctx.routerPolicy ?? DEFAULT_POLICY;
+  }
+
+  private setFloor(next: FloorState): void {
+    const f = this.floor;
+    if (f.tier === next.tier && f.passStreak === next.passStreak && f.aboveStreak === next.aboveStreak && f.note === next.note) return;
+    this.floor = { ...next };
+    this.floorDirty = true;
+  }
+
+  /**
+   * Only first-attempt BUILD dispatches are routed by (and move) the hive's
+   * floor. Reworks and re-dispatches escalate locally and leave it alone.
+   */
+  private floorOutcome(t: TrainRecord, outcome: FloorOutcome, model: string): void {
+    const c = t.modelChoice;
+    if (!c || c.role !== "builder" || t.action !== "BUILD" || t.modelChoiceAttempt !== 1) return;
+    if (!isCatalogModel(model)) return; // scripted drones / unknown pins teach the router nothing
+    this.setFloor(floorAfter(this.floor, outcome, c.tier, t.modelProbe, this.policy()));
+  }
+
+  /** build-result: count the attempt for the model that built the head, and a failure for each model that could not. */
+  private recordBuild(t: TrainRecord, r: BuildResult): void {
+    if (t.modelOutcome !== null) return;
+    const choice = t.modelChoice;
+    const used = r.model ?? choice?.model ?? null;
+    if (!used) return; // a pre-router dispatch: nothing to attribute
+    const role: RouterRole = choice?.role === "rework" || (!choice && t.action === "REWORK") ? "rework" : "builder";
+    const failed = [...new Set(r.failedModels ?? [])].filter((m) => m !== used);
+    // Only catalog models are tracked (a scripted drone reports its own name).
+    const tracked = failed.filter((m) => isCatalogModel(m));
+    for (const model of tracked) this.modelDeltas.push({ model, role, attempts: 1, passes: 0, failures: 1, streak: "fail" });
+    if (tracked.length) this.floorOutcome(t, "unusable", tracked[0]!);
+    if (isCatalogModel(used)) {
+      this.modelDeltas.push({ model: used, role, attempts: 1, passes: 0, failures: 0, ...(r.buildMs !== undefined ? { buildMs: r.buildMs } : {}) });
+    }
+    const reason =
+      choice && used !== choice.model
+        ? `fell back to ${used}${failed.length ? ` after ${failed.length} unusable` : ""} · ${choice.reason}`
+        : (choice?.reason ?? t.modelReason);
+    this.setTrain(t, { model: used, modelReason: reason ? clip200(reason) : null, modelOutcome: "BUILT" });
+  }
+
+  /**
+   * Gate verdict: a pass credits the model that built the head; a fail after
+   * the build is the build's failure. A fail before any build-result (the
+   * builder gave up) counts as an attempt and a failure for the chosen model.
+   */
+  private recordVerdict(t: TrainRecord, passed: boolean): void {
+    const role: RouterRole = t.modelChoice?.role === "rework" || (!t.modelChoice && t.action === "REWORK") ? "rework" : "builder";
+    if (t.modelOutcome === "BUILT" && t.model && !isCatalogModel(t.model)) {
+      this.setTrain(t, { modelOutcome: passed ? "PASSED" : "FAILED" }, false);
+    } else if (t.modelOutcome === "BUILT" && t.model) {
+      this.modelDeltas.push(
+        passed
+          ? { model: t.model, role, attempts: 0, passes: 1, failures: 0, streak: "pass" }
+          : { model: t.model, role, attempts: 0, passes: 0, failures: 1, streak: "fail" },
+      );
+      this.setTrain(t, { modelOutcome: passed ? "PASSED" : "FAILED" }, false);
+      this.floorOutcome(t, passed ? "pass" : "gate-fail", t.model);
+    } else if (t.modelOutcome === null && !passed && t.phase === "BUILDING" && t.modelChoice) {
+      // The builder gave up ("no usable change set from …"): a builder failure.
+      const model = t.modelChoice.model;
+      if (isCatalogModel(model)) this.modelDeltas.push({ model, role, attempts: 1, passes: 0, failures: 1, streak: "fail" });
+      this.setTrain(t, { modelOutcome: "FAILED" }, false);
+      this.floorOutcome(t, "unusable", model);
+    }
   }
 
   private dispatchLander(t: TrainRecord): void {
@@ -922,11 +1098,27 @@ export class TrainPlanner {
       seen.add(key);
       return true;
     });
-    const result: PlanResult = { outcome, prompts, trains, deployments, effects: [...effects, ...broadcasts] };
+    const result: PlanResult = {
+      outcome,
+      prompts,
+      trains,
+      deployments,
+      effects: [...effects, ...broadcasts],
+      modelStats: this.modelDeltas,
+      ...(this.routerDirty ? { routerDispatches: this.routerDispatches } : {}),
+      ...(this.floorDirty ? { routerFloor: { ...this.floor } } : {}),
+    };
+    this.modelDeltas = [];
+    this.routerDirty = false;
+    this.floorDirty = false;
     this.dirtyPrompts.clear();
     this.dirtyTrains.clear();
     this.dirtyDeployments.clear();
     this.effects = [];
     return result;
   }
+}
+
+function clip200(s: string): string {
+  return s.length <= 200 ? s : `${s.slice(0, 199)}…`;
 }

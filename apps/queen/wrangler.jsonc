@@ -51,7 +51,15 @@
     // demos, minutes for real use) and the minimum candidate requests per window.
     // The watchdog gives Sentinel max(COMMAND_TIMEOUT_MS, window + 5 min).
     "SENTINEL_WINDOW_SECONDS": "60",
-    "SENTINEL_MIN_REQUESTS": "100"
+    "SENTINEL_MIN_REQUESTS": "100",
+    // Model router floor (AIMD): clean builds at the floor before it backs off
+    // a tier (K), and floor dispatches above the cheapest tier before a probe
+    // one tier lower (N).
+    "ROUTER_BACKOFF_STREAK": "3",
+    "ROUTER_PROBE_AFTER": "4"
+    // Model router: set "MODEL_ROUTER_PIN_BUILDER" to a model id (e.g.
+    // "@cf/zai-org/glm-5.3") to force it for every builder / rework drone
+    // (demos, debugging). Unset or blank = the Queen routes per task.
   },
   // Secret (not in this file): `wrangler secret put QUEEN_INTERNAL_TOKEN`.
   // Guards /internal/*, /audit, /scribe, /trains/:id/result. See .dev.vars.example.
@@ -70,7 +78,9 @@
         "QUEEN_INTERNAL_AUTH": "disabled",
         "COMMAND_TIMEOUT_MS": "600000",
         "SENTINEL_WINDOW_SECONDS": "60",
-        "SENTINEL_MIN_REQUESTS": "100"
+        "SENTINEL_MIN_REQUESTS": "100",
+        "ROUTER_BACKOFF_STREAK": "3",
+        "ROUTER_PROBE_AFTER": "4"
       },
       "durable_objects": {
         "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
@@ -85,7 +95,9 @@
         "QUEEN_INTERNAL_TOKEN": "test-internal-token",
         "COMMAND_TIMEOUT_MS": "600000",
         "SENTINEL_WINDOW_SECONDS": "60",
-        "SENTINEL_MIN_REQUESTS": "100"
+        "SENTINEL_MIN_REQUESTS": "100",
+        "ROUTER_BACKOFF_STREAK": "3",
+        "ROUTER_PROBE_AFTER": "4"
       },
       "durable_objects": {
         "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]

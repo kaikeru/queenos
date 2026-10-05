@@ -26,9 +26,10 @@
     { "name": "provisioner-workflow", "binding": "PROVISIONER", "class_name": "ProvisionerWorkflow", "script_name": "queenos-provisioner" }
   ],
   "vars": {
-    // "scripted" is a deterministic two-turn interview (demo video, tests); "live" calls the model.
-    "GENESIS_LLM_MODE": "scripted",
-    "MODEL_GENESIS": "anthropic/claude-sonnet-5-5",
+    // "scripted" is a deterministic two-turn interview (demo video, tests); "live" calls the model through
+    // AI Gateway (env.test stays scripted).
+    "GENESIS_LLM_MODE": "live",
+    "MODEL_GENESIS": "@cf/zai-org/glm-5.3-flash",
     "AI_GATEWAY_ID": "queenos"
   },
   "env": {
@@ -37,7 +38,7 @@
     "test": {
       "durable_objects": { "bindings": [{ "name": "GENESIS", "class_name": "GenesisNode" }] },
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GenesisNode"] }],
-      "vars": { "GENESIS_LLM_MODE": "scripted", "MODEL_GENESIS": "anthropic/claude-sonnet-5-5", "AI_GATEWAY_ID": "queenos" }
+      "vars": { "GENESIS_LLM_MODE": "scripted", "MODEL_GENESIS": "@cf/zai-org/glm-5.3-flash", "AI_GATEWAY_ID": "queenos" }
     }
   }
 }

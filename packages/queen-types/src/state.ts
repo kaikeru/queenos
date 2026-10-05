@@ -52,6 +52,8 @@ export const MergeTrainSchema = z.object({
   headSha: z.string().nullable().optional(), // head_sha (pushed by the builder)
   landedSha: z.string().nullable().optional(), // landed_sha (hive main after landing)
   previewUrl: z.string().nullable().optional(), // preview_url (Herald's Worker Preview URL; set when DEPLOYING -> TESTING)
+  model: z.string().nullable().optional(), // model (router's choice for this train's builder, or the model actually used)
+  modelReason: z.string().max(200).nullable().optional(), // model_reason (why the router chose it)
 });
 export type MergeTrain = z.infer<typeof MergeTrainSchema>;
 

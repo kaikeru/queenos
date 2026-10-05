@@ -5,37 +5,29 @@
  */
 import type { DroneTask, GitNotesPayload } from "@queenos/queen-types";
 import { ledgerFilePath, serializeLedger } from "@queenos/hive-kit";
-import { ChangeSetError, parseChangeSet, type ChangeSet } from "./change-set";
+import type { ChangeSet } from "./change-set";
 import type { DroneConfig } from "./config";
 import type { DronePorts, GitSession } from "./ports";
-import { BUILDER_SYSTEM_PROMPT, buildBuilderMessages } from "./prompt";
-import { FEATURE_REGISTRY_PATH, SCRIPTED_MODEL, mergeRegistry, registryModules, scriptedChangeSet } from "./scripted";
+import { generateLive, type Generated } from "./generate";
+import { gatherRepoContext } from "./repo-context";
+import { FEATURE_REGISTRY_PATH, SCRIPTED_MODEL, featureModuleName, mergeRegistry, registryModules, scriptedChangeSet } from "./scripted";
 
 export type LedgerStore = "git-notes" | "ledger-file";
 
-export interface Generated {
-  changeSet: ChangeSet;
-  model: string;
-  temperature: number;
-  usage: { inputTokens: number; outputTokens: number };
-}
+export type { Generated } from "./generate";
 
 /** The AI step. Returns only the validated change set (well under 1 MiB). */
-export async function generateChangeSet(task: DroneTask, ports: Pick<DronePorts, "llm">, config: DroneConfig): Promise<Generated> {
+export async function generateChangeSet(
+  task: DroneTask,
+  ports: Pick<DronePorts, "llm" | "artifacts" | "git">,
+  config: DroneConfig,
+): Promise<Generated> {
   if (config.llmMode === "scripted") {
-    return { changeSet: scriptedChangeSet(task), model: SCRIPTED_MODEL, temperature: 0, usage: { inputTokens: 0, outputTokens: 0 } };
+    return { changeSet: scriptedChangeSet(task), model: SCRIPTED_MODEL, failedModels: [], repaired: false, temperature: 0, usage: { inputTokens: 0, outputTokens: 0 } };
   }
   if (!ports.llm) throw new Error("UNAVAILABLE: no LLM port in live mode");
-  const res = await ports.llm.complete({
-    model: config.aiGateway.model,
-    system: BUILDER_SYSTEM_PROMPT,
-    messages: buildBuilderMessages(task),
-    maxTokens: 16_000,
-    ...(config.sendTemperature ? { temperature: config.temperature } : {}),
-    metadata: { promptId: task.promptId, trainId: task.trainId, action: task.action },
-  });
-  if (res.finishReason === "length" || res.finishReason === "max_tokens") throw new ChangeSetError("model output was truncated (max_tokens)");
-  return { changeSet: parseChangeSet(res.text), model: res.model, temperature: config.temperature, usage: res.usage ?? { inputTokens: 0, outputTokens: 0 } };
+  const context = await gatherRepoContext(task, branchOf(task.baseRef), ports);
+  return generateLive({ llm: ports.llm, task, config, context });
 }
 
 /** Marks every commit a drone makes, so a retried step can recognise its own pushed work. */
@@ -80,16 +72,22 @@ export interface CommitPushResult {
 }
 
 /**
- * The change set only knows its own feature, but trains chain: merge the
- * template's feature registry with the one already on the branch so earlier
- * features stay registered.
+ * The change set only knows its own feature, but trains chain: merge the template's feature registry
+ * with the one already on the branch so earlier features stay registered. Works for live output too:
+ * the registry is re-rendered in the canonical shape from whatever modules the model's registry
+ * imports PLUS every new `src/features/<name>.js` the change set adds (a model that forgot to
+ * register its module still ships a working feature).
  */
-async function withMergedRegistry(repo: GitSession, files: ChangeSet["files"]): Promise<ChangeSet["files"]> {
+export async function withMergedRegistry(repo: Pick<GitSession, "readFiles">, files: ChangeSet["files"]): Promise<ChangeSet["files"]> {
   const entry = files.find((f) => f.path === FEATURE_REGISTRY_PATH);
-  if (!entry) return files;
+  const added = files.flatMap((f) => {
+    const m = featureModuleName(f.path);
+    return m ? [m] : [];
+  });
+  if (!entry && added.length === 0) return files;
   const existing = (await repo.readFiles([FEATURE_REGISTRY_PATH]).catch(() => ({}) as Record<string, string>))[FEATURE_REGISTRY_PATH] ?? null;
-  const merged = mergeRegistry(existing, registryModules(entry.content));
-  return files.map((f) => (f === entry ? { ...f, content: merged } : f));
+  const merged = mergeRegistry(existing, [...(entry ? registryModules(entry.content) : []), ...added]);
+  return entry ? files.map((f) => (f === entry ? { ...f, content: merged } : f)) : [...files, { path: FEATURE_REGISTRY_PATH, content: merged }];
 }
 
 export async function commitAndPush(ports: Pick<DronePorts, "artifacts" | "git">, input: CommitPushInput): Promise<CommitPushResult> {

@@ -35,7 +35,7 @@ describe("DroneWorkflow (Workflows runtime, scripted mode, fake ports)", () => {
 
     const q = w.queen("hive");
     expect(q.calls.map((c) => c.method)).toEqual(["appendAudit", "reportBuildResult", "appendAudit"]);
-    expect(q.calls[1]!.input).toEqual({ trainId: "wf-train-1", headSha: out.headSha });
+    expect(q.calls[1]!.input).toMatchObject({ trainId: "wf-train-1", headSha: out.headSha, model: "queenos/scripted-drone-v1" });
     expect(q.audits().map((a) => a.status)).toEqual(["RUNNING", "PASSED"]);
   });
 

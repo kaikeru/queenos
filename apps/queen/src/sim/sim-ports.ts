@@ -26,7 +26,14 @@
  * re-dispatches are no-ops.
  *
  * Deterministic outcomes: a prompt containing "[fail]" fails its first build
- * test (SECURITY rejects it); the REWORK attempt passes.
+ * test (SECURITY rejects it); the REWORK attempt (escalated to the frontier
+ * tier by the Queen's model router) passes.
+ *
+ * Models: the sim builder reports `model` = the Queen's choice
+ * (`task.modelChoice`) and a plausible `buildMs` (frontier slower than fast;
+ * the build job's delay scales the same way). A BUILD whose prompt contains
+ * "[bad-json]" has the chosen model "return unusable output": the first
+ * fallback builds instead, reported in `failedModels`.
  *
  * Nothing in production code imports this file; only src/sim/worker.ts does.
  */
@@ -102,6 +109,10 @@ export const DEFAULT_SIM_DELAYS: SimDelays = {
 };
 
 export const FAIL_MARKER = "[fail]";
+/** The chosen model "returns unusable JSON" on a BUILD; the first fallback succeeds (failedModels demo). */
+export const BAD_JSON_MARKER = "[bad-json]";
+/** Build time per model tier, relative to `delays.build`. */
+export const TIER_BUILD_FACTOR = { light: 0.7, fast: 1, frontier: 1.6 } as const;
 /** A release containing a prompt with this marker fails its 10% canary step (auto-rollback demo). */
 export const CANARY_FAIL_MARKER = "[canary-fail]";
 export const CANARY_FAIL_PERCENT = 10;
@@ -120,6 +131,7 @@ const DONE_KEY = "sim:done";
 const TEARDOWNS_KEY = "sim:teardowns";
 const STABLE_KEY = (hive: string) => `sim:stable:${hive}`;
 const DONE_LIMIT = 2000;
+/** Model named in non-builder ledger notes (gatekeepers / Scribe keep their env model). */
 const MODEL = "claude-opus-5-5";
 
 /** Small deterministic string hash, rendered as a 40-char hex "git SHA". */
@@ -205,11 +217,20 @@ export class SimExecutors {
   private async dispatchDrone(task: DroneTask, attempt?: number): Promise<{ instanceId: string }> {
     const id = droneInstanceId(task, attempt);
     const kind = task.action === "LAND" ? "land" : "build";
-    if (!(await this.add({ id, kind, due: this.now() + this.delays[kind], task }))) return { instanceId: id };
+    if (!(await this.add({ id, kind, due: this.now() + this.droneDelay(task), task }))) return { instanceId: id };
     // The drone "starts": its first card pulses yellow immediately.
     if (kind === "build") await this.audit(task, "BUILDER", "RUNNING", null);
     else await this.audit(task, "LANDER", "RUNNING", null);
     return { instanceId: id };
+  }
+
+  /** Builds take longer on bigger models (and once more for a fallback after bad output). */
+  private droneDelay(task: DroneTask): number {
+    if (task.action === "LAND") return this.delays.land;
+    const choice = task.modelChoice;
+    if (!choice) return this.delays.build;
+    const base = Math.round(this.delays.build * TIER_BUILD_FACTOR[choice.tier]);
+    return badJson(task) ? base + Math.round(this.delays.build * 0.5) : base;
   }
 
   private async enqueue(job: Job): Promise<{ instanceId: string }> {
@@ -387,17 +408,18 @@ export class SimExecutors {
     switch (job.kind) {
       case "build": {
         const headSha = fakeSha(`head:${task.trainId}`);
-        const res = await this.queen().reportBuildResult({ trainId: task.trainId, headSha });
+        const build = simBuild(task, this.droneDelay(task));
+        const res = await this.queen().reportBuildResult({ trainId: task.trainId, headSha, ...build });
         if (res.outcome !== "applied") {
           // Superseded while building: close the pulsing card instead of leaving it yellow.
           await this.audit(task, "BUILDER", "REJECTED", {
-            ...builderNote(task, headSha),
+            ...builderNote(task, headSha, build),
             result: "failure",
             reasoningSteps: ["Train was superseded by an upstream ejection; abandoned this build."],
           });
           return;
         }
-        await this.audit(task, "BUILDER", "PASSED", builderNote(task, headSha));
+        await this.audit(task, "BUILDER", "PASSED", builderNote(task, headSha, build));
         await this.audit(task, "POLICY", "RUNNING", null);
         await this.audit(task, "SECURITY", "RUNNING", null);
         await this.audit(task, "GATEKEEPER", "RUNNING", null);
@@ -463,15 +485,31 @@ export class SimExecutors {
 
 // ── plausible Cognitive Ledger payloads ──────────────────────────────────
 
-const subject = (task: DroneTask) => task.promptText.replace(FAIL_MARKER, "").trim().slice(0, 80);
+const subject = (task: DroneTask) => task.promptText.replace(FAIL_MARKER, "").replace(BAD_JSON_MARKER, "").trim().slice(0, 80);
 
-function builderNote(task: DroneTask, headSha: string): GitNotesPayload {
+const badJson = (task: DroneTask) => task.action === "BUILD" && task.promptText.includes(BAD_JSON_MARKER) && (task.modelChoice?.fallbacks.length ?? 0) > 0;
+
+type SimBuild = Pick<BuildResult, "model" | "failedModels" | "buildMs">;
+
+/** What the sim builder reports about models: the Queen's choice, or its first fallback after "[bad-json]". */
+export function simBuild(task: DroneTask, buildMs: number): SimBuild {
+  const choice = task.modelChoice;
+  if (!choice) return {};
+  const jitter = (task.promptText.length % 7) * 37;
+  if (badJson(task)) return { model: choice.fallbacks[0]!, failedModels: [choice.model], buildMs: buildMs + jitter };
+  return { model: choice.model, buildMs: buildMs + jitter };
+}
+
+function builderNote(task: DroneTask, headSha: string, build: SimBuild = {}): GitNotesPayload {
   const rework = task.action === "REWORK";
+  const failed = build.failedModels ?? [];
   return {
     taskPrompt: task.promptText,
-    model: MODEL,
+    model: build.model ?? MODEL,
     temperature: 0.2,
     reasoningSteps: [
+      ...(task.modelChoice ? [`Queen routed this build to ${task.modelChoice.model} (${task.modelChoice.reason}).`] : []),
+      ...failed.map((m) => `${m} returned an unusable change set (invalid JSON); fell back to ${build.model}.`),
       `Parsed the request: "${subject(task)}".`,
       ...(rework && task.scribeSummary ? [`Read Scribe's note on the failed attempt: ${task.scribeSummary}`] : []),
       "Searched the repo for the module boundary and existing conventions.",
@@ -479,7 +517,7 @@ function builderNote(task: DroneTask, headSha: string): GitNotesPayload {
       `Committed and pushed ${headSha.slice(0, 7)} to ${task.artifactRepo}.`,
     ],
     result: "success",
-    executionTimeMs: 2600 + (task.promptText.length % 7) * 150,
+    executionTimeMs: build.buildMs ?? 2600 + (task.promptText.length % 7) * 150,
     discardedPaths: [
       "Rewrite the whole module (rejected: widens the blast radius).",
       "Add a new dependency (rejected: policy prefers the standard library).",

@@ -73,7 +73,8 @@ export async function summarizeFailure(opts: { log: string; failingCheck?: strin
       model: opts.model,
       system: SCRIBE_PROMPT,
       messages: [{ role: "user", content: truncateLog(opts.log) }],
-      maxTokens: 200,
+      // Reasoning models spend part of the budget thinking; the answer is clipped to 500 chars anyway.
+      maxTokens: 1_500,
       ...(opts.metadata ? { metadata: opts.metadata } : {}),
     });
     const text = enforceSummary(res.text);

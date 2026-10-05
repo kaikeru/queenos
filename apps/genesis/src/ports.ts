@@ -63,7 +63,7 @@ export function loadConfig(env: Partial<Record<string, unknown>>): GenesisConfig
   };
   return {
     llmMode: str("GENESIS_LLM_MODE", "scripted") === "live" ? "live" : "scripted",
-    model: str("MODEL_GENESIS", "anthropic/claude-sonnet-5-5"),
+    model: str("MODEL_GENESIS", "@cf/zai-org/glm-5.3-flash"),
     gatewayId: str("AI_GATEWAY_ID", "queenos"),
     pollMs: num("GENESIS_POLL_MS", 5_000),
     launchTimeoutMs: num("GENESIS_LAUNCH_TIMEOUT_MS", 10 * 60_000),

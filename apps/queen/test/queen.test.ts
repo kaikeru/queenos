@@ -2,7 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { DeployCommand, DroneTask, ProvisionCommand, QueenServerMessage, SentinelCommand } from "@queenos/queen-types";
-import type { QueenNode, SocketAttachment } from "../src/queen-node";
+import { modelPin, routerPolicy, type QueenNode, type SocketAttachment } from "../src/queen-node";
 import { migrate } from "../src/db";
 import type { RecordingDispatcher, RecordingHerald, RecordingProvisioner, RecordingSentinel } from "./fakes";
 
@@ -731,8 +731,83 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([5, 5, 5]);
-    expect(state.tables).toEqual(["audit_trail", "deployments", "merge_trains", "prompt_runs", "releases", "sentinel_verdicts"]);
+    expect([state.before, state.after, state.version]).toEqual([6, 6, 6]);
+    expect(state.tables).toEqual(["audit_trail", "deployments", "merge_trains", "model_router", "model_stats", "prompt_runs", "releases", "sentinel_verdicts"]);
     ws.close(1000, "done");
+  });
+});
+
+describe("model router (DO)", () => {
+  const QWEN = "@cf/qwen/qwen3.8-27b";
+  const GLM_FLASH = "@cf/zai-org/glm-5.3-flash";
+
+  it("dispatches with a modelChoice, persists model stats once per result, and broadcasts models.updated + the floor", async () => {
+    const ns = newHive();
+    await submit(ns, "add a health route");
+    const { ws, next } = await connect(`/hives/${ns}/room`);
+    const first = await next();
+    expect(first).toMatchObject({ type: "snapshot", modelStats: [], routerFloor: { tier: "fast", streak: 0, backoffAfter: 3, probeIn: null } });
+
+    const reported = new Set<string>();
+    await settle(ns, reported);
+    let s = await inspect(ns);
+    const task = s.tasks.find((t) => t.role === "BUILDER")!;
+    expect(task.modelChoice).toMatchObject({ model: QWEN, tier: "fast", role: "builder" });
+    const trainId = s.trains[0]!.train_id;
+    let row = (await runInDurableObject(stubFor(ns), (q: QueenNode) => q.sql.exec("SELECT model, model_reason FROM merge_trains").one())) as { model: string; model_reason: string };
+    expect(row).toEqual({ model: QWEN, model_reason: task.modelChoice!.reason });
+
+    // The chosen model returned junk; the first fallback built the head.
+    const built = await post(ns, "/internal/webhook/build-result", { trainId, headSha: "h1", model: GLM_FLASH, failedModels: [QWEN], buildMs: 4100 });
+    expect(await built.json()).toMatchObject({ outcome: "applied", train: { model: GLM_FLASH } });
+    const upd = await next((m) => m.type === "models.updated");
+    expect(upd).toMatchObject({ type: "models.updated", floor: { tier: "frontier", streak: 0, probeIn: 4 } });
+    if (upd.type === "models.updated") {
+      expect(upd.stats).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ model: QWEN, role: "builder", attempts: 1, passes: 0, failures: 1 }),
+          expect.objectContaining({ model: GLM_FLASH, role: "builder", attempts: 1, passes: 0, failures: 0, avgBuildMs: 4100 }),
+        ]),
+      );
+      expect(upd.stats[0]).not.toHaveProperty("failStreak");
+    }
+
+    await settle(ns, reported);
+    const pass = { trainId, passed: true, summary: "green", commitSha: "h1" };
+    expect(await (await post(ns, "/internal/webhook/train-result", pass)).json()).toMatchObject({ outcome: "applied" });
+    expect(await (await post(ns, "/internal/webhook/train-result", pass)).json()).toMatchObject({ outcome: "ignored:duplicate" });
+    // A duplicate build-result is ignored too.
+    await post(ns, "/internal/webhook/build-result", { trainId, headSha: "h1", model: GLM_FLASH, buildMs: 1 });
+
+    const snap = await snapshotOf(ns);
+    expect(snap.modelStats).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ model: GLM_FLASH, attempts: 1, passes: 1, failures: 0, avgBuildMs: 4100 }),
+        expect.objectContaining({ model: QWEN, attempts: 1, passes: 0, failures: 1 }),
+      ]),
+    );
+    expect(snap.modelStats).toHaveLength(2);
+    expect(snap.routerFloor).toEqual({ tier: "frontier", streak: 0, backoffAfter: 3, probeIn: 4 });
+    expect(snap.trains[0]).toMatchObject({ model: GLM_FLASH, modelReason: expect.stringContaining("fell back to") });
+    row = (await runInDurableObject(stubFor(ns), (q: QueenNode) => q.sql.exec("SELECT model, model_reason FROM merge_trains").one())) as typeof row;
+    expect(row.model).toBe(GLM_FLASH);
+    ws.close(1000, "done");
+
+    // The next first-attempt build routes at the raised floor, and says why.
+    await submit(ns, "add a metrics route");
+    await settle(ns, reported);
+    s = await inspect(ns);
+    const second = s.tasks.filter((t) => t.role === "BUILDER").at(-1)!;
+    expect(second.modelChoice).toMatchObject({ tier: "frontier" });
+    expect(second.modelChoice!.reason).toMatch(/^raised to frontier after an unusable change set · frontier tier/);
+  });
+
+  it("reads MODEL_ROUTER_PIN_BUILDER, ROUTER_BACKOFF_STREAK and ROUTER_PROBE_AFTER", () => {
+    expect(modelPin({})).toBeNull();
+    expect(modelPin({ MODEL_ROUTER_PIN_BUILDER: "  " })).toBeNull();
+    expect(modelPin({ MODEL_ROUTER_PIN_BUILDER: " @cf/zai-org/glm-5.3 " })).toBe("@cf/zai-org/glm-5.3");
+    expect(routerPolicy({})).toEqual({ backoffStreak: 3, probeAfter: 4 });
+    expect(routerPolicy({ ROUTER_BACKOFF_STREAK: "5", ROUTER_PROBE_AFTER: "2" })).toEqual({ backoffStreak: 5, probeAfter: 2 });
+    expect(routerPolicy({ ROUTER_BACKOFF_STREAK: "0", ROUTER_PROBE_AFTER: "x" })).toEqual({ backoffStreak: 3, probeAfter: 4 });
   });
 });

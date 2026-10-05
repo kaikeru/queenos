@@ -126,7 +126,7 @@ describe("builder prompt", () => {
     expect(m!.content).toContain("<hive_memory>");
     expect(m!.content).toContain("mem1");
     expect(m!.content).toContain("it broke");
-    expect(m!.content).toMatch(/<request>\ndo x\n<\/request>$/);
+    expect(m!.content).toMatch(/<request>\ndo x\n<\/request>/);
   });
   it("omits the failure block for BUILD", () => {
     const [m] = buildBuilderMessages({ promptText: "do x", action: "BUILD", ragContext: [], scribeSummary: "ignored" });
@@ -138,12 +138,12 @@ describe("config", () => {
   it("defaults to scripted mode", () => {
     const c = readConfig({});
     expect(c.llmMode).toBe("scripted");
-    expect(c.aiGateway.model).toBe("anthropic/claude-opus-5-5");
+    expect(c.aiGateway.model).toBe("@cf/zai-org/glm-5.3-flash");
     expect(c.sendTemperature).toBe(false);
     expect(SCRIPTED_MODEL).toMatch(/scripted/);
   });
   it("resolves the Builder model and gateway id from vars", () => {
-    expect(readConfig({ DRONE_LLM_MODE: "live" }).aiGateway).toEqual({ gatewayId: "queenos", model: "anthropic/claude-opus-5-5" });
+    expect(readConfig({ DRONE_LLM_MODE: "live" }).aiGateway).toEqual({ gatewayId: "queenos", model: "@cf/zai-org/glm-5.3-flash" });
     const c = readConfig({ DRONE_LLM_MODE: "live", AI_GATEWAY_ID: "g", MODEL_BUILDER: "@cf/meta/llama-3.1-8b-instruct", AI_TEMPERATURE: "0.3" });
     expect(c.aiGateway).toEqual({ gatewayId: "g", model: "@cf/meta/llama-3.1-8b-instruct" });
     expect(c).toMatchObject({ temperature: 0.3, sendTemperature: true });

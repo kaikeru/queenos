@@ -65,7 +65,7 @@ describe("BUILD (scripted)", () => {
     // Queen: RUNNING audit, build result, PASSED audit carrying the same ledger.
     const q = w.queen("hive");
     expect(q.calls.map((c) => c.method)).toEqual(["appendAudit", "reportBuildResult", "appendAudit"]);
-    expect(q.calls[1]!.input).toEqual({ trainId: "train-1", headSha: out.headSha });
+    expect(q.calls[1]!.input).toEqual({ trainId: "train-1", headSha: out.headSha, model: SCRIPTED_MODEL, buildMs: expect.any(Number) });
     const [running, passed] = q.audits();
     expect(running).toMatchObject({ promptId: "prompt-1", droneRole: "BUILDER", status: "RUNNING", gitNotesPayload: null });
     expect(passed).toMatchObject({ droneRole: "BUILDER", status: "PASSED", gitNotesPayload: note });
@@ -102,7 +102,7 @@ describe("BUILD (scripted)", () => {
 
     // Two branch pushes (code, then ledger commit); the Queen tests the ledger commit.
     expect(w.git.pushes.map((p) => p.remoteRef)).toEqual(["main", "main"]);
-    expect(w.queen("hive").calls[1]!.input).toEqual({ trainId: "train-1", headSha: out.headSha });
+    expect(w.queen("hive").calls[1]!.input).toMatchObject({ trainId: "train-1", headSha: out.headSha, model: SCRIPTED_MODEL });
   });
 
   it("a retried commit step recognises its own pushed work (no duplicate commit)", async () => {
@@ -142,7 +142,7 @@ describe("BUILD (scripted)", () => {
 
 describe("BUILD / REWORK (live LLM via fake gateway)", () => {
   const reply = JSON.stringify({
-    files: [{ path: "src/theme.ts", content: "export const dark = true;\n" }],
+    files: [{ path: "src/features/theme.js", content: 'export const slug = "theme";\nexport function handle() { return Response.json({ dark: true }); }\n' }],
     reasoningSteps: ["fixed null theme"],
     discardedPaths: ["src/legacy-theme.ts"],
   });
@@ -164,23 +164,32 @@ describe("BUILD / REWORK (live LLM via fake gateway)", () => {
 
     const passed = w.queen("hive").audits()[1]!;
     expect(passed.gitNotesPayload).toMatchObject({
-      model: "anthropic/claude-opus-5-5",
+      model: "@cf/zai-org/glm-5.3-flash",
       reasoningSteps: ["fixed null theme"],
       discardedPaths: ["src/legacy-theme.ts"],
     });
-    expect(await w.git.repo("hive-train-aaaaaaaaaaaa").readFiles(["src/theme.ts"])).toEqual({ "src/theme.ts": "export const dark = true;\n" });
+    const repo = w.git.repo("hive-train-aaaaaaaaaaaa");
+    expect(Object.keys(await repo.readFiles(["src/features/theme.js"]))).toEqual(["src/features/theme.js"]);
+    // The model never touched the registry: the drone registered the new module for it.
+    expect((await repo.readFiles(["src/features/index.js"]))["src/features/index.js"]).toContain('import * as f0 from "./theme.js";');
+    // The prompt carries the repo's real file list; the Queen hears which model built it.
+    expect(req.messages[0]!.content).toContain("<repo_files>");
+    expect(w.queen("hive").calls.find((c) => c.method === "reportBuildResult")?.input).toMatchObject({ model: "@cf/zai-org/glm-5.3-flash", buildMs: expect.any(Number) });
+    expect(w.artifacts.calls.map((c) => c.scope)).toEqual(["read", "write"]);
   });
 
-  it("retries invalid model output, then reports a failed train and a REJECTED audit", async () => {
+  it("repairs once, then falls over models; exhausting them reports a failed train and a REJECTED audit (no step retries)", async () => {
     const { w } = await world();
-    w.llm = new FakeLlm(() => "I cannot produce JSON today");
+    const llm = new FakeLlm(() => "I cannot produce JSON today");
+    w.llm = llm;
     const steps = new InlineSteps();
     await expect(runDrone(task(), steps, w.ports(), live)).rejects.toBeInstanceOf(DroneFailedError);
 
-    expect(steps.log.find((l) => l.name === "generate change set")).toEqual({ name: "generate change set", attempts: 4, ok: false });
+    expect(steps.log.find((l) => l.name === "generate change set")).toEqual({ name: "generate change set", attempts: 1, ok: false });
+    expect(llm.requests).toHaveLength(2); // first try + the single repair turn on the only model
     const q = w.queen("hive");
     const failure = q.calls.find((c) => c.method === "reportTrainResult");
-    expect(failure?.input).toMatchObject({ trainId: "train-1", passed: false, summary: expect.stringMatching(/generation: no JSON object/) });
+    expect(failure?.input).toMatchObject({ trainId: "train-1", passed: false, summary: expect.stringMatching(/generation: no usable change set from @cf\/zai-org\/glm-5.3-flash: no JSON object/) });
     expect(q.audits().map((a) => a.status)).toEqual(["RUNNING", "REJECTED"]);
     expect(q.audits()[1]!.gitNotesPayload).toMatchObject({ result: "failure" });
     expect(w.git.pushes).toEqual([]);

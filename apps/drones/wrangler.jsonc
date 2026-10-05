@@ -31,12 +31,12 @@
   "vars": {
     // "live" calls the LLM via the AI binding through AI Gateway; "scripted" returns a deterministic
     // change set (demo video, tests). Git + Artifacts run for real in both.
-    "DRONE_LLM_MODE": "scripted",
+    "DRONE_LLM_MODE": "live",
     // Artificial "thinking" time in scripted mode (durable step.sleep).
     "DRONE_SCRIPTED_DELAY_MS": "4000",
     "AI_GATEWAY_ID": "queenos",
-    // Per-role model: Workers AI ("@cf/...") or third-party ("anthropic/claude-opus-5-5").
-    "MODEL_BUILDER": "anthropic/claude-opus-5-5"
+    // Fallback model when the Queen sends no modelChoice (it normally picks per task). Workers AI ("@cf/...").
+    "MODEL_BUILDER": "@cf/zai-org/glm-5.3-flash"
   },
   "env": {
     // Used only by vitest (see vitest.config.ts). Named envs do not inherit
@@ -48,7 +48,7 @@
         "DRONE_LLM_MODE": "scripted",
         "DRONE_SCRIPTED_DELAY_MS": "0",
         "AI_GATEWAY_ID": "queenos",
-        "MODEL_BUILDER": "anthropic/claude-opus-5-5"
+        "MODEL_BUILDER": "@cf/zai-org/glm-5.3-flash"
       }
     }
   }
