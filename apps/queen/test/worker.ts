@@ -3,7 +3,7 @@
  * recording executor / drone ports through the createPorts() constructor seam.
  */
 import { QueenNode as ProdQueenNode, type QueenPorts } from "../src/queen-node";
-import { RecordingDispatcher, RecordingHerald, RecordingProvisioner } from "./fakes";
+import { RecordingDispatcher, RecordingHerald, RecordingProvisioner, RecordingSentinel } from "./fakes";
 
 export { default } from "../src/index";
 
@@ -16,6 +16,11 @@ export class QueenNode extends ProdQueenNode {
   }
 
   protected override createPorts(): QueenPorts {
-    return { provisioner: new RecordingProvisioner(), herald: new RecordingHerald(), dispatcher: new RecordingDispatcher() };
+    return {
+      provisioner: new RecordingProvisioner(),
+      herald: new RecordingHerald(),
+      sentinel: new RecordingSentinel(),
+      dispatcher: new RecordingDispatcher(),
+    };
   }
 }

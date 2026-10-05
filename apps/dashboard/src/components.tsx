@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "./router";
+import { ApiError, api, errorMessage } from "./api";
+import { useEscape } from "./hooks";
+import { phaseHeadline, shortVersion, tapButtonState, tapErrorMessage, timelineSteps, type SiteReleaseView } from "./releases";
+import { CANARY_STEPS, type Release, type SentinelVerdict } from "@queenos/queen-types";
 import {
   PHASE_FLOW,
   excerpt,
   letterOf,
   previewView,
+  releaseLetters,
   type AuditCard,
   type SiteRow,
   type Lane,
@@ -406,46 +411,294 @@ export function Composer(props: { disabled: boolean; onSubmit: (text: string) =>
 
 const STATUS_TONE: Record<string, string> = { PENDING: "building", LIVE: "merged", FAILED: "failed", TORN_DOWN: "" };
 
-/** Compact per-environment view of deployments (previews today; staging/canary/prod from P3). */
-export function Sites({ rows, state }: { rows: SiteRow[]; state: State }) {
+const VERDICT_TONE = { PROMOTE: "ok", ROLLBACK: "bad" } as const;
+
+function VerdictLine({ verdict }: { verdict: SentinelVerdict | null }) {
+  if (!verdict) return <div className="site__muted">no verdict yet</div>;
+  return (
+    <div className={`site__verdict site__verdict--${VERDICT_TONE[verdict.verdict]}`} title={verdict.summary}>
+      <b>{verdict.verdict}</b> {excerpt(verdict.summary, 90)}
+    </div>
+  );
+}
+
+const PHASE_CHIP: Record<string, string> = {
+  STAGING: "building",
+  VALIDATING: "testing",
+  AWAITING_TAP: "queued",
+  CANARY: "testing",
+  SHIPPED: "merged",
+  FAILED: "failed",
+  ROLLED_BACK: "failed",
+  SUPERSEDED: "",
+};
+
+function UrlLink({ url }: { url: string | null }) {
+  return url ? (
+    <a href={url} target="_blank" rel="noreferrer" title={url}>
+      {hostOf(url)}
+    </a>
+  ) : (
+    <span className="site__muted">no URL yet</span>
+  );
+}
+
+/** Per-environment view: previews from deployments; staging, canary and prod from releases (P3). */
+export function Sites({ rows, state, view }: { rows: SiteRow[]; state: State; view: SiteReleaseView }) {
+  const byEnv = Object.fromEntries(rows.map((r) => [r.environment, r]));
+  const preview = byEnv.preview;
   return (
     <section className="sites panel" aria-label="sites">
       <p className="eyebrow">SITES</p>
       <ul className="sites__list">
-        {rows.map((row) => (
-          <li key={row.environment} className={`site${row.configured ? "" : " site--off"}`}>
+        {preview && (
+          <li className="site">
             <div className="site__head">
-              <b>{row.environment}</b>
-              {!row.configured ? (
-                <span className="site__muted">not configured</span>
-              ) : row.environment === "preview" ? (
-                <span className="site__muted">
-                  {row.deployments.length} active{row.retired ? ` · ${row.retired} torn down` : ""}
-                </span>
-              ) : null}
+              <b>preview</b>
+              <span className="site__muted">
+                {preview.deployments.length} active{preview.retired ? ` · ${preview.retired} torn down` : ""}
+              </span>
             </div>
-            {row.configured &&
-              row.deployments.slice(0, 6).map((d) => {
-                const train = d.trainId ? state.trains[d.trainId] : undefined;
-                const cars = train ? train.includedPrompts.map((id) => letterOf(state, id)).join("+") : d.deploymentId;
-                return (
-                  <div key={d.deploymentId} className="site__row">
-                    <span className={`chip chip--sm chip--${STATUS_TONE[d.status] ?? ""}`}>{d.status === "PENDING" ? "DEPLOYING" : d.status.replace("_", " ")}</span>
-                    <span className="site__cars">{cars}</span>
-                    {d.url && d.status === "LIVE" ? (
-                      <a href={d.url} target="_blank" rel="noreferrer" title={d.url}>
-                        {hostOf(d.url)}
-                      </a>
-                    ) : (
-                      <span className="site__muted">{d.summary ? excerpt(d.summary, 36) : d.commitSha ? short(d.commitSha) : ""}</span>
-                    )}
-                  </div>
-                );
-              })}
-            {row.environment === "preview" && row.configured && row.deployments.length === 0 && <div className="site__muted">no live previews</div>}
+            {preview.deployments.slice(0, 6).map((d) => {
+              const train = d.trainId ? state.trains[d.trainId] : undefined;
+              const cars = train ? train.includedPrompts.map((id) => letterOf(state, id)).join("+") : d.deploymentId;
+              return (
+                <div key={d.deploymentId} className="site__row">
+                  <span className={`chip chip--sm chip--${STATUS_TONE[d.status] ?? ""}`}>{d.status === "PENDING" ? "DEPLOYING" : d.status.replace("_", " ")}</span>
+                  <span className="site__cars">{cars}</span>
+                  {d.url && d.status === "LIVE" ? (
+                    <a href={d.url} target="_blank" rel="noreferrer" title={d.url}>
+                      {hostOf(d.url)}
+                    </a>
+                  ) : (
+                    <span className="site__muted">{d.summary ? excerpt(d.summary, 36) : d.commitSha ? short(d.commitSha) : ""}</span>
+                  )}
+                </div>
+              );
+            })}
+            {preview.deployments.length === 0 && <div className="site__muted">no live previews</div>}
+          </li>
+        )}
+
+        <li className={`site site--staging${view.staging ? "" : " site--off"}`}>
+          <div className="site__head">
+            <b>staging</b>
+            {view.staging ? <span className={`chip chip--sm chip--${PHASE_CHIP[view.staging.phase] ?? ""}`}>{view.staging.phase.replace("_", " ")}</span> : <span className="site__muted">no release yet</span>}
+          </div>
+          {view.staging && (
+            <>
+              <div className="site__row site__row--url"><UrlLink url={view.staging.url} /></div>
+              <VerdictLine verdict={view.staging.verdict} />
+            </>
+          )}
+        </li>
+
+        <li className={`site site--canary${view.canary ? "" : " site--off"}${view.canary?.live ? " site--live" : ""}${view.canary?.phase === "ROLLED_BACK" ? " site--rolledback" : ""}`}>
+          <div className="site__head">
+            <b>canary</b>
+            {view.canary ? (
+              <span className={`chip chip--sm chip--${PHASE_CHIP[view.canary.phase] ?? ""}`}>{view.canary.phase === "CANARY" ? `${view.canary.percent}%` : view.canary.phase.replace("_", " ")}</span>
+            ) : (
+              <span className="site__muted">idle</span>
+            )}
+          </div>
+          {view.canary && (
+            <>
+              <CanaryBar percent={view.canary.percent} rolledBack={view.canary.phase === "ROLLED_BACK"} shipped={view.canary.phase === "SHIPPED"} />
+              <div className="site__versions">
+                <span>candidate <code>{view.canary.candidate ?? "n/a"}</code></span>
+                <span>stable <code>{view.canary.stable ?? "n/a"}</code></span>
+              </div>
+              <VerdictLine verdict={view.canary.verdict} />
+            </>
+          )}
+        </li>
+
+        <li className={`site site--prod${view.prod ? "" : " site--off"}`}>
+          <div className="site__head">
+            <b>prod</b>
+            {!view.prod && <span className="site__muted">nothing shipped yet</span>}
+          </div>
+          {view.prod && (
+            <>
+              <div className="site__row site__row--url"><UrlLink url={view.prod.url} /></div>
+              <div className="site__versions">
+                <span>stable <code>{view.prod.stable ?? "n/a"}</code></span>
+                {view.prod.tappedBy && <span>shipped by <b>{view.prod.tappedBy}</b></span>}
+              </div>
+            </>
+          )}
+        </li>
+      </ul>
+    </section>
+  );
+}
+
+/** Progress across the canary steps with the current one lit. */
+export function CanaryBar({ percent, rolledBack, shipped }: { percent: number; rolledBack: boolean; shipped: boolean }) {
+  return (
+    <ol className={`cbar${rolledBack ? " cbar--bad" : ""}${shipped ? " cbar--done" : ""}`} aria-label={`canary at ${percent}%`}>
+      {CANARY_STEPS.map((s, i) => {
+        const prev = CANARY_STEPS[i - 1] ?? 0;
+        const reached = percent >= s;
+        const current = !shipped && percent > prev && percent <= s;
+        return (
+          <li key={s} className={`${reached ? "reached" : ""}${current ? " current" : ""}`}>
+            <i />
+            <span>{s}%</span>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+// ── release timeline ──────────────────────────────────────────────────────
+
+export function ReleaseTimeline(props: { hive: string; state: State; release: Release | null; onTapped?: () => void }) {
+  const { release, state } = props;
+  const [modal, setModal] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [sentFor, setSentFor] = useState<string | null>(null);
+  const [error, setError] = useState<{ status: number; text: string } | null>(null);
+  const closeModal = () => {
+    if (!pending) setModal(false);
+  };
+  useEscape(closeModal, modal);
+
+  // A new phase means the tap landed (or went stale): drop the local "sent" lock.
+  const phase = release?.phase;
+  useEffect(() => {
+    setSentFor(null);
+    setPending(false);
+  }, [phase, release?.releaseId]);
+
+  if (!release) {
+    return (
+      <section className="rtl rtl--empty panel" aria-label="release timeline">
+        <p className="eyebrow">RELEASE</p>
+        <p className="muted">No release yet. When trains land on main, the Queen cuts a release and walks it up the ladder.</p>
+      </section>
+    );
+  }
+  const steps = timelineSteps(release, state.canaryPeak[release.releaseId] ?? 0);
+  const letters = release.trainIds.length ? releaseLetters(state, release) : "no trains";
+  const tap = tapButtonState(release, { pending, sentFor });
+  const stagingVerdict = state.verdicts[release.releaseId]?.staging ?? null;
+
+  const confirm = async () => {
+    setPending(true);
+    setError(null);
+    try {
+      await api.tapRelease(props.hive, release.releaseId);
+      setSentFor(release.releaseId);
+      setModal(false);
+    } catch (e) {
+      const status = e instanceof ApiError ? e.status : 0;
+      setError({ status, text: tapErrorMessage(status, errorMessage(e)) });
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <section className={`rtl rtl--${release.phase.toLowerCase()} panel`} aria-label="release timeline">
+      <header className="rtl__head">
+        <div>
+          <p className="eyebrow">RELEASE</p>
+          <h2>
+            <code>{short(release.headSha)}</code>
+            <span className="rtl__trains" title={`${release.trainIds.length} trains`}>
+              {letters.split("+").map((l, i) => (
+                <span key={`${l}${i}`} className="car__unit car__unit--tail">
+                  {l}
+                </span>
+              ))}
+            </span>
+          </h2>
+          <p className="rtl__headline">{phaseHeadline(release)}</p>
+        </div>
+        {tap.visible && (
+          <button
+            type="button"
+            className="tap-btn"
+            disabled={!tap.enabled}
+            onClick={() => {
+              setError(null);
+              setModal(true);
+            }}
+          >
+            {tap.label}
+          </button>
+        )}
+      </header>
+
+      <ol className="rtl__steps">
+        {steps.map((s) => (
+          <li key={s.key} className={`rstep rstep--${s.state}${s.percent ? " rstep--canary" : ""}`} aria-current={s.state === "now" ? "step" : undefined}>
+            <i>{s.state === "done" ? "✓" : s.state === "bad" ? "✕" : ""}</i>
+            <span>{s.label}</span>
           </li>
         ))}
-      </ul>
+      </ol>
+
+      {release.summary && <p className="rtl__summary">{release.summary}</p>}
+      {release.phase === "ROLLED_BACK" && <div className="rtl__banner rtl__banner--bad">ROLLED BACK{release.stableVersionId ? ` to ${shortVersion(release.stableVersionId)}` : ""}</div>}
+      {release.phase === "SHIPPED" && <div className="rtl__banner rtl__banner--ok">SHIPPED{release.tappedBy ? ` by ${release.tappedBy}` : ""}</div>}
+      {sentFor === release.releaseId && error === null && release.phase === "AWAITING_TAP" && <p className="muted">Tap sent. Waiting for the Queen to start the canary…</p>}
+
+      {modal && (
+        <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && closeModal()}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="tap-title">
+            <p className="eyebrow">SHIP TO PRODUCTION</p>
+            <h2 id="tap-title">
+              Ship release <code>{short(release.headSha)}</code>?
+            </h2>
+            <dl className="modal__facts">
+              <div>
+                <dt>TRAINS</dt>
+                <dd>
+                  {letters}
+                  <ul>
+                    {release.trainIds.map((id) => {
+                      const t = state.trains[id];
+                      const tail = t?.includedPrompts.at(-1);
+                      return (
+                        <li key={id}>
+                          [{tail ? letterOf(state, tail) : "?"}] {tail ? excerpt(state.prompts[tail]?.promptText ?? "", 60) : id.slice(0, 8)}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </dd>
+              </div>
+              <div>
+                <dt>STAGING VERDICT</dt>
+                <dd>
+                  <VerdictLine verdict={stagingVerdict} />
+                </dd>
+              </div>
+              <div>
+                <dt>PLAN</dt>
+                <dd>Canary at {CANARY_STEPS.join(" → ")}%, Sentinel checks every step, automatic rollback on a bad verdict.</dd>
+              </div>
+            </dl>
+            {error && (
+              <p className="modal__error" role="alert">
+                {error.text}
+              </p>
+            )}
+            <div className="modal__actions">
+              <button type="button" className="btn" onClick={closeModal} disabled={pending}>
+                Cancel
+              </button>
+              <button type="button" className="btn btn--ship" onClick={() => void confirm()} disabled={pending} autoFocus>
+                {pending ? "Sending…" : "Confirm: ship it"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -465,9 +718,9 @@ export function Ticker({ items }: { items: TickerItem[] }) {
       <ol ref={ref}>
         {items.length === 0 && <li className="ticker__empty">Silence on the wire.</li>}
         {items.map((t) => (
-          <li key={t.id} className={`tick tick--${t.kind}`}>
+          <li key={t.id} className={`tick tick--${t.kind}${t.tone ? ` tick--${t.tone}` : ""}`}>
             <time>{clock(t.at)}</time>
-            <span className="tick__kind">{t.kind === "scribe" ? "SCRIBE" : t.kind === "error" ? "ERR" : t.kind === "system" ? "SYS" : "EVT"}</span>
+            <span className="tick__kind">{t.kind === "scribe" ? "SCRIBE" : t.kind === "error" ? "ERR" : t.kind === "system" ? "SYS" : t.kind === "sentinel" ? "SENT" : "EVT"}</span>
             <span className="tick__text">{t.text}</span>
           </li>
         ))}

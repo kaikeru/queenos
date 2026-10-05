@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
-import type { AppendAuditInput, DeployResult, DroneTask, MergeTrain, ProvisionResult } from "@queenos/queen-types";
-import { SimExecutors, TEST_RETRY_MS, fakeSha, simPreviewUrl, type SimQueen, type SimStore } from "../src/sim/sim-ports";
+import type { AppendAuditInput, DeployResult, DroneTask, MergeTrain, PromptRun, ProvisionResult, Release, SentinelCommand, SentinelVerdict } from "@queenos/queen-types";
+import {
+  SimExecutors,
+  TEST_RETRY_MS,
+  fakeSha,
+  simPreviewUrl,
+  simProdUrl,
+  simStagingUrl,
+  simVersionId,
+  type SimQueen,
+  type SimStore,
+} from "../src/sim/sim-ports";
 
 function harness() {
   const kv = new Map<string, unknown>();
@@ -10,6 +20,9 @@ function harness() {
   const audits: AppendAuditInput[] = [];
   const provisions: ProvisionResult[] = [];
   const deploys: DeployResult[] = [];
+  const verdicts: SentinelVerdict[] = [];
+  /** What the fake Queen's snapshot says about releases and prompts (for the sim Sentinel). */
+  const world: { releases: Release[]; promptRuns: PromptRun[]; trains: MergeTrain[] } = { releases: [], promptRuns: [], trains: [] };
   /** Phase the fake Queen reports for every train (the sim gatekeeper waits for TESTING). */
   const phase: { value: MergeTrain["phase"] } = { value: "TESTING" };
   const store: SimStore = {
@@ -28,17 +41,23 @@ function harness() {
     reportLandResult: async (r) => (calls.push(`land:${r.trainId}:${r.landed}`), { outcome: "applied" }),
     reportProvisionResult: async (r) => (provisions.push(r), calls.push(`provision:${r.op}:${r.commandId}`), { outcome: "applied" }),
     reportDeployResult: async (r) => (deploys.push(r), calls.push(`deploy:${r.op}:${r.commandId}`), { outcome: "applied" }),
+    reportSentinelVerdict: async (v) => (verdicts.push(v), calls.push(`verdict:${v.verdict}:${v.commandId}`), { outcome: "applied" }),
     getSnapshot: () => ({
-      trains: [{ trainId: "t1", baseSha: "", includedPrompts: [], artifactRepo: "r", status: "TESTING", createdAt: 0, phase: phase.value, previewUrl: simPreviewUrl("t1") }],
+      trains: [
+        { trainId: "t1", baseSha: "", includedPrompts: [], artifactRepo: "r", status: "TESTING", createdAt: 0, phase: phase.value, previewUrl: simPreviewUrl("t1") },
+        ...world.trains,
+      ],
+      releases: world.releases,
+      promptRuns: world.promptRuns,
     }),
   };
-  const delays = { fork: 300, delete: 50, deploy: 1500, teardown: 50, build: 100, test: 100, land: 100 };
+  const delays = { fork: 300, delete: 50, deploy: 1500, teardown: 50, build: 100, test: 100, land: 100, sentinel: 2000 };
   const sim = new SimExecutors(() => queen, store, delays, () => clock);
   const advance = async (ms: number) => {
     clock += ms;
     return sim.runDue();
   };
-  return { sim, advance, calls, audits, provisions, deploys, phase, alarm: () => alarm };
+  return { sim, advance, calls, audits, provisions, deploys, verdicts, world, phase, alarm: () => alarm };
 }
 
 const task = (over: Partial<DroneTask>): DroneTask => ({
@@ -143,5 +162,118 @@ describe("sim drones", () => {
     await h.advance(100);
     expect(h.calls).toEqual(["land:t1:true"]);
     expect(h.audits.at(-1)).toMatchObject({ droneRole: "LANDER", status: "PASSED" });
+  });
+});
+
+describe("sim release executors", () => {
+  const release = (releaseId: string, trainIds: string[]): Release => ({
+    releaseId,
+    hive: "n",
+    headSha: "h",
+    trainIds,
+    phase: "CANARY",
+    canaryPercent: 10,
+    stagingUrl: null,
+    prodUrl: null,
+    candidateVersionId: null,
+    stableVersionId: null,
+    tappedBy: null,
+    tappedAt: null,
+    summary: null,
+    createdAt: 0,
+    updatedAt: 0,
+  });
+  const train = (trainId: string, includedPrompts: string[]): MergeTrain => ({
+    trainId,
+    baseSha: "",
+    includedPrompts,
+    artifactRepo: "r",
+    status: "MERGED",
+    createdAt: 0,
+  });
+  const prompt = (promptId: string, promptText: string): PromptRun => ({ promptId, namespace: "n", promptText, status: "MERGED", createdAt: 0 });
+  const canaryCmd = (over: Partial<SentinelCommand>): SentinelCommand => ({
+    commandId: "r1-verify1-1",
+    hive: "n",
+    releaseId: "r1",
+    environment: "canary",
+    scriptName: "n-app",
+    url: simProdUrl("n"),
+    candidateVersionId: "v-c",
+    stableVersionId: "v-s",
+    canaryPercent: 1,
+    paths: ["/", "/health"],
+    windowSeconds: 60,
+    minRequests: 100,
+    ...over,
+  });
+
+  it("herald: staging deploys report the staging URL with a fake version id", async () => {
+    const h = harness();
+    await h.sim.herald.dispatch({ op: "DEPLOY", commandId: "r1-staging-1", hive: "n", environment: "staging", releaseId: "r1", artifactRepo: "n", commitSha: "abc1234" });
+    await h.advance(1500);
+    expect(h.deploys).toEqual([
+      expect.objectContaining({ commandId: "r1-staging-1", op: "DEPLOY", environment: "staging", releaseId: "r1", ok: true, url: simStagingUrl("n"), versionId: simVersionId("staging:r1-staging-1"), commitSha: "abc1234" }),
+    ]);
+    expect(simStagingUrl("n")).toBe("https://n-staging.sim.queenos.dev");
+  });
+
+  it("herald: canary step 1 uploads a candidate and names the (simulated) stable version; later steps reuse them; rollback restores stable", async () => {
+    const h = harness();
+    const base = { op: "DEPLOY" as const, hive: "n", environment: "canary" as const, releaseId: "r1", artifactRepo: "n", commitSha: "abc" };
+    await h.sim.herald.dispatch({ ...base, commandId: "r1-canary1-1", percent: 1 });
+    await h.advance(1500);
+    const first = h.deploys[0]!;
+    expect(first).toMatchObject({ ok: true, url: "https://n-app.sim.queenos.dev", versionId: simVersionId("candidate:r1"), stableVersionId: simVersionId("prod:n"), percent: 1 });
+    await h.sim.herald.dispatch({ ...base, commandId: "r1-canary10-1", percent: 10, versionId: first.versionId!, stableVersionId: first.stableVersionId! });
+    await h.advance(1500);
+    expect(h.deploys[1]).toMatchObject({ versionId: first.versionId, stableVersionId: first.stableVersionId, percent: 10 });
+    await h.sim.herald.dispatch({ op: "ROLLBACK", commandId: "r1-rollback-1", hive: "n", environment: "canary", toVersionId: first.stableVersionId! });
+    await h.advance(50);
+    expect(h.deploys[2]).toMatchObject({ op: "ROLLBACK", ok: true, versionId: first.stableVersionId, percent: 100 });
+  });
+
+  it("herald: a candidate shipped at 100% becomes the next release's stable version", async () => {
+    const h = harness();
+    const base = { op: "DEPLOY" as const, hive: "n", environment: "canary" as const, artifactRepo: "n", commitSha: "abc" };
+    await h.sim.herald.dispatch({ ...base, releaseId: "r1", commandId: "r1-canary100-1", percent: 100, versionId: "v-r1", stableVersionId: "v-old" });
+    await h.advance(1500);
+    await h.sim.herald.dispatch({ ...base, releaseId: "r2", commandId: "r2-canary1-1", percent: 1 });
+    await h.advance(1500);
+    expect(h.deploys[1]).toMatchObject({ stableVersionId: "v-r1", versionId: simVersionId("candidate:r2") });
+  });
+
+  it("sentinel: PROMOTE after ~2 s for staging and healthy canary steps", async () => {
+    const h = harness();
+    await h.sim.sentinel.dispatch({ ...canaryCmd({}), commandId: "r1-validate-1", environment: "staging", scriptName: "n-staging", url: simStagingUrl("n"), candidateVersionId: undefined, stableVersionId: undefined, canaryPercent: undefined });
+    await h.advance(1999);
+    expect(h.verdicts).toEqual([]);
+    await h.advance(1);
+    expect(h.verdicts[0]).toMatchObject({ commandId: "r1-validate-1", releaseId: "r1", environment: "staging", verdict: "PROMOTE", metrics: { baselineErrorRate: null } });
+    await h.sim.sentinel.dispatch(canaryCmd({}));
+    await h.advance(2000);
+    expect(h.verdicts[1]).toMatchObject({ environment: "canary", verdict: "PROMOTE", metrics: { baselineErrorRate: 0.001 } });
+  });
+
+  it("sentinel: ROLLBACK at the 10% step when a prompt in the release contains [canary-fail]; other steps promote", async () => {
+    const h = harness();
+    h.world.releases = [release("r1", ["t9"])];
+    h.world.trains = [train("t9", ["p1", "p2"])];
+    h.world.promptRuns = [prompt("p1", "add a page"), prompt("p2", "slow query [canary-fail]")];
+    await h.sim.sentinel.dispatch(canaryCmd({ commandId: "r1-verify1-1", canaryPercent: 1 }));
+    await h.sim.sentinel.dispatch(canaryCmd({ commandId: "r1-verify10-1", canaryPercent: 10 }));
+    await h.advance(2000);
+    expect(h.verdicts.map((v) => [v.commandId, v.verdict])).toEqual([
+      ["r1-verify1-1", "PROMOTE"],
+      ["r1-verify10-1", "ROLLBACK"],
+    ]);
+    expect(h.verdicts[1]!.summary).toMatch(/Rolling back/);
+
+    // A release without the marker promotes at 10% too.
+    h.world.releases = [release("r2", ["t8"])];
+    h.world.trains = [train("t8", ["p1"])];
+    await h.sim.sentinel.dispatch(canaryCmd({ commandId: "r2-verify10-1", releaseId: "r2", canaryPercent: 10 }));
+    await h.advance(2000);
+    expect(h.verdicts.at(-1)).toMatchObject({ commandId: "r2-verify10-1", verdict: "PROMOTE" });
   });
 });

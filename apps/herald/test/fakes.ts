@@ -1,7 +1,7 @@
 /** In-memory stand-ins for Artifacts, git, Cloudflare and the Queen. */
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowStepConfig } from "cloudflare:workers";
-import { CloudflareApiError, type PreviewDeploymentInput, type PreviewInfo } from "@queenos/hive-kit";
+import { CloudflareApiError, type DeploymentInfo, type DeploymentVersion, type PreviewDeploymentInput, type PreviewInfo, type WorkerVersionInput } from "@queenos/hive-kit";
 import type { DeployCommand, DeployResult } from "@queenos/queen-types";
 import type { StepRunner } from "../src/orchestrate";
 import type { ArtifactsPort, CloneRequest, CloudflareApi, CloudflareCredentials, CredentialsPort, GitPort, GitSession, HeraldPorts, QueenPort, RepoAccess } from "../src/ports";
@@ -90,6 +90,45 @@ export class FakeCloudflare implements CloudflareApi {
     this.maybeFail("deployPreview");
     this.deployments.push({ worker, previewId, input });
     return { id: `dep-${this.deployments.length}`, urls: this.noUrls ? [] : [`https://dep${this.deployments.length}-${worker}.sub.workers.dev`] };
+  }
+  /** Per-script deployment history, newest first (as the real API lists it). */
+  readonly scriptDeployments = new Map<string, DeploymentInfo[]>();
+  readonly uploads: { script: string; input: WorkerVersionInput; versionId: string }[] = [];
+  readonly created: { script: string; versions: DeploymentVersion[]; force: boolean }[] = [];
+  /** Errors thrown by createDeployment, consumed one per call. */
+  deploymentErrors: Error[] = [];
+
+  async enableSubdomain(script: string) {
+    this.calls.push(`enableSubdomain:${script}`);
+    this.maybeFail("enableSubdomain");
+  }
+  async workerUrl(script: string) {
+    this.calls.push(`workerUrl:${script}`);
+    return `https://${script}.sub.workers.dev`;
+  }
+  async uploadVersion(script: string, input: WorkerVersionInput) {
+    this.calls.push(`uploadVersion:${script}`);
+    this.maybeFail("uploadVersion");
+    const versionId = `ver-${this.uploads.length + 1}`;
+    this.uploads.push({ script, input, versionId });
+    return { versionId };
+  }
+  async createDeployment(script: string, versions: DeploymentVersion[], opts: { annotations?: Record<string, string>; force?: boolean } = {}) {
+    this.calls.push(`createDeployment:${script}${opts.force ? ":force" : ""}`);
+    this.maybeFail("createDeployment");
+    const err = this.deploymentErrors.shift();
+    if (err) throw err;
+    this.created.push({ script, versions, force: !!opts.force });
+    const list = this.scriptDeployments.get(script) ?? [];
+    const id = `dep-${this.created.length}`;
+    list.unshift({ id, createdOn: "", versions });
+    this.scriptDeployments.set(script, list);
+    return { id };
+  }
+  async getCurrentDeployment(script: string) {
+    this.calls.push(`getCurrentDeployment:${script}`);
+    this.maybeFail("getCurrentDeployment");
+    return this.scriptDeployments.get(script)?.[0] ?? null;
   }
   async deletePreview(worker: string, name: string) {
     this.calls.push(`deletePreview:${worker}/${name}`);

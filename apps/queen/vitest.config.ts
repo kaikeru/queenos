@@ -2,6 +2,9 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  // The first request in a file pays workerd + module cold start; under a full
+  // parallel `turbo run test` that alone can exceed vitest's 5 s default.
+  test: { testTimeout: 20_000 },
   plugins: [
     cloudflareTest({
       // Never open a remote proxy session (needs Cloudflare credentials).

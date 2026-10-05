@@ -1,10 +1,10 @@
 import { env, exports } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { DeployCommand, DroneTask, ProvisionCommand, QueenServerMessage } from "@queenos/queen-types";
+import type { DeployCommand, DroneTask, ProvisionCommand, QueenServerMessage, SentinelCommand } from "@queenos/queen-types";
 import type { QueenNode, SocketAttachment } from "../src/queen-node";
 import { migrate } from "../src/db";
-import type { RecordingDispatcher, RecordingHerald, RecordingProvisioner } from "./fakes";
+import type { RecordingDispatcher, RecordingHerald, RecordingProvisioner, RecordingSentinel } from "./fakes";
 
 const worker = exports.default;
 /** wrangler.jsonc env.test sets QUEEN_INTERNAL_TOKEN. */
@@ -62,6 +62,7 @@ function inspect(ns: string) {
     const provisioner = q.ports.provisioner as RecordingProvisioner;
     const herald = q.ports.herald as RecordingHerald;
     const drones = q.ports.dispatcher as RecordingDispatcher;
+    const sentinel = q.ports.sentinel as RecordingSentinel;
     const provisions = provisioner.commands.map((c) => ({ ...c })) as ProvisionCommand[];
     const deploys = herald.commands.map((c) => ({ ...c })) as DeployCommand[];
     return {
@@ -70,6 +71,7 @@ function inspect(ns: string) {
       forks: provisions.filter((c): c is Fork => c.op === "FORK").map((c) => ({ source: c.sourceRepo, name: c.forkName, commandId: c.commandId, trainId: c.trainId })),
       deleted: provisions.flatMap((c) => (c.op === "DELETE" ? [c.repo] : [])),
       tasks: drones.tasks.map((t) => ({ ...t })) as DroneTask[],
+      sentinels: sentinel.commands.map((c) => ({ ...c })) as SentinelCommand[],
       trains: q.sql.exec("SELECT * FROM merge_trains ORDER BY seq").toArray() as unknown as TrainRow[],
       prompts: q.sql.exec("SELECT prompt_id, status, summary, attempts FROM prompt_runs ORDER BY seq").toArray(),
     };
@@ -103,7 +105,7 @@ async function settle(ns: string, reported: Set<string>, opts: { deploys?: boole
     }
     if (opts.deploys !== false) {
       for (const c of s.deploys) {
-        if (c.op !== "DEPLOY" || reported.has(c.commandId)) continue;
+        if (c.op !== "DEPLOY" || c.environment !== "preview" || reported.has(c.commandId)) continue;
         reported.add(c.commandId);
         progressed = true;
         const res = await post(ns, "/internal/webhook/deploy-result", {
@@ -353,13 +355,15 @@ describe("executor results", () => {
     await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "ok" });
     await post(ns, "/internal/webhook/land-result", { trainId, landed: true, mainSha: "m1" });
     const s = await inspect(ns);
-    expect(s.deploys.at(-1)).toEqual({ op: "TEARDOWN", commandId: `${trainId}-teardown-1`, hive: ns, environment: "preview", trainId });
+    expect(s.deploys.filter((d) => d.op === "TEARDOWN")).toEqual([{ op: "TEARDOWN", commandId: `${trainId}-teardown-1`, hive: ns, environment: "preview", trainId }]);
+    // The merge also cut a release: its staging deploy goes to the Herald.
+    expect(s.deploys.at(-1)).toMatchObject({ op: "DEPLOY", environment: "staging", artifactRepo: ns, commitSha: "m1" });
     expect(s.trains[0]).toMatchObject({ phase: "MERGED", deploy_state: "TEARING_DOWN", preview_url: previewUrl(trainId) });
 
     const td = { commandId: `${trainId}-teardown-1`, op: "TEARDOWN", environment: "preview", ok: true };
     expect(await (await post(ns, "/internal/webhook/deploy-result", td)).json()).toMatchObject({ outcome: "applied", train: { status: "MERGED" } });
     expect(await (await post(ns, "/internal/webhook/deploy-result", td)).json()).toMatchObject({ outcome: "ignored:duplicate" });
-    expect((await snapshotOf(ns)).deployments?.[0]).toMatchObject({ status: "TORN_DOWN" });
+    expect((await snapshotOf(ns)).deployments?.find((d) => d.environment === "preview")).toMatchObject({ status: "TORN_DOWN" });
     expect(await rpcError(stubFor(ns).reportDeployResult({ commandId: "unknown-cmd", op: "TEARDOWN", environment: "preview", ok: true }))).toMatch(
       /^NOT_FOUND: /,
     );
@@ -448,6 +452,131 @@ describe("command watchdog (alarm)", () => {
     await post(ns, "/internal/webhook/train-result", { trainId, passed: false, summary: "smoke failed" });
     // Ejection issues DELETE + TEARDOWN (and a rework fork): armed again.
     expect(await alarmAt(ns)).not.toBeNull();
+  });
+});
+
+/** One prompt merged to main as `mainSha`: a release is cut. Returns the staging DEPLOY. */
+async function mergedRelease(ns: string, mainSha = "main-1") {
+  const { trainId } = await oneTrain(ns, { live: true });
+  await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "ok" });
+  await post(ns, "/internal/webhook/land-result", { trainId, landed: true, mainSha });
+  const s = await inspect(ns);
+  const staging = s.deploys.find((d): d is Extract<DeployCommand, { op: "DEPLOY" }> => d.op === "DEPLOY" && d.environment === "staging");
+  expect(staging).toBeDefined();
+  return { trainId, staging: staging! };
+}
+
+function tap(ns: string, releaseId: string, user?: string, extra: Record<string, string> = {}) {
+  return worker.fetch(`http://queen.test/hives/${ns}/releases/${releaseId}/tap`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(user === undefined ? {} : { "x-queen-user": user }), ...extra },
+    body: JSON.stringify({ releaseId }),
+  });
+}
+
+const verdict = (c: SentinelCommand, v: "PROMOTE" | "ROLLBACK" = "PROMOTE") => ({
+  commandId: c.commandId,
+  releaseId: c.releaseId,
+  environment: c.environment,
+  verdict: v,
+  metrics: { requests: 320, errorRate: 0, p99Ms: 40, baselineErrorRate: null },
+  summary: v === "PROMOTE" ? "healthy" : "5xx spike",
+});
+
+describe("release train", () => {
+  it("a merge cuts a release; staging -> validation -> AWAITING_TAP -> tap -> canary 1%, all over HTTP; snapshot lists releases", async () => {
+    const ns = newHive();
+    const { trainId, staging } = await mergedRelease(ns);
+    const releaseId = staging.releaseId!;
+    expect(staging).toEqual({ op: "DEPLOY", commandId: `${releaseId}-staging-1`, hive: ns, environment: "staging", releaseId, artifactRepo: ns, commitSha: "main-1" });
+    let snap = await snapshotOf(ns);
+    expect(snap.releases).toEqual([expect.objectContaining({ releaseId, phase: "STAGING", headSha: "main-1", trainIds: [trainId], hive: ns })]);
+
+    // Herald reports staging without releaseId: resolved from the command id.
+    const res = await post(ns, "/internal/webhook/deploy-result", { commandId: staging.commandId, op: "DEPLOY", environment: "staging", ok: true, url: `https://${ns}-staging.test.dev` });
+    expect(await res.json()).toMatchObject({ outcome: "applied", release: { phase: "VALIDATING", stagingUrl: `https://${ns}-staging.test.dev` } });
+    const [validate] = (await inspect(ns)).sentinels;
+    expect(validate).toMatchObject({ commandId: `${releaseId}-validate-1`, environment: "staging", scriptName: `${ns}-staging`, windowSeconds: 60, minRequests: 100 });
+
+    // Not tappable yet.
+    expect((await tap(ns, releaseId, "kyle@kaikeru.com")).status).toBe(409);
+
+    const v = await post(ns, "/internal/webhook/sentinel-verdict", verdict(validate!));
+    expect(await v.json()).toMatchObject({ outcome: "applied", release: { phase: "AWAITING_TAP" } });
+    expect(await (await post(ns, "/internal/webhook/sentinel-verdict", verdict(validate!))).json()).toMatchObject({ outcome: "ignored:duplicate" });
+
+    // The tap route is a user route: no bearer token needed, but x-queen-user is.
+    const anon = await tap(ns, releaseId);
+    expect(anon.status).toBe(401);
+    expect(await anon.json()).toMatchObject({ error: { code: "UNAUTHORIZED" } });
+    expect((await tap(ns, releaseId, "   ", AUTH)).status).toBe(401);
+    const ok = await tap(ns, releaseId, "kyle@kaikeru.com");
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toMatchObject({ outcome: "applied", release: { phase: "CANARY", tappedBy: "kyle@kaikeru.com" } });
+    expect((await tap(ns, releaseId, "kyle@kaikeru.com")).status).toBe(409);
+    expect((await tap(ns, "no-such-release", "kyle@kaikeru.com")).status).toBe(404);
+    const mismatch = await worker.fetch(`http://queen.test/hives/${ns}/releases/${releaseId}/tap`, {
+      method: "POST",
+      headers: { "x-queen-user": "kyle@kaikeru.com" },
+      body: JSON.stringify({ releaseId: "other" }),
+    });
+    expect(mismatch.status).toBe(400);
+
+    const s = await inspect(ns);
+    expect(s.deploys.at(-1)).toEqual({ op: "DEPLOY", commandId: `${releaseId}-canary1-1`, hive: ns, environment: "canary", releaseId, artifactRepo: ns, commitSha: "main-1", percent: 1 });
+    snap = await snapshotOf(ns);
+    expect(snap.releases?.[0]).toMatchObject({ phase: "CANARY", tappedBy: "kyle@kaikeru.com" });
+    expect(snap.deployments?.find((d) => d.environment === "staging")).toMatchObject({ status: "LIVE", url: `https://${ns}-staging.test.dev` });
+    expect(snap.deployments?.find((d) => d.environment === "canary")).toMatchObject({ status: "PENDING", percent: 1 });
+  });
+
+  it("the root alias routes the tap with the x-queen-hive header", async () => {
+    const ns = newHive();
+    const { staging } = await mergedRelease(ns);
+    const res = await worker.fetch(`http://queen.test/releases/${staging.releaseId}/tap`, {
+      method: "POST",
+      headers: { "x-queen-hive": ns, "x-queen-user": "kyle@kaikeru.com" },
+    });
+    expect(res.status).toBe(409); // STAGING: wrong phase, but routed to the right hive
+  });
+
+  it("reportSentinelVerdict (RPC): NOT_FOUND for an unknown release, INVALID_INPUT for bad input, stale for an old command", async () => {
+    const ns = newHive();
+    const { staging } = await mergedRelease(ns);
+    await stubFor(ns).reportDeployResult({ commandId: staging.commandId, op: "DEPLOY", environment: "staging", releaseId: staging.releaseId, ok: true, url: "https://s.test.dev" });
+    const [validate] = (await inspect(ns)).sentinels;
+    const good = verdict(validate!);
+    expect(await rpcError(stubFor(ns).reportSentinelVerdict({ ...good, releaseId: "nope" }))).toMatch(/^NOT_FOUND: /);
+    expect(await rpcError(stubFor(ns).reportSentinelVerdict({ ...good, verdict: "MAYBE" } as never))).toMatch(/^INVALID_INPUT: /);
+    expect((await stubFor(ns).reportSentinelVerdict({ ...good, commandId: `${staging.releaseId}-validate-0` })).outcome).toBe("ignored:stale");
+    expect((await stubFor(ns).reportSentinelVerdict(good)).outcome).toBe("applied");
+    expect(await rpcError(stubFor(ns).reportDeployResult({ commandId: "unknown-cmd", op: "DEPLOY", environment: "canary", ok: true }))).toMatch(/^NOT_FOUND: /);
+    expect((await post(ns, "/internal/webhook/sentinel-verdict", { ...good, summary: "x".repeat(501) })).status).toBe(400);
+  });
+
+  it("broadcasts release.updated and sentinel.verdict to the War Room", async () => {
+    const ns = newHive();
+    const { ws, next } = await connect(`/hives/${ns}/room`);
+    await next();
+    const { staging } = await mergedRelease(ns);
+    expect(await next((m) => m.type === "release.updated")).toMatchObject({ release: { phase: "STAGING", releaseId: staging.releaseId } });
+    await post(ns, "/internal/webhook/deploy-result", { commandId: staging.commandId, op: "DEPLOY", environment: "staging", ok: true, url: "https://s.test.dev" });
+    const [validate] = (await inspect(ns)).sentinels;
+    await post(ns, "/internal/webhook/sentinel-verdict", verdict(validate!));
+    expect(await next((m) => m.type === "sentinel.verdict")).toMatchObject({ verdict: { verdict: "PROMOTE", releaseId: staging.releaseId } });
+    expect(await next((m) => m.type === "release.updated")).toMatchObject({ release: { phase: "AWAITING_TAP" } });
+    ws.close(1000, "done");
+  });
+
+  it("the watchdog alarm covers release commands", async () => {
+    const ns = newHive();
+    const { staging } = await mergedRelease(ns);
+    await runInDurableObject(stubFor(ns), (q: QueenNode) => {
+      (q as unknown as { clockOffset: number }).clockOffset = 600_000 + 2_000;
+    });
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    const ids = (await inspect(ns)).deploys.filter((d) => d.op === "DEPLOY" && d.environment === "staging").map((d) => d.commandId);
+    expect(ids).toEqual([staging.commandId, `${staging.releaseId}-staging-2`]);
   });
 });
 
@@ -588,8 +717,8 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([3, 3, 3]);
-    expect(state.tables).toEqual(["audit_trail", "deployments", "merge_trains", "prompt_runs"]);
+    expect([state.before, state.after, state.version]).toEqual([4, 4, 4]);
+    expect(state.tables).toEqual(["audit_trail", "deployments", "merge_trains", "prompt_runs", "releases"]);
     ws.close(1000, "done");
   });
 });

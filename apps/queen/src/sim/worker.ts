@@ -1,7 +1,7 @@
 /**
  * Simulation entrypoint (`wrangler dev --env sim`). Same Worker and Durable
- * Object as production, but createPorts() returns a fake Provisioner, Herald
- * and drones that auto-advance the merge train. See sim-ports.ts.
+ * Object as production, but createPorts() returns a fake Provisioner, Herald,
+ * Sentinel and drones that auto-advance the merge train and the release train. See sim-ports.ts.
  *
  * This file is only referenced by wrangler.jsonc env.sim.main; the default
  * bundle (src/index.ts) never imports it.
@@ -35,7 +35,7 @@ export class QueenNode extends ProdQueenNode {
     // Called from the base constructor: `this.ctx` is set, subclass fields are not.
     const sim = new SimExecutors(() => this, this.ctx.storage);
     this.sim = sim;
-    return { provisioner: sim.provisioner, herald: sim.herald, dispatcher: sim.drones };
+    return { provisioner: sim.provisioner, herald: sim.herald, sentinel: sim.sentinel, dispatcher: sim.drones };
   }
 
   /** Simulated executors run off the DO alarm (hibernation-safe); then normal reconcile. */

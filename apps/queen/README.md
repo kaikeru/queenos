@@ -19,7 +19,9 @@ There is **one `QueenNode` per hive**, addressed by `idFromName(namespace)`. A h
 | POST | `/internal/webhook/build-result` | `reportBuildResult(BuildResult)` | The builder pushed the train head, so successors can fork from it |
 | POST | `/internal/webhook/land-result` | `reportLandResult(LandResult)` | The lander pushed the head to the hive's `main` → MERGED |
 | POST | `/internal/webhook/provision-result` | `reportProvisionResult(ProvisionResult)` | The Provisioner's FORK / DELETE outcome; idempotent by `commandId` |
-| POST | `/internal/webhook/deploy-result` | `reportDeployResult(DeployResult)` | The Herald's preview DEPLOY / TEARDOWN outcome; idempotent by `commandId` (the train is found from `trainId`, or else from the command id) |
+| POST | `/internal/webhook/deploy-result` | `reportDeployResult(DeployResult)` | The Herald's outcome; idempotent by `commandId`. Preview DEPLOY / TEARDOWN go to the train (found from `trainId`, or else the command id); staging / canary DEPLOY and ROLLBACK go to the release (found from `releaseId`, or else the command id) and return `{outcome, release}` |
+| POST | `/internal/webhook/sentinel-verdict` | `reportSentinelVerdict(SentinelVerdict)` | `{outcome, release}`; Sentinel's PROMOTE / ROLLBACK for staging or a canary step; idempotent by `commandId` |
+| POST | `/releases/:releaseId/tap` | `tapRelease({releaseId, user})` | **User route**: needs `x-queen-user` (set by the edge after Cloudflare Access), 401 without; not behind the bearer token. Body `{releaseId}` optional (must match the path). 409 unless AWAITING_TAP, 404 if unknown. Starts the canary at 1% |
 | POST | `/audit` | `appendAudit(AppendAudit)` | 201 `{event}`; a Cognitive Ledger entry (GitNotesPayload ≤ 16 KiB) |
 | POST | `/scribe` | `recordScribeSummary(ScribeSummary)` | `{promptRun, train}`; the summary is ≤ 500 chars |
 | GET | `/snapshot` | `getSnapshot()` | A `snapshot` server message |
@@ -79,13 +81,14 @@ The Queen decides, records and dispatches. It performs **no external I/O** (it h
 |---|---|---|---|
 | `PROVISIONER` | `provisioner-workflow` / `ProvisionerWorkflow` (`queenos-provisioner`) | `ProvisionCommand` FORK / DELETE | `reportProvisionResult` |
 | `HERALD` | `herald-workflow` / `HeraldWorkflow` (`queenos-herald`) | `DeployCommand` DEPLOY / TEARDOWN (preview) | `reportDeployResult` |
+| `SENTINEL` | `sentinel-workflow` / `SentinelWorkflow` (`queenos-sentinel`) | `SentinelCommand` (staging / canary health window) | `reportSentinelVerdict` |
 | `DRONES` | `drone-workflow` / `DroneWorkflow` (`queenos-drones`) | `DroneTask` BUILD / REWORK / LAND | build / train / land results |
 
 - **Command ids** are `<trainId>-<op>-<n>` (`fork`, `delete`, `deploy`, `teardown`; `n` counts attempts). The id is stored on the train row in the same transaction as the decision, **before** dispatch, and is also the Workflow instance id, so re-dispatching it is a no-op.
 - **Results** are matched by command id. A result for an older attempt returns `ignored:stale`, a repeat returns `ignored:duplicate`, and an unknown train returns `NOT_FOUND`. Executors treat `INVALID_INPUT:` / `NOT_FOUND:` / `CONFLICT:` errors as permanent.
 - **FORK failure:** retried under a new command id, up to 3 attempts. After that the train fails like a test failure (EJECTED, and the prompt is re-queued as REWORK).
 - **DELETE and TEARDOWN failures** are only recorded (`fork_state = DELETE_FAILED`, deployment `FAILED`); nothing is ejected.
-- **Non-preview Herald results** (staging/canary/prod, ROLLBACK: "not implemented (P3)") are ignored (`ignored:unknown`).
+- **Release commands** (staging / canary deploys, rollbacks, Sentinel windows) follow the same rules; see "Release train" below.
 - **Reconcile:** if a dispatch throws, the DO sets an alarm, and `reconcile()` re-sends every pending command under the same id. A pending fork whose source changed gets a new id.
 
 **Seed requirement (P2 / Genesis, not owned yet):** the Herald deploys a hive only if its repo contains `.queen/deploy.json` (from `templates/worker-starter`). Nothing seeds the hive repo yet. Genesis / `createHive` must seed it.
@@ -121,3 +124,24 @@ The planner lives in `src/train/planner.ts`. It is pure and returns effects for 
   - After 2 reworks the prompt is marked FAILED.
 - **Durability:** command ids and dispatch intents are persisted before anything is dispatched. If a dispatch fails, the DO sets an alarm, and `reconcile()` re-issues it once that alarm fires.
 - **Late deploys:** if a DEPLOY completes after its train ended (it was never LIVE), the preview may have been re-created behind the teardown, so a second TEARDOWN is issued, once.
+
+## Release train (P3)
+
+The planner lives in `src/release/planner.ts` (pure, like the train planner) and shares the Queen's SQLite (`releases` table; environment rows `staging` / `canary` / `prod` in `deployments`). A MERGED train hands the new main head to it in the same transaction.
+
+| Phase | Waiting on | Next |
+|---|---|---|
+| `STAGING` | Herald `DEPLOY staging` → `<hive>-staging` | ok → `VALIDATING` (stagingUrl); !ok → `FAILED` |
+| `VALIDATING` | Sentinel (staging) | PROMOTE → `AWAITING_TAP`; ROLLBACK → `FAILED` (P5: bisect + revert) |
+| `AWAITING_TAP` | a human (`POST .../tap`) | tap → `CANARY` 1% (records tappedBy / tappedAt) |
+| `CANARY` | Herald `DEPLOY canary` at 1 / 10 / 50 / 100%, then Sentinel per step | PROMOTE → next step; at 100% → `SHIPPED`. ROLLBACK or deploy !ok → Herald `ROLLBACK` → `ROLLED_BACK` (no stable version → `FAILED`) |
+| `SHIPPED` / `ROLLED_BACK` / `FAILED` / `SUPERSEDED` | — | terminal |
+
+- A merge during STAGING / VALIDATING / AWAITING_TAP supersedes the release (late results → `ignored:stale`) and cuts a new one. A merge during CANARY is queued and cut when the canary ends.
+- A release carries every train landed since the last SHIPPED release.
+- First prod deploy: Herald returns no `stableVersionId` and deploys at 100%, so the canary is a single 100% step.
+- Command ids: `<releaseId>-<op>-<n>`, op `staging`, `validate`, `canary<p>`, `verify<p>`, `rollback`.
+- Watchdog: same caps as the train; Sentinel gets `max(COMMAND_TIMEOUT_MS, SENTINEL_WINDOW_SECONDS*1000 + 5 min)`. A lost canary verdict rolls back.
+- Vars: `SENTINEL_WINDOW_SECONDS` (default 60) and `SENTINEL_MIN_REQUESTS` (default 100).
+- Broadcasts `release.updated` (updatedAt strictly increases), `deployment.updated`, `sentinel.verdict`; the snapshot has `releases` (newest first, 20).
+- Sim: staging → AWAITING_TAP automatically; then `curl -XPOST localhost:8787/hives/<hive>/releases/<id>/tap -H 'x-queen-user: you@example.com'`. A prompt containing `[canary-fail]` makes the sim Sentinel roll back at 10%.

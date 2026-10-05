@@ -16,15 +16,19 @@ import type {
   MergeTrain,
   PromptRun,
   QueenServerMessage,
+  Release,
+  SentinelVerdict,
 } from "@queenos/queen-types";
 
-export type TickerKind = "scribe" | "status" | "error" | "system";
+export type TickerKind = "scribe" | "status" | "error" | "system" | "sentinel";
 
 export interface TickerItem {
   id: number;
   at: number;
   kind: TickerKind;
   text: string;
+  /** Sentinel lines: how the verdict reads. */
+  tone?: "ok" | "bad";
 }
 
 export interface LandedCommit {
@@ -43,6 +47,14 @@ export interface State {
   trainOrder: string[];
   /** Deployments by deploymentId (per-train previews; staging/canary/prod from P3). */
   deployments: Record<string, Deployment>;
+  /** Releases by releaseId (P3). */
+  releases: Record<string, Release>;
+  /** Release ids, newest first. */
+  releaseOrder: string[];
+  /** Latest Sentinel verdict per release and environment (not part of the snapshot). */
+  verdicts: Record<string, Partial<Record<SentinelVerdict["environment"], SentinelVerdict>>>;
+  /** Highest canary percent ever seen per release (a rollback may reset `canaryPercent`). */
+  canaryPeak: Record<string, number>;
   audit: AuditEvent[];
   /** Newest first. */
   ticker: TickerItem[];
@@ -66,6 +78,10 @@ export const initialState: State = {
   trains: {},
   trainOrder: [],
   deployments: {},
+  releases: {},
+  releaseOrder: [],
+  verdicts: {},
+  canaryPeak: {},
   audit: [],
   ticker: [],
   landed: [],
@@ -110,10 +126,10 @@ function upsertOrdered(order: string[], id: string, createdAt: number, all: Reco
   return next;
 }
 
-function pushTicker(s: State, kind: TickerKind, text: string, at: number): State {
+function pushTicker(s: State, kind: TickerKind, text: string, at: number, tone?: "ok" | "bad"): State {
   // Scribe lines can arrive twice (audit entry and train summary); show once.
   if (kind === "scribe" && s.ticker.slice(0, 12).some((t) => t.kind === "scribe" && t.text === text)) return s;
-  const item: TickerItem = { id: s.tickerSeq + 1, at, kind, text };
+  const item: TickerItem = { id: s.tickerSeq + 1, at, kind, text, ...(tone ? { tone } : {}) };
   return { ...s, tickerSeq: item.id, ticker: [item, ...s.ticker].slice(0, TICKER_LIMIT) };
 }
 
@@ -162,6 +178,9 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
         trains,
         trainOrder: byCreated(msg.trains).map((t) => t.trainId),
         deployments: Object.fromEntries((msg.deployments ?? []).map((d) => [d.deploymentId, d])),
+        releases: Object.fromEntries((msg.releases ?? []).map((r) => [r.releaseId, r])),
+        releaseOrder: [...(msg.releases ?? [])].sort((a, b) => b.createdAt - a.createdAt).map((r) => r.releaseId),
+        canaryPeak: Object.fromEntries((msg.releases ?? []).map((r) => [r.releaseId, Math.max(state.canaryPeak[r.releaseId] ?? 0, r.canaryPercent ?? 0)])),
         audit: msg.recentAudit.slice(-AUDIT_LIMIT),
         landed: [],
       };
@@ -233,6 +252,35 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
       }
       return next;
     }
+    case "release.updated": {
+      const r = msg.release;
+      const prev = state.releases[r.releaseId];
+      if (prev && prev.updatedAt > r.updatedAt) return state; // out-of-order frame
+      const releases = { ...state.releases, [r.releaseId]: r };
+      let next: State = {
+        ...state,
+        releases,
+        releaseOrder: state.releaseOrder.includes(r.releaseId)
+          ? state.releaseOrder
+          : [...state.releaseOrder, r.releaseId].sort((x, y) => releases[y]!.createdAt - releases[x]!.createdAt),
+        canaryPeak: { ...state.canaryPeak, [r.releaseId]: Math.max(state.canaryPeak[r.releaseId] ?? 0, r.canaryPercent ?? 0) },
+      };
+      const label = `Release ${r.headSha.slice(0, 7)}`;
+      if (!prev) next = pushTicker(next, "status", `${label} created (${releaseLetters(next, r)})`, at);
+      else if (prev.phase !== r.phase || prev.canaryPercent !== r.canaryPercent) {
+        const tail = r.phase === "CANARY" && r.canaryPercent ? ` at ${r.canaryPercent}%` : "";
+        const bad = r.phase === "ROLLED_BACK" || r.phase === "FAILED";
+        next = pushTicker(next, bad ? "error" : "status", `${label} ${r.phase.replace("_", " ")}${tail}${bad && r.summary ? `: ${excerpt(r.summary, 80)}` : ""}${r.phase === "SHIPPED" && r.tappedBy ? ` (tapped by ${r.tappedBy})` : ""}`, at);
+      }
+      return next;
+    }
+    case "sentinel.verdict": {
+      const v = msg.verdict;
+      const prev = state.verdicts[v.releaseId]?.[v.environment];
+      if (prev && prev.commandId === v.commandId && prev.verdict === v.verdict) return state;
+      const next: State = { ...state, verdicts: { ...state.verdicts, [v.releaseId]: { ...state.verdicts[v.releaseId], [v.environment]: v } } };
+      return pushTicker(next, "sentinel", `Sentinel ${v.verdict}: ${v.summary}`, at, v.verdict === "PROMOTE" ? "ok" : "bad");
+    }
     case "audit.appended": {
       const e = msg.event;
       if (state.audit.some((x) => x.eventId === e.eventId)) return state;
@@ -246,6 +294,18 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
       return next;
     }
   }
+}
+
+/** Letters (queen-queue letters of each train's tail prompt) of the trains in a release, e.g. "A+B+C". */
+export function releaseLetters(state: Pick<State, "trains" | "promptOrder">, release: Release): string {
+  const letters: string[] = [];
+  for (const id of release.trainIds) {
+    const t = state.trains[id];
+    const tail = t ? tailOf(t) : undefined;
+    const l = tail ? letterOf(state, tail) : "?";
+    if (!letters.includes(l)) letters.push(l);
+  }
+  return letters.length ? letters.join("+") : "no trains";
 }
 
 // ── selectors ─────────────────────────────────────────────────────────────

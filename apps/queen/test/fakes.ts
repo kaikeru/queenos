@@ -1,4 +1,4 @@
-import type { DeployCommand, DroneTask, ProvisionCommand } from "@queenos/queen-types";
+import type { DeployCommand, DroneTask, ProvisionCommand, SentinelCommand } from "@queenos/queen-types";
 import { droneInstanceId, type DroneDispatcher } from "../src/drones";
 import type { CommandDispatcher } from "../src/executors";
 
@@ -20,6 +20,7 @@ export class RecordingCommands<C extends { commandId: string }> implements Comma
 
 export class RecordingProvisioner extends RecordingCommands<ProvisionCommand> {}
 export class RecordingHerald extends RecordingCommands<DeployCommand> {}
+export class RecordingSentinel extends RecordingCommands<SentinelCommand> {}
 
 export class RecordingDispatcher implements DroneDispatcher {
   readonly tasks: DroneTask[] = [];

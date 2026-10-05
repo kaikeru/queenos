@@ -1,17 +1,24 @@
 import { useCallback, useMemo, useReducer, useState } from "react";
 import { DEMO_PROMPTS } from "./demo";
-import { Composer, Lanes, LedgerPanel, MainTrack, Sites, Ticker, TopBar } from "./components";
+import { Composer, Lanes, LedgerPanel, MainTrack, ReleaseTimeline, Sites, Ticker, TopBar } from "./components";
+import { currentRelease, siteReleaseView } from "./releases";
+import { useMockQueen } from "./useMockQueen";
 import { buildLanes, buildSites, initialState, reducer, type AuditCard, type Lane } from "./reducer";
 import { useQueenSocket } from "./useQueenSocket";
 
+// A build-time constant (replaced by Vite), so the mock is tree-shaken from production bundles.
+const useRoomSocket = import.meta.env.VITE_MOCK_API === "1" ? useMockQueen : useQueenSocket;
+
 export function WarRoom({ hive, backTo }: { hive: string; backTo?: string }) {
   const [state, dispatch] = useReducer(reducer, initialState);
-  const { status, latencyMs, retryAt, send } = useQueenSocket(hive, dispatch);
+  const { status, latencyMs, retryAt, send } = useRoomSocket(hive, dispatch);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [swarming, setSwarming] = useState(false);
 
   const lanes = useMemo(() => buildLanes(state), [state]);
   const sites = useMemo(() => buildSites(state), [state.deployments]);
+  const release = useMemo(() => currentRelease(state), [state.releases, state.releaseOrder]);
+  const siteView = useMemo(() => siteReleaseView(state), [state.releases, state.releaseOrder, state.verdicts, state.canaryPeak]);
   const closeLedger = useCallback(() => setSelectedKey(null), []);
   // Re-resolve the open card from live state so a RUNNING card updates in place.
   const selected = useMemo<{ card: AuditCard; lane: Lane } | null>(() => {
@@ -45,13 +52,14 @@ export function WarRoom({ hive, backTo }: { hive: string; backTo?: string }) {
     <div className="app">
       <TopBar hive={hive} status={status} latencyMs={latencyMs} retryAt={retryAt} state={state} backTo={backTo} />
       <MainTrack landed={state.landed} state={state} />
+      <ReleaseTimeline hive={hive} state={state} release={release} />
       <div className="layout">
         <main className="layout__lanes">
           <Lanes lanes={lanes} selected={selectedKey} onSelect={(card) => setSelectedKey(card.key)} />
         </main>
         <aside className="layout__side">
           <Composer disabled={status !== "open"} onSubmit={submit} onSwarm={() => void swarm()} swarming={swarming} />
-          <Sites rows={sites} state={state} />
+          <Sites rows={sites} state={state} view={siteView} />
           <Ticker items={state.ticker} />
         </aside>
       </div>

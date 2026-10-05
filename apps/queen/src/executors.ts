@@ -6,9 +6,12 @@
  * (`reportProvisionResult` / `reportDeployResult`).
  *
  * - PROVISIONER: `ProvisionerWorkflow` in apps/provisioner (Artifacts fork / delete).
- * - HERALD: `HeraldWorkflow` in apps/herald (Worker Preview deploy / teardown).
+ * - HERALD: `HeraldWorkflow` in apps/herald (preview deploy / teardown; staging,
+ *   canary and rollback for the release train).
+ * - SENTINEL: `SentinelWorkflow` in apps/sentinel (health verdicts for staging
+ *   and each canary step; reports back with `reportSentinelVerdict`).
  */
-import type { DeployCommand, ProvisionCommand } from "@queenos/queen-types";
+import type { DeployCommand, ProvisionCommand, SentinelCommand } from "@queenos/queen-types";
 import { QueenError } from "./errors";
 
 export interface CommandDispatcher<C extends { commandId: string }> {
@@ -20,6 +23,8 @@ export interface CommandDispatcher<C extends { commandId: string }> {
 export type ProvisionerDispatcher = CommandDispatcher<ProvisionCommand>;
 /** Deploys and tears down environments (Herald Workflow). */
 export type DeployDispatcher = CommandDispatcher<DeployCommand>;
+/** Judges release health (Sentinel Workflow). */
+export type SentinelDispatcher = CommandDispatcher<SentinelCommand>;
 
 /** Starts a Workflow instance with `id = params.commandId`; an existing instance counts as success. */
 export class WorkflowCommandDispatcher<C extends { commandId: string }> implements CommandDispatcher<C> {

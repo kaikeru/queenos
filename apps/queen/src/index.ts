@@ -6,12 +6,14 @@ import {
   LandResultSchema,
   ProvisionResultSchema,
   ScribeSummarySchema,
+  SentinelVerdictSchema,
   SubmitPromptSchema,
+  TapToShipSchema,
   TrainResultSchema,
 } from "@queenos/queen-types";
 import { requireInternalAuth } from "./auth";
 import { QueenError, asQueenError, parseOrThrow } from "./errors";
-import { DEFAULT_HIVE, HIVE_HEADER, assertNamespace } from "./queen-node";
+import { DEFAULT_HIVE, HIVE_HEADER, USER_HEADER, assertNamespace } from "./queen-node";
 
 export { QueenNode } from "./queen-node";
 
@@ -86,6 +88,33 @@ hive.post("/prompts", async (c) => {
   return c.json({ promptRun }, 201);
 });
 
+// Tap to ship: a USER route. The edge verifies Cloudflare Access and sets
+// x-queen-user (stripping any client-supplied value); it is not behind the
+// internal bearer token. 401 without a user, 409 outside AWAITING_TAP.
+hive.post("/releases/:releaseId/tap", async (c) => {
+  const user = c.req.header(USER_HEADER)?.trim();
+  if (!user) {
+    return c.json({ error: { code: "UNAUTHORIZED", message: `missing ${USER_HEADER} (sign in through Cloudflare Access)` } }, 401);
+  }
+  const releaseId = c.req.param("releaseId");
+  // The dashboard sends `{releaseId}`; the body is optional, but must agree with the path.
+  const raw = await c.req.text();
+  if (raw.trim()) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new QueenError("INVALID_INPUT", "body must be JSON");
+    }
+    const tap = TapToShipSchema.partial().safeParse(parsed);
+    if (!tap.success) throw QueenError.invalid("tap", tap.error.issues);
+    if (tap.data.releaseId !== undefined && tap.data.releaseId !== releaseId) {
+      throw new QueenError("INVALID_INPUT", "releaseId in body does not match the path");
+    }
+  }
+  return c.json(await stub(c, hiveOf(c)).tapRelease({ releaseId, user }));
+});
+
 // Machine-only routes: shared bearer secret (src/auth.ts). POST /prompts and the
 // WebSocket room stay open for the dashboard (see README: needs auth post-hackathon).
 for (const path of ["/internal/*", "/trains/*", "/audit", "/scribe"]) hive.use(path, requireInternalAuth);
@@ -124,10 +153,17 @@ hive.post("/internal/webhook/provision-result", async (c) => {
   return c.json(await stub(c, hiveOf(c)).reportProvisionResult(result));
 });
 
-// Herald reports a preview DEPLOY / TEARDOWN outcome (idempotent by commandId).
+// Herald reports a DEPLOY / TEARDOWN / ROLLBACK outcome (preview -> trains,
+// staging / canary -> releases; idempotent by commandId).
 hive.post("/internal/webhook/deploy-result", async (c) => {
   const result = parseOrThrow(DeployResultSchema, await body(c), "deploy result");
   return c.json(await stub(c, hiveOf(c)).reportDeployResult(result));
+});
+
+// Sentinel reports a staging / canary health verdict (idempotent by commandId).
+hive.post("/internal/webhook/sentinel-verdict", async (c) => {
+  const verdict = parseOrThrow(SentinelVerdictSchema, await body(c), "sentinel verdict");
+  return c.json(await stub(c, hiveOf(c)).reportSentinelVerdict(verdict));
 });
 
 hive.post("/audit", async (c) => {

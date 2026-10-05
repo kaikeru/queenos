@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // apps/queen binds to this Worker by name ("script_name": "queenos-sentinel").
+  "name": "queenos-sentinel",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  "workers_dev": false,
+  "preview_urls": false,
+  "workflows": [
+    {
+      // apps/queen's SENTINEL binding names this workflow + class.
+      "name": "sentinel-workflow",
+      "binding": "SENTINEL_WORKFLOW",
+      "class_name": "SentinelWorkflow"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen").
+      // One QueenNode per hive: QUEEN.idFromName(hive).
+      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" }
+    ]
+  },
+  "env": {
+    // Used only by vitest (see vitest.config.ts): no cross-script QUEEN DO in
+    // the pool. Tests inject fake ports through test/worker.ts.
+    "test": {
+      "workflows": [{ "name": "sentinel-workflow", "binding": "SENTINEL_WORKFLOW", "class_name": "SentinelWorkflow" }]
+    }
+  }
+}

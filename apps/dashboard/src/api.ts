@@ -35,12 +35,12 @@ interface Parser<T> {
   parse(v: unknown): T;
 }
 
-async function request<T>(method: string, path: string, parser: Parser<T>, body?: unknown): Promise<T> {
+async function request<T>(method: string, path: string, parser: Parser<T>, body?: unknown, credentials: RequestCredentials = "same-origin"): Promise<T> {
   let res: Response;
   try {
     res = await fetch(path, {
       method,
-      credentials: "same-origin",
+      credentials,
       headers: { accept: "application/json", ...(body !== undefined ? { "content-type": "application/json" } : {}) },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
@@ -85,7 +85,12 @@ const UrlParser: Parser<{ url: string }> = {
 };
 const ProjectsParser: Parser<Project[]> = { parse: (v) => ProjectSchema.array().parse(v) };
 
+const AnyParser: Parser<unknown> = { parse: (v) => v };
+
 export const api = {
+  /** The edge adds the signed-in user's identity; we only need to send the cookie. */
+  tapRelease: (hive: string, releaseId: string) =>
+    request("POST", `/hives/${enc(hive)}/releases/${enc(releaseId)}/tap`, AnyParser, { releaseId }, "include"),
   me: () => request("GET", "/api/me", MeParser),
   projects: () => request("GET", "/api/projects", ProjectsParser),
   startGenesis: (hive: string, name: string) => request("POST", "/api/genesis", WizardStateSchema, { hive, name }),

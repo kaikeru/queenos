@@ -132,6 +132,46 @@ describe("CloudflareClient", () => {
     await expect(client.createDeployment("app", [{ versionId: "a", percentage: 50 }])).rejects.toBeInstanceOf(CloudflareApiError);
   });
 
+  it("listDeployments maps the real shape (newest first); getCurrentDeployment is the head or null", async () => {
+    const real = {
+      deployments: [
+        { id: "d2", source: "api", strategy: "percentage", created_on: "2026-10-05T01:17:59Z", versions: [{ version_id: "v2", percentage: 10 }, { version_id: "v1", percentage: 90 }] },
+        { id: "d1", source: "api", strategy: "percentage", created_on: "2026-10-05T01:17:47Z", versions: [{ version_id: "v1", percentage: 100 }] },
+      ],
+    };
+    const a = harness(ok(real), ok(real));
+    const list = await a.client.listDeployments("hive-app");
+    expect(a.calls[0]!.url).toBe(`${base}/workers/scripts/hive-app/deployments`);
+    expect(list[0]).toEqual({ id: "d2", createdOn: "2026-10-05T01:17:59Z", versions: [{ versionId: "v2", percentage: 10 }, { versionId: "v1", percentage: 90 }] });
+    expect((await a.client.getCurrentDeployment("hive-app"))!.id).toBe("d2");
+
+    const b = harness(ok({ deployments: [] }), fail(404, 10007));
+    expect(await b.client.getCurrentDeployment("hive-app")).toBeNull();
+    expect(await b.client.getCurrentDeployment("hive-app")).toBeNull();
+  });
+
+  it("enableSubdomain posts enabled:true; workerUrl composes the workers.dev URL", async () => {
+    const a = harness(ok({ enabled: true, previews_enabled: true }), ok({ subdomain: "kyle-477" }));
+    await a.client.enableSubdomain("hive-app");
+    expect(a.calls[0]!.url).toBe(`${base}/workers/scripts/hive-app/subdomain`);
+    expect(a.calls[0]!.init.method).toBe("POST");
+    expect(JSON.parse(a.calls[0]!.init.body as string)).toEqual({ enabled: true, previews_enabled: true });
+    expect(await a.client.workerUrl("hive-app")).toBe("https://hive-app.kyle-477.workers.dev");
+  });
+
+  it("createDeployment force sends ?force=true; secretsMismatch classifies the refusal", async () => {
+    const a = harness(ok({ id: "d" }));
+    await a.client.createDeployment("s", [{ versionId: "v1", percentage: 100 }], { force: true });
+    expect(a.calls[0]!.url).toBe(`${base}/workers/scripts/s/deployments?force=true`);
+
+    const b = harness(fail(400, 10215, "secrets differ"), fail(400, 10021, "bad module"));
+    const e1 = await b.client.createDeployment("s", [{ versionId: "v1", percentage: 100 }]).catch((e) => e);
+    expect(e1).toBeInstanceOf(CloudflareApiError);
+    expect(e1.secretsMismatch).toBe(true);
+    const e2 = await b.client.createDeployment("s", [{ versionId: "v1", percentage: 100 }]).catch((e) => e);
+    expect(e2.secretsMismatch).toBe(false);
+  });
+
   it("getWorkersSubdomain", async () => {
     const { client, calls } = harness(ok({ subdomain: "kyle" }));
     expect(await client.getWorkersSubdomain()).toBe("kyle");

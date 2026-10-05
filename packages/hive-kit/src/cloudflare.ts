@@ -18,6 +18,9 @@ export const PREVIEW_NOT_FOUND_CODES: readonly number[] = [10025, 10222];
 /** Cloudflare API error codes that mean "that Worker does not exist". */
 export const WORKER_NOT_FOUND_CODES: readonly number[] = [10007, 10090];
 
+/** Best-known API codes for "version secrets differ" (UNVERIFIED; see `secretsMismatch`). */
+export const SECRETS_MISMATCH_CODES: readonly number[] = [10215];
+
 export class CloudflareApiError extends Error {
   override readonly name = "CloudflareApiError";
   constructor(
@@ -32,6 +35,15 @@ export class CloudflareApiError extends Error {
     readonly endpoint: string,
   ) {
     super(message);
+  }
+
+  /**
+   * A rollback/deploy refused because the target version's secrets differ from the
+   * current ones; wrangler retries with `?force=true`. The exact code is not
+   * reproducible on demand, so match the documented codes or the message.
+   */
+  get secretsMismatch(): boolean {
+    return (this.status === 400 || this.status === 409) && (this.codes.some((c) => SECRETS_MISMATCH_CODES.includes(c)) || /secret/i.test(this.message));
   }
 
   /** HTTP 404 or an API code for a missing Worker/Preview. */
@@ -109,6 +121,13 @@ export interface DeploymentVersion {
   percentage: number;
 }
 
+/** One entry of `GET …/scripts/{s}/deployments` (newest first). */
+export interface DeploymentInfo {
+  id: string;
+  createdOn: string;
+  versions: DeploymentVersion[];
+}
+
 interface ApiEnvelope<T> {
   success?: boolean;
   errors?: { code?: number; message?: string }[];
@@ -171,6 +190,19 @@ export class CloudflareClient {
       if (e instanceof CloudflareApiError && e.status === 409) return { created: false }; // raced
       throw e;
     }
+  }
+
+  /**
+   * `POST …/scripts/{s}/subdomain {enabled, previews_enabled}`: serve the script on
+   * `<script>.<account-subdomain>.workers.dev`. Idempotent (verified 200 either way).
+   */
+  async enableSubdomain(script: string): Promise<void> {
+    await this.request("POST", `${this.acct()}/workers/scripts/${enc(script)}/subdomain`, { json: { enabled: true, previews_enabled: true } });
+  }
+
+  /** `https://<script>.<account-subdomain>.workers.dev` */
+  async workerUrl(script: string): Promise<string> {
+    return `https://${script}.${await this.getWorkersSubdomain()}.workers.dev`;
   }
 
   async deleteWorker(name: string): Promise<boolean> {
@@ -255,6 +287,33 @@ export class CloudflareClient {
       query: { bindings_inherit: "strict" },
     });
     return { versionId: r.id };
+  }
+
+  /**
+   * `GET …/scripts/{s}/deployments`: newest first (default page of 10). Each has
+   * `versions:[{version_id, percentage}]`; the first entry is the live one.
+   * An uploaded-but-never-deployed Worker returns `{deployments: []}`.
+   */
+  async listDeployments(script: string): Promise<DeploymentInfo[]> {
+    const r = await this.request<{ deployments?: { id: string; created_on?: string; versions?: { version_id: string; percentage: number }[] }[] }>(
+      "GET",
+      `${this.acct()}/workers/scripts/${enc(script)}/deployments`,
+    );
+    return (r?.deployments ?? []).map((d) => ({
+      id: d.id,
+      createdOn: d.created_on ?? "",
+      versions: (d.versions ?? []).map((v) => ({ versionId: v.version_id, percentage: v.percentage })),
+    }));
+  }
+
+  /** The live deployment (or null when the script was never deployed or does not exist). */
+  async getCurrentDeployment(script: string): Promise<DeploymentInfo | null> {
+    try {
+      return (await this.listDeployments(script))[0] ?? null;
+    } catch (e) {
+      if (e instanceof CloudflareApiError && e.notFound) return null;
+      throw e;
+    }
   }
 
   /**

@@ -7,6 +7,12 @@
  * - provisioner: FORK reports ok after ~300 ms (DELETE shortly after).
  * - herald: DEPLOY reports a LIVE preview at `https://<trainId>-preview.sim.queenos.dev`
  *   after ~1.5 s; TEARDOWN reports ok and is recorded (see teardowns()).
+ *   Release deploys: staging at `https://<hive>-staging.sim.queenos.dev`, canary
+ *   steps on `https://<hive>-app.sim.queenos.dev` with fake version ids (a
+ *   simulated pre-existing prod version is the first stable baseline), and
+ *   ROLLBACK restores the stable version.
+ * - sentinel: PROMOTE after ~2 s, except ROLLBACK at the 10% canary step when
+ *   any prompt in the release contains "[canary-fail]" (auto-rollback demo).
  * - drones: scripted builder / gatekeeper / lander behaviour (build-result,
  *   audit events, train-result, land-result).
  *
@@ -27,6 +33,10 @@
 import type {
   AppendAuditInput,
   AuditEvent,
+  Release,
+  PromptRun,
+  SentinelCommand,
+  SentinelVerdict,
   BuildResult,
   DeployCommand,
   DeployResult,
@@ -41,7 +51,7 @@ import type {
 } from "@queenos/queen-types";
 import type { DroneDispatcher } from "../drones";
 import { droneInstanceId } from "../drones";
-import type { DeployDispatcher, ProvisionerDispatcher } from "../executors";
+import type { DeployDispatcher, ProvisionerDispatcher, SentinelDispatcher } from "../executors";
 
 /** The slice of QueenNode the simulated executors call (its public RPC surface). */
 export interface SimQueen {
@@ -51,7 +61,14 @@ export interface SimQueen {
   reportLandResult(r: LandResultInput): Promise<{ outcome: string }>;
   reportProvisionResult(r: ProvisionResult): Promise<{ outcome: string }>;
   reportDeployResult(r: DeployResult): Promise<{ outcome: string }>;
-  getSnapshot(): { trains: MergeTrain[] } | Promise<{ trains: MergeTrain[] }>;
+  reportSentinelVerdict(v: SentinelVerdict): Promise<{ outcome: string }>;
+  getSnapshot(): SimSnapshot | Promise<SimSnapshot>;
+}
+
+export interface SimSnapshot {
+  trains: MergeTrain[];
+  releases?: Release[];
+  promptRuns?: PromptRun[];
 }
 
 /** The slice of DurableObjectStorage the scheduler needs (KV + alarm). */
@@ -70,6 +87,7 @@ export interface SimDelays {
   build: number;
   test: number;
   land: number;
+  sentinel: number;
 }
 
 export const DEFAULT_SIM_DELAYS: SimDelays = {
@@ -80,9 +98,13 @@ export const DEFAULT_SIM_DELAYS: SimDelays = {
   build: 3500,
   test: 3000,
   land: 2000,
+  sentinel: 2000,
 };
 
 export const FAIL_MARKER = "[fail]";
+/** A release containing a prompt with this marker fails its 10% canary step (auto-rollback demo). */
+export const CANARY_FAIL_MARKER = "[canary-fail]";
+export const CANARY_FAIL_PERCENT = 10;
 /** The sim gatekeeper waits for TESTING (the preview going LIVE) this often, this many times. */
 export const TEST_RETRY_MS = 500;
 export const TEST_MAX_TRIES = 40;
@@ -90,11 +112,13 @@ export const TEST_MAX_TRIES = 40;
 type DroneJob = { id: string; kind: "build" | "test" | "land"; due: number; task: DroneTask; tries?: number };
 type ProvisionJob = { id: string; kind: "provision"; due: number; command: ProvisionCommand };
 type DeployJob = { id: string; kind: "deploy"; due: number; command: DeployCommand };
-type Job = DroneJob | ProvisionJob | DeployJob;
+type SentinelJob = { id: string; kind: "sentinel"; due: number; command: SentinelCommand };
+type Job = DroneJob | ProvisionJob | DeployJob | SentinelJob;
 
 const JOBS_KEY = "sim:jobs";
 const DONE_KEY = "sim:done";
 const TEARDOWNS_KEY = "sim:teardowns";
+const STABLE_KEY = (hive: string) => `sim:stable:${hive}`;
 const DONE_LIMIT = 2000;
 const MODEL = "claude-opus-5-5";
 
@@ -116,6 +140,16 @@ export function simPreviewUrl(trainId: string): string {
   return `https://${trainId}-preview.sim.queenos.dev`;
 }
 
+export function simStagingUrl(hive: string): string {
+  return `https://${hive}-staging.sim.queenos.dev`;
+}
+
+export function simProdUrl(hive: string): string {
+  return `https://${hive}-app.sim.queenos.dev`;
+}
+
+export const simVersionId = (seed: string) => `sim-${fakeSha(seed).slice(0, 12)}`;
+
 export class SimExecutors {
   readonly drones: DroneDispatcher = { dispatch: (task, attempt) => this.dispatchDrone(task, attempt) };
   readonly provisioner: ProvisionerDispatcher = {
@@ -125,6 +159,9 @@ export class SimExecutors {
   readonly herald: DeployDispatcher = {
     dispatch: (command) =>
       this.enqueue({ id: command.commandId, kind: "deploy", due: this.now() + (command.op === "DEPLOY" ? this.delays.deploy : this.delays.teardown), command }),
+  };
+  readonly sentinel: SentinelDispatcher = {
+    dispatch: (command) => this.enqueue({ id: command.commandId, kind: "sentinel", due: this.now() + this.delays.sentinel, command }),
   };
 
   constructor(
@@ -204,6 +241,8 @@ export class SimExecutors {
         return this.runProvision(job.command);
       case "deploy":
         return this.runDeploy(job.command);
+      case "sentinel":
+        return this.runSentinel(job.command);
       default:
         return this.runDrone(job);
     }
@@ -228,6 +267,42 @@ export class SimExecutors {
   private async runDeploy(c: DeployCommand): Promise<void> {
     switch (c.op) {
       case "DEPLOY":
+        if (c.environment === "staging") {
+          await this.queen().reportDeployResult({
+            commandId: c.commandId,
+            op: "DEPLOY",
+            environment: "staging",
+            releaseId: c.releaseId,
+            ok: true,
+            url: simStagingUrl(c.hive),
+            versionId: simVersionId(`staging:${c.commandId}`),
+            percent: 100,
+            commitSha: c.commitSha,
+            summary: `Sim Herald deployed ${c.commitSha.slice(0, 7)} to ${c.hive}-staging at 100%.`,
+          });
+          return;
+        }
+        if (c.environment === "canary" || c.environment === "prod") {
+          // Like the real Herald: upload the candidate once (step 1), then re-split it against the stable version.
+          const stable = c.stableVersionId ?? (await this.stable(c.hive));
+          const candidate = c.versionId ?? simVersionId(`candidate:${c.releaseId ?? c.commitSha}`);
+          const percent = c.percent ?? 100;
+          if (percent === 100) await this.store.put(STABLE_KEY(c.hive), candidate);
+          await this.queen().reportDeployResult({
+            commandId: c.commandId,
+            op: "DEPLOY",
+            environment: c.environment,
+            releaseId: c.releaseId,
+            ok: true,
+            url: simProdUrl(c.hive),
+            versionId: candidate,
+            stableVersionId: stable,
+            percent,
+            commitSha: c.commitSha,
+            summary: `Sim Herald split ${c.hive}-app: ${candidate} ${percent}% / ${stable} ${100 - percent}%.`,
+          });
+          return;
+        }
         await this.queen().reportDeployResult({
           commandId: c.commandId,
           op: "DEPLOY",
@@ -253,9 +328,53 @@ export class SimExecutors {
         return;
       }
       case "ROLLBACK":
-        await this.queen().reportDeployResult({ commandId: c.commandId, op: "ROLLBACK", environment: c.environment, ok: true });
+        await this.store.put(STABLE_KEY(c.hive), c.toVersionId);
+        await this.queen().reportDeployResult({
+          commandId: c.commandId,
+          op: "ROLLBACK",
+          environment: c.environment,
+          ok: true,
+          versionId: c.toVersionId,
+          percent: 100,
+          summary: `Sim Herald restored ${c.toVersionId} at 100% on ${c.hive}-app.`,
+        });
         return;
     }
+  }
+
+  /** The version at 100% on `<hive>-app`; a simulated pre-existing prod version before the first ship. */
+  private async stable(hive: string): Promise<string> {
+    return (await this.store.get<string>(STABLE_KEY(hive))) ?? simVersionId(`prod:${hive}`);
+  }
+
+  private async runSentinel(c: SentinelCommand): Promise<void> {
+    const fail = c.environment === "canary" && c.canaryPercent === CANARY_FAIL_PERCENT && (await this.releaseHasMarker(c.releaseId, CANARY_FAIL_MARKER));
+    const requests = c.minRequests + 37;
+    const where = c.environment === "staging" ? `${c.scriptName} (staging)` : `${c.scriptName} at ${c.canaryPercent}%`;
+    await this.queen().reportSentinelVerdict({
+      commandId: c.commandId,
+      releaseId: c.releaseId,
+      environment: c.environment,
+      verdict: fail ? "ROLLBACK" : "PROMOTE",
+      metrics: {
+        requests,
+        errorRate: fail ? 0.124 : 0.002,
+        p99Ms: fail ? 1840 : 86,
+        baselineErrorRate: c.environment === "canary" && c.stableVersionId ? 0.001 : null,
+      },
+      summary: fail
+        ? `${where}: candidate 5xx rate 12.4% vs stable 0.1% over ${requests} requests; p99 1840 ms. Rolling back.`
+        : `${where}: ${requests} requests, 0.2% errors, p99 86 ms; within SLOs.`,
+    });
+  }
+
+  /** Whether any prompt included in the release's trains contains `marker`. */
+  private async releaseHasMarker(releaseId: string, marker: string): Promise<boolean> {
+    const snap = await this.queen().getSnapshot();
+    const rel = snap.releases?.find((r) => r.releaseId === releaseId);
+    if (!rel) return false;
+    const promptIds = new Set(snap.trains.filter((t) => rel.trainIds.includes(t.trainId)).flatMap((t) => t.includedPrompts));
+    return (snap.promptRuns ?? []).some((p) => promptIds.has(p.promptId) && p.promptText.includes(marker));
   }
 
   private async trainPhase(trainId: string): Promise<MergeTrain | undefined> {

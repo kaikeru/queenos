@@ -14,6 +14,8 @@ import {
   type WizardState,
 } from "@queenos/queen-types";
 
+import { activeMockQueen } from "./mockQueen";
+
 const KEY = "queenos-mock-v1";
 const EMAIL = "kyle@kaikeru.com";
 const CREATE_MS = 3500;
@@ -293,6 +295,12 @@ export function installMockApi(): void {
   const real = window.fetch.bind(window);
   window.fetch = async (input, init) => {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url, window.location.origin);
+    const tap = url.pathname.match(/^\/hives\/[^/]+\/releases\/([^/]+)\/tap$/);
+    if (tap && activeMockQueen()) {
+      await sleep(250);
+      const r = activeMockQueen()!.tap(decodeURIComponent(tap[1]!));
+      return new Response(JSON.stringify(r.body), { status: r.status, headers: { "content-type": "application/json" } });
+    }
     if (!url.pathname.startsWith("/api/")) return real(input, init);
     const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
     await sleep(200 + Math.random() * 350);

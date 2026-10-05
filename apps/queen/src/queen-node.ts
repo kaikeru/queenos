@@ -10,6 +10,11 @@
  * external I/O itself; forks/deletes run in the Provisioner Workflow, preview
  * deploys/teardowns in the Herald Workflow, builds/landings in drones. Each
  * reports back over RPC (reportProvisionResult, reportDeployResult, ...).
+ *
+ * Release train (P3, src/release/planner.ts): every MERGED train cuts (or
+ * supersedes, or queues behind a canary) a release. The Herald deploys it to
+ * staging and canary, the Sentinel Workflow judges each step
+ * (reportSentinelVerdict), and a human taps to ship (tapRelease).
  */
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -20,6 +25,7 @@ import {
   ProvisionResultSchema,
   QueenClientMessageSchema,
   ScribeSummarySchema,
+  SentinelVerdictSchema,
   SubmitPromptSchema,
   TrainResultSchema,
   type AppendAuditInput,
@@ -32,7 +38,9 @@ import {
   type PromptRun,
   type ProvisionResult,
   type QueenServerMessage,
+  type Release,
   type ScribeSummary,
+  type SentinelVerdict,
   type SubmitPrompt,
   type TrainResult,
 } from "@queenos/queen-types";
@@ -41,13 +49,15 @@ import {
   rowToAudit,
   rowToDeployment,
   rowToPrompt,
+  rowToRelease,
   rowToTrain,
   upsertDeployment,
   upsertPrompt,
+  upsertRelease,
   upsertTrain,
 } from "./db";
 import { WorkflowDroneDispatcher, type DroneDispatcher } from "./drones";
-import { WorkflowCommandDispatcher, type DeployDispatcher, type ProvisionerDispatcher } from "./executors";
+import { WorkflowCommandDispatcher, type DeployDispatcher, type ProvisionerDispatcher, type SentinelDispatcher } from "./executors";
 import { QueenError, asQueenError, parseOrThrow } from "./errors";
 import {
   DEFAULT_COMMAND_TIMEOUT_MS,
@@ -59,7 +69,21 @@ import {
   type HiveState,
   type Outcome,
   type PlanResult,
+  type PromptRecord,
+  type TrainRecord,
 } from "./train/planner";
+import {
+  DEFAULT_SENTINEL,
+  ReleasePlanner,
+  releaseWatchdogDeadline,
+  toRelease,
+  type ReleaseEffect,
+  type ReleaseOutcome,
+  type ReleasePlanResult,
+  type ReleaseRecord,
+  type ReleaseState,
+  type SentinelSettings,
+} from "./release/planner";
 
 /** Header the Worker uses to tell the DO which hive a WebSocket belongs to. */
 export const HIVE_HEADER = "x-queen-hive";
@@ -83,7 +107,22 @@ export function commandTimeoutMs(env: { COMMAND_TIMEOUT_MS?: string | number }):
   const v = Number(env.COMMAND_TIMEOUT_MS);
   return Number.isFinite(v) && v > 0 ? v : DEFAULT_COMMAND_TIMEOUT_MS;
 }
+/** SENTINEL_WINDOW_SECONDS / SENTINEL_MIN_REQUESTS (wrangler vars); defaults 60 s / 100 requests. */
+export function sentinelSettings(env: { SENTINEL_WINDOW_SECONDS?: string | number; SENTINEL_MIN_REQUESTS?: string | number }): SentinelSettings {
+  const int = (v: unknown, min: number, fallback: number) => {
+    const n = Number(v);
+    return Number.isInteger(n) && n >= min ? n : fallback;
+  };
+  return {
+    windowSeconds: int(env.SENTINEL_WINDOW_SECONDS, 5, DEFAULT_SENTINEL.windowSeconds),
+    minRequests: int(env.SENTINEL_MIN_REQUESTS, 1, DEFAULT_SENTINEL.minRequests),
+  };
+}
+/** Header the edge sets to the Cloudflare Access-verified user email (user routes only). */
+export const USER_HEADER = "x-queen-user";
 const SNAPSHOT_LIMIT = 200;
+const RELEASE_SNAPSHOT_LIMIT = 20;
+const IN_FLIGHT_SQL = "('STAGING', 'VALIDATING', 'AWAITING_TAP', 'CANARY')";
 const AUDIT_SNAPSHOT_LIMIT = 50;
 
 export interface QueenPorts {
@@ -91,6 +130,8 @@ export interface QueenPorts {
   provisioner: ProvisionerDispatcher;
   /** Herald Workflow (DEPLOY / TEARDOWN / ROLLBACK). */
   herald: DeployDispatcher;
+  /** Sentinel Workflow (release health verdicts). */
+  sentinel: SentinelDispatcher;
   /** Drone Workflow (BUILD / REWORK / LAND). */
   dispatcher: DroneDispatcher;
 }
@@ -107,6 +148,33 @@ export interface SocketAttachment {
 export interface TrainUpdate {
   outcome: Outcome;
   train: MergeTrain | null;
+}
+
+export interface ReleaseUpdate {
+  outcome: ReleaseOutcome;
+  release: Release | null;
+}
+
+/** Everything one decision changed, persisted in one transaction (train and release planners). */
+interface Persist {
+  prompts: PromptRecord[];
+  trains: TrainRecord[];
+  deployments: Deployment[];
+  releases: ReleaseRecord[];
+  effects: (Effect | ReleaseEffect)[];
+}
+
+function merged(...plans: (PlanResult | ReleasePlanResult | null)[]): Persist {
+  const out: Persist = { prompts: [], trains: [], deployments: [], releases: [], effects: [] };
+  for (const p of plans) {
+    if (!p) continue;
+    if ("prompts" in p) out.prompts.push(...p.prompts);
+    if ("trains" in p) out.trains.push(...p.trains);
+    if ("releases" in p) out.releases.push(...p.releases);
+    out.deployments.push(...p.deployments);
+    out.effects.push(...p.effects);
+  }
+  return out;
 }
 
 type Snapshot = Extract<QueenServerMessage, { type: "snapshot" }>;
@@ -141,6 +209,7 @@ export class QueenNode extends DurableObject<Env> {
     return {
       provisioner: new WorkflowCommandDispatcher(env.PROVISIONER, "PROVISIONER"),
       herald: new WorkflowCommandDispatcher(env.HERALD, "HERALD"),
+      sentinel: new WorkflowCommandDispatcher(env.SENTINEL, "SENTINEL"),
       dispatcher: new WorkflowDroneDispatcher(env.DRONES),
     };
   }
@@ -158,7 +227,7 @@ export class QueenNode extends DurableObject<Env> {
       throw new QueenError("CONFLICT", `this hive is "${hive}", not "${prompt.namespace}"`);
     }
     const promptId = crypto.randomUUID();
-    await this.apply(this.plan(prompt.namespace, [], (p) => p.submit({ promptId, promptText: prompt.promptText })));
+    await this.apply(merged(this.plan(prompt.namespace, [], (p) => p.submit({ promptId, promptText: prompt.promptText }))));
     return toPromptRun(this.loadPrompt(promptId)!);
   }
 
@@ -174,10 +243,21 @@ export class QueenNode extends DurableObject<Env> {
     return this.trainTransition(r.trainId, (p) => p.buildResult(r));
   }
 
-  /** Lander pushed (or failed to push) the head to main (POST /internal/webhook/land-result). */
+  /**
+   * Lander pushed (or failed to push) the head to main (POST /internal/webhook/land-result).
+   * A MERGED train hands the new main head to the release planner, in the same transaction.
+   */
   async reportLandResult(input: LandResultInput): Promise<TrainUpdate> {
     const r = parseOrThrow(LandResultSchema, input, "land result");
-    return this.trainTransition(r.trainId, (p) => p.landResult(r));
+    return this.trainTransition(
+      r.trainId,
+      (p) => p.landResult(r),
+      (plan, hive) => {
+        const t = plan.outcome === "applied" ? plan.trains.find((x) => x.trainId === r.trainId && x.phase === "MERGED") : undefined;
+        const headSha = t?.landedSha ?? t?.headSha;
+        return t && headSha ? this.planRelease(hive, [], (rp) => rp.landed({ trainId: t.trainId, headSha })) : null;
+      },
+    );
   }
 
   /**
@@ -191,15 +271,48 @@ export class QueenNode extends DurableObject<Env> {
   }
 
   /**
-   * Herald outcome for a preview DEPLOY or TEARDOWN command
-   * (POST /internal/webhook/deploy-result). Idempotent by commandId. The train
-   * is resolved from `trainId`, or else from the command id.
+   * Herald outcome (POST /internal/webhook/deploy-result). Idempotent by commandId.
+   * - preview DEPLOY / TEARDOWN: the train is resolved from `trainId`, or else from the command id.
+   * - staging / canary DEPLOY and ROLLBACK: routed to the release planner; the
+   *   release is resolved from `releaseId`, or else from the command id.
    */
-  async reportDeployResult(input: DeployResult): Promise<TrainUpdate> {
+  async reportDeployResult(input: DeployResult): Promise<TrainUpdate | ReleaseUpdate> {
     const r = parseOrThrow(DeployResultSchema, input, "deploy result");
+    if (r.environment !== "preview") {
+      const releaseId = r.releaseId ?? this.releaseIdForCommand(r.commandId);
+      if (!releaseId) throw new QueenError("NOT_FOUND", `no release for command ${r.commandId}`);
+      return this.releaseTransition(releaseId, (p) => p.deployResult({ ...r, releaseId }));
+    }
     const trainId = r.trainId ?? this.trainIdForCommand(r.commandId);
     if (!trainId) throw new QueenError("NOT_FOUND", `no train for command ${r.commandId}`);
     return this.trainTransition(trainId, (p) => p.deployResult({ ...r, trainId }));
+  }
+
+  /**
+   * Sentinel health verdict for a staging validation or canary step
+   * (POST /internal/webhook/sentinel-verdict). Idempotent by commandId: a
+   * superseded or older command returns `ignored:stale`.
+   */
+  async reportSentinelVerdict(input: SentinelVerdict): Promise<ReleaseUpdate> {
+    const v = parseOrThrow(SentinelVerdictSchema, input, "sentinel verdict");
+    return this.releaseTransition(v.releaseId, (p) => p.sentinelVerdict(v));
+  }
+
+  /**
+   * Tap to ship (POST /hives/:hive/releases/:releaseId/tap). `user` is the
+   * Access-verified email the edge put in `x-queen-user`. Only valid in
+   * AWAITING_TAP (CONFLICT otherwise); starts the canary at 1%.
+   */
+  async tapRelease(input: { releaseId: string; user: string }): Promise<ReleaseUpdate> {
+    const releaseId = typeof input?.releaseId === "string" ? input.releaseId.trim() : "";
+    const user = typeof input?.user === "string" ? input.user.trim() : "";
+    if (!releaseId || releaseId.length > 128) throw new QueenError("INVALID_INPUT", "releaseId is required");
+    if (!user || user.length > 320) throw new QueenError("INVALID_INPUT", "user is required");
+    const res = await this.releaseTransition(releaseId, (p) => p.tap(releaseId, user));
+    if (res.outcome === "conflict") {
+      throw new QueenError("CONFLICT", `release ${releaseId} is ${res.release?.phase ?? "unknown"}; only AWAITING_TAP can be tapped`);
+    }
+    return res;
   }
 
   /** Cognitive Ledger entry from a drone. */
@@ -267,6 +380,10 @@ export class QueenNode extends DurableObject<Env> {
           .map(rowToAudit),
       ),
       deployments: this.listDeployments(),
+      releases: this.sql
+        .exec("SELECT * FROM releases ORDER BY seq DESC LIMIT ?", RELEASE_SNAPSHOT_LIMIT)
+        .toArray()
+        .map((r) => toRelease(rowToRelease(r))),
     };
   }
 
@@ -290,7 +407,7 @@ export class QueenNode extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     const hive = this.hiveNamespace();
     if (hive === null) return;
-    await this.apply(this.plan(hive, [], (p) => p.reconcile()));
+    await this.apply(merged(this.plan(hive, [], (p) => p.reconcile()), this.planRelease(hive, [], (p) => p.reconcile())));
   }
 
   // ── WebSocket (hibernation API) ───────────────────────────────────────
@@ -413,6 +530,60 @@ export class QueenNode extends DurableObject<Env> {
     return row ? String(row.train_id) : null;
   }
 
+  private releaseIdForCommand(commandId: string): string | null {
+    const row = this.sql
+      .exec(
+        `SELECT release_id FROM releases
+         WHERE deploy_command_id = ? OR rollback_command_id = ? OR substr(?, 1, length(release_id) + 1) = release_id || '-'
+         ORDER BY seq DESC LIMIT 1`,
+        commandId,
+        commandId,
+        commandId,
+      )
+      .toArray()[0];
+    return row ? String(row.release_id) : null;
+  }
+
+  private loadRelease(releaseId: string): ReleaseRecord | null {
+    const row = this.sql.exec("SELECT * FROM releases WHERE release_id = ?", releaseId).toArray()[0];
+    return row ? rowToRelease(row) : null;
+  }
+
+  /** The in-flight release, the newest release, any named ones, and the environment rows. */
+  private loadReleaseState(releaseIds: string[]): ReleaseState {
+    const named = releaseIds.length ? ` OR release_id IN (${releaseIds.map(() => "?").join(",")})` : "";
+    const releases = this.sql
+      .exec(
+        `SELECT * FROM releases WHERE phase IN ${IN_FLIGHT_SQL} OR seq = (SELECT MAX(seq) FROM releases)${named} ORDER BY seq`,
+        ...releaseIds,
+      )
+      .toArray()
+      .map(rowToRelease);
+    const deployments = this.sql.exec("SELECT * FROM deployments WHERE environment != 'preview'").toArray().map(rowToDeployment);
+    const maxSeq = Number(this.sql.exec("SELECT COALESCE(MAX(seq), 0) AS m FROM releases").one().m);
+    return { releases, deployments, maxSeq };
+  }
+
+  private planRelease(namespace: string, releaseIds: string[], fn: (p: ReleasePlanner) => ReleasePlanResult): ReleasePlanResult {
+    const planner = new ReleasePlanner(this.loadReleaseState(releaseIds), {
+      namespace,
+      now: this.now(),
+      newId: () => crypto.randomUUID(),
+      commandTimeoutMs: commandTimeoutMs(this.env),
+      sentinel: sentinelSettings(this.env),
+    });
+    return fn(planner);
+  }
+
+  private async releaseTransition(releaseId: string, fn: (p: ReleasePlanner) => ReleasePlanResult): Promise<ReleaseUpdate> {
+    const hive = this.hiveNamespace();
+    if (hive === null || !this.loadRelease(releaseId)) throw new QueenError("NOT_FOUND", `release ${releaseId} not found`);
+    const plan = this.planRelease(hive, [releaseId], fn);
+    await this.apply(merged(plan));
+    const release = this.loadRelease(releaseId);
+    return { outcome: plan.outcome, release: release ? toRelease(release) : null };
+  }
+
   private loadTrain(trainId: string) {
     const row = this.sql.exec("SELECT * FROM merge_trains WHERE train_id = ?", trainId).toArray()[0];
     return row ? rowToTrain(row) : null;
@@ -449,11 +620,16 @@ export class QueenNode extends DurableObject<Env> {
     return fn(planner);
   }
 
-  private async trainTransition(trainId: string, fn: (p: TrainPlanner) => PlanResult): Promise<TrainUpdate> {
+  private async trainTransition(
+    trainId: string,
+    fn: (p: TrainPlanner) => PlanResult,
+    then?: (plan: PlanResult, hive: string) => ReleasePlanResult | null,
+  ): Promise<TrainUpdate> {
     const hive = this.hiveNamespace();
     if (hive === null || !this.loadTrain(trainId)) throw new QueenError("NOT_FOUND", `train ${trainId} not found`);
     const plan = this.plan(hive, [trainId], fn);
-    await this.apply(plan);
+    // Still synchronous: the release decision sees the same state and commits with the train's.
+    await this.apply(merged(plan, then?.(plan, hive) ?? null));
     const train = this.loadTrain(trainId);
     return { outcome: plan.outcome, train: train ? toMergeTrain(train) : null };
   }
@@ -464,12 +640,13 @@ export class QueenNode extends DurableObject<Env> {
    * rows, so a crash between steps is repaired by the reconcile alarm, and a
    * re-dispatch of the same command id is a no-op.
    */
-  private async apply(plan: PlanResult): Promise<void> {
-    if (plan.prompts.length || plan.trains.length || plan.deployments.length) {
+  private async apply(plan: Persist): Promise<void> {
+    if (plan.prompts.length || plan.trains.length || plan.deployments.length || plan.releases.length) {
       this.ctx.storage.transactionSync(() => {
         for (const p of plan.prompts) upsertPrompt(this.sql, p);
         for (const t of plan.trains) upsertTrain(this.sql, t);
         for (const d of plan.deployments) upsertDeployment(this.sql, d);
+        for (const r of plan.releases) upsertRelease(this.sql, r);
       });
     }
     for (const e of plan.effects) if (e.type === "broadcast") this.broadcast(e.message);
@@ -485,15 +662,20 @@ export class QueenNode extends DurableObject<Env> {
   private async armWatchdog(): Promise<void> {
     if (this.hiveNamespace() === null) return;
     const now = this.now();
-    const due = watchdogDeadline(this.loadState([]).trains, commandTimeoutMs(this.env), now);
-    if (due === null) return;
+    const timeout = commandTimeoutMs(this.env);
+    const deadlines = [
+      watchdogDeadline(this.loadState([]).trains, timeout, now),
+      releaseWatchdogDeadline(this.loadReleaseState([]).releases, timeout, sentinelSettings(this.env).windowSeconds, now),
+    ].filter((d): d is number => d !== null);
+    if (!deadlines.length) return;
+    const due = Math.min(...deadlines);
     // Real time for the alarm itself; `now()` may be skewed by tests.
     const at = Date.now() + Math.max(0, due - now) + WATCHDOG_SLACK_MS;
     const current = await this.ctx.storage.getAlarm();
     if (current === null || at < current) await this.ctx.storage.setAlarm(at);
   }
 
-  private async execute(e: Exclude<Effect, { type: "broadcast" }>): Promise<void> {
+  private async execute(e: Exclude<Effect | ReleaseEffect, { type: "broadcast" }>): Promise<void> {
     switch (e.type) {
       case "provision": {
         // Async: the Provisioner reports back via reportProvisionResult.
@@ -513,6 +695,15 @@ export class QueenNode extends DurableObject<Env> {
         }
         return;
       }
+      case "sentinel": {
+        // Async: the Sentinel reports back via reportSentinelVerdict.
+        try {
+          await this.ports.sentinel.dispatch(e.command);
+        } catch (err) {
+          return this.ioFailed(e, err);
+        }
+        return;
+      }
       case "dispatchDrone": {
         try {
           await this.ports.dispatcher.dispatch(e.task, e.attempt);
@@ -521,13 +712,13 @@ export class QueenNode extends DurableObject<Env> {
         }
         const hive = this.hiveNamespace()!;
         const phase = e.task.action === "LAND" ? "LANDING" : "BUILDING";
-        await this.apply(this.plan(hive, [e.trainId], (p) => p.dispatched(e.trainId, phase)));
+        await this.apply(merged(this.plan(hive, [e.trainId], (p) => p.dispatched(e.trainId, phase))));
         return;
       }
     }
   }
 
-  private async ioFailed(e: Effect, err: unknown): Promise<void> {
+  private async ioFailed(e: Effect | ReleaseEffect, err: unknown): Promise<void> {
     console.error(`queen: ${e.type} failed; reconciling in ${RECONCILE_DELAY_MS} ms`, err);
     if ((await this.ctx.storage.getAlarm()) === null) {
       await this.ctx.storage.setAlarm(Date.now() + RECONCILE_DELAY_MS);

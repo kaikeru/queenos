@@ -7,9 +7,11 @@ import {
   DeploymentSchema,
   MergeTrainSchema,
   PromptRunSchema,
+  ReleaseSchema,
   type AuditEvent,
   type Deployment,
 } from "@queenos/queen-types";
+import type { ReleasePending, ReleaseRecord } from "./release/planner";
 import type { DeployState, ForkState, PromptRecord, TrainAction, TrainPhase, TrainRecord } from "./train/planner";
 
 /**
@@ -125,6 +127,43 @@ const MIGRATIONS: readonly string[] = [
   ALTER TABLE merge_trains ADD COLUMN drone_issued_at INTEGER;
   -- Attempt of the current phase's drone (Workflow instance id suffix when > 1).
   ALTER TABLE merge_trains ADD COLUMN drone_attempt INTEGER NOT NULL DEFAULT 1;
+  `,
+  `
+  -- v4: release train (P3). ReleaseSchema columns plus planner-internal ones.
+  -- Environment state (staging / canary / prod) lives in deployments rows.
+  CREATE TABLE releases (
+    release_id TEXT PRIMARY KEY,
+    hive TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    train_ids TEXT NOT NULL /* JSON array, landing order */,
+    phase TEXT NOT NULL,
+    canary_percent INTEGER,
+    staging_url TEXT,
+    prod_url TEXT,
+    candidate_version_id TEXT,
+    stable_version_id TEXT,
+    tapped_by TEXT,
+    tapped_at INTEGER,
+    summary TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    -- Internal: creation order, canary step index, what is outstanding (DEPLOY/SENTINEL/ROLLBACK).
+    seq INTEGER NOT NULL,
+    step INTEGER,
+    pending TEXT,
+    -- Internal: current command ids (= executor Workflow instance ids) and watchdog clocks.
+    deploy_command_id TEXT,
+    deploy_issued_at INTEGER,
+    sentinel_command_id TEXT,
+    sentinel_issued_at INTEGER,
+    rollback_command_id TEXT,
+    rollback_issued_at INTEGER,
+    -- Internal (CANARY only): a main head that landed during the canary, cut next.
+    next_head_sha TEXT,
+    next_train_ids TEXT NOT NULL DEFAULT '[]'
+  );
+  CREATE INDEX releases_phase ON releases(phase, seq);
+  CREATE INDEX releases_seq ON releases(seq);
   `,
 ];
 
@@ -316,5 +355,82 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     t.teardownIssuedAt,
     t.droneIssuedAt,
     t.droneAttempt,
+  );
+}
+
+export function rowToRelease(r: Row): ReleaseRecord {
+  const base = ReleaseSchema.parse({
+    releaseId: r.release_id,
+    hive: r.hive,
+    headSha: r.head_sha,
+    trainIds: JSON.parse(String(r.train_ids)),
+    phase: r.phase,
+    canaryPercent: num(r.canary_percent),
+    stagingUrl: str(r.staging_url),
+    prodUrl: str(r.prod_url),
+    candidateVersionId: str(r.candidate_version_id),
+    stableVersionId: str(r.stable_version_id),
+    tappedBy: str(r.tapped_by),
+    tappedAt: num(r.tapped_at),
+    summary: str(r.summary),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  });
+  return {
+    ...base,
+    seq: Number(r.seq),
+    step: num(r.step),
+    pending: str(r.pending) as ReleasePending | null,
+    deployCommandId: str(r.deploy_command_id),
+    deployIssuedAt: num(r.deploy_issued_at),
+    sentinelCommandId: str(r.sentinel_command_id),
+    sentinelIssuedAt: num(r.sentinel_issued_at),
+    rollbackCommandId: str(r.rollback_command_id),
+    rollbackIssuedAt: num(r.rollback_issued_at),
+    nextHeadSha: str(r.next_head_sha),
+    nextTrainIds: JSON.parse(String(r.next_train_ids ?? "[]")) as string[],
+  };
+}
+
+const RELEASE_COLUMNS = [
+  "release_id", "hive", "head_sha", "train_ids", "phase", "canary_percent", "staging_url", "prod_url",
+  "candidate_version_id", "stable_version_id", "tapped_by", "tapped_at", "summary", "created_at", "updated_at",
+  "seq", "step", "pending", "deploy_command_id", "deploy_issued_at", "sentinel_command_id", "sentinel_issued_at",
+  "rollback_command_id", "rollback_issued_at", "next_head_sha", "next_train_ids",
+] as const;
+
+export function upsertRelease(sql: SqlStorage, r: ReleaseRecord): void {
+  const updates = RELEASE_COLUMNS.filter((c) => c !== "release_id" && c !== "hive" && c !== "created_at" && c !== "seq")
+    .map((c) => `${c} = excluded.${c}`)
+    .join(", ");
+  sql.exec(
+    `INSERT INTO releases (${RELEASE_COLUMNS.join(", ")}) VALUES (${RELEASE_COLUMNS.map(() => "?").join(", ")})
+     ON CONFLICT(release_id) DO UPDATE SET ${updates}`,
+    r.releaseId,
+    r.hive,
+    r.headSha,
+    JSON.stringify(r.trainIds),
+    r.phase,
+    r.canaryPercent,
+    r.stagingUrl,
+    r.prodUrl,
+    r.candidateVersionId,
+    r.stableVersionId,
+    r.tappedBy,
+    r.tappedAt,
+    r.summary,
+    r.createdAt,
+    r.updatedAt,
+    r.seq,
+    r.step,
+    r.pending,
+    r.deployCommandId,
+    r.deployIssuedAt,
+    r.sentinelCommandId,
+    r.sentinelIssuedAt,
+    r.rollbackCommandId,
+    r.rollbackIssuedAt,
+    r.nextHeadSha,
+    JSON.stringify(r.nextTrainIds),
   );
 }

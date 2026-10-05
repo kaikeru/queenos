@@ -14,6 +14,7 @@ const routes: Array<[string, string, unknown]> = [
   ["/internal/webhook/land-result", "POST", {}],
   ["/internal/webhook/provision-result", "POST", {}],
   ["/internal/webhook/deploy-result", "POST", {}],
+  ["/internal/webhook/sentinel-verdict", "POST", {}],
   ["/trains/t1/result", "POST", {}],
   ["/audit", "POST", {}],
   ["/scribe", "POST", scribe],

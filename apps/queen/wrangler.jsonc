@@ -28,18 +28,30 @@
       "script_name": "queenos-provisioner"
     },
     {
-      // Herald (Worker Preview deploy / teardown): apps/herald.
+      // Herald (preview deploy / teardown; staging, canary and rollback): apps/herald.
       "binding": "HERALD",
       "name": "herald-workflow",
       "class_name": "HeraldWorkflow",
       "script_name": "queenos-herald"
+    },
+    {
+      // Sentinel (release health verdicts for staging and canary steps): apps/sentinel.
+      "binding": "SENTINEL",
+      "name": "sentinel-workflow",
+      "class_name": "SentinelWorkflow",
+      "script_name": "queenos-sentinel"
     }
   ],
   "vars": {
     // Command watchdog: a FORK / DELETE / DEPLOY / TEARDOWN command or drone
     // task unreported for this long is re-issued under a new id (then failed
     // after the attempt cap). Milliseconds; default 10 min.
-    "COMMAND_TIMEOUT_MS": "600000"
+    "COMMAND_TIMEOUT_MS": "600000",
+    // Sentinel window per staging validation / canary step (seconds; short for
+    // demos, minutes for real use) and the minimum candidate requests per window.
+    // The watchdog gives Sentinel max(COMMAND_TIMEOUT_MS, window + 5 min).
+    "SENTINEL_WINDOW_SECONDS": "60",
+    "SENTINEL_MIN_REQUESTS": "100"
   },
   // Secret (not in this file): `wrangler secret put QUEEN_INTERNAL_TOKEN`.
   // Guards /internal/*, /audit, /scribe, /trains/:id/result. See .dev.vars.example.
@@ -54,7 +66,12 @@
       "name": "queen",
       "main": "src/sim/worker.ts",
       // Local demo only: no secret needed. Never set this in the default env.
-      "vars": { "QUEEN_INTERNAL_AUTH": "disabled", "COMMAND_TIMEOUT_MS": "600000" },
+      "vars": {
+        "QUEEN_INTERNAL_AUTH": "disabled",
+        "COMMAND_TIMEOUT_MS": "600000",
+        "SENTINEL_WINDOW_SECONDS": "60",
+        "SENTINEL_MIN_REQUESTS": "100"
+      },
       "durable_objects": {
         "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
       },
@@ -64,7 +81,12 @@
     // (wrangler warns about that on every test run; it is intentional).
     "test": {
       // Fixed non-secret token so tests exercise the real auth path.
-      "vars": { "QUEEN_INTERNAL_TOKEN": "test-internal-token", "COMMAND_TIMEOUT_MS": "600000" },
+      "vars": {
+        "QUEEN_INTERNAL_TOKEN": "test-internal-token",
+        "COMMAND_TIMEOUT_MS": "600000",
+        "SENTINEL_WINDOW_SECONDS": "60",
+        "SENTINEL_MIN_REQUESTS": "100"
+      },
       "durable_objects": {
         "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
       }

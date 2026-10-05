@@ -87,7 +87,19 @@ export class VaultCredentialsPort implements CredentialsPort {
 // ── Cloudflare REST ──────────────────────────────────────────────────────
 
 /** The subset of hive-kit's CloudflareClient the Herald uses. */
-export type CloudflareApi = Pick<CloudflareClient, "ensureWorker" | "getPreview" | "createPreview" | "deployPreview" | "deletePreview">;
+export type CloudflareApi = Pick<
+  CloudflareClient,
+  | "ensureWorker"
+  | "enableSubdomain"
+  | "workerUrl"
+  | "getPreview"
+  | "createPreview"
+  | "deployPreview"
+  | "deletePreview"
+  | "uploadVersion"
+  | "createDeployment"
+  | "getCurrentDeployment"
+>;
 
 // ── Queen ────────────────────────────────────────────────────────────────
 

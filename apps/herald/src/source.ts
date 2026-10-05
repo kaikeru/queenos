@@ -81,15 +81,24 @@ function fnv1a(text: string): string {
   return (h >>> 0).toString(16).padStart(8, "0");
 }
 
-/** Parent Worker for a hive's deployments: `<hive>-app` (≤ 63 chars, lowercase DNS label). */
-export function workerNameFor(hive: string): string {
+function hiveSlug(hive: string): string {
   const slug = hive
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 50)
     .replace(/-+$/g, "");
-  return `${slug || `h${fnv1a(hive)}`}-app`;
+  return slug || `h${fnv1a(hive)}`;
+}
+
+/** Parent Worker for a hive's deployments: `<hive>-app` (≤ 63 chars, lowercase DNS label). Prod + canary + previews. */
+export function workerNameFor(hive: string): string {
+  return `${hiveSlug(hive)}-app`;
+}
+
+/** Staging Worker for a hive: `<hive>-staging` (a separate script; always 100% of the newest candidate). */
+export function stagingWorkerNameFor(hive: string): string {
+  return `${hiveSlug(hive)}-staging`;
 }
 
 /**

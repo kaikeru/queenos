@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DeploymentSchema } from "./executors.js";
+import { ReleaseSchema, SentinelVerdictSchema } from "./releases.js";
 import { AuditEventSchema, MergeTrainSchema, PromptRunSchema } from "./state.js";
 import { SubmitPromptSchema } from "./train.js";
 
@@ -15,11 +16,15 @@ export const QueenServerMessageSchema = z.discriminatedUnion("type", [
      * Queens and hand-built snapshots stay valid; treat a missing value as [].
      */
     deployments: z.array(DeploymentSchema).optional(),
+    /** Recent releases, newest first (P3). Optional for the same reason. */
+    releases: z.array(ReleaseSchema).optional(),
   }),
   z.object({ type: z.literal("prompt.updated"), promptRun: PromptRunSchema }),
   z.object({ type: z.literal("train.updated"), train: MergeTrainSchema }),
   z.object({ type: z.literal("audit.appended"), event: AuditEventSchema }),
   z.object({ type: z.literal("deployment.updated"), deployment: DeploymentSchema }),
+  z.object({ type: z.literal("release.updated"), release: ReleaseSchema }),
+  z.object({ type: z.literal("sentinel.verdict"), verdict: SentinelVerdictSchema }),
   z.object({ type: z.literal("error"), message: z.string(), code: z.string().optional() }),
   /** Reply to a JSON `{"type":"ping"}`. (The literal string "ping" is auto-answered with "pong".) */
   z.object({ type: z.literal("pong") }),

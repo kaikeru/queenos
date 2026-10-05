@@ -84,6 +84,12 @@ export const DeployCommandSchema = z.discriminatedUnion("op", [
     commitSha: z.string().min(1),
     /** Canary only: percentage of traffic routed to the new version (1-100). */
     percent: z.number().int().min(1).max(100).optional(),
+    /** Release this deploy belongs to (staging / canary). */
+    releaseId: z.string().min(1).optional(),
+    /** Canary steps after the first: reuse this already-uploaded candidate version instead of re-uploading. */
+    versionId: z.string().min(1).optional(),
+    /** Canary: the version that keeps the remaining traffic. */
+    stableVersionId: z.string().min(1).optional(),
   }),
   z.object({
     op: z.literal("TEARDOWN"),
@@ -112,6 +118,10 @@ export const DeployResultSchema = z.object({
   /** Public URL of the deployed environment (e.g. a Worker Preview URL). */
   url: z.string().url().optional(),
   versionId: z.string().optional(),
+  /** Canary: the stable version Herald found (or kept) on the script, i.e. the rollback target. */
+  stableVersionId: z.string().optional(),
+  releaseId: z.string().optional(),
+  percent: z.number().int().min(0).max(100).optional(),
   commitSha: z.string().optional(),
   summary: Summary.optional(),
 });

@@ -40,6 +40,7 @@ WORKERS=(
   "queen:queen"
   "provisioner:queenos-provisioner"
   "herald:queenos-herald"
+  "sentinel:queenos-sentinel"
   "drones:queenos-drones"
   "gatekeepers:queenos-gatekeepers"
   "vault:queenos-vault"
