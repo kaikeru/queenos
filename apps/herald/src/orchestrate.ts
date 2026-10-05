@@ -73,6 +73,22 @@ export async function runHerald(payload: unknown, step: StepRunner, ports: Heral
   }
   const cmd = parsed.data;
 
+  // Log trace context if present
+  if (cmd.trace) {
+    const traceparentParts = cmd.trace.traceparent.split("-");
+    console.log(
+      JSON.stringify({
+        trace_id: traceparentParts[1],
+        span_id: traceparentParts[2],
+        hive: cmd.hive,
+        command_id: cmd.commandId,
+        step: "herald_start",
+        op: cmd.op,
+        environment: cmd.environment,
+      })
+    );
+  }
+
   let outcome: Outcome;
   if (cmd.op === "DEPLOY" && cmd.environment === "preview") {
     outcome = await deployPreview(cmd, step, ports);
@@ -112,6 +128,23 @@ export async function runHerald(payload: unknown, step: StepRunner, ports: Heral
       return `rejected: ${clip(messageOf(e), 200)}`;
     }
   });
+
+  // Log trace context for result if present
+  if (cmd.trace) {
+    const traceparentParts = cmd.trace.traceparent.split("-");
+    console.log(
+      JSON.stringify({
+        trace_id: traceparentParts[1],
+        span_id: traceparentParts[2],
+        hive: cmd.hive,
+        command_id: cmd.commandId,
+        step: "herald_result",
+        op: cmd.op,
+        outcome: outcome.ok ? "ok" : "fail",
+        ms: 0, // timing collected by Workflows
+      })
+    );
+  }
 
   return {
     commandId: cmd.commandId,

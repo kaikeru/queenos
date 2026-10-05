@@ -66,6 +66,22 @@ export async function runProvision(payload: unknown, step: StepRunner, ports: Pr
     throw new ProvisionFailedError(`invalid ProvisionCommand: ${parsed.error.issues.map((i) => i.path.join(".")).join(", ")}`);
   }
   const cmd = parsed.data;
+
+  // Log trace context if present
+  if (cmd.trace) {
+    const traceparentParts = cmd.trace.traceparent.split("-");
+    console.log(
+      JSON.stringify({
+        trace_id: traceparentParts[1],
+        span_id: traceparentParts[2],
+        hive: cmd.hive,
+        command_id: cmd.commandId,
+        step: "provisioner_start",
+        op: cmd.op,
+      })
+    );
+  }
+
   if (cmd.op === "CREATE_HIVE") return runCreateHive(cmd, step, ports);
 
   let work: Work;
@@ -118,6 +134,23 @@ export async function runProvision(payload: unknown, step: StepRunner, ports: Pr
       return `rejected: ${clip(messageOf(e), 200)}`;
     }
   });
+
+  // Log trace context for result if present
+  if (cmd.trace) {
+    const traceparentParts = cmd.trace.traceparent.split("-");
+    console.log(
+      JSON.stringify({
+        trace_id: traceparentParts[1],
+        span_id: traceparentParts[2],
+        hive: cmd.hive,
+        command_id: cmd.commandId,
+        step: "provisioner_result",
+        op: cmd.op,
+        outcome: work.ok ? "ok" : "fail",
+        ms: 0, // timing collected by Workflows
+      })
+    );
+  }
 
   return { commandId: cmd.commandId, op: cmd.op, ok: work.ok, summary: result.summary ?? "", queenOutcome };
 }

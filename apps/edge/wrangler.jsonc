@@ -8,6 +8,10 @@
   // *.workers.dev would bypass the Access app (docs/deploy-discovery.md section 8).
   "workers_dev": false,
   "preview_urls": false,
+  // Observability: structured JSON logs with trace context are filtered via trace_id.
+  // To opt into Workers Traces (beta), uncomment and redeploy:
+  // "observability": {"enabled": true, "head_sampling_rate": 1, "traces": {"enabled": true}}
+  "observability": {"enabled": true, "head_sampling_rate": 1},
   "routes": [{ "pattern": "queenos.kaikeru.com", "custom_domain": true }],
   "assets": {
     // The War Room SPA. Build it first: pnpm --filter @queenos/dashboard build.

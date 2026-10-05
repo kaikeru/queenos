@@ -10,6 +10,10 @@
   // (docs/deploy-discovery.md §8: workers.dev would bypass Access).
   "workers_dev": false,
   "preview_urls": false,
+  // Observability: structured JSON logs with trace context are filtered via trace_id.
+  // To opt into Workers Traces (beta), uncomment and redeploy:
+  // "observability": {"enabled": true, "head_sampling_rate": 1, "traces": {"enabled": true}}
+  "observability": {"enabled": true, "head_sampling_rate": 1},
   "durable_objects": {
     // One VaultNode per hive: VAULT_NODE.idFromName(hive). Bound only here.
     "bindings": [{ "name": "VAULT_NODE", "class_name": "VaultNode" }]

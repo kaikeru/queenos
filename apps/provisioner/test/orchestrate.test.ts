@@ -48,6 +48,32 @@ describe("runProvision FORK", () => {
     expect(w.queen.results[0]!.summary!.length).toBe(500);
     expect(ProvisionResultSchema.safeParse(w.queen.results[0]).success).toBe(true);
   });
+
+  it("forks from a car's fork repo (any source repo name, not only the hive repo) with no special-casing", async () => {
+    const w = new FakeWorld();
+    // A car is a merge train that forked from another train (or main).
+    // The sourceRepo here is a car fork repo name, not the hive repo.
+    const carForkSourceRepo = "hive-car-k23-xyz-abcdef";
+    const steps = new InlineSteps();
+    const out = await runProvision(
+      fork({ sourceRepo: carForkSourceRepo, forkName: "hive-train-bbbbbbbbbbbb" }),
+      steps,
+      w.ports()
+    );
+
+    // Verify that Artifacts was called with the car fork repo as the source.
+    expect(w.artifacts.calls).toEqual(["fork:hive-car-k23-xyz-abcdef->hive-train-bbbbbbbbbbbb"]);
+    expect(out).toMatchObject({ ok: true });
+    const r = ProvisionResultSchema.parse(w.queen.results[0]);
+    expect(r).toMatchObject({
+      commandId: "cmd-1",
+      op: "FORK",
+      trainId: "train-1",
+      ok: true,
+      artifactRepo: "hive-train-bbbbbbbbbbbb",
+      baseSha: "a".repeat(40),
+    });
+  });
 });
 
 describe("runProvision DELETE", () => {
