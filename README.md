@@ -174,7 +174,7 @@ pnpm dev:sim                               # Queen on :8787 and dashboard on :51
 
 Open <http://localhost:5173/?hive=demo> and click **Launch demo swarm**. The dashboard proxies `/hives` to the Queen at `localhost:8787` (override with `QUEEN_DEV_URL`). To run them separately instead: `pnpm --filter @queenos/queen dev:sim` and `pnpm --filter @queenos/dashboard dev`.
 
-**What you should see:** in sim, each train goes TESTING then MERGED within about 15 seconds. **Launch demo swarm** submits 4 prompts; the one containing `[fail]` is ejected once and reworked (the rework passes), and all four are MERGED after roughly 30 seconds.
+**What you should see:** in sim, each train goes TESTING then MERGED within about 15 seconds. **Launch demo swarm** submits 4 prompts: one with `[fail]` is rejected by the security scan and reworked (the rework passes), one with `[review-fail]` is rejected by the REVIEWER and reworked (the rework is approved), and all four are MERGED after roughly 30–40 seconds. A merged run produces a release that reaches AWAITING TAP; tapping it works in the sim.
 
 Smoke check the Queen (returns a JSON snapshot):
 
