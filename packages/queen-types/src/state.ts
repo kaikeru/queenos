@@ -75,6 +75,8 @@ export const MergeTrainSchema = z.object({
   conflict: MergeConflictSchema.nullable().optional(), // conflict (BUILD: JSON MergeConflict that ejected it)
   changedPaths: z.array(z.string()).optional(), // changed_paths (BUILD: JSON, from BuildResult)
   waitForCarSeq: z.number().int().nullable().optional(), // wait_for_car_seq (BUILD: conflict/integration rework)
+  carSeq: z.number().int().optional(), // QUEUE: the car's seq (queue rail ordering)
+  fastForward: z.boolean().optional(), // QUEUE: a single member fast-forwarded (car gate skipped)
 });
 export type MergeTrain = z.infer<typeof MergeTrainSchema>;
 

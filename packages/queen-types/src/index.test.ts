@@ -41,6 +41,12 @@ import {
   ReleaseSchema,
   ResolveEscalationSchema,
   RUNBOOK,
+  type EscalationAction,
+  type EscalationReason,
+  BudgetBoostSchema,
+  ItemDetailSchema,
+  MetricsViewSchema,
+  QueueViewSchema,
   ScribeSummarySchema,
   SentinelCommandSchema,
   SentinelVerdictSchema,
@@ -537,6 +543,38 @@ describe("v2 schemas round-trip", () => {
     }
     expect(escalationActions("APPROVAL_REQUIRED")).toEqual(["ship", "hold"]);
     expect(escalationActions("REWORK_EXHAUSTED")).toEqual(["retry", "cancel"]);
+  });
+
+  it("has runbook text for every reason x action pair the Queen can open", () => {
+    // Default actions per reason, plus the narrowed sets the planners pass explicitly.
+    const offered: [EscalationReason, EscalationAction[]][] = [
+      ...EscalationReasonSchema.options.map((r): [EscalationReason, EscalationAction[]] => [r, escalationActions(r)]),
+      ["SENTINEL_INCONCLUSIVE", ["ack"]],
+      ["GUARDRAIL_TRIPPED", ["ack"]],
+      ["EXECUTOR_LOST", ["ack"]],
+    ];
+    for (const [reason, actions] of offered) {
+      for (const a of actions) expect(RUNBOOK[reason].actions[a]?.length, `${reason} x ${a}`).toBeGreaterThan(0);
+    }
+    expect(RUNBOOK.SENTINEL_INCONCLUSIVE.actions.ack).toBeDefined();
+  });
+
+  it("parses the REST views and the additive v12 fields", () => {
+    expect(QueueViewSchema.parse({ cars: [], waiting: [], conflicts: [], bisects: [] }).cars).toEqual([]);
+    expect(MetricsViewSchema.parse({ rollups: [], hive: null, source: "ae" }).source).toBe("ae");
+    expect(ItemDetailSchema.safeParse({ item: {}, children: [], trains: [], races: [], release: null, escalations: [] }).success).toBe(false);
+    const train = { trainId: "t", baseSha: "b", includedPrompts: [], artifactRepo: "r", status: "BUILDING", createdAt: 1 };
+    expect(MergeTrainSchema.parse({ ...train, carSeq: 3, fastForward: true })).toMatchObject({ carSeq: 3, fastForward: true });
+    expect(MergeTrainSchema.parse(train)).not.toHaveProperty("carSeq");
+    expect(BudgetBoostSchema.safeParse({ day: "2026-10-05", dailyCredits: 1, dailyDispatches: 2 }).success).toBe(true);
+    expect(BudgetBoostSchema.safeParse({ day: "today", dailyCredits: 1, dailyDispatches: 2 }).success).toBe(false);
+  });
+
+  it("allows 24 oracle children", () => {
+    expect(GuardrailsSchema.parse({ ...GUARDRAIL_DEFAULTS, maxChildrenPerItem: 24 }).maxChildrenPerItem).toBe(24);
+    expect(GUARDRAIL_MAX.maxChildrenPerItem).toBe(24);
+    expect(GuardrailsSchema.safeParse({ ...GUARDRAIL_DEFAULTS, maxChildrenPerItem: 25 }).success).toBe(false);
+    expect(OracleResultSchema).toBeDefined();
   });
 
   it("keeps guardrail defaults inside GUARDRAIL_MAX and the schema", () => {

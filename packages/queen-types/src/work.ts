@@ -159,7 +159,7 @@ export type WorkAction = z.infer<typeof WorkActionSchema>;
 
 /** Per-hive hard caps (§2.9). Defaults in GUARDRAIL_DEFAULTS; overrides clamped to GUARDRAIL_MAX. */
 export const GuardrailsSchema = z.object({
-  maxChildrenPerItem: z.number().int().min(1).max(12),
+  maxChildrenPerItem: z.number().int().min(1).max(24),
   maxDepth: z.number().int().min(1).max(3),
   maxOpenItems: z.number().int().min(1).max(100),
   maxActiveTrains: z.number().int().min(1).max(256),
@@ -187,7 +187,7 @@ export const GUARDRAIL_DEFAULTS = {
 
 /** The "max" column of §2.9: per-hive overrides are clamped to these (same as GuardrailsSchema's bounds). */
 export const GUARDRAIL_MAX = {
-  maxChildrenPerItem: 12,
+  maxChildrenPerItem: 24,
   maxDepth: 3,
   maxOpenItems: 100,
   maxActiveTrains: 256,

@@ -170,11 +170,11 @@ export interface TrainRecord extends MergeTrain {
   // lane, members, carId, passedSeq, ...) come from MergeTrain.
   /** Build credits (budget + race ranking). */
   credits?: number | null;
-  /** QUEUE: the failed car this bisect composition came from; BUILD: a pending bisect pin (queue.ts). */
+  /** QUEUE car: the failed car id; pool BUILD train: a pending bisect pin `"<failedCarId>#<half>"` (queue.ts). */
   bisectOf?: string | null;
   /**
    * BUILD: the builder's Think `verify` tool passed (BuildResult.verified; race
-   * ranking key 4). NOT persisted yet (no merge_trains column): see WP1.2 report.
+   * ranking key 4). Persisted in `merge_trains.verified` (v12; NULL = unknown).
    */
   verified?: boolean | null;
 }
@@ -202,6 +202,9 @@ export interface PromptRecord extends PromptRun {
   seq: number;
   summary: string | null;
   attempts: number;
+  /** v8 `race_width` / `difficulty` (the work item's dispatch decision; absent on v1 records). */
+  raceWidth?: number;
+  difficulty?: string;
 }
 
 /** What the planner needs to know about the work item behind a prompt (prompt_id = item_id). */
@@ -487,6 +490,7 @@ export function toMergeTrainV2(t: TrainRecord): MergeTrain {
   if (t.conflict) v2.conflict = { ...t.conflict, paths: [...t.conflict.paths] };
   if (t.changedPaths) v2.changedPaths = [...t.changedPaths];
   if (t.waitForCarSeq !== null && t.waitForCarSeq !== undefined) v2.waitForCarSeq = t.waitForCarSeq;
+  if (t.lane === "QUEUE") v2.carSeq = t.seq;
   return { ...toMergeTrain(t), ...v2 };
 }
 

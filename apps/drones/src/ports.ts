@@ -73,6 +73,10 @@ export type GitSession = Pick<
   | "writeRef"
   | "listFiles"
   | "readFiles"
+  | "merge"
+  | "findMergeBase"
+  | "changedPaths"
+  | "deepen"
 >;
 
 export interface CloneRequest {

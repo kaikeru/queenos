@@ -160,7 +160,7 @@ export const AE_MAX_POINTS_PER_INVOCATION = 200;
 
 /**
  * AE layout: indexes [hive]; blobs [type, hive, kindOrRole, model, outcome,
- * environment, traceId, itemId]; doubles [valueMs, tokensIn, tokensOut, credits, count].
+ * environment, traceId, itemId]; doubles [valueMs, tokensIn, tokensOut, credits, count, errorRate].
  */
 export interface AnalyticsPoint {
   type: string;
@@ -177,6 +177,8 @@ export interface AnalyticsPoint {
   credits?: number;
   /** Default 1. */
   count?: number;
+  /** 0..1 (the Sentinel window point). Optional trailing AE double. */
+  errorRate?: number;
 }
 
 /** Event-log retention (pruned in the alarm): whichever is smaller. */

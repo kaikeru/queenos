@@ -907,7 +907,7 @@ describe("guardrails and compose helpers", () => {
 
   it("effectiveGuardrails clamps overrides to GUARDRAIL_MAX", () => {
     expect(effectiveGuardrails({ maxChildrenPerItem: 99, maxDepth: 0, maxAutoFiledPerHour: 0 })).toMatchObject({
-      maxChildrenPerItem: 12,
+      maxChildrenPerItem: 24,
       maxDepth: 1,
       maxAutoFiledPerHour: 0,
       maxOpenItems: 40,

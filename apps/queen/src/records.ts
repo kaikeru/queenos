@@ -3,7 +3,7 @@
  * by db.ts (row mapping) and the pure planners (work ledger, races, affinity,
  * autonomy). Each extends its queen-types contract with Queen-internal columns.
  */
-import type { AutonomyLevel, Escalation, EscalationReason, HiveSettingsOverrides, Race, WorkItem } from "@queenos/queen-types";
+import type { AutonomyLevel, BudgetBoost, Escalation, EscalationReason, HiveSettingsOverrides, Race, WorkItem } from "@queenos/queen-types";
 
 /** Row of `work_items`. */
 export interface WorkItemRecord extends WorkItem {
@@ -48,6 +48,8 @@ export interface HiveSettingsRecord {
   leaseExpiresAt: number | null;
   /** Consecutive merge-queue cars failed on infrastructure (3 → EXECUTOR_LOST). */
   carInfraFailures: number;
+  /** Today-only budget raise (v12 `budget_boost`); only in effect while `day` is the current UTC day. */
+  budgetBoost?: BudgetBoost | null;
 }
 
 export type PathClaimSource = "predicted" | "actual" | "conflict";

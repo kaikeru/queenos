@@ -18,6 +18,7 @@ import {
   rowToEvent,
   rowToMetric,
   rowToPrompt,
+  upsertPrompt,
   rowToRace,
   rowToRelease,
   rowToTrain,
@@ -55,26 +56,26 @@ const columns = (sql: SqlStorage, table: string) =>
 const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v FROM _migrations").one().v);
 
 describe("migrations", () => {
-  it("a fresh DO migrates to v11", async () => {
-    expect(SCHEMA_VERSION).toBe(11);
+  it("a fresh DO migrates to v12", async () => {
+    expect(SCHEMA_VERSION).toBe(12);
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
-      expect(version(q.sql)).toBe(11);
+      expect(version(q.sql)).toBe(12);
       const t = tables(q.sql);
       for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims"]) {
         expect(t.has(name), name).toBe(true);
       }
-      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of"]) {
+      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified"]) {
         expect(columns(q.sql, "merge_trains").has(c), c).toBe(true);
       }
       for (const c of ["paths", "wait_reason", "conflicts"]) expect(columns(q.sql, "work_items").has(c), c).toBe(true);
-      for (const c of ["leased_slots", "lease_expires_at", "car_infra_failures"]) expect(columns(q.sql, "hive_settings").has(c), c).toBe(true);
+      for (const c of ["leased_slots", "lease_expires_at", "car_infra_failures", "budget_boost"]) expect(columns(q.sql, "hive_settings").has(c), c).toBe(true);
       expect(columns(q.sql, "releases").has("trace_id")).toBe(true);
       expect(columns(q.sql, "prompt_runs").has("race_width")).toBe(true);
       // A new hive has no settings row yet (it gets one, autonomous, at its first v2 filing).
       expect(loadHiveSettings(q.sql)).toBeNull();
       // Idempotent: re-running is a no-op.
-      expect(migrate(state.storage)).toBe(11);
-      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(11);
+      expect(migrate(state.storage)).toBe(12);
+      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(12);
     });
   });
 
@@ -139,8 +140,8 @@ describe("migrations", () => {
       };
 
       // ── migrate ──
-      expect(migrate(state.storage)).toBe(11);
-      expect(version(sql)).toBe(11);
+      expect(migrate(state.storage)).toBe(12);
+      expect(version(sql)).toBe(12);
 
       // 3 work_items: user feature items with the prompt ids, v2 trace ids and first-line titles.
       const items = sql.exec("SELECT * FROM work_items ORDER BY seq").toArray().map(rowToWorkItem);
@@ -272,6 +273,12 @@ describe("v2 row mappers round-trip", () => {
       };
       upsertHiveSettings(sql, settings);
       expect(loadHiveSettings(sql)).toEqual(settings);
+      expect(loadHiveSettings(sql)).not.toHaveProperty("budgetBoost");
+      const boosted = { ...settings, budgetBoost: { day: "2026-10-05", dailyCredits: 75_000, dailyDispatches: 600 } };
+      upsertHiveSettings(sql, boosted);
+      expect(loadHiveSettings(sql)).toEqual(boosted);
+      upsertHiveSettings(sql, settings);
+      expect(loadHiveSettings(sql)).toEqual(settings);
 
       const esc = {
         escalationId: "e1",
@@ -354,9 +361,21 @@ describe("v2 row mappers round-trip", () => {
         changedPaths: ["a.js"],
         waitForCarSeq: 4,
         bisectOf: "car0",
+        verified: true,
       };
       upsertTrain(sql, car);
       expect(rowToTrain(sql.exec("SELECT * FROM merge_trains WHERE train_id = 'car1'").one())).toEqual(car);
+      upsertTrain(sql, { ...car, verified: false });
+      expect(rowToTrain(sql.exec("SELECT * FROM merge_trains WHERE train_id = 'car1'").one()).verified).toBe(false);
+      upsertTrain(sql, { ...car, verified: null });
+      expect(rowToTrain(sql.exec("SELECT * FROM merge_trains WHERE train_id = 'car1'").one())).not.toHaveProperty("verified");
+      upsertTrain(sql, car);
+
+      // prompt_runs: race_width and difficulty (v8 columns) round-trip.
+      const prompt = rowToPrompt(sql.exec("SELECT * FROM prompt_runs WHERE prompt_id = ?", itemId).one());
+      expect(prompt).toMatchObject({ raceWidth: 1, difficulty: "normal" });
+      upsertPrompt(sql, { ...prompt, raceWidth: 3, difficulty: "hard" });
+      expect(rowToPrompt(sql.exec("SELECT * FROM prompt_runs WHERE prompt_id = ?", itemId).one())).toMatchObject({ raceWidth: 3, difficulty: "hard" });
       upsertTrain(sql, { ...car, trainId: "t9", lane: undefined, members: undefined, changedPaths: undefined, score: null, conflict: null });
       const plain = rowToTrain(sql.exec("SELECT * FROM merge_trains WHERE train_id = 't9'").one());
       expect(plain.lane).toBe("BUILD");

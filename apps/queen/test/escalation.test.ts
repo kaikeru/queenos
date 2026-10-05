@@ -59,6 +59,7 @@ const paths: { reason: EscalationReason; subject: EscalationSubject; action: Esc
   { reason: "SENTINEL_INCONCLUSIVE", subject: release, action: "ship", intents: [{ type: "release.tap", releaseId: "r1", user: USER }] },
   { reason: "SENTINEL_INCONCLUSIVE", subject: release, action: "hold", intents: [] },
   { reason: "REWORK_EXHAUSTED", subject: item, action: "retry", view: { itemStatus: "FAILED" }, intents: [{ type: "work.retry", itemId: "i1", user: USER, resetAttempts: true, resetConflicts: true }] },
+  { reason: "SENTINEL_INCONCLUSIVE", subject: release, action: "ack", intents: [] },
   { reason: "REWORK_EXHAUSTED", subject: item, action: "cancel", intents: [{ type: "work.cancel", itemId: "i1", user: USER }] },
   { reason: "ROLLBACK_STREAK", subject: hive, action: "resume_autonomy", intents: [{ type: "autonomy.resume", resetStreak: true }] },
   { reason: "ROLLBACK_STREAK", subject: hive, action: "ack", intents: [] },

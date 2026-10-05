@@ -4,6 +4,8 @@
  */
 import {
   AuditEventSchema,
+  BudgetBoostSchema,
+  type BudgetBoost,
   AutonomyLevelSchema,
   DeploymentSchema,
   EscalationReasonSchema,
@@ -386,7 +388,7 @@ const MIGRATIONS: readonly Migration[] = [
   ALTER TABLE merge_trains ADD COLUMN conflict TEXT;                        -- BUILD: JSON MergeConflict that ejected it
   ALTER TABLE merge_trains ADD COLUMN changed_paths TEXT;                   -- BUILD: JSON, from BuildResult
   ALTER TABLE merge_trains ADD COLUMN wait_for_car_seq INTEGER;             -- BUILD: conflict/integration rework waits for this car seq
-  ALTER TABLE merge_trains ADD COLUMN bisect_of TEXT;                       -- QUEUE: the failed car this composition came from
+  ALTER TABLE merge_trains ADD COLUMN bisect_of TEXT;                       -- pool BUILD train: "<failedCarId>#<half>" pin; QUEUE car: the failed car id
   CREATE INDEX merge_trains_lane ON merge_trains(lane, phase, seq);
   CREATE INDEX merge_trains_car ON merge_trains(car_id);
   CREATE INDEX merge_trains_board ON merge_trains(lane, phase, car_id, passed_seq);
@@ -404,6 +406,12 @@ const MIGRATIONS: readonly Migration[] = [
   ALTER TABLE hive_settings ADD COLUMN leased_slots INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE hive_settings ADD COLUMN lease_expires_at INTEGER;
   ALTER TABLE hive_settings ADD COLUMN car_infra_failures INTEGER NOT NULL DEFAULT 0;
+  `,
+  `
+  -- v12: Sentinel verified flag, today-only budget boost.
+  ALTER TABLE merge_trains ADD COLUMN verified INTEGER;        -- NULL = not checked; 1 / 0 = Sentinel verdict
+  -- budget_boost: JSON BudgetBoost (day, dailyCredits, dailyDispatches); in effect only on that UTC day.
+  ALTER TABLE hive_settings ADD COLUMN budget_boost TEXT;
   `,
 ];
 
@@ -455,7 +463,15 @@ export function rowToPrompt(r: Row): PromptRecord {
     status: r.status,
     createdAt: r.created_at,
   });
-  return { ...base, seq: Number(r.seq), summary: str(r.summary), attempts: Number(r.attempts) };
+  return {
+    ...base,
+    seq: Number(r.seq),
+    summary: str(r.summary),
+    attempts: Number(r.attempts),
+    // v8 columns (absent only before migrate()).
+    ...(r.race_width !== undefined && r.race_width !== null ? { raceWidth: Number(r.race_width) } : {}),
+    ...(r.difficulty !== undefined && r.difficulty !== null ? { difficulty: String(r.difficulty) } : {}),
+  };
 }
 
 export function rowToTrain(r: Row): TrainRecord {
@@ -522,6 +538,7 @@ export function rowToTrain(r: Row): TrainRecord {
     ...(r.changed_paths !== null && r.changed_paths !== undefined ? { changedPaths: parseJson(r.changed_paths, stringArray) ?? [] } : {}),
     waitForCarSeq: num(r.wait_for_car_seq),
     bisectOf: str(r.bisect_of ?? null),
+    ...(r.verified !== null && r.verified !== undefined ? { verified: Number(r.verified) === 1 } : {}),
   };
 }
 
@@ -676,9 +693,10 @@ export function appendAuditRow(sql: SqlStorage, e: AuditEvent, hive: string): vo
 
 export function upsertPrompt(sql: SqlStorage, p: PromptRecord): void {
   sql.exec(
-    `INSERT INTO prompt_runs (prompt_id, namespace, prompt_text, status, created_at, seq, summary, attempts)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(prompt_id) DO UPDATE SET status = excluded.status, summary = excluded.summary, attempts = excluded.attempts`,
+    `INSERT INTO prompt_runs (prompt_id, namespace, prompt_text, status, created_at, seq, summary, attempts, race_width, difficulty)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(prompt_id) DO UPDATE SET status = excluded.status, summary = excluded.summary, attempts = excluded.attempts,
+       race_width = excluded.race_width, difficulty = excluded.difficulty`,
     p.promptId,
     p.namespace,
     p.promptText,
@@ -687,6 +705,8 @@ export function upsertPrompt(sql: SqlStorage, p: PromptRecord): void {
     p.seq,
     p.summary,
     p.attempts,
+    p.raceWidth ?? 1,
+    p.difficulty ?? "normal",
   );
 }
 
@@ -698,9 +718,9 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        fork_issued_at, delete_issued_at, deploy_issued_at, teardown_issued_at, drone_issued_at, drone_attempt,
        model, model_reason, model_choice, model_choice_attempt, model_outcome, model_probe, memories,
        trace_id, race_id, candidate, race_outcome, gate_score, credits,
-       lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of)
+       lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of, verified)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
        status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
@@ -718,7 +738,7 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        race_outcome = excluded.race_outcome, gate_score = excluded.gate_score, credits = excluded.credits,
        lane = excluded.lane, members = excluded.members, car_id = excluded.car_id, passed_seq = excluded.passed_seq,
        conflict = excluded.conflict, changed_paths = excluded.changed_paths,
-       wait_for_car_seq = excluded.wait_for_car_seq, bisect_of = excluded.bisect_of`,
+       wait_for_car_seq = excluded.wait_for_car_seq, bisect_of = excluded.bisect_of, verified = excluded.verified`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -769,6 +789,7 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     json(t.changedPaths),
     t.waitForCarSeq ?? null,
     t.bisectOf ?? null,
+    t.verified === null || t.verified === undefined ? null : t.verified ? 1 : 0,
   );
 }
 
@@ -1116,6 +1137,7 @@ export function upsertRace(sql: SqlStorage, r: RaceRecord): void {
 
 export function rowToHiveSettings(r: Row): HiveSettingsRecord {
   const autonomy = AutonomyLevelSchema.safeParse(r.autonomy);
+  const boost = parseJson(r.budget_boost ?? null, schemaCheck<BudgetBoost>(BudgetBoostSchema));
   return {
     hive: String(r.hive),
     // An unknown level is treated as the safe one.
@@ -1136,6 +1158,7 @@ export function rowToHiveSettings(r: Row): HiveSettingsRecord {
     leasedSlots: Number(r.leased_slots ?? 0),
     leaseExpiresAt: num(r.lease_expires_at),
     carInfraFailures: Number(r.car_infra_failures ?? 0),
+    ...(boost ? { budgetBoost: boost } : {}),
   };
 }
 
@@ -1148,13 +1171,14 @@ export function loadHiveSettings(sql: SqlStorage): HiveSettingsRecord | null {
 export function upsertHiveSettings(sql: SqlStorage, h: HiveSettingsRecord): void {
   sql.exec(
     `INSERT INTO hive_settings (id, hive, autonomy, settings, budget_day, credits_used, dispatches, auto_filed_hour, auto_filed_count,
-       rollback_streak, degraded_by, updated_by, updated_at, leased_slots, lease_expires_at, car_infra_failures)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       rollback_streak, degraded_by, updated_by, updated_at, leased_slots, lease_expires_at, car_infra_failures, budget_boost)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET autonomy = excluded.autonomy, settings = excluded.settings, budget_day = excluded.budget_day,
        credits_used = excluded.credits_used, dispatches = excluded.dispatches, auto_filed_hour = excluded.auto_filed_hour,
        auto_filed_count = excluded.auto_filed_count, rollback_streak = excluded.rollback_streak, degraded_by = excluded.degraded_by,
        updated_by = excluded.updated_by, updated_at = excluded.updated_at, leased_slots = excluded.leased_slots,
-       lease_expires_at = excluded.lease_expires_at, car_infra_failures = excluded.car_infra_failures`,
+       lease_expires_at = excluded.lease_expires_at, car_infra_failures = excluded.car_infra_failures,
+       budget_boost = excluded.budget_boost`,
     h.hive,
     h.autonomy,
     JSON.stringify(h.overrides),
@@ -1170,6 +1194,7 @@ export function upsertHiveSettings(sql: SqlStorage, h: HiveSettingsRecord): void
     h.leasedSlots,
     h.leaseExpiresAt,
     h.carInfraFailures,
+    h.budgetBoost ? JSON.stringify(h.budgetBoost) : null,
   );
 }
 

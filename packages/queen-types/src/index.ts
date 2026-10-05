@@ -15,3 +15,4 @@ export * from "./oracle.js";
 export * from "./autonomy.js";
 export * from "./observability.js";
 export * from "./queue.js";
+export * from "./rest.js";

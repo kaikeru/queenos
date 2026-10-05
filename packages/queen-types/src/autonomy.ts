@@ -69,7 +69,11 @@ export const RUNBOOK: Readonly<Record<EscalationReason, RunbookEntry>> = {
   SENTINEL_INCONCLUSIVE: {
     what: "Sentinel could not measure staging (readiness timeout, or fewer than half the minimum requests).",
     did: "Parked the release at AWAITING_TAP, even in an autonomous hive.",
-    actions: { ship: "Ship anyway: start the canary at 1% (each step is still checked).", hold: "Keep it parked." },
+    actions: {
+      ship: "Ship anyway: start the canary at 1% (each step is still checked).",
+      hold: "Keep it parked.",
+      ack: "Acknowledge; the release was already rolled back or is superseded.",
+    },
   },
   REWORK_EXHAUSTED: {
     what: "An item failed its gate after the maximum reworks, or hit the merge-conflict rework cap.",
@@ -143,6 +147,17 @@ export const HiveSettingsOverridesSchema = z.object({
   race: HiveSettingsSchema.shape.race.partial().optional(),
 });
 export type HiveSettingsOverrides = z.infer<typeof HiveSettingsOverridesSchema>;
+
+/**
+ * A today-only raise of the budget (the `raise_budget` escalation action): the
+ * limits that apply on `day` (UTC, YYYY-MM-DD); ignored on any other day.
+ */
+export const BudgetBoostSchema = z.object({
+  day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  dailyCredits: z.number().int().min(0),
+  dailyDispatches: z.number().int().min(0),
+});
+export type BudgetBoost = z.infer<typeof BudgetBoostSchema>;
 
 /** PATCH /hives/:hive/settings. */
 export const UpdateHiveSettingsSchema = z.object({

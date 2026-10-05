@@ -38,7 +38,7 @@ export const OracleCommandSchema = z.discriminatedUnion("op", [
         }),
       )
       .max(30),
-    limits: z.object({ maxChildren: z.number().int().min(1).max(12) }),
+    limits: z.object({ maxChildren: z.number().int().min(1).max(24) }),
   }),
   z.object({
     op: z.literal("TRIAGE"),
@@ -81,7 +81,7 @@ export const OracleResultSchema = z.object({
   /** false (LLM failure): the Queen falls back to one item with the whole prompt. */
   ok: z.boolean(),
   /** DECOMPOSE. */
-  children: z.array(DecomposedChildSchema).max(12).optional(),
+  children: z.array(DecomposedChildSchema).max(24).optional(),
   /** TRIAGE. */
   similar: z.array(SimilarItemSchema).max(5).optional(),
   model: z.string().optional(),

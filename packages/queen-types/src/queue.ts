@@ -82,7 +82,7 @@ export const GateTargetSchema = z.object({
 });
 export type GateTarget = z.infer<typeof GateTargetSchema>;
 
-/** Clone/fetch depth shared by the MERGE and LANDER drones (apps/drones/src/land.ts has its own copy until WP1.12 moves it). */
+/** Clone/fetch depth shared by the MERGE and LANDER drones (apps/drones/src/land.ts imports this). */
 export const LAND_DEPTH = 100;
 
 /** Global concurrency lease request (SwarmGovernor DO, §4.3). */
