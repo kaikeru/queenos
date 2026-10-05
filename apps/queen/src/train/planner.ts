@@ -1,33 +1,48 @@
 /**
- * Speculative Merge Train planner (pure: no I/O, no clock, no randomness).
+ * Train planner (pure: no I/O, no clock, no randomness). v2 design §2.3.
  *
- * Model (Google-style submit queue, chained forks):
- * - Every queued prompt owns exactly one *active* train. Active trains, in
- *   `seq` order, ARE the queue. Train k contains main + prompts 1..k.
- * - Content is cumulative via chained forks: train-1 is forked from the hive
- *   repo (`<namespace>`), train-k is forked from train-(k-1)'s fork once
- *   train-(k-1)'s builder has pushed. Builds chain; tests run speculatively and
- *   in parallel.
- * - Results arrive in any order. A passed train lands only when it is the
- *   head of the queue (every earlier train has MERGED). Later passed trains
- *   wait and cascade once the head lands.
- * - The Queen performs no I/O. Forks and fork deletes are commands to the
- *   Provisioner Workflow; preview deploys and teardowns are commands to the
- *   Herald Workflow. Each command id is stored on the train row (persisted
- *   before dispatch); results come back asynchronously and are matched by
- *   command id, so duplicate and late results are idempotent.
- * - After the builder pushes, the train is DEPLOYING: the Herald deploys the
- *   head to a per-train Worker Preview. A LIVE preview moves the train to
- *   TESTING (gatekeepers smoke-test `previewUrl`); a failed deploy fails the
- *   train like a failed test. Successor forks chain on the push, not the deploy.
- * - Landing is a git push performed by a LANDER drone (Artifacts has no merge
- *   API). The train is MERGED only when the lander confirms the new main SHA.
- * - MERGED and EJECTED trains get their fork deleted and their preview torn down.
- * - A failed train is EJECTED and its fork deleted. Every later train that
- *   contains the failed prompt is superseded (EJECTED) and re-provisioned under
- *   a new train id, forked from the nearest surviving predecessor (or main).
- *   The failed prompt re-enters the queue at the tail as a REWORK train, which
- *   carries the Scribe summary. After `maxReworks` reworks it is FAILED.
+ * Two lanes of trains, both in `merge_trains`, told apart by `lane`:
+ * - BUILD (one train per build attempt of an item: a race candidate or a
+ *   rework). Every BUILD train forks from hive main (`<namespace>`) the moment
+ *   it is enqueued: independent items build in parallel, nothing waits for a
+ *   predecessor, and a failed build never supersedes anyone. The one exception
+ *   is `waitForCarSeq` (a conflict / integration rework): it stays
+ *   WAITING_PARENT until every QUEUE car with seq ≤ waitForCarSeq is terminal,
+ *   then forks from main. Fork → BUILDER → push → preview → gate is v1's
+ *   pipeline. A pass moves the train to PASSED with a queue ticket
+ *   (`passedSeq`): it is waiting to board a car.
+ * - QUEUE (one train per merge *car*, v1's speculative train repurposed).
+ *   queue.ts (WP1.11) forms cars, interprets the MERGE drone's result, fails
+ *   and bisects cars and lands them; this planner materialises cars, forks
+ *   them (from the car ahead once it pushed, or main), dispatches the MERGE
+ *   drone in place of a builder, deploys car previews and lands the head car
+ *   with the LANDER (always a fast-forward).
+ *
+ * The merge queue is on when `ctx.queue` is set (WP2.1 wires it). Without it
+ * (Phase 1, queue.ts still a seam) passed builds land directly, one at a time
+ * in `passedSeq` order; since they all forked from main, a build that lost the
+ * race to main gets NOT_FAST_FORWARD from the lander and is reworked.
+ *
+ * Races (best-of-N, §2.3.6): `enqueue(prompt, action, w > 1)` creates a race
+ * and w BUILD candidates on w distinct models (router.routeRace). A passing
+ * candidate waits in TESTING (`raceOutcome PASSED`); a failing one is ejected
+ * alone. The race is decided when every candidate reported, or at its
+ * deadline (RACE_GRACE_MS after the first pass): rankCandidates() picks the
+ * winner (PASSED + passedSeq), the others are EJECTED as LOST. No pass at all:
+ * the race is ABANDONED and the prompt is reworked once (attempts + 1) with
+ * the best failure's Scribe summary. Race candidates never move the AIMD floor.
+ *
+ * Unchanged from v1: forks, deletes, preview deploys and teardowns are
+ * commands to executors, stored on the train row (persisted before dispatch)
+ * and matched by command id, so duplicate and late results are idempotent;
+ * the watchdog re-issues lost commands; MERGED and EJECTED trains get their
+ * fork deleted and preview torn down; REWORK carries the Scribe summary and
+ * is capped by `maxReworks`.
+ *
+ * v2 observability: every train carries its item's `traceId`; every command
+ * and drone task carries `trace.traceparent` (span = spanIdFor(command id /
+ * drone instance id)); every visible phase change is an EventDraft in
+ * `PlanResult.events`.
  *
  * Every method returns the changed rows (for the DO to persist) plus an
  * explicit list of effects for the DO to execute afterwards.
@@ -38,7 +53,11 @@ import type {
   DeployResult,
   Deployment,
   DroneTask,
+  EventDraft,
   LandResult,
+  MergeConflict,
+  MergeMember,
+  MergeResult,
   MergeTrain,
   ModelChoice,
   PromptRun,
@@ -47,12 +66,29 @@ import type {
   ProvisionResult,
   QueenServerMessage,
   RecalledMemory,
+  TraceContext,
   TrainPhase as QueenTrainPhase,
   TrainResult,
   TrainState,
 } from "@queenos/queen-types";
-import { MAX_RECALL_QUERY, memoryToRagSnippet } from "@queenos/queen-types";
-import { DEFAULT_POLICY, INITIAL_FLOOR, floorAfter, isCatalogModel, route, type FloorOutcome, type FloorState, type RouterPolicy, type RouterRole, type RouterStats } from "../models/router";
+import { MAX_RECALL_QUERY, RACE_GRACE_MS, memoryToRagSnippet, spanIdFor, traceIdFromUuid, traceparent } from "@queenos/queen-types";
+import { droneInstanceId } from "../drones";
+import {
+  DEFAULT_POLICY,
+  INITIAL_FLOOR,
+  floorAfter,
+  isCatalogModel,
+  route,
+  routeRace,
+  type FloorOutcome,
+  type FloorState,
+  type RouterPolicy,
+  type RouterRole,
+  type RouterStats,
+} from "../models/router";
+import type { RaceRecord } from "../records";
+import * as queue from "./queue";
+import { buildCredits, rankCandidates, raceWidth, type RaceCandidate } from "./race";
 
 /**
  * Planner-internal train lifecycle (TrainPhaseSchema in queen-types, exposed
@@ -75,10 +111,12 @@ export const MAX_FORK_ATTEMPTS = 3;
 export const MAX_COMMAND_ATTEMPTS = MAX_FORK_ATTEMPTS;
 /** Default for COMMAND_TIMEOUT_MS: how long a dispatched command may stay unreported. */
 export const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
+/** Default Guardrails.maxConflictReworks (D7). */
+export const DEFAULT_MAX_CONFLICT_REWORKS = 2;
 
 export interface TrainRecord extends MergeTrain {
   seq: number;
-  /** The prompt this train was provisioned for (its tail). */
+  /** The prompt this train was provisioned for (a car: its first member's prompt). */
   promptId: string;
   phase: TrainPhase;
   forkState: ForkState;
@@ -128,12 +166,17 @@ export interface TrainRecord extends MergeTrain {
   modelProbe: boolean;
   /** Hive memories the Provisioner recalled when it forked this train (best first). Feeds `ragContext`. */
   memories: RecalledMemory[];
-  // v2 internals (migrations v9 / v11; optional until WP1.2 / WP1.11 populate them).
-  // The visible v2 fields (traceId, raceId, lane, members, carId, passedSeq, ...) come from MergeTrain.
+  // v2 internals (migrations v9 / v11). The visible v2 fields (traceId, raceId,
+  // lane, members, carId, passedSeq, ...) come from MergeTrain.
   /** Build credits (budget + race ranking). */
   credits?: number | null;
-  /** QUEUE: the failed car this bisect composition came from. */
+  /** QUEUE: the failed car this bisect composition came from; BUILD: a pending bisect pin (queue.ts). */
   bisectOf?: string | null;
+  /**
+   * BUILD: the builder's Think `verify` tool passed (BuildResult.verified; race
+   * ranking key 4). NOT persisted yet (no merge_trains column): see WP1.2 report.
+   */
+  verified?: boolean | null;
 }
 
 export type ModelOutcome = "BUILT" | "PASSED" | "FAILED";
@@ -161,9 +204,27 @@ export interface PromptRecord extends PromptRun {
   attempts: number;
 }
 
+/** What the planner needs to know about the work item behind a prompt (prompt_id = item_id). */
+export interface PlannerItem {
+  itemId: string;
+  /** The item's trace (default: traceIdFromUuid(itemId), which matches the v8/v9 backfill). */
+  traceId?: string | null;
+  /** 0..3 (merge-queue member order). Default 2. */
+  priority?: number;
+  /** Predicted touch set (race ranking key 5). */
+  paths?: string[];
+  /** Explicit race width for reworks. */
+  bestOf?: number | null;
+  /** Conflict reworks so far (work_items.conflicts; D7). */
+  conflicts?: number;
+}
+
 export interface HiveState {
   prompts: PromptRecord[];
-  /** All active trains, plus any terminal train relevant to the call. */
+  /**
+   * All active trains, plus any terminal train relevant to the call. v2: plus
+   * every candidate (terminal ones included) of each loaded RACING race.
+   */
   trains: TrainRecord[];
   /** Deployment rows of the loaded trains (preview rows are `preview-<trainId>`). */
   deployments?: Deployment[];
@@ -175,6 +236,48 @@ export interface HiveState {
   routerDispatches?: number;
   /** The hive's builder tier floor (AIMD + probes). */
   routerFloor?: FloorState;
+  /** v2: RACING races (and any race named by the call). */
+  races?: RaceRecord[];
+  /** v2: work items of the loaded prompts. */
+  items?: PlannerItem[];
+  /** v2: MAX(passed_seq) over every train (terminal ones included): queue tickets stay monotonic. */
+  maxPassedSeq?: number;
+}
+
+/** Race policy inputs (HiveSettings.race + Guardrails + budget), for rework widths. */
+export interface RaceSettings {
+  reworkWidth: number;
+  hardWidth: number;
+  maxRaceWidth: number;
+  /** Build slots free when the plan starts (§2.3.1); the planner tracks its own usage. */
+  slotsFree: number;
+  /** Daily credits left (null = no budget check). */
+  remainingCredits?: number | null;
+}
+
+/** The queue.ts functions the planner calls (injectable for tests; default: queue.ts). */
+export interface QueueHooks {
+  formCars: typeof queue.formCars;
+  mergeResult: typeof queue.mergeResult;
+  carFailed: typeof queue.carFailed;
+  carLanded: typeof queue.carLanded;
+}
+
+export const DEFAULT_QUEUE_HOOKS: QueueHooks = {
+  formCars: queue.formCars,
+  mergeResult: queue.mergeResult,
+  carFailed: queue.carFailed,
+  carLanded: queue.carLanded,
+};
+
+/** Turns the merge queue on (passed builds board cars instead of landing directly). */
+export interface QueueOptions {
+  settings: queue.QueueSettings;
+  /** hive_settings.car_infra_failures. */
+  carInfraFailures?: number;
+  /** Car formation paused (open EXECUTOR_LOST). */
+  paused?: boolean;
+  hooks?: Partial<QueueHooks>;
 }
 
 export interface PlannerContext {
@@ -183,12 +286,22 @@ export interface PlannerContext {
   newId: () => string;
   /** Rework attempts allowed before a prompt is FAILED. Default 2. */
   maxReworks?: number;
+  /** Conflict reworks allowed before a prompt is FAILED (Guardrails.maxConflictReworks). Default 2. */
+  maxConflictReworks?: number;
   /** Watchdog: an outstanding command older than this is re-issued. Default 10 min. */
   commandTimeoutMs?: number;
   /** MODEL_ROUTER_PIN_BUILDER: force this model for builder / rework drones. */
   modelPin?: string | null;
   /** ROUTER_BACKOFF_STREAK / ROUTER_PROBE_AFTER. */
   routerPolicy?: RouterPolicy;
+  /** v2: rework race widths. Absent: reworks are single builds (v1). */
+  race?: RaceSettings;
+  /** v2: how long the other candidates get after a race's first pass. Default RACE_GRACE_MS. */
+  raceGraceMs?: number;
+  /** v2: the merge queue. Absent: passed builds land directly (Phase 1 default); car results are still handled. */
+  queue?: QueueOptions;
+  /** v2: item priority for car member order (default: HiveState.items, else 2). */
+  priorityOf?: (promptId: string) => number;
 }
 
 export type Effect =
@@ -216,16 +329,36 @@ export interface PlanResult {
   routerDispatches?: number;
   /** New floor state, when this plan moved it. */
   routerFloor?: FloorState;
+  /** v2: event_log drafts (train phases, races, queue). */
+  events: EventDraft[];
+  /** v2: changed race rows. */
+  races: RaceRecord[];
+  /** v2: what landed on main (a car: all its members; a direct landing: the train) → rp.landed. */
+  landed?: { sha: string; trainIds: string[] };
+  /** v2: paths to claim (source "conflict") on items whose member conflicted in a car (§2.3.5). */
+  conflictClaims: { itemId: string; paths: string[] }[];
+  /** v2: new work_items.conflicts per item (conflict reworks, D7). */
+  itemConflicts: { itemId: string; conflicts: number }[];
+  /** v2: new hive_settings.car_infra_failures, when it changed. */
+  carInfraFailures?: number;
+  /** v2: open EXECUTOR_LOST (subject hive) and pause car formation. */
+  executorLost?: boolean;
 }
 
 const TERMINAL: ReadonlySet<TrainPhase> = new Set(["MERGED", "EJECTED"]);
-/** Phases in which the builder has pushed, so a successor can fork from this train. */
+/** Phases in which a car has pushed, so the next car can fork from it. */
 const PUSHED: ReadonlySet<TrainPhase> = new Set(["DEPLOYING", "TESTING", "PASSED", "LANDING"]);
 /** Preview states that may have left a live (or half-created) Worker Preview behind. */
 const PREVIEW_EXISTS: ReadonlySet<DeployState> = new Set(["PENDING", "LIVE", "FAILED"]);
+const ACTOR = "queen";
 
 export function isActive(t: TrainRecord): boolean {
   return !TERMINAL.has(t.phase);
+}
+
+/** A QUEUE-lane train (merge car). Absent lane = BUILD. */
+export function isCar(t: Pick<TrainRecord, "lane">): boolean {
+  return t.lane === "QUEUE";
 }
 
 export function statusOf(phase: TrainPhase): TrainState {
@@ -259,6 +392,16 @@ export function commandAttempt(commandId: string | null): number {
   return commandId ? Number(/-(\d+)$/.exec(commandId)?.[1] ?? 0) : 0;
 }
 
+/** The trace a train belongs to: its item's, else derived from its prompt id (= item id). */
+export function traceOfTrain(t: Pick<TrainRecord, "traceId" | "promptId">): string {
+  return t.traceId ?? traceIdFromUuid(t.promptId);
+}
+
+/** W3C trace context for a command or drone instance of `t` (span = spanIdFor(key)). */
+export function traceFor(t: Pick<TrainRecord, "traceId" | "promptId">, key: string): TraceContext {
+  return { traceparent: traceparent(traceOfTrain(t), spanIdFor(key)) };
+}
+
 /** Command-id field -> its watchdog clock (setTrain stamps the clock when the id changes). */
 const ISSUED_AT = {
   forkCommandId: "forkIssuedAt",
@@ -289,18 +432,26 @@ export function outstandingSince(t: TrainRecord, now: number): number[] {
 }
 
 /**
- * When the DO alarm must next run for the watchdog: the earliest
- * `issuedAt + timeout` over every outstanding command, or null if none.
+ * When the DO alarm must next run: the earliest `issuedAt + timeout` over
+ * every outstanding command, or the earliest RACING race deadline (v2; pass
+ * `races`), or null if none.
  */
-export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: number, now: number): number | null {
-  const all = trains.flatMap((t) => outstandingSince(t, now));
-  return all.length ? Math.min(...all) + timeoutMs : null;
+export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: number, now: number, races: readonly RaceRecord[] = []): number | null {
+  const all = trains.flatMap((t) => outstandingSince(t, now)).map((x) => x + timeoutMs);
+  for (const r of races) if (r.state === "RACING" && r.deadlineAt !== null) all.push(r.deadlineAt);
+  return all.length ? Math.min(...all) : null;
 }
 
 export function previewDeploymentId(trainId: string): string {
   return `preview-${trainId}`;
 }
 
+/**
+ * The v1 War Room view of a train (the snapshot and `train.updated`). Kept
+ * v1-shaped on purpose (migrations.test: a v7 hive's snapshot is unchanged by
+ * v8–v11). v2 consumers use toMergeTrainV2 (WP2 switches the snapshot and
+ * broadcasts to it together with the dashboard).
+ */
 export function toMergeTrain(t: TrainRecord): MergeTrain {
   return {
     trainId: t.trainId,
@@ -321,6 +472,24 @@ export function toMergeTrain(t: TrainRecord): MergeTrain {
   };
 }
 
+/** toMergeTrain plus the v2 fields that are set (lane only for cars: absent = BUILD). */
+export function toMergeTrainV2(t: TrainRecord): MergeTrain {
+  const v2: Partial<MergeTrain> = {};
+  if (t.traceId) v2.traceId = t.traceId;
+  if (t.raceId) v2.raceId = t.raceId;
+  if (t.candidate !== null && t.candidate !== undefined) v2.candidate = t.candidate;
+  if (t.raceOutcome) v2.raceOutcome = t.raceOutcome;
+  if (t.score) v2.score = { ...t.score };
+  if (t.lane === "QUEUE") v2.lane = "QUEUE";
+  if (t.members) v2.members = [...t.members];
+  if (t.carId) v2.carId = t.carId;
+  if (t.passedSeq !== null && t.passedSeq !== undefined) v2.passedSeq = t.passedSeq;
+  if (t.conflict) v2.conflict = { ...t.conflict, paths: [...t.conflict.paths] };
+  if (t.changedPaths) v2.changedPaths = [...t.changedPaths];
+  if (t.waitForCarSeq !== null && t.waitForCarSeq !== undefined) v2.waitForCarSeq = t.waitForCarSeq;
+  return { ...toMergeTrain(t), ...v2 };
+}
+
 export function toPromptRun(p: PromptRecord): PromptRun {
   return {
     promptId: p.promptId,
@@ -331,45 +500,97 @@ export function toPromptRun(p: PromptRecord): PromptRun {
   };
 }
 
+function copyTrain(t: TrainRecord): TrainRecord {
+  return {
+    ...t,
+    includedPrompts: [...t.includedPrompts],
+    memories: [...(t.memories ?? [])],
+    ...(t.members ? { members: [...t.members] } : {}),
+    ...(t.changedPaths ? { changedPaths: [...t.changedPaths] } : {}),
+  };
+}
+
+/** How a fail() came about, for the rework it triggers. */
+interface FailOptions {
+  /** conflict → conflicts + 1 (D7), not attempts; integration / default → attempts + 1. */
+  cause?: "conflict" | "integration";
+  waitForCarSeq?: number | null;
+  conflict?: MergeConflict | null;
+  /** For a car: a gate verdict (bisect) or infrastructure. Default infra. */
+  carCause?: queue.CarFailureCause;
+}
+
 export class TrainPlanner {
   private readonly prompts = new Map<string, PromptRecord>();
   private readonly trains: TrainRecord[];
   private maxTrainSeq: number;
   private maxPromptSeq: number;
+  private maxPassedSeq: number;
   private readonly maxReworks: number;
+  private readonly maxConflictReworks: number;
   private readonly timeoutMs: number;
   private readonly dirtyPrompts = new Map<string, boolean>(); // id -> broadcast?
   private readonly dirtyTrains = new Map<string, boolean>();
   private readonly deployments = new Map<string, Deployment>();
   private readonly dirtyDeployments = new Set<string>();
+  private readonly races = new Map<string, RaceRecord>();
+  private readonly dirtyRaces = new Set<string>();
+  private readonly items = new Map<string, PlannerItem>();
+  private readonly conflicts = new Map<string, number>();
+  private readonly dirtyConflicts = new Set<string>();
   private effects: Effect[] = [];
+  private events: EventDraft[] = [];
+  private landed: { sha: string; trainIds: string[] } | null = null;
+  private conflictClaims: { itemId: string; paths: string[] }[] = [];
   private modelDeltas: ModelStatDelta[] = [];
   private readonly modelStats: RouterStats[];
   private routerDispatches: number;
   private routerDirty = false;
   private floor: FloorState;
   private floorDirty = false;
+  private carInfraFailures: number;
+  private carInfraDirty = false;
+  private executorLost = false;
+  private readonly hooks: QueueHooks;
+  private readonly activeBuildsAtStart: number;
+  private landing = false;
+  private landAgain = false;
 
   constructor(
     state: HiveState,
     private readonly ctx: PlannerContext,
   ) {
     for (const p of state.prompts) this.prompts.set(p.promptId, { ...p });
-    this.trains = state.trains.map((t) => ({ ...t, includedPrompts: [...t.includedPrompts], memories: [...(t.memories ?? [])] }));
+    this.trains = state.trains.map(copyTrain);
     for (const d of state.deployments ?? []) this.deployments.set(d.deploymentId, { ...d });
+    for (const r of state.races ?? []) this.races.set(r.raceId, { ...r, trainIds: [...r.trainIds] });
+    for (const i of state.items ?? []) {
+      this.items.set(i.itemId, { ...i });
+      if (i.conflicts !== undefined) this.conflicts.set(i.itemId, i.conflicts);
+    }
     this.maxTrainSeq = state.maxTrainSeq;
     this.maxPromptSeq = state.maxPromptSeq;
+    this.maxPassedSeq = Math.max(state.maxPassedSeq ?? 0, ...this.trains.map((t) => t.passedSeq ?? 0));
     this.modelStats = state.modelStats ?? [];
     this.routerDispatches = state.routerDispatches ?? 0;
     this.floor = { ...(state.routerFloor ?? INITIAL_FLOOR) };
     this.maxReworks = ctx.maxReworks ?? 2;
+    this.maxConflictReworks = ctx.maxConflictReworks ?? DEFAULT_MAX_CONFLICT_REWORKS;
     this.timeoutMs = ctx.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    this.carInfraFailures = ctx.queue?.carInfraFailures ?? 0;
+    this.hooks = { ...DEFAULT_QUEUE_HOOKS, ...(ctx.queue?.hooks ?? {}) };
+    this.activeBuildsAtStart = this.activeBuilds();
   }
 
   // ── public transitions ────────────────────────────────────────────────
 
-  /** A new prompt joins the tail of the queue. */
-  submit(input: { promptId: string; promptText: string }): PlanResult {
+  /**
+   * A prompt (a dispatched work item: promptId = itemId) gets its BUILD
+   * train(s), forked from hive main at once. `raceWidth` > 1 starts a race
+   * (the caller applied race.raceWidth(); the planner narrows it to the
+   * number of distinct models the router can offer).
+   */
+  submit(input: { promptId: string; promptText: string; raceWidth?: number; difficulty?: "normal" | "hard" }): PlanResult {
     const prompt: PromptRecord = {
       promptId: input.promptId,
       namespace: this.ctx.namespace,
@@ -382,7 +603,7 @@ export class TrainPlanner {
     };
     this.prompts.set(prompt.promptId, prompt);
     this.markPrompt(prompt);
-    this.enqueue(prompt, "BUILD");
+    this.enqueue(prompt, "BUILD", input.raceWidth ?? 1);
     return this.finish("applied");
   }
 
@@ -396,7 +617,7 @@ export class TrainPlanner {
   private forkResult(t: TrainRecord, r: ProvisionResult): PlanResult {
     if (r.commandId !== t.forkCommandId) return this.finish("ignored:stale"); // an older attempt
     if (!isActive(t)) {
-      // Superseded while the fork was in flight: a created fork is an orphan.
+      // Ejected while the fork was in flight: a created fork is an orphan.
       if (r.ok && t.forkState !== "DELETING") this.deleteFork(t);
       return this.finish("ignored:stale");
     }
@@ -413,7 +634,7 @@ export class TrainPlanner {
       dispatched: false,
       droneAttempt: 1,
     });
-    this.setPromptStatus(t.promptId, "BUILDING");
+    this.promptStatus(t, "BUILDING");
     this.dispatchBuilder(t);
     return this.finish("applied");
   }
@@ -425,7 +646,7 @@ export class TrainPlanner {
       this.setTrain(t, { phase: "WAITING_PARENT", forkState: "NONE" }, false);
       this.scheduleFork(t);
     } else {
-      this.setPromptSummary(t.promptId, summary);
+      this.promptSummary(t, summary);
       this.fail(t, `fork failed: ${summary}`);
     }
   }
@@ -477,8 +698,8 @@ export class TrainPlanner {
   private previewFailed(t: TrainRecord, summary: string, commitSha: string | null, versionId: string | null): void {
     this.setTrain(t, { deployState: "FAILED" }, false);
     this.setDeployment(t, { status: "FAILED", summary, commitSha, versionId });
-    this.setPromptSummary(t.promptId, summary);
-    this.fail(t, `preview deploy failed: ${summary}`);
+    this.promptSummary(t, summary);
+    this.fail(t, `preview deploy failed: ${summary}`, { carCause: "infra" });
   }
 
   private previewTornDown(t: TrainRecord, r: DeployResult): PlanResult {
@@ -506,53 +727,84 @@ export class TrainPlanner {
     return this.finish("applied");
   }
 
-  /**
-   * A builder pushed the train head: deploy its preview (DEPLOYING), and let
-   * the successor fork from it right away (chaining does not wait on deploys).
-   */
+  /** A builder pushed the BUILD train head: deploy its preview (DEPLOYING). Nothing forks from a build train. */
   buildResult(r: BuildResult): PlanResult {
     const t = this.find(r.trainId);
-    if (!t) return this.finish("ignored:unknown");
+    if (!t || isCar(t)) return this.finish("ignored:unknown"); // cars report mergeResult
     if (!isActive(t)) return this.finish("ignored:stale");
     if (t.phase !== "BUILDING") return this.finish("ignored:duplicate");
     if (t.forkState !== "READY") return this.finish("ignored:premature");
     this.recordBuild(t, r);
-    this.setTrain(t, { phase: "DEPLOYING", headSha: r.headSha });
-    this.setPromptStatus(t.promptId, "IN_TRAIN");
+    this.setTrain(t, {
+      phase: "DEPLOYING",
+      headSha: r.headSha,
+      ...(r.changedPaths ? { changedPaths: [...r.changedPaths] } : {}),
+      ...(r.verified !== undefined ? { verified: r.verified } : {}),
+    });
+    this.promptStatus(t, "IN_TRAIN");
     this.deployPreview(t);
-    this.scheduleSuccessor(t);
     return this.finish("applied");
   }
 
-  /** A gatekeeper reports the speculative test verdict. */
+  /** The MERGE drone's report for a car (`trainId` = car id). Guards as buildResult's. */
+  mergeResult(r: MergeResult): PlanResult {
+    const car = this.find(r.trainId);
+    if (!car || !isCar(car)) return this.finish("ignored:unknown");
+    if (!isActive(car)) return this.finish("ignored:stale");
+    if (car.phase !== "BUILDING") return this.finish("ignored:duplicate");
+    if (car.forkState !== "READY") return this.finish("ignored:premature");
+    this.applyQueue(this.hooks.mergeResult(car, r, this.trains, this.queueContext()));
+    if (isActive(car) && car.phase === "BUILDING") {
+      // The queue left the car where it was (e.g. ok:false without a decision): an infra failure.
+      this.fail(car, r.summary || "MERGE drone failed (nothing pushed)", { carCause: "infra" });
+    }
+    this.maybeLand();
+    return this.finish("applied");
+  }
+
+  /** A gatekeeper reports the test verdict (a BUILD train's full gate, or a car's integration gate). */
   trainResult(r: TrainResult): PlanResult {
     const t = this.find(r.trainId);
     if (!t) return this.finish("ignored:unknown");
     if (!isActive(t)) return this.finish("ignored:stale");
     if (t.phase === "PASSED" || t.phase === "LANDING") return this.finish("ignored:duplicate");
+    if (t.raceOutcome === "PASSED") return this.finish("ignored:duplicate"); // a race candidate already passed
     if (t.phase === "WAITING_PARENT" || t.forkState !== "READY") {
       return this.finish("ignored:premature");
     }
     // A pass must come from testing the live preview; a failure (e.g. the
     // builder giving up) is honoured in any phase.
     if (r.passed && t.phase !== "TESTING") return this.finish("ignored:premature");
-    this.setPromptSummary(t.promptId, r.summary);
+    if (isCar(t)) {
+      if (!r.passed) {
+        this.fail(t, r.summary, { carCause: "gate" });
+      } else {
+        this.setTrain(t, { phase: "PASSED", summary: r.summary, headSha: r.commitSha ?? t.headSha, ...(r.score ? { score: r.score } : {}) });
+        this.maybeLand();
+      }
+      return this.finish("applied");
+    }
+    this.promptSummary(t, r.summary);
     this.recordVerdict(t, r.passed);
     if (!r.passed) {
+      this.setTrain(t, { summary: r.summary, ...(r.score ? { score: r.score } : {}) }, false);
       this.fail(t, r.summary);
       return this.finish("applied");
     }
-    this.setTrain(t, {
-      phase: "PASSED",
-      summary: r.summary,
-      headSha: r.commitSha ?? t.headSha,
-    });
-    this.setPromptStatus(t.promptId, "IN_TRAIN");
+    const race = this.racingRaceOf(t);
+    if (race) {
+      // A candidate stays in TESTING until the race is decided.
+      this.setTrain(t, { raceOutcome: "PASSED", summary: r.summary, headSha: r.commitSha ?? t.headSha, score: r.score ?? null });
+      if (race.deadlineAt === null) this.setRace(race, { deadlineAt: this.ctx.now + (this.ctx.raceGraceMs ?? RACE_GRACE_MS) });
+      this.maybeDecide(race);
+      return this.finish("applied");
+    }
+    this.pass(t, { summary: r.summary, headSha: r.commitSha ?? t.headSha, ...(r.score ? { score: r.score } : {}) });
     this.maybeLand();
     return this.finish("applied");
   }
 
-  /** The lander confirms (or fails) the push of the train head to hive main. */
+  /** The lander confirms (or fails) the push of a head (a car's, or a direct-landing build's) to hive main. */
   landResult(r: LandResult): PlanResult {
     const t = this.find(r.trainId);
     if (!t) return this.finish("ignored:unknown");
@@ -562,25 +814,35 @@ export class TrainPlanner {
       this.landFailed(t, r.summary || "lander could not push the train head to main");
       return this.finish("applied");
     }
-    this.setTrain(t, { phase: "MERGED", landedSha: r.mainSha ?? null });
-    this.deleteFork(t);
-    this.teardownPreview(t);
-    this.setPromptStatus(t.promptId, "MERGED");
-    if (r.summary) this.setPromptSummary(t.promptId, r.summary);
+    const sha = r.mainSha ?? t.headSha ?? null;
+    if (isCar(t)) {
+      this.applyQueue(this.hooks.carLanded(t, sha ?? "", this.trains, this.queueContext()));
+      if (isActive(t)) this.setTrain(t, { phase: "MERGED", landedSha: sha });
+      this.cleanUp(t); // the car's own fork and preview (idempotent: applyQueue may have issued them)
+      const members = (t.members ?? []).filter((id) => this.find(id)?.phase === "MERGED");
+      if (sha) this.landed = { sha, trainIds: members };
+    } else {
+      this.setTrain(t, { phase: "MERGED", landedSha: r.mainSha ?? null });
+      this.deleteFork(t);
+      this.teardownPreview(t);
+      this.promptStatus(t, "MERGED");
+      if (r.summary) this.promptSummary(t, r.summary);
+      if (sha) this.landed = { sha, trainIds: [t.trainId] };
+    }
     this.maybeLand();
     return this.finish("applied");
   }
 
   private landFailed(t: TrainRecord, summary: string): void {
-    this.setPromptSummary(t.promptId, summary);
-    this.fail(t, summary);
+    this.promptSummary(t, summary);
+    this.fail(t, summary, { carCause: "infra" });
   }
 
   /**
    * Crash / failure recovery (DO alarm). First the watchdog (see watchdog()),
    * then re-dispatch every pending command (same command id, so a command
    * that did start is not started twice), re-deriving a pending fork's
-   * source, plus undispatched drones.
+   * source, plus undispatched drones; then due race deadlines and the queue.
    */
   reconcile(): PlanResult {
     this.watchdog();
@@ -600,7 +862,7 @@ export class TrainPlanner {
       } else if (t.forkState === "PENDING") {
         const source = this.forkSourceFor(t);
         if (source === null) {
-          // Predecessor was superseded/re-queued: wait for the new one.
+          // A car whose predecessor was ejected / re-formed: wait for the new one.
           this.setTrain(t, { phase: "WAITING_PARENT", forkState: "NONE", forkSource: null });
         } else {
           if (source !== t.forkSource || !t.forkCommandId) {
@@ -618,6 +880,9 @@ export class TrainPlanner {
       } else if (t.phase === "LANDING" && !t.dispatched) {
         this.dispatchLander(t);
       }
+    }
+    for (const race of [...this.races.values()]) {
+      if (race.state === "RACING") this.maybeDecide(race);
     }
     this.maybeLand();
     return this.finish("applied");
@@ -653,7 +918,7 @@ export class TrainPlanner {
         else this.previewFailed(t, late("Herald DEPLOY", t.deployCommandId), t.headSha, null);
       } else if (droneOutstanding(t) && expired(t.droneIssuedAt)) {
         const lander = t.phase === "LANDING";
-        const summary = late(lander ? "LANDER drone" : "BUILDER drone", null);
+        const summary = late(lander ? "LANDER drone" : isCar(t) ? "MERGE drone" : "BUILDER drone", null);
         if (t.droneAttempt < MAX_COMMAND_ATTEMPTS) {
           this.setTrain(t, { dispatched: false, droneAttempt: t.droneAttempt + 1 }, false);
           if (lander) this.dispatchLander(t);
@@ -661,83 +926,160 @@ export class TrainPlanner {
         } else if (lander) {
           this.landFailed(t, summary);
         } else {
-          // Same path as a builder giving up (a failed trainResult).
-          this.setPromptSummary(t.promptId, summary);
-          this.fail(t, summary);
+          // Same path as a builder giving up (a failed trainResult); a car: infra.
+          this.promptSummary(t, summary);
+          this.fail(t, summary, { carCause: "infra" });
         }
       }
     }
   }
 
-  // ── internals ─────────────────────────────────────────────────────────
+  // ── internals: lanes ──────────────────────────────────────────────────
 
   private active(): TrainRecord[] {
     return this.trains.filter(isActive).sort((a, b) => a.seq - b.seq);
+  }
+
+  /** Active QUEUE cars in seq order. */
+  private cars(): TrainRecord[] {
+    return this.active().filter(isCar);
+  }
+
+  /** Active BUILD trains (slots, §2.3.1). */
+  private activeBuilds(): number {
+    return this.trains.filter((t) => isActive(t) && !isCar(t)).length;
   }
 
   private find(trainId: string): TrainRecord | undefined {
     return this.trains.find((t) => t.trainId === trainId);
   }
 
-  private predecessor(t: TrainRecord): TrainRecord | undefined {
-    return this.active()
-      .filter((x) => x.seq < t.seq)
-      .at(-1);
+  private item(promptId: string): PlannerItem | undefined {
+    return this.items.get(promptId);
   }
 
-  /** Repo to fork from, or null when the predecessor has not pushed yet. */
+  /**
+   * Repo to fork from, or null to wait:
+   * - BUILD: hive main, unless a conflict / integration rework still waits for
+   *   a car with seq ≤ waitForCarSeq to become terminal;
+   * - QUEUE: the car ahead once it has pushed (null until then), or main.
+   */
   private forkSourceFor(t: TrainRecord): string | null {
-    const parent = this.predecessor(t);
-    if (!parent) return this.ctx.namespace;
-    return PUSHED.has(parent.phase) ? parent.artifactRepo : null;
+    if (isCar(t)) {
+      const ahead = this.cars()
+        .filter((c) => c.seq < t.seq)
+        .at(-1);
+      if (!ahead) return this.ctx.namespace;
+      return PUSHED.has(ahead.phase) ? ahead.artifactRepo : null;
+    }
+    const wait = t.waitForCarSeq;
+    if (wait !== null && wait !== undefined && this.cars().some((c) => c.seq <= wait)) return null;
+    return this.ctx.namespace;
   }
 
-  private enqueue(prompt: PromptRecord, action: TrainAction): TrainRecord {
-    const ahead = this.active().map((t) => t.promptId);
-    const trainId = this.ctx.newId();
-    const train: TrainRecord = {
-      trainId,
-      baseSha: "", // resolved from the fork once it exists
-      includedPrompts: [...ahead, prompt.promptId],
-      artifactRepo: trainRepoName(this.ctx.namespace, trainId),
-      status: "BUILDING",
-      createdAt: this.ctx.now,
-      seq: ++this.maxTrainSeq,
-      promptId: prompt.promptId,
-      phase: "WAITING_PARENT",
-      forkState: "NONE",
-      forkSource: null,
-      headSha: null,
-      landedSha: null,
-      summary: null,
-      reason: null,
-      action,
-      dispatched: false,
-      forkCommandId: null,
-      deleteCommandId: null,
-      deployState: "NONE",
-      deployCommandId: null,
-      teardownCommandId: null,
-      previewUrl: null,
-      forkIssuedAt: null,
-      deleteIssuedAt: null,
-      deployIssuedAt: null,
-      teardownIssuedAt: null,
-      droneIssuedAt: null,
-      droneAttempt: 1,
-      model: null,
-      modelReason: null,
-      modelChoice: null,
-      modelChoiceAttempt: null,
-      modelOutcome: null,
-      modelProbe: false,
-      memories: [],
-    };
-    this.trains.push(train);
-    this.markTrain(train);
+  /** Build slots still free for rework races (the plan's own usage included). */
+  private slotsFree(): number {
+    const base = this.ctx.race?.slotsFree ?? Number.POSITIVE_INFINITY;
+    return base + this.activeBuildsAtStart - this.activeBuilds();
+  }
+
+  private enqueue(prompt: PromptRecord, action: TrainAction, width = 1, opts: { waitForCarSeq?: number | null } = {}): TrainRecord[] {
+    const item = this.item(prompt.promptId);
+    const traceId = item?.traceId ?? traceIdFromUuid(prompt.promptId);
+    let choices: ModelChoice[] = [];
+    if (width > 1) {
+      choices = this.routeRaceFor(prompt, action, width);
+      width = choices.length;
+    }
+    const raceId = width > 1 ? this.ctx.newId() : null;
+    const created: TrainRecord[] = [];
+    for (let candidate = 0; candidate < width; candidate++) {
+      const trainId = this.ctx.newId();
+      const choice = raceId ? choices[candidate]! : null;
+      const train: TrainRecord = {
+        trainId,
+        baseSha: "", // resolved from the fork once it exists
+        includedPrompts: [prompt.promptId],
+        artifactRepo: trainRepoName(this.ctx.namespace, trainId),
+        status: "BUILDING",
+        createdAt: this.ctx.now,
+        seq: ++this.maxTrainSeq,
+        promptId: prompt.promptId,
+        phase: "WAITING_PARENT",
+        forkState: "NONE",
+        forkSource: null,
+        headSha: null,
+        landedSha: null,
+        summary: null,
+        reason: null,
+        action,
+        dispatched: false,
+        forkCommandId: null,
+        deleteCommandId: null,
+        deployState: "NONE",
+        deployCommandId: null,
+        teardownCommandId: null,
+        previewUrl: null,
+        forkIssuedAt: null,
+        deleteIssuedAt: null,
+        deployIssuedAt: null,
+        teardownIssuedAt: null,
+        droneIssuedAt: null,
+        droneAttempt: 1,
+        model: choice?.model ?? null,
+        modelReason: choice?.reason ?? null,
+        modelChoice: choice,
+        modelChoiceAttempt: choice ? 1 : null,
+        modelOutcome: null,
+        modelProbe: false,
+        memories: [],
+        traceId,
+        lane: "BUILD",
+        raceId,
+        candidate: raceId ? candidate : null,
+        raceOutcome: raceId ? "RACING" : null,
+        carId: null,
+        passedSeq: null,
+        waitForCarSeq: opts.waitForCarSeq ?? null,
+      };
+      this.trains.push(train);
+      this.markTrain(train);
+      created.push(train);
+      this.event(train, {
+        type: "train.enqueued",
+        summary: `${action} train ${trainId} for ${prompt.promptId}${raceId ? ` (race ${raceId} candidate ${candidate + 1}/${width})` : ""}`,
+        data: { action, lane: "BUILD", raceId, candidate: raceId ? candidate : null, waitForCarSeq: opts.waitForCarSeq ?? null, model: choice?.model ?? null },
+      });
+    }
+    if (raceId) {
+      const race: RaceRecord = {
+        raceId,
+        itemId: prompt.promptId,
+        width,
+        state: "RACING",
+        trainIds: created.map((t) => t.trainId),
+        winnerTrainId: null,
+        reason: null,
+        deadlineAt: null,
+        createdAt: this.ctx.now,
+        decidedAt: null,
+      };
+      this.races.set(raceId, race);
+      this.dirtyRaces.add(raceId);
+      this.events.push({
+        type: "race.started",
+        actor: ACTOR,
+        traceId,
+        spanId: spanIdFor(raceId),
+        parentSpanId: spanIdFor(prompt.promptId),
+        itemId: prompt.promptId,
+        summary: `race ${raceId}: ${width} candidates on ${choices.map((c) => c.model).join(", ")}`,
+        data: { raceId, trainIds: race.trainIds, models: choices.map((c) => c.model), action },
+      });
+    }
     this.setPromptStatus(prompt.promptId, "QUEUED");
-    this.scheduleFork(train);
-    return train;
+    for (const t of created) this.scheduleFork(t);
+    return created;
   }
 
   private scheduleFork(t: TrainRecord): void {
@@ -753,6 +1095,11 @@ export class TrainPlanner {
     this.emitFork(t);
   }
 
+  /** Fork every train that can now (a waiting rework whose car ended, a car whose predecessor pushed). */
+  private kick(): void {
+    for (const t of this.active()) if (t.phase === "WAITING_PARENT") this.scheduleFork(t);
+  }
+
   private emitFork(t: TrainRecord): void {
     this.effects.push({
       type: "provision",
@@ -765,12 +1112,14 @@ export class TrainPlanner {
         sourceRepo: t.forkSource!,
         forkName: t.artifactRepo,
         ...this.recallQuery(t),
+        trace: traceFor(t, t.forkCommandId!),
       },
     });
   }
 
-  /** What the Provisioner recalls hive memories for: the train's prompt (a pure function of it, so re-dispatches match). */
+  /** What the Provisioner recalls hive memories for: the train's prompt (a pure function of it, so re-dispatches match). Cars recall nothing. */
   private recallQuery(t: TrainRecord): { recallQuery?: string } {
+    if (isCar(t)) return {};
     const text = this.prompts.get(t.promptId)?.promptText;
     return text ? { recallQuery: text.slice(0, MAX_RECALL_QUERY) } : {};
   }
@@ -779,7 +1128,7 @@ export class TrainPlanner {
     this.effects.push({
       type: "provision",
       trainId: t.trainId,
-      command: { op: "DELETE", commandId: t.deleteCommandId!, hive: this.ctx.namespace, trainId: t.trainId, repo: t.artifactRepo },
+      command: { op: "DELETE", commandId: t.deleteCommandId!, hive: this.ctx.namespace, trainId: t.trainId, repo: t.artifactRepo, trace: traceFor(t, t.deleteCommandId!) },
     });
   }
 
@@ -802,6 +1151,7 @@ export class TrainPlanner {
         trainId: t.trainId,
         artifactRepo: t.artifactRepo,
         commitSha: t.headSha!,
+        trace: traceFor(t, t.deployCommandId!),
       },
     });
   }
@@ -822,7 +1172,7 @@ export class TrainPlanner {
     this.effects.push({
       type: "deploy",
       trainId: t.trainId,
-      command: { op: "TEARDOWN", commandId: t.teardownCommandId!, hive: this.ctx.namespace, environment: "preview", trainId: t.trainId },
+      command: { op: "TEARDOWN", commandId: t.teardownCommandId!, hive: this.ctx.namespace, environment: "preview", trainId: t.trainId, trace: traceFor(t, t.teardownCommandId!) },
     });
   }
 
@@ -845,53 +1195,123 @@ export class TrainPlanner {
     this.dirtyDeployments.add(id);
   }
 
-  private scheduleSuccessor(t: TrainRecord): void {
-    const next = this.active().find((x) => x.seq > t.seq);
+  /** A car pushed: the car behind it can fork from it. */
+  private scheduleSuccessor(car: TrainRecord): void {
+    const next = this.cars().find((x) => x.seq > car.seq);
     if (next) this.scheduleFork(next);
   }
 
-  private maybeLand(): void {
-    const head = this.active()[0];
-    if (head?.phase !== "PASSED") return;
-    this.setTrain(head, { phase: "LANDING", dispatched: false, droneAttempt: 1 });
-    this.dispatchLander(head);
+  /** A BUILD train passed its gate (or won its race): it takes a queue ticket and waits to board. */
+  private pass(t: TrainRecord, patch: Partial<TrainRecord>): void {
+    this.setTrain(t, { ...patch, phase: "PASSED", passedSeq: ++this.maxPassedSeq });
+    this.promptStatus(t, "IN_TRAIN");
   }
 
-  private fail(t: TrainRecord, summary: string): void {
-    const queue = this.active();
-    const idx = queue.indexOf(t);
-    this.eject(t, `failed: ${summary}`);
-    const superseded = queue
-      .slice(idx + 1)
-      .filter((s) => s.includedPrompts.includes(t.promptId));
-    for (const s of superseded) {
-      this.eject(s, `superseded: prompt ${t.promptId} ejected from train ${t.trainId}`);
+  /** Re-entrancy-safe: fail() inside a queue decision may ask to land again. */
+  private maybeLand(): void {
+    if (this.landing) {
+      this.landAgain = true;
+      return;
     }
-    // Successors slide forward, re-forked from the nearest survivor (or main).
-    for (const s of superseded) {
-      const p = this.prompts.get(s.promptId);
-      if (p) this.enqueue(p, s.action);
+    this.landing = true;
+    try {
+      let rounds = 0;
+      do {
+        this.landAgain = false;
+        this.landStep();
+      } while (this.landAgain && ++rounds < 16);
+    } finally {
+      this.landing = false;
     }
-    // The failed prompt is ejected, then re-enters the queue as a rework.
-    const failed = this.prompts.get(t.promptId);
-    if (failed) {
-      failed.attempts += 1;
-      this.setPromptStatus(failed.promptId, "EJECTED");
-      this.effects.push({
-        type: "broadcast",
-        message: { type: "prompt.updated", promptRun: toPromptRun(failed) },
-      });
-      if (failed.attempts > this.maxReworks) {
-        this.setPromptStatus(failed.promptId, "FAILED");
-      } else {
-        this.enqueue(failed, "REWORK");
+  }
+
+  private landStep(): void {
+    if (this.ctx.queue) {
+      // Passed builds board cars; the head car lands once every car ahead merged.
+      this.applyQueue(this.hooks.formCars(this.trains, this.queueContext()));
+      const head = this.cars()[0];
+      if (head?.phase === "PASSED") {
+        this.setTrain(head, { phase: "LANDING", dispatched: false, droneAttempt: 1 });
+        this.dispatchLander(head);
+      }
+    } else if (!this.active().some((t) => !isCar(t) && t.phase === "LANDING")) {
+      // Direct landing (no merge queue): one build at a time, in ticket order.
+      const next = this.active()
+        .filter((t) => !isCar(t) && t.phase === "PASSED")
+        .sort((a, b) => (a.passedSeq ?? Number.MAX_SAFE_INTEGER) - (b.passedSeq ?? Number.MAX_SAFE_INTEGER) || a.seq - b.seq)[0];
+      if (next) {
+        this.setTrain(next, { phase: "LANDING", dispatched: false, droneAttempt: 1 });
+        this.dispatchLander(next);
       }
     }
+    this.kick();
+  }
+
+  // ── internals: failure ────────────────────────────────────────────────
+
+  private fail(t: TrainRecord, summary: string, opts: FailOptions = {}): void {
+    if (!isActive(t)) return;
+    if (isCar(t)) {
+      this.failCar(t, summary, opts.carCause ?? "infra");
+      return;
+    }
+    const race = opts.cause ? undefined : this.racingRaceOf(t);
+    if (race) {
+      this.raceCandidateFailed(t, race, summary);
+      return;
+    }
+    this.eject(t, `failed: ${summary}`, opts.conflict ? { conflict: opts.conflict } : {});
+    this.rework(t.promptId, opts);
     this.maybeLand();
   }
 
-  private eject(t: TrainRecord, reason: string): void {
-    this.setTrain(t, { phase: "EJECTED", reason });
+  /** The prompt's train failed: EJECTED, then a REWORK (or FAILED past the cap). */
+  private rework(promptId: string, opts: FailOptions = {}): void {
+    const failed = this.prompts.get(promptId);
+    if (!failed) return;
+    let exhausted: boolean;
+    if (opts.cause === "conflict") {
+      const n = (this.conflicts.get(promptId) ?? 0) + 1;
+      this.conflicts.set(promptId, n);
+      this.dirtyConflicts.add(promptId);
+      exhausted = n > this.maxConflictReworks;
+    } else {
+      failed.attempts += 1;
+      exhausted = failed.attempts > this.maxReworks;
+    }
+    this.setPromptStatus(failed.promptId, "EJECTED");
+    this.effects.push({
+      type: "broadcast",
+      message: { type: "prompt.updated", promptRun: toPromptRun(failed) },
+    });
+    if (exhausted) {
+      this.setPromptStatus(failed.promptId, "FAILED");
+    } else {
+      this.enqueue(failed, "REWORK", this.reworkWidth(failed), { waitForCarSeq: opts.waitForCarSeq ?? null });
+    }
+  }
+
+  private reworkWidth(p: PromptRecord): number {
+    const race = this.ctx.race;
+    if (!race) return 1;
+    return raceWidth({
+      action: "REWORK",
+      bestOf: this.item(p.promptId)?.bestOf ?? null,
+      modelPin: this.ctx.modelPin ?? null,
+      race,
+      maxRaceWidth: race.maxRaceWidth,
+      slotsFree: this.slotsFree(),
+      remainingCredits: race.remainingCredits ?? null,
+    });
+  }
+
+  private eject(t: TrainRecord, reason: string, extra: Partial<TrainRecord> = {}): void {
+    this.setTrain(t, { ...extra, phase: "EJECTED", reason });
+    this.cleanUp(t);
+  }
+
+  /** Delete the fork and tear the preview down, unless that is already under way. */
+  private cleanUp(t: TrainRecord): void {
     if (t.forkState === "PENDING" || t.forkState === "READY") this.deleteFork(t);
     if (PREVIEW_EXISTS.has(t.deployState)) this.teardownPreview(t);
   }
@@ -901,27 +1321,296 @@ export class TrainPlanner {
     this.emitDelete(t);
   }
 
+  // ── internals: merge queue ────────────────────────────────────────────
+
+  private queueContext(): queue.QueueContext {
+    return {
+      namespace: this.ctx.namespace,
+      now: this.ctx.now,
+      newId: this.ctx.newId,
+      settings: this.ctx.queue?.settings ?? { maxQueueBatch: 1, maxQueueDepth: 1 },
+      priorityOf: this.ctx.priorityOf ?? ((promptId) => this.item(promptId)?.priority ?? 2),
+      carInfraFailures: this.carInfraFailures,
+      paused: (this.ctx.queue?.paused ?? false) || this.executorLost,
+    };
+  }
+
+  /** A car failed: queue.carFailed decides (supersede, bisect, integration rework, infra count). */
+  private failCar(car: TrainRecord, summary: string, cause: queue.CarFailureCause): void {
+    this.applyQueue(this.hooks.carFailed(car, summary, cause, this.trains, this.queueContext()));
+    if (isActive(car)) this.eject(car, `failed: ${summary}`);
+    this.maybeLand();
+  }
+
+  /**
+   * Apply a queue decision: materialise new cars, apply patches through
+   * setTrain (then react to phase changes: car pushed → preview + successor;
+   * member MERGED → prompt MERGED), take the queue's own effects and events
+   * (its fork DELETEs / TEARDOWNs of trains it ejected or merged), then fail()
+   * each MemberFailure.
+   */
+  private applyQueue(d: queue.QueueDecision): void {
+    const moved: [TrainRecord, TrainPhase][] = [];
+    for (const { trainId, patch } of d.patches) {
+      const t = this.find(trainId);
+      if (!t) continue;
+      const before = t.phase;
+      this.setTrain(t, patch);
+      if (t.phase !== before) moved.push([t, before]);
+    }
+    this.effects.push(...d.effects);
+    this.events.push(...d.events);
+    if (d.carInfraFailures !== undefined && d.carInfraFailures !== this.carInfraFailures) {
+      this.carInfraFailures = d.carInfraFailures;
+      this.carInfraDirty = true;
+    }
+    if (d.executorLost) this.executorLost = true;
+    for (const draft of d.cars) this.materializeCar(draft);
+    for (const [t] of moved) {
+      if (isCar(t)) {
+        if (t.phase === "DEPLOYING" && t.deployState === "NONE") this.deployPreview(t);
+        if (PUSHED.has(t.phase)) this.scheduleSuccessor(t);
+      } else if (t.phase === "MERGED") {
+        this.promptStatus(t, "MERGED");
+      }
+      if (!isActive(t)) this.cleanUp(t); // no-op when the queue already issued the commands
+    }
+    for (const f of d.failures) {
+      const t = this.find(f.trainId);
+      if (!t || !isActive(t)) continue;
+      this.promptSummary(t, f.summary);
+      if (f.claimPaths.length) this.conflictClaims.push({ itemId: t.promptId, paths: [...f.claimPaths] });
+      this.fail(t, f.summary, { cause: f.cause, waitForCarSeq: f.waitForCarSeq, conflict: f.conflict });
+    }
+  }
+
+  private materializeCar(draft: queue.CarDraft): void {
+    if (this.find(draft.carId)) return;
+    const members = draft.members.map((id) => this.find(id)).filter((t): t is TrainRecord => !!t);
+    const first = members[0];
+    const car: TrainRecord = {
+      trainId: draft.carId,
+      baseSha: "",
+      includedPrompts: [...draft.includedPrompts],
+      artifactRepo: trainRepoName(this.ctx.namespace, draft.carId),
+      status: "BUILDING",
+      createdAt: this.ctx.now,
+      seq: ++this.maxTrainSeq,
+      promptId: first?.promptId ?? draft.includedPrompts.at(-1) ?? draft.carId,
+      phase: "WAITING_PARENT",
+      forkState: "NONE",
+      forkSource: null,
+      headSha: null,
+      landedSha: null,
+      summary: null,
+      reason: null,
+      action: "BUILD",
+      dispatched: false,
+      forkCommandId: null,
+      deleteCommandId: null,
+      deployState: "NONE",
+      deployCommandId: null,
+      teardownCommandId: null,
+      previewUrl: null,
+      forkIssuedAt: null,
+      deleteIssuedAt: null,
+      deployIssuedAt: null,
+      teardownIssuedAt: null,
+      droneIssuedAt: null,
+      droneAttempt: 1,
+      model: null,
+      modelReason: null,
+      modelChoice: null,
+      modelChoiceAttempt: null,
+      modelOutcome: null,
+      modelProbe: false,
+      memories: [],
+      traceId: first ? traceOfTrain(first) : null,
+      lane: "QUEUE",
+      members: [...draft.members],
+      bisectOf: draft.bisectOf,
+    };
+    this.trains.push(car);
+    this.markTrain(car);
+    for (const m of members) if (m.carId !== draft.carId) this.setTrain(m, { carId: draft.carId }, false);
+    this.event(car, { type: "train.enqueued", summary: `car ${car.trainId} with ${members.length} member(s)`, data: { lane: "QUEUE", members: draft.members, bisectOf: draft.bisectOf } });
+    this.scheduleFork(car);
+  }
+
+  private mergeMembers(car: TrainRecord): MergeMember[] {
+    return (car.members ?? []).flatMap((id) => {
+      const m = this.find(id);
+      if (!m) return [];
+      const title = (this.prompts.get(m.promptId)?.promptText ?? m.promptId).split("\n")[0]!.slice(0, 120);
+      return [{ trainId: m.trainId, promptId: m.promptId, artifactRepo: m.artifactRepo, headSha: m.headSha ?? "", title }];
+    });
+  }
+
+  // ── internals: races ──────────────────────────────────────────────────
+
+  /** The train's race, if it is a candidate still in a RACING race. */
+  private racingRaceOf(t: TrainRecord): RaceRecord | undefined {
+    if (!t.raceId || isCar(t)) return undefined;
+    const race = this.races.get(t.raceId);
+    if (race?.state !== "RACING") return undefined;
+    return t.raceOutcome === "RACING" || t.raceOutcome === "PASSED" ? race : undefined;
+  }
+
+  private setRace(r: RaceRecord, patch: Partial<RaceRecord>): void {
+    Object.assign(r, patch);
+    this.dirtyRaces.add(r.raceId);
+  }
+
+  /** A candidate failed (gate, build, watchdog): eject it alone; no rework yet. */
+  private raceCandidateFailed(t: TrainRecord, race: RaceRecord, summary: string): void {
+    this.eject(t, `failed in race: ${summary}`, { raceOutcome: "FAILED", summary: clip500(summary) });
+    this.maybeDecide(race);
+  }
+
+  /**
+   * Decide the race once every candidate has reported, or at its deadline.
+   * Candidates missing from the loaded state are terminal (reported, failed).
+   */
+  private maybeDecide(race: RaceRecord): void {
+    if (race.state !== "RACING") return;
+    const cands = race.trainIds.map((id) => this.find(id)).filter((t): t is TrainRecord => !!t);
+    const live = cands.filter(isActive);
+    const pending = live.filter((t) => t.raceOutcome === "RACING");
+    const passed = live.filter((t) => t.raceOutcome === "PASSED");
+    const due = race.deadlineAt !== null && this.ctx.now >= race.deadlineAt;
+    if (pending.length && !(due && passed.length)) return;
+    const predicted = this.item(race.itemId)?.paths ?? [];
+    const prompt = this.prompts.get(race.itemId);
+    if (passed.length) {
+      const ranking = rankCandidates(passed.map(toCandidate), { predictedPaths: predicted });
+      const winner = this.find(ranking.winner!.trainId)!;
+      this.pass(winner, { raceOutcome: "WON", reason: ranking.reason });
+      for (const l of [...passed, ...pending]) {
+        if (l === winner) continue;
+        const why = l.raceOutcome === "RACING" ? "still running at the race deadline" : (ranking.lostBecause[l.trainId] ?? "ranked lower");
+        this.eject(l, `lost race to ${winner.trainId}: ${why}`, { raceOutcome: "LOST" });
+      }
+      this.setRace(race, { state: "DECIDED", winnerTrainId: winner.trainId, reason: ranking.reason, decidedAt: this.ctx.now });
+      this.raceEvent(race, winner, `race ${race.raceId} decided: ${winner.trainId} ${ranking.reason}`, { winner: winner.trainId, outcome: "DECIDED" });
+      this.maybeLand();
+      return;
+    }
+    // Nobody passed: one failure for the item, with the best failure's Scribe summary.
+    const failed = cands.filter((t) => t.raceOutcome === "FAILED");
+    const best = failed.length ? this.find(rankCandidates(failed.map(toCandidate), { predictedPaths: predicted }).winner!.trainId) : undefined;
+    const why = best?.summary ?? prompt?.summary ?? "every race candidate failed";
+    this.setRace(race, { state: "ABANDONED", reason: clip(`abandoned: no candidate passed; best failure ${best?.trainId ?? "?"}: ${why}`, 300), decidedAt: this.ctx.now });
+    this.raceEvent(race, best ?? cands[0], `race ${race.raceId} abandoned: no candidate passed`, { outcome: "ABANDONED", best: best?.trainId ?? null }, "warn");
+    if (prompt) {
+      this.setPromptSummary(prompt.promptId, why);
+      this.rework(prompt.promptId);
+    }
+    this.maybeLand();
+  }
+
+  private raceEvent(race: RaceRecord, t: TrainRecord | undefined, summary: string, data: Record<string, unknown>, severity: EventDraft["severity"] = "info"): void {
+    this.events.push({
+      type: "race.decided",
+      severity,
+      actor: ACTOR,
+      traceId: t ? traceOfTrain(t) : traceIdFromUuid(race.itemId),
+      spanId: spanIdFor(race.raceId),
+      parentSpanId: spanIdFor(race.itemId),
+      itemId: race.itemId,
+      trainId: t?.trainId ?? null,
+      summary: clip500(summary),
+      data: { raceId: race.raceId, ...data },
+    });
+  }
+
+  private routeRaceFor(p: PromptRecord, action: TrainAction, width: number): ModelChoice[] {
+    const role: RouterRole = action === "REWORK" ? "rework" : "builder";
+    const summary = action === "REWORK" ? (p.summary ?? "") : "";
+    this.routerDispatches += 1;
+    this.routerDirty = true;
+    return routeRace(
+      {
+        role,
+        attempt: p.attempts + 1,
+        promptChars: p.promptText.length + summary.length,
+        stats: this.modelStats,
+        pin: this.ctx.modelPin ?? null,
+        dispatchIndex: this.routerDispatches,
+        floor: this.floor,
+        policy: this.policy(),
+      },
+      width,
+    );
+  }
+
+  // ── internals: drones ─────────────────────────────────────────────────
+
   private dispatchBuilder(t: TrainRecord): void {
+    if (isCar(t)) {
+      this.dispatchMerge(t);
+      return;
+    }
     const p = this.prompts.get(t.promptId);
     if (!p) return;
     const modelChoice = this.routeBuilder(t, p);
+    const task: DroneTask = {
+      promptId: p.promptId,
+      trainId: t.trainId,
+      namespace: this.ctx.namespace,
+      artifactRepo: t.artifactRepo,
+      baseRef: "main",
+      promptText: p.promptText,
+      role: "BUILDER",
+      action: t.action,
+      ragContext: t.memories.map(memoryToRagSnippet),
+      ...(t.action === "REWORK" && p.summary ? { scribeSummary: p.summary } : {}),
+      modelChoice,
+    };
+    this.pushDrone(t, task);
+  }
+
+  /** A car's "builder": the deterministic MERGE drone (no LLM, no model choice). */
+  private dispatchMerge(car: TrainRecord): void {
+    const members = this.mergeMembers(car);
+    this.pushDrone(car, {
+      promptId: car.promptId,
+      trainId: car.trainId,
+      namespace: this.ctx.namespace,
+      artifactRepo: car.artifactRepo,
+      baseRef: "main",
+      promptText: `queue car ${car.trainId}: ${members.length} members`,
+      role: "LANDER",
+      action: "MERGE",
+      ragContext: [],
+      members,
+    });
+  }
+
+  private dispatchLander(t: TrainRecord): void {
+    const car = isCar(t);
+    const members = car ? this.mergeMembers(t) : [];
+    const p = this.prompts.get(t.promptId);
+    this.pushDrone(t, {
+      promptId: t.promptId,
+      trainId: t.trainId,
+      namespace: this.ctx.namespace,
+      artifactRepo: t.artifactRepo,
+      baseRef: t.headSha ?? "main",
+      promptText: car ? `queue car ${t.trainId}: ${members.length} members` : (p?.promptText ?? t.promptId),
+      role: "LANDER",
+      action: "LAND",
+      ragContext: [],
+      ...(car ? { members } : {}),
+    });
+  }
+
+  private pushDrone(t: TrainRecord, task: DroneTask): void {
+    const attempt = t.droneAttempt;
     this.effects.push({
       type: "dispatchDrone",
       trainId: t.trainId,
-      attempt: t.droneAttempt,
-      task: {
-        promptId: p.promptId,
-        trainId: t.trainId,
-        namespace: this.ctx.namespace,
-        artifactRepo: t.artifactRepo,
-        baseRef: "main",
-        promptText: p.promptText,
-        role: "BUILDER",
-        action: t.action,
-        ragContext: t.memories.map(memoryToRagSnippet),
-        ...(t.action === "REWORK" && p.summary ? { scribeSummary: p.summary } : {}),
-        modelChoice,
-      },
+      attempt,
+      task: { ...task, trace: traceFor(t, droneInstanceId(task, attempt)) },
     });
   }
 
@@ -932,7 +1621,8 @@ export class TrainPlanner {
    * persisted on the train before dispatch, so a reconcile re-dispatch of the
    * same Workflow instance carries the same choice. The attempt is the
    * prompt's failed attempts plus the drone attempt: 1 for a first BUILD,
-   * >= 2 for a REWORK or a watchdog re-dispatch (escalation).
+   * >= 2 for a REWORK or a watchdog re-dispatch (escalation). Race candidates
+   * were routed at enqueue (routeRace); their re-dispatches never move the floor.
    */
   private routeBuilder(t: TrainRecord, p: PromptRecord): ModelChoice {
     if (t.modelChoice && t.modelChoiceAttempt === t.droneAttempt) return t.modelChoice;
@@ -950,7 +1640,7 @@ export class TrainPlanner {
       floor: this.floor,
       policy: this.policy(),
     });
-    if (routed.floorRouted) this.setFloor(routed.floor);
+    if (routed.floorRouted && !t.raceId) this.setFloor(routed.floor);
     const choice = routed.choice;
     this.setTrain(t, {
       modelChoice: choice,
@@ -975,17 +1665,19 @@ export class TrainPlanner {
 
   /**
    * Only first-attempt BUILD dispatches are routed by (and move) the hive's
-   * floor. Reworks and re-dispatches escalate locally and leave it alone.
+   * floor. Reworks, re-dispatches and race candidates leave it alone.
    */
   private floorOutcome(t: TrainRecord, outcome: FloorOutcome, model: string): void {
     const c = t.modelChoice;
-    if (!c || c.role !== "builder" || t.action !== "BUILD" || t.modelChoiceAttempt !== 1) return;
+    if (!c || c.role !== "builder" || t.action !== "BUILD" || t.modelChoiceAttempt !== 1 || t.raceId) return;
     if (!isCatalogModel(model)) return; // scripted drones / unknown pins teach the router nothing
     this.setFloor(floorAfter(this.floor, outcome, c.tier, t.modelProbe, this.policy()));
   }
 
   /** build-result: count the attempt for the model that built the head, and a failure for each model that could not. */
   private recordBuild(t: TrainRecord, r: BuildResult): void {
+    const credits = buildCredits(r.usage, r.model ?? t.modelChoice?.model ?? null);
+    if (credits !== null) this.setTrain(t, { credits }, false);
     if (t.modelOutcome !== null) return;
     const choice = t.modelChoice;
     const used = r.model ?? choice?.model ?? null;
@@ -1032,27 +1724,10 @@ export class TrainPlanner {
     }
   }
 
-  private dispatchLander(t: TrainRecord): void {
-    const p = this.prompts.get(t.promptId);
-    this.effects.push({
-      type: "dispatchDrone",
-      trainId: t.trainId,
-      attempt: t.droneAttempt,
-      task: {
-        promptId: t.promptId,
-        trainId: t.trainId,
-        namespace: this.ctx.namespace,
-        artifactRepo: t.artifactRepo,
-        baseRef: t.headSha ?? "main",
-        promptText: p?.promptText ?? t.promptId,
-        role: "LANDER",
-        action: "LAND",
-        ragContext: [],
-      },
-    });
-  }
+  // ── rows, events, result ──────────────────────────────────────────────
 
   private setTrain(t: TrainRecord, patch: Partial<TrainRecord>, visible = true): void {
+    const before = t.phase;
     // Watchdog clocks: a new command id (or a confirmed drone dispatch) starts one.
     const stamped: Partial<TrainRecord> = {};
     for (const [idField, clock] of Object.entries(ISSUED_AT) as [keyof typeof ISSUED_AT, (typeof ISSUED_AT)[keyof typeof ISSUED_AT]][]) {
@@ -1063,7 +1738,33 @@ export class TrainPlanner {
     }
     Object.assign(t, patch, stamped);
     t.status = statusOf(t.phase);
-    this.markTrain(t, visible);
+    this.markTrain(t, visible || t.phase !== before);
+    if (t.phase !== before) this.phaseEvent(t, before);
+  }
+
+  /** `train.phase`: a build train's span is a child of its item's; a car's is recorded in each member's trace. */
+  private phaseEvent(t: TrainRecord, from: TrainPhase): void {
+    const to = t.phase;
+    const severity: EventDraft["severity"] = to === "EJECTED" ? "warn" : "info";
+    const what = isCar(t) ? "car" : "train";
+    const summary = clip500(`${what} ${t.trainId} ${from} → ${to}${to === "EJECTED" && t.reason ? `: ${t.reason}` : ""}`);
+    const data = { from, to, lane: t.lane ?? "BUILD", ...(t.raceId ? { raceId: t.raceId, candidate: t.candidate ?? null } : {}), ...(t.reason && to === "EJECTED" ? { reason: t.reason } : {}) };
+    this.event(t, { type: "train.phase", severity, summary, data });
+  }
+
+  private event(t: TrainRecord, e: Pick<EventDraft, "type" | "summary" | "data" | "severity">): void {
+    if (isCar(t)) {
+      const members = (t.members ?? []).map((id) => this.find(id)).filter((m): m is TrainRecord => !!m);
+      if (members.length) {
+        for (const m of members) {
+          this.events.push({ ...e, actor: ACTOR, traceId: traceOfTrain(m), spanId: spanIdFor(t.trainId), parentSpanId: spanIdFor(m.trainId), itemId: m.promptId, trainId: t.trainId });
+        }
+        return;
+      }
+      this.events.push({ ...e, actor: ACTOR, traceId: traceOfTrain(t), spanId: spanIdFor(t.trainId), parentSpanId: null, itemId: null, trainId: t.trainId });
+      return;
+    }
+    this.events.push({ ...e, actor: ACTOR, traceId: traceOfTrain(t), spanId: spanIdFor(t.trainId), parentSpanId: spanIdFor(t.promptId), itemId: t.promptId, trainId: t.trainId });
   }
 
   private markTrain(t: TrainRecord, visible = true): void {
@@ -1072,6 +1773,15 @@ export class TrainPlanner {
 
   private markPrompt(p: PromptRecord, visible = true): void {
     this.dirtyPrompts.set(p.promptId, (this.dirtyPrompts.get(p.promptId) ?? false) || visible);
+  }
+
+  /** Prompt status of a BUILD train's prompt (cars carry several prompts and set none). */
+  private promptStatus(t: TrainRecord, status: PromptStatus): void {
+    if (!isCar(t)) this.setPromptStatus(t.promptId, status);
+  }
+
+  private promptSummary(t: TrainRecord, summary: string): void {
+    if (!isCar(t)) this.setPromptSummary(t.promptId, summary);
   }
 
   private setPromptStatus(promptId: string, status: PromptStatus): void {
@@ -1090,11 +1800,12 @@ export class TrainPlanner {
 
   private finish(outcome: Outcome): PlanResult {
     const prompts = [...this.dirtyPrompts.keys()].map((id) => ({ ...this.prompts.get(id)! }));
-    const trains = [...this.dirtyTrains.keys()].map((id) => {
-      const t = this.find(id)!;
-      return { ...t, includedPrompts: [...t.includedPrompts] };
-    });
+    const trains = [...this.dirtyTrains.keys()].map((id) => copyTrain(this.find(id)!));
     const deployments = [...this.dirtyDeployments].map((id) => ({ ...this.deployments.get(id)! }));
+    const races = [...this.dirtyRaces].map((id) => {
+      const r = this.races.get(id)!;
+      return { ...r, trainIds: [...r.trainIds] };
+    });
     const broadcasts: Effect[] = [
       ...prompts
         .filter((p) => this.dirtyPrompts.get(p.promptId))
@@ -1103,6 +1814,7 @@ export class TrainPlanner {
         .filter((t) => this.dirtyTrains.get(t.trainId))
         .map((t): Effect => ({ type: "broadcast", message: { type: "train.updated", train: toMergeTrain(t) } })),
       ...deployments.map((d): Effect => ({ type: "broadcast", message: { type: "deployment.updated", deployment: d } })),
+      ...races.map((r): Effect => ({ type: "broadcast", message: { type: "race.updated", race: r } })),
     ];
     // The watchdog may re-issue a command that reconcile then re-emits: one dispatch each.
     const seen = new Set<string>();
@@ -1127,18 +1839,52 @@ export class TrainPlanner {
       modelStats: this.modelDeltas,
       ...(this.routerDirty ? { routerDispatches: this.routerDispatches } : {}),
       ...(this.floorDirty ? { routerFloor: { ...this.floor } } : {}),
+      events: this.events,
+      races,
+      ...(this.landed ? { landed: this.landed } : {}),
+      conflictClaims: this.conflictClaims,
+      itemConflicts: [...this.dirtyConflicts].map((itemId) => ({ itemId, conflicts: this.conflicts.get(itemId)! })),
+      ...(this.carInfraDirty ? { carInfraFailures: this.carInfraFailures } : {}),
+      ...(this.executorLost ? { executorLost: true } : {}),
     };
     this.modelDeltas = [];
+    this.events = [];
+    this.landed = null;
+    this.conflictClaims = [];
     this.routerDirty = false;
     this.floorDirty = false;
+    this.carInfraDirty = false;
     this.dirtyPrompts.clear();
     this.dirtyTrains.clear();
     this.dirtyDeployments.clear();
+    this.dirtyRaces.clear();
+    this.dirtyConflicts.clear();
     this.effects = [];
     return result;
   }
 }
 
+function toCandidate(t: TrainRecord): RaceCandidate {
+  return {
+    trainId: t.trainId,
+    candidate: t.candidate ?? 0,
+    passed: t.raceOutcome === "PASSED" || t.raceOutcome === "WON",
+    score: t.score ?? null,
+    verified: t.verified ?? null,
+    changedPaths: t.changedPaths ?? null,
+    credits: t.credits ?? null,
+    model: t.model,
+  };
+}
+
+function clip(s: string, n: number): string {
+  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+}
+
 function clip200(s: string): string {
-  return s.length <= 200 ? s : `${s.slice(0, 199)}…`;
+  return clip(s, 200);
+}
+
+function clip500(s: string): string {
+  return clip(s, 500);
 }

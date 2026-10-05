@@ -162,23 +162,21 @@ describe("queen worker", () => {
 });
 
 describe("merge train via HTTP", () => {
-  it("submitting 3 prompts creates 3 cumulative trains with chained forks", async () => {
+  it("submitting 3 prompts creates 3 independent BUILD trains, all forked from main at once", async () => {
     const ns = newHive();
     const [a, b, c] = [await submit(ns, "A"), await submit(ns, "B"), await submit(ns, "C")];
     let s = await inspect(ns);
-    expect(s.trains.map((t) => JSON.parse(t.included_prompts))).toEqual([[a], [a, b], [a, b, c]]);
+    expect(s.trains.map((t) => JSON.parse(t.included_prompts))).toEqual([[a], [b], [c]]);
     expect(s.trains.map((t) => t.status)).toEqual(["BUILDING", "BUILDING", "BUILDING"]);
     const [t1, t2, t3] = s.trains;
     expect(t1!.artifact_repo).toMatch(new RegExp(`^${ns}-train-[0-9a-f]{12}$`));
-    // The Queen only dispatches the fork; nothing is built until the Provisioner reports.
-    expect(s.forks).toEqual([{ source: ns, name: t1!.artifact_repo, commandId: `${t1!.train_id}-fork-1`, trainId: t1!.train_id }]);
+    // The Queen only dispatches the forks; nothing is built until the Provisioner reports.
+    expect(s.forks).toEqual([t1!, t2!, t3!].map((t) => ({ source: ns, name: t.artifact_repo, commandId: `${t.train_id}-fork-1`, trainId: t.train_id })));
     expect(s.tasks).toEqual([]);
     const reported = new Set<string>();
     await settle(ns, reported);
     s = await inspect(ns);
-    expect(s.tasks).toEqual([
-      expect.objectContaining({ trainId: t1!.train_id, promptId: a, role: "BUILDER", action: "BUILD", ragContext: [] }),
-    ]);
+    expect(s.tasks).toEqual([a, b, c].map((p) => expect.objectContaining({ promptId: p, role: "BUILDER", action: "BUILD", ragContext: [] })));
 
     for (const t of [t1!, t2!]) {
       const res = await post(ns, "/internal/webhook/build-result", { trainId: t.train_id, headSha: `h-${t.train_id}` });
@@ -190,9 +188,8 @@ describe("merge train via HTTP", () => {
       [t1!.train_id, "preview", t1!.artifact_repo, `h-${t1!.train_id}`],
       [t2!.train_id, "preview", t2!.artifact_repo, `h-${t2!.train_id}`],
     ]);
-    expect(s.forks.map((f) => f.source)).toEqual([ns, t1!.artifact_repo, t2!.artifact_repo]);
-    expect(s.forks.map((f) => f.name)).toEqual([t1!.artifact_repo, t2!.artifact_repo, t3!.artifact_repo]);
-    expect(s.tasks.map((t) => t.promptId)).toEqual([a, b, c]);
+    // A push forks nobody: still exactly the three forks of hive main.
+    expect(s.forks.map((f) => f.source)).toEqual([ns, ns, ns]);
   });
 
   it("results drive MERGED / EJECTED in SQLite", async () => {
@@ -206,16 +203,17 @@ describe("merge train via HTTP", () => {
       await settle(ns, reported);
     }
 
-    // B fails: B ejected (rework), C superseded and re-provisioned as main+[A,C].
+    // B fails: only B is ejected; its rework forks from main. C is untouched (no supersede).
     const fail = await post(ns, "/internal/webhook/train-result", { trainId: t2!.train_id, passed: false, summary: "B: 3 tests failed" });
     expect(await fail.json()).toMatchObject({ outcome: "applied", train: { status: "EJECTED" } });
     let s = await inspect(ns);
     const byId = Object.fromEntries(s.trains.map((t) => [t.train_id, t]));
     expect(byId[t2!.train_id]!.status).toBe("EJECTED");
-    expect(byId[t3!.train_id]!.status).toBe("EJECTED");
-    expect(s.deleted).toEqual([t2!.artifact_repo, t3!.artifact_repo]);
+    expect(byId[t3!.train_id]!.status).toBe("TESTING");
+    expect(s.deleted).toEqual([t2!.artifact_repo]);
     const active = s.trains.filter((t) => t.status !== "EJECTED");
-    expect(active.map((t) => JSON.parse(t.included_prompts))).toEqual([[a], [a, c], [a, c, b]]);
+    expect(active.map((t) => JSON.parse(t.included_prompts))).toEqual([[a], [c], [b]]);
+    expect(active.at(-1)!.fork_source).toBe(ns);
     expect(s.prompts).toContainEqual({ prompt_id: b, status: "QUEUED", summary: "B: 3 tests failed", attempts: 1 });
 
     // A passes (via the /trains/:id/result alias) -> head lands through a LANDER drone.
@@ -230,14 +228,11 @@ describe("merge train via HTTP", () => {
     expect(s.prompts.find((p) => p.prompt_id === a)!.status).toBe("MERGED");
     expect(s.deleted).toContain(t1!.artifact_repo);
 
-    // A late result for the superseded train is ignored idempotently.
-    const late = await post(ns, "/internal/webhook/train-result", { trainId: t3!.train_id, passed: true, summary: "late" });
+    // A late result for the ejected train is ignored idempotently.
+    const late = await post(ns, "/internal/webhook/train-result", { trainId: t2!.train_id, passed: true, summary: "late" });
     expect(await late.json()).toMatchObject({ outcome: "ignored:stale", train: { status: "EJECTED" } });
 
-    // A REWORK drone carries the Scribe summary once B's new train forks.
-    await settle(ns, reported);
-    const cTrain = active[1]!;
-    await post(ns, "/internal/webhook/build-result", { trainId: cTrain.train_id, headSha: "h-c2" });
+    // A REWORK drone carries the Scribe summary as soon as B's new train forks (from main, no waiting).
     await settle(ns, reported);
     s = await inspect(ns);
     expect(s.tasks.at(-1)).toMatchObject({ promptId: b, action: "REWORK", scribeSummary: "B: 3 tests failed" });
@@ -355,7 +350,9 @@ describe("executor results", () => {
     await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "ok" });
     await post(ns, "/internal/webhook/land-result", { trainId, landed: true, mainSha: "m1" });
     const s = await inspect(ns);
-    expect(s.deploys.filter((d) => d.op === "TEARDOWN")).toEqual([{ op: "TEARDOWN", commandId: `${trainId}-teardown-1`, hive: ns, environment: "preview", trainId }]);
+    expect(s.deploys.filter((d) => d.op === "TEARDOWN")).toEqual([
+      { op: "TEARDOWN", commandId: `${trainId}-teardown-1`, hive: ns, environment: "preview", trainId, trace: { traceparent: expect.stringMatching(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/) } },
+    ]);
     // The merge also cut a release: its staging deploy goes to the Herald.
     expect(s.deploys.at(-1)).toMatchObject({ op: "DEPLOY", environment: "staging", artifactRepo: ns, commitSha: "m1" });
     expect(s.trains[0]).toMatchObject({ phase: "MERGED", deploy_state: "TEARING_DOWN", preview_url: previewUrl(trainId) });

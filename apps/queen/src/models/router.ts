@@ -296,6 +296,78 @@ export function route(input: ChooseModelInput): RouteResult {
   };
 }
 
+/** Vendor prefix of a model id (`@cf/deepseek-ai/...` → `@cf/deepseek-ai`): races prefer different vendors. */
+export function vendorOf(id: string): string {
+  const parts = id.split("/");
+  return parts.length > 2 ? parts.slice(0, 2).join("/") : (parts[0] ?? id);
+}
+
+/**
+ * Best-of-N routing (v2 §2.3.6): up to `width` DISTINCT models for one race.
+ * Candidate 1 is route()'s value pick at the starting tier (no probe and no
+ * exploration: a race already explores). The rest are the next best by value
+ * at or above the starting tier, preferring a vendor prefix not yet in the
+ * race; tiers below are used only when nothing at or above is left. Each
+ * candidate's fallbacks exclude every sibling's model. A pin returns only the
+ * pinned model (races need distinct models). Fewer than `width` choices means
+ * the catalog has no more distinct fitting models: the caller narrows the race.
+ *
+ * Races never move the floor: the caller ignores floor changes (none are
+ * returned) and only bumps its dispatch counter.
+ */
+export function routeRace(input: ChooseModelInput, width: number): ModelChoice[] {
+  const catalog = input.catalog ?? MODEL_CATALOG;
+  const floorIn: FloorState = { ...(input.floor ?? INITIAL_FLOOR), aboveStreak: 0 };
+  const first = route({ ...input, floor: floorIn, dispatchIndex: 0 }).choice;
+  const n = Math.max(1, Math.floor(width));
+  if (input.pin?.trim() || n === 1) return [first];
+
+  const role = input.role;
+  const floorRouted = role === "builder" && input.attempt <= 1;
+  const wanted = floorRouted ? clampFloor(floorIn.tier, catalog) : "frontier";
+  const need = estimateTokens(input.promptChars);
+  const fits = catalog.map((model, index) => ({ model, index })).filter(({ model }) => model.roles.includes(role) && canToolLoop(model) && model.contextWindow >= need);
+  const atOrAbove = rank(
+    fits.filter((c) => tierIdx(c.model.tier) >= tierIdx(wanted)),
+    role,
+    input.stats,
+  );
+  const below = TIERS.slice(0, tierIdx(wanted))
+    .reverse()
+    .flatMap((t) => rank(fits.filter((c) => c.model.tier === t), role, input.stats));
+  const pool = [...atOrAbove, ...below];
+
+  const picked: Ranked[] = [];
+  const firstRanked = pool.find((r) => r.model.id === first.model);
+  if (firstRanked) picked.push(firstRanked);
+  while (picked.length < n) {
+    const rest = pool.filter((r) => !picked.includes(r) && r.model.id !== first.model);
+    if (!rest.length) break;
+    const vendors = new Set([first.model, ...picked.map((r) => r.model.id)].map(vendorOf));
+    picked.push(rest.find((r) => !vendors.has(vendorOf(r.model.id))) ?? rest[0]!);
+  }
+  const ids = new Set([first.model, ...picked.map((r) => r.model.id)]);
+  const fallbacksFor = (tier: ModelTier) => {
+    const sameTier = pool.filter((r) => r.model.tier === tier && !ids.has(r.model.id));
+    const others = pool.filter((r) => r.model.tier !== tier && !ids.has(r.model.id));
+    return [...sameTier, ...others].slice(0, MAX_FALLBACKS).map((r) => r.model.id);
+  };
+  const others = picked.filter((r) => r.model.id !== first.model);
+  const total = 1 + others.length;
+  const choices: ModelChoice[] = [{ ...first, reason: clip(`race 1/${total} · ${first.reason}`), fallbacks: fallbacksFor(first.tier) }];
+  others.forEach((r, i) => {
+    const detail = r.attempts > 0 ? `value ${r.passes}/${r.attempts} @ cost ${r.model.cost}` : "no track record yet";
+    choices.push({
+      model: r.model.id,
+      tier: r.model.tier,
+      role,
+      reason: clip(`race ${i + 2}/${total} · next distinct model · ${r.model.tier} tier · ${detail}`),
+      fallbacks: fallbacksFor(r.model.tier),
+    });
+  });
+  return choices;
+}
+
 export type FloorOutcome = "pass" | "gate-fail" | "unusable";
 
 /**

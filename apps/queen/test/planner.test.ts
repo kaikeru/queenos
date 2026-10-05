@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import type { DeployCommand, Deployment, ProvisionCommand, RecalledMemory } from "@queenos/queen-types";
+import { describe, expect, it, vi } from "vitest";
+import type { DeployCommand, Deployment, EventDraft, GateScore, ProvisionCommand, RecalledMemory } from "@queenos/queen-types";
+import { spanIdFor, traceIdFromUuid, traceparent } from "@queenos/queen-types";
+import type { RaceRecord } from "../src/records";
+import type { QueueDecision } from "../src/train/queue";
 import { INITIAL_FLOOR, type FloorState, type RouterPolicy, type RouterStats } from "../src/models/router";
 import {
   DEFAULT_COMMAND_TIMEOUT_MS,
@@ -9,10 +12,14 @@ import {
   TrainPlanner,
   nextCommandId,
   toMergeTrain,
+  toMergeTrainV2,
   type Effect,
   type ModelStatDelta,
   type PlanResult,
+  type PlannerItem,
   type PromptRecord,
+  type QueueOptions,
+  type RaceSettings,
   type TrainRecord,
 } from "../src/train/planner";
 
@@ -36,11 +43,24 @@ class Sim {
   floor: FloorState = { ...INITIAL_FLOOR };
   pin: string | null = null;
   policy: RouterPolicy | undefined;
+  /** v2: races, items, rework race policy, merge queue options (injected hooks). */
+  races = new Map<string, RaceRecord>();
+  items: PlannerItem[] = [];
+  race: RaceSettings | undefined;
+  queue: QueueOptions | undefined;
+  events: EventDraft[] = [];
+  results: PlanResult[] = [];
+  maxPassedSeq = 0;
   private ids = 0;
   private maxTrainSeq = 0;
   private maxPromptSeq = 0;
 
   run(fn: (p: TrainPlanner) => PlanResult): PlanResult {
+    return this.runMany((p) => [fn(p)])[0]!;
+  }
+
+  /** Several transitions on ONE planner (one DO decision), each result persisted. */
+  runMany(fn: (p: TrainPlanner) => PlanResult[]): PlanResult[] {
     const planner = new TrainPlanner(
       {
         prompts: [...this.prompts.values()],
@@ -51,10 +71,27 @@ class Sim {
         modelStats: [...this.stats.values()],
         routerDispatches: this.routerDispatches,
         routerFloor: this.floor,
+        races: [...this.races.values()],
+        items: this.items,
+        maxPassedSeq: this.maxPassedSeq,
       },
-      { namespace: "hive", now: this.now, newId: () => `t${++this.ids}`, modelPin: this.pin, routerPolicy: this.policy },
+      {
+        namespace: "hive",
+        now: this.now,
+        newId: () => `t${++this.ids}`,
+        modelPin: this.pin,
+        routerPolicy: this.policy,
+        ...(this.race ? { race: this.race } : {}),
+        ...(this.queue ? { queue: this.queue } : {}),
+      },
     );
-    const r = fn(planner);
+    const rs = fn(planner);
+    for (const r of rs) this.persist(r);
+    return rs;
+  }
+
+  private persist(r: PlanResult): void {
+    this.results.push(r);
     for (const p of r.prompts) {
       this.prompts.set(p.promptId, p);
       this.maxPromptSeq = Math.max(this.maxPromptSeq, p.seq);
@@ -62,13 +99,15 @@ class Sim {
     for (const t of r.trains) {
       this.trains.set(t.trainId, t);
       this.maxTrainSeq = Math.max(this.maxTrainSeq, t.seq);
+      this.maxPassedSeq = Math.max(this.maxPassedSeq, t.passedSeq ?? 0);
     }
+    for (const race of r.races) this.races.set(race.raceId, race);
+    this.events.push(...r.events);
     for (const d of r.deployments) this.deployments.set(d.deploymentId, d);
     this.effects.push(...r.effects);
     for (const d of r.modelStats) this.applyDelta(d);
     if (r.routerDispatches !== undefined) this.routerDispatches = r.routerDispatches;
     if (r.routerFloor !== undefined) this.floor = r.routerFloor;
-    return r;
   }
 
   /** Mirror of db.applyModelStatDelta. */
@@ -109,7 +148,7 @@ class Sim {
   takeOp(op: "TEARDOWN"): Teardown[];
   takeOp(op: string): unknown[] {
     const match = (e: Effect) => (e.type === "provision" || e.type === "deploy") && e.command.op === op;
-    const out = this.effects.filter(match).map((e) => (e as Extract<Effect, { type: "provision" | "deploy" }>).command);
+    const out = this.effects.filter(match).map((e) => withoutTrace((e as Extract<Effect, { type: "provision" | "deploy" }>).command));
     this.effects = this.effects.filter((e) => !match(e));
     return out;
   }
@@ -117,11 +156,13 @@ class Sim {
   /** The Provisioner completes every pending FORK (fake Artifacts). */
   completeForks(): void {
     for (;;) {
-      const c = this.takeOp("FORK")[0];
-      if (!c) return;
-      this.run((p) =>
-        p.provisionResult({ commandId: c.commandId, op: "FORK", trainId: c.trainId, ok: true, artifactRepo: c.forkName, baseSha: `sha:${c.sourceRepo}` }),
-      );
+      const forks = this.takeOp("FORK");
+      if (!forks.length) return;
+      for (const c of forks) {
+        this.run((p) =>
+          p.provisionResult({ commandId: c.commandId, op: "FORK", trainId: c.trainId, ok: true, artifactRepo: c.forkName, baseSha: `sha:${c.sourceRepo}` }),
+        );
+      }
     }
   }
 
@@ -187,24 +228,40 @@ class Sim {
   }
 }
 
+/** Commands without their W3C trace (asserted separately in "planner: trace"). */
+function withoutTrace<T extends { trace?: unknown }>(c: T): Omit<T, "trace"> {
+  const { trace: _trace, ...rest } = c;
+  void _trace;
+  return rest;
+}
+
+/** Effects with executor commands stripped of their trace. */
+function plain(effects: Effect[]): unknown[] {
+  return effects.map((e) => (e.type === "provision" || e.type === "deploy" ? { ...e, command: withoutTrace(e.command) } : e));
+}
+
 const url = (trainId: string) => `https://${trainId}-preview.test.dev`;
 
 describe("planner: provisioning", () => {
-  it("chains cumulative trains: train-1 from main, train-k from train-(k-1) after it pushes", () => {
+  it("BUILD trains fork from main at once: each includes only its own prompt; a push forks nobody", () => {
     const s = new Sim();
     s.submit("A", "B", "C");
-    const forks = s.take("provision");
-    expect(forks).toEqual([
-      {
-        type: "provision",
-        trainId: "t1",
-        command: { op: "FORK", commandId: "t1-fork-1", hive: "hive", trainId: "t1", sourceRepo: "hive", forkName: "hive-train-t1", recallQuery: "do A" },
-      },
+    expect(s.takeOp("FORK")).toEqual(
+      ["A", "B", "C"].map((id, i) => ({
+        op: "FORK",
+        commandId: `t${i + 1}-fork-1`,
+        hive: "hive",
+        trainId: `t${i + 1}`,
+        sourceRepo: "hive",
+        forkName: `hive-train-t${i + 1}`,
+        recallQuery: `do ${id}`,
+      })),
+    );
+    expect([...s.trains.values()].map((t) => [t.includedPrompts, t.lane, t.phase, t.forkState])).toEqual([
+      [["A"], "BUILD", "BUILDING", "PENDING"],
+      [["B"], "BUILD", "BUILDING", "PENDING"],
+      [["C"], "BUILD", "BUILDING", "PENDING"],
     ]);
-    expect(s.trains.get("t1")!.forkCommandId).toBe("t1-fork-1");
-    expect(s.trains.get("t2")!.phase).toBe("WAITING_PARENT");
-    expect(s.trains.get("t3")!.includedPrompts).toEqual(["A", "B", "C"]);
-    expect(s.trains.get("t2")!.includedPrompts).toEqual(["A", "B"]);
     expect(s.status("B")).toBe("QUEUED");
 
     s.run((p) => p.provisionResult({ commandId: "t1-fork-1", op: "FORK", trainId: "t1", ok: true, artifactRepo: "hive-train-t1", baseSha: "m0" }));
@@ -216,13 +273,20 @@ describe("planner: provisioning", () => {
     s.run((p) => p.buildResult({ trainId: "t1", headSha: "h1" }));
     expect(s.trains.get("t1")).toMatchObject({ phase: "DEPLOYING", status: "TESTING", deployState: "PENDING" });
     expect(s.status("A")).toBe("IN_TRAIN");
-    // The successor forks on the push; it does not wait for the preview deploy.
-    expect(s.takeOp("FORK")).toEqual([
-      { op: "FORK", commandId: "t2-fork-1", hive: "hive", trainId: "t2", sourceRepo: "hive-train-t1", forkName: "hive-train-t2", recallQuery: "do B" },
-    ]);
+    expect(s.takeOp("FORK")).toEqual([]); // nothing forks from a build train
     expect(s.takeOp("DEPLOY")).toEqual([
       { op: "DEPLOY", commandId: "t1-deploy-1", hive: "hive", environment: "preview", trainId: "t1", artifactRepo: "hive-train-t1", commitSha: "h1" },
     ]);
+  });
+
+  it("6 independent submits in one decision → 6 FORK effects, all with sourceRepo = namespace", () => {
+    const s = new Sim();
+    const ids = ["A", "B", "C", "D", "E", "F"];
+    const rs = s.runMany((p) => ids.map((id) => p.submit({ promptId: id, promptText: `do ${id}` })));
+    const forks = rs.flatMap((r) => r.effects).filter((e) => e.type === "provision" && e.command.op === "FORK") as Extract<Effect, { type: "provision" }>[];
+    expect(forks).toHaveLength(6);
+    expect(forks.map((f) => (f.command as Fork).sourceRepo)).toEqual(Array(6).fill("hive"));
+    expect(new Set(forks.map((f) => (f.command as Fork).forkName)).size).toBe(6);
   });
 
   it("broadcasts prompt.updated and train.updated for visible changes", () => {
@@ -256,41 +320,37 @@ describe("planner: results", () => {
     expect(landers.map((d) => d.task.promptId)).toEqual(["B", "C"]);
   });
 
-  it("all pass out of order: later passes wait, then cascade behind the head", () => {
+  it("passes out of order land in ticket order (passedSeq), one at a time (direct landing, no merge queue)", () => {
     const s = Sim.abc();
     s.result("C", true);
     s.result("B", true);
-    expect(s.take("dispatchDrone")).toEqual([]);
-    expect(s.trainOf("C").phase).toBe("PASSED");
+    expect(s.take("dispatchDrone").map((d) => d.task.promptId)).toEqual(["C"]);
+    expect([s.trainOf("C").passedSeq, s.trainOf("B").passedSeq]).toEqual([1, 2]);
+    expect(s.trainOf("B").phase).toBe("PASSED");
     s.result("A", true);
-    expect(s.take("dispatchDrone").map((d) => d.task.promptId)).toEqual(["A"]);
-    s.land("A");
-    expect(s.trainOf("B").phase).toBe("LANDING");
-    expect(s.trainOf("C").phase).toBe("PASSED"); // only the head lands
-    s.land("B");
+    expect(s.trainOf("A")).toMatchObject({ phase: "PASSED", passedSeq: 3 });
     s.land("C");
-    expect(s.take("dispatchDrone").map((d) => d.task.promptId)).toEqual(["B", "C"]);
+    expect(s.trainOf("B").phase).toBe("LANDING");
+    expect(s.trainOf("A").phase).toBe("PASSED");
+    s.land("B");
+    s.land("A");
+    expect(s.take("dispatchDrone").map((d) => d.task.promptId)).toEqual(["B", "A"]);
     expect([...s.trains.values()].every((t) => t.status === "MERGED")).toBe(true);
   });
 
-  it("middle train fails: B ejected for rework; C re-forked as main+[A,C]; A unaffected", () => {
+  it("a failed build is ejected alone (no supersede); its REWORK forks from main at once and carries the summary", () => {
     const s = Sim.abc();
     s.result("A", true); // A is landing; keep it in flight
     s.take("dispatchDrone");
     s.result("B", false, "B broke the build");
     expect(s.trains.get("t1")!.phase).toBe("LANDING");
     expect(s.trains.get("t2")).toMatchObject({ status: "EJECTED", reason: "failed: B broke the build" });
-    expect(s.trains.get("t3")!.status).toBe("EJECTED");
-    expect(s.trains.get("t3")!.reason).toMatch(/^superseded/);
-    expect(s.takeOp("DELETE").map((e) => e.trainId)).toEqual(["t2", "t3"]);
-    expect(s.takeOp("TEARDOWN").map((e) => e.trainId)).toEqual(["t2", "t3"]);
+    expect(s.trains.get("t3")!.phase).toBe("TESTING"); // C is untouched
+    expect(s.takeOp("DELETE").map((e) => e.trainId)).toEqual(["t2"]);
+    expect(s.takeOp("TEARDOWN").map((e) => e.trainId)).toEqual(["t2"]);
 
-    const c2 = s.trainOf("C");
-    expect(c2.trainId).toBe("t4");
-    expect(c2.includedPrompts).toEqual(["A", "C"]);
-    expect(c2.forkSource).toBe("hive-train-t1");
     const b2 = s.trainOf("B");
-    expect(b2).toMatchObject({ trainId: "t5", action: "REWORK", includedPrompts: ["A", "C", "B"], phase: "WAITING_PARENT" });
+    expect(b2).toMatchObject({ trainId: "t4", action: "REWORK", includedPrompts: ["B"], forkSource: "hive", lane: "BUILD" });
     // EJECTED is broadcast before the rework re-queues the prompt.
     const bStates = s
       .take("broadcast")
@@ -298,12 +358,9 @@ describe("planner: results", () => {
     expect(bStates.slice(0, 2)).toEqual(["EJECTED", "QUEUED"]);
     expect(s.prompts.get("B")).toMatchObject({ attempts: 1, summary: "B broke the build" });
 
-    // C' builds -> the rework train forks from it and dispatches a REWORK carrying the summary.
-    s.completeForks();
-    s.take("dispatchDrone");
-    s.build("C");
+    // Sim.result completed the rework's fork (from main), so its REWORK drone is already out.
     const rework = s.take("dispatchDrone").find((d) => d.task.promptId === "B")!;
-    expect(rework.task).toMatchObject({ action: "REWORK", role: "BUILDER", scribeSummary: "B broke the build", artifactRepo: "hive-train-t5" });
+    expect(rework.task).toMatchObject({ action: "REWORK", role: "BUILDER", scribeSummary: "B broke the build", artifactRepo: "hive-train-t4" });
     s.land("A");
     s.result("C", true);
     s.land("C");
@@ -313,46 +370,40 @@ describe("planner: results", () => {
     expect([s.status("A"), s.status("B"), s.status("C")]).toEqual(["MERGED", "MERGED", "MERGED"]);
   });
 
-  it("head train fails: B and C slide forward and B re-forks from main", () => {
+  it("a pass waiting to land is unaffected by another train's failure", () => {
     const s = Sim.abc();
-    s.result("C", true); // speculative pass is discarded with its train
+    s.result("A", true); // landing
+    s.result("C", true); // waiting, ticket 2
+    s.result("B", false);
+    expect(s.trainOf("C")).toMatchObject({ phase: "PASSED", passedSeq: 2, includedPrompts: ["C"] });
+    expect(s.trainOf("B")).toMatchObject({ includedPrompts: ["B"], action: "REWORK", forkSource: "hive" });
+  });
+
+  it("a failed build never ejects anyone else", () => {
+    const s = Sim.abc();
     s.result("A", false);
-    expect(s.trainOf("B")).toMatchObject({ includedPrompts: ["B"], forkSource: "hive", phase: "BUILDING" });
-    expect(s.trainOf("C")).toMatchObject({ includedPrompts: ["B", "C"], phase: "WAITING_PARENT" });
-    expect(s.trainOf("A")).toMatchObject({ includedPrompts: ["B", "C", "A"], action: "REWORK" });
-    expect(s.status("A")).toBe("QUEUED");
-    expect(["t1", "t2", "t3"].map((id) => s.trains.get(id)!.status)).toEqual(["EJECTED", "EJECTED", "EJECTED"]);
-  });
-
-  it("tail train fails: only the tail is ejected and re-queued", () => {
-    const s = Sim.abc();
-    s.result("C", false);
-    expect(s.trains.get("t1")!.phase).toBe("TESTING");
     expect(s.trains.get("t2")!.phase).toBe("TESTING");
-    expect(s.trains.get("t3")!.phase).toBe("EJECTED");
-    expect(s.takeOp("DELETE").map((e) => e.trainId)).toEqual(["t3"]);
-    // B already pushed, so the rework forks immediately from B's fork.
-    expect(s.trainOf("C")).toMatchObject({ trainId: "t4", includedPrompts: ["A", "B", "C"], forkSource: "hive-train-t2" });
+    expect(s.trains.get("t3")!.phase).toBe("TESTING");
+    expect(s.trains.get("t1")!.phase).toBe("EJECTED");
+    expect(s.takeOp("DELETE").map((e) => e.trainId)).toEqual(["t1"]);
   });
 
-  it("a new prompt arriving mid-train joins the tail, excluding merged prompts", () => {
+  it("a new prompt forks from main whatever is in flight", () => {
     const s = Sim.abc();
     s.result("A", true);
     s.land("A");
     s.submit("D");
     const d = s.trainOf("D");
-    expect(d.includedPrompts).toEqual(["B", "C", "D"]);
-    expect(s.takeOp("FORK").at(-1)).toMatchObject({ trainId: d.trainId, sourceRepo: "hive-train-t3" });
+    expect(d.includedPrompts).toEqual(["D"]);
+    expect(s.takeOp("FORK").at(-1)).toMatchObject({ trainId: d.trainId, sourceRepo: "hive" });
   });
 
-  it("a new prompt waits for an unpushed predecessor", () => {
+  it("a new prompt never waits for an unpushed train", () => {
     const s = new Sim();
     s.submit("A");
     s.completeForks();
     s.submit("B");
-    expect(s.trainOf("B").phase).toBe("WAITING_PARENT");
-    s.build("A");
-    expect(s.trainOf("B").forkSource).toBe("hive-train-t1");
+    expect(s.trainOf("B")).toMatchObject({ phase: "BUILDING", forkState: "PENDING", forkSource: "hive" });
   });
 
   it("caps reworks: a prompt that keeps failing is FAILED", () => {
@@ -378,16 +429,17 @@ describe("planner: results", () => {
 });
 
 describe("planner: idempotency", () => {
-  it("ignores a result for an already-superseded train", () => {
+  it("ignores a result for an already-ejected train", () => {
     const s = Sim.abc();
     s.result("B", false);
     s.take("broadcast");
-    const r = s.run((p) => p.trainResult({ trainId: "t3", passed: true, summary: "late" }));
-    expect(r).toEqual({ outcome: "ignored:stale", prompts: [], trains: [], deployments: [], effects: [], modelStats: [] });
+    const r = s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "late" }));
+    expect(r).toEqual({ outcome: "ignored:stale", prompts: [], trains: [], deployments: [], effects: [], modelStats: [], events: [], races: [], itemConflicts: [], conflictClaims: [] });
   });
 
   it("ignores duplicate, unknown and premature results", () => {
     const s = Sim.abc();
+    s.result("A", true); // A lands first, so B waits PASSED
     s.result("B", true);
     expect(s.run((p) => p.trainResult({ trainId: "t2", passed: false, summary: "dup" })).outcome).toBe("ignored:duplicate");
     expect(s.trainOf("B").phase).toBe("PASSED");
@@ -409,23 +461,26 @@ describe("planner: idempotency", () => {
     expect(r.effects).toEqual([]);
   });
 
-  it("deletes an orphan fork that completes after its train was superseded", () => {
+  it("deletes an orphan fork that completes after its train was ejected (a race loser at the deadline)", () => {
     const s = new Sim();
-    s.submit("A", "B");
-    s.completeForks();
-    s.run((p) => p.buildResult({ trainId: "t1", headSha: "h1" })); // B's fork is now in flight
-    const [bFork] = s.takeOp("FORK");
-    expect(bFork).toMatchObject({ trainId: "t2", sourceRepo: "hive-train-t1" });
-    s.result("A", false, "x"); // B (contains A) is superseded mid-fork
-    expect(s.trains.get("t2")).toMatchObject({ phase: "EJECTED", forkState: "DELETING", deleteCommandId: "t2-delete-1" });
-    const dels = s.takeOp("DELETE");
-    expect(dels.map((d) => d.commandId)).toEqual(["t1-delete-1", "t2-delete-1"]);
-    s.run((p) => p.provisionResult({ commandId: "t2-delete-1", op: "DELETE", trainId: "t2", ok: true }));
-    expect(s.trains.get("t2")!.forkState).toBe("DELETED");
+    s.run((p) => p.submit({ promptId: "A", promptText: "do A", raceWidth: 2 })); // race t1: t2, t3
+    const [f2, f3] = s.takeOp("FORK");
+    s.run((p) => p.provisionResult({ commandId: f2!.commandId, op: "FORK", trainId: "t2", ok: true, artifactRepo: "hive-train-t2", baseSha: "m" }));
+    s.run((p) => p.buildResult({ trainId: "t2", headSha: "h2" }));
+    s.completeDeploys();
+    s.effects = [];
+    expect(s.trains.get("t2")!.phase).toBe("TESTING");
+    s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "ok" }));
+    s.now += 90_000;
+    s.run((p) => p.reconcile()); // deadline: t3 (fork still in flight) loses
+    expect(s.trains.get("t3")).toMatchObject({ phase: "EJECTED", forkState: "DELETING", deleteCommandId: "t3-delete-1", raceOutcome: "LOST" });
+    s.takeOp("DELETE");
+    s.run((p) => p.provisionResult({ commandId: "t3-delete-1", op: "DELETE", trainId: "t3", ok: true }));
+    expect(s.trains.get("t3")!.forkState).toBe("DELETED");
     // The fork finishes after the delete: it is an orphan, deleted under a new command.
-    const late = s.run((p) => p.provisionResult({ commandId: bFork!.commandId, op: "FORK", trainId: "t2", ok: true, artifactRepo: "hive-train-t2", baseSha: "m" }));
+    const late = s.run((p) => p.provisionResult({ commandId: f3!.commandId, op: "FORK", trainId: "t3", ok: true, artifactRepo: "hive-train-t3", baseSha: "m" }));
     expect(late.outcome).toBe("ignored:stale");
-    expect(s.takeOp("DELETE")).toEqual([{ op: "DELETE", commandId: "t2-delete-2", hive: "hive", trainId: "t2", repo: "hive-train-t2" }]);
+    expect(s.takeOp("DELETE")).toEqual([{ op: "DELETE", commandId: "t3-delete-2", hive: "hive", trainId: "t3", repo: "hive-train-t3" }]);
   });
 
   it("a duplicate FORK result is a no-op", () => {
@@ -446,7 +501,7 @@ describe("planner: reconcile", () => {
     s.take("provision");
     const r = s.run((p) => p.reconcile());
     // Same command id: if the first dispatch did start a Workflow, this is a no-op.
-    expect(r.effects).toContainEqual({
+    expect(plain(r.effects)).toContainEqual({
       type: "provision",
       trainId: "t1",
       command: { op: "FORK", commandId: "t1-fork-1", hive: "hive", trainId: "t1", sourceRepo: "hive", forkName: "hive-train-t1", recallQuery: "do A" },
@@ -459,29 +514,28 @@ describe("planner: reconcile", () => {
     expect(s.run((p) => p.reconcile()).effects.filter((e) => e.type === "dispatchDrone")).toHaveLength(0);
   });
 
-  it("re-derives a pending fork's source (under a new command id) when its predecessor merged meanwhile", () => {
+  it("a pending fork is re-sent to main with the same command id; merged trains' deletes and teardowns are re-sent", () => {
     const s = new Sim();
     s.submit("A", "B");
     s.completeForks();
     s.run((p) => p.buildResult({ trainId: "t1", headSha: "h1" }));
     s.completeDeploys();
-    expect(s.takeOp("FORK").map((c) => c.commandId)).toEqual(["t2-fork-1"]); // B's fork from A's repo is lost
-    s.effects = [];
     s.result("A", true);
     s.land("A");
     s.effects = [];
+    s.trains.set("t2", { ...s.trains.get("t2")!, forkState: "PENDING", phase: "BUILDING" }); // B's fork result was lost
     const r = s.run((p) => p.reconcile());
-    expect(r.effects).toContainEqual({
+    expect(plain(r.effects)).toContainEqual({
       type: "provision",
       trainId: "t2",
-      command: { op: "FORK", commandId: "t2-fork-2", hive: "hive", trainId: "t2", sourceRepo: "hive", forkName: "hive-train-t2", recallQuery: "do B" },
+      command: { op: "FORK", commandId: "t2-fork-1", hive: "hive", trainId: "t2", sourceRepo: "hive", forkName: "hive-train-t2", recallQuery: "do B" },
     });
-    expect(r.effects).toContainEqual({
+    expect(plain(r.effects)).toContainEqual({
       type: "provision",
       trainId: "t1",
       command: { op: "DELETE", commandId: "t1-delete-1", hive: "hive", trainId: "t1", repo: "hive-train-t1" },
     });
-    expect(r.effects).toContainEqual({
+    expect(plain(r.effects)).toContainEqual({
       type: "deploy",
       trainId: "t1",
       command: { op: "TEARDOWN", commandId: "t1-teardown-1", hive: "hive", environment: "preview", trainId: "t1" },
@@ -609,13 +663,13 @@ describe("planner: preview deploys", () => {
     expect(r.outcome).toBe("applied");
     expect(s.trains.get("t1")).toMatchObject({ phase: "EJECTED", reason: "failed: preview deploy failed: Worker failed to start: SyntaxError", deployState: "TEARING_DOWN" });
     expect(s.deployments.get("preview-t1")).toMatchObject({ status: "FAILED", summary: "Worker failed to start: SyntaxError" });
-    expect(s.trains.get("t2")!.reason).toMatch(/^superseded/);
-    expect(s.takeOp("TEARDOWN").map((c) => c.commandId)).toEqual(["t1-teardown-1", "t2-teardown-1"]);
+    expect(s.trains.get("t2")!.phase).toBe("DEPLOYING"); // B is untouched
+    expect(s.takeOp("TEARDOWN").map((c) => c.commandId)).toEqual(["t1-teardown-1"]);
     s.completeForks();
-    expect(s.trainOf("A")).toMatchObject({ action: "REWORK", includedPrompts: ["B", "A"] });
+    expect(s.trainOf("A")).toMatchObject({ action: "REWORK", includedPrompts: ["A"], forkSource: "hive" });
     expect(s.prompts.get("A")).toMatchObject({ attempts: 1, summary: "Worker failed to start: SyntaxError" });
     const rework = s.take("dispatchDrone").find((d) => d.task.promptId === "A");
-    expect(rework).toBeUndefined(); // waits for B' to push
+    expect(rework!.task).toMatchObject({ action: "REWORK", scribeSummary: "Worker failed to start: SyntaxError" }); // no waiting
   });
 
   it("an ok deploy without a URL counts as a failure", () => {
@@ -1044,8 +1098,8 @@ describe("planner: hive memory", () => {
     s.run((p) => p.submit({ promptId: "A", promptText: long }));
     const [first] = s.takeOp("FORK");
     expect(first!.recallQuery).toBe(long.slice(0, 4_000));
-    const again = s.run((p) => p.reconcile()).effects.find((e) => e.type === "provision");
-    expect(again).toEqual({ type: "provision", trainId: "t1", command: first });
+    const again = s.run((p) => p.reconcile()).effects.find((e) => e.type === "provision")!;
+    expect(plain([again])[0]).toEqual({ type: "provision", trainId: "t1", command: first });
   });
 
   it("a fork retry under a new command id recalls for the same prompt", () => {
@@ -1104,5 +1158,351 @@ describe("planner: hive memory", () => {
     const lander = s.take("dispatchDrone").find((e) => e.task.role === "LANDER");
     expect(lander!.task.ragContext).toEqual([]);
     expect(s.trains.get("t2")!.memories).toEqual(mems);
+  });
+});
+
+// ── v2: races, merge-queue hooks, traces ─────────────────────────────────
+
+const DS_FLASH = "@cf/deepseek-ai/deepseek-v4-flash-0731";
+const GLM_FLASH = "@cf/zai-org/glm-5.3-flash";
+const KIMI = "@cf/moonshotai/kimi-k2.7-code";
+const score = (over: Partial<GateScore> = {}): GateScore => ({ review: "approved", satisfied: 4, missing: 0, changedFiles: 2, changedBytes: 3000, checks: 5, ...over });
+
+/** A race of `width` for prompt A: race t1, candidates t2.., all forked, built and live. */
+function raceSim(width = 3): Sim {
+  const s = new Sim();
+  s.run((p) => p.submit({ promptId: "A", promptText: "do A", raceWidth: width }));
+  s.completeForks();
+  for (let i = 0; i < width; i++) s.run((p) => p.buildResult({ trainId: `t${i + 2}`, headSha: `h${i + 2}`, model: undefined }));
+  s.completeDeploys();
+  s.take("dispatchDrone");
+  return s;
+}
+
+describe("planner: races (best-of-N)", () => {
+  it("a race's candidates all fork from main at once, on distinct models whose fallbacks exclude their siblings", () => {
+    const s = new Sim();
+    const r = s.run((p) => p.submit({ promptId: "A", promptText: "do A", raceWidth: 3 }));
+    expect(s.takeOp("FORK").map((f) => [f.trainId, f.sourceRepo])).toEqual([
+      ["t2", "hive"],
+      ["t3", "hive"],
+      ["t4", "hive"],
+    ]);
+    expect(r.races).toEqual([expect.objectContaining({ raceId: "t1", itemId: "A", width: 3, state: "RACING", trainIds: ["t2", "t3", "t4"], deadlineAt: null })]);
+    const cands = ["t2", "t3", "t4"].map((id) => s.trains.get(id)!);
+    expect(cands.map((t) => [t.raceId, t.candidate, t.raceOutcome, t.includedPrompts])).toEqual([
+      ["t1", 0, "RACING", ["A"]],
+      ["t1", 1, "RACING", ["A"]],
+      ["t1", 2, "RACING", ["A"]],
+    ]);
+    expect(cands.map((t) => t.model)).toEqual([DS_FLASH, GLM_FLASH, KIMI]);
+    for (const t of cands) for (const fb of t.modelChoice!.fallbacks) expect([DS_FLASH, GLM_FLASH, KIMI]).not.toContain(fb);
+    expect(r.events.filter((e) => e.type === "race.started")).toHaveLength(1);
+    for (const id of ["t2", "t3", "t4"]) {
+      s.run((p) => p.provisionResult({ commandId: `${id}-fork-1`, op: "FORK", trainId: id, ok: true, artifactRepo: `hive-train-${id}` }));
+    }
+    expect(s.take("dispatchDrone").map((d) => d.task.modelChoice?.model)).toEqual([DS_FLASH, GLM_FLASH, KIMI]);
+  });
+
+  it("the winner (by rankCandidates) gets passedSeq; losers are EJECTED as LOST; the floor does not move; stats count every candidate", () => {
+    const s = raceSim();
+    const floor = { ...s.floor };
+    s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "ok", score: score({ review: "skipped" }) }));
+    expect(s.trains.get("t2")).toMatchObject({ phase: "TESTING", raceOutcome: "PASSED" });
+    expect(s.races.get("t1")!.deadlineAt).toBe(s.now + 90_000);
+    s.run((p) => p.trainResult({ trainId: "t3", passed: true, summary: "ok", score: score({ changedBytes: 3000 }) }));
+    s.run((p) => p.trainResult({ trainId: "t4", passed: true, summary: "ok", score: score({ changedBytes: 9000 }) }));
+    expect(s.trains.get("t3")).toMatchObject({ raceOutcome: "WON", passedSeq: 1 });
+    expect(s.trains.get("t3")!.reason).toMatch(/^won: reviewer approved \(4\/0\).*2\.9 KB vs 8\.8 KB; GLM-5\.3 Flash$/);
+    expect(s.trains.get("t3")!.phase).toBe("LANDING"); // direct landing: nothing ahead
+    expect(s.trains.get("t2")).toMatchObject({ phase: "EJECTED", raceOutcome: "LOST" });
+    expect(s.trains.get("t2")!.reason).toMatch(/^lost race to t3: reviewer approved/);
+    expect(s.trains.get("t4")!.reason).toBe("lost race to t3: 2.9 KB vs 8.8 KB");
+    expect(s.races.get("t1")).toMatchObject({ state: "DECIDED", winnerTrainId: "t3" });
+    expect(s.status("A")).toBe("IN_TRAIN");
+    expect(s.floor).toEqual(floor);
+    for (const m of [DS_FLASH, GLM_FLASH, KIMI]) expect(s.stat(m)).toMatchObject({ attempts: 1, passes: 1 });
+    expect(s.events.filter((e) => e.type === "race.decided")).toHaveLength(1);
+  });
+
+  it("a late loser result is ignored:stale", () => {
+    const s = raceSim(2);
+    s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "ok" }));
+    s.run((p) => p.trainResult({ trainId: "t3", passed: true, summary: "ok" }));
+    expect(s.trains.get("t3")!.raceOutcome).toBe("LOST"); // tie → lower candidate index wins
+    expect(s.run((p) => p.trainResult({ trainId: "t3", passed: true, summary: "late" })).outcome).toBe("ignored:stale");
+    expect(s.run((p) => p.buildResult({ trainId: "t3", headSha: "late" })).outcome).toBe("ignored:stale");
+  });
+
+  it("at the deadline the race is decided with the passes so far; still-running candidates lose; the alarm covers it", () => {
+    const s = raceSim();
+    s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "ok" }));
+    const deadline = s.now + 90_000;
+    expect(watchdogDeadline([...s.trains.values()], DEFAULT_COMMAND_TIMEOUT_MS, s.now, [...s.races.values()])).toBe(deadline);
+    s.now = deadline - 1;
+    s.run((p) => p.reconcile());
+    expect(s.races.get("t1")!.state).toBe("RACING");
+    s.now = deadline;
+    s.run((p) => p.reconcile());
+    expect(s.trains.get("t2")).toMatchObject({ raceOutcome: "WON", passedSeq: 1 });
+    expect(["t3", "t4"].map((id) => s.trains.get(id)!.reason)).toEqual(["lost race to t2: still running at the race deadline", "lost race to t2: still running at the race deadline"]);
+  });
+
+  it("a failing candidate is ejected alone; when all fail the race is ABANDONED and the item reworks once with the best failure's summary", () => {
+    const s = raceSim();
+    s.run((p) => p.trainResult({ trainId: "t2", passed: false, summary: "bad 1", score: score({ review: "off", missing: 3 }) }));
+    expect(s.trains.get("t2")).toMatchObject({ phase: "EJECTED", raceOutcome: "FAILED", reason: "failed in race: bad 1" });
+    expect(s.prompts.get("A")!.attempts).toBe(0);
+    expect([...s.trains.values()].filter(isActiveRow)).toHaveLength(2); // no rework yet
+    s.run((p) => p.trainResult({ trainId: "t3", passed: false, summary: "bad 2", score: score({ missing: 1 }) }));
+    s.run((p) => p.trainResult({ trainId: "t4", passed: false, summary: "bad 3" }));
+    expect(s.races.get("t1")).toMatchObject({ state: "ABANDONED", winnerTrainId: null });
+    expect(s.prompts.get("A")).toMatchObject({ attempts: 1, summary: "bad 2" });
+    const active = [...s.trains.values()].filter(isActiveRow);
+    expect(active).toEqual([expect.objectContaining({ promptId: "A", action: "REWORK", raceId: null, forkSource: "hive" })]);
+  });
+
+  it("the rework width comes from the race policy (reworkWidth), and a pin forces width 1", () => {
+    const s = new Sim();
+    s.race = { reworkWidth: 2, hardWidth: 3, maxRaceWidth: 3, slotsFree: 10 };
+    s.submit("A");
+    s.completeForks();
+    s.build("A");
+    s.result("A", false, "nope");
+    const reworks = [...s.trains.values()].filter((t) => isActiveRow(t) && t.action === "REWORK");
+    expect(reworks).toHaveLength(2);
+    expect(new Set(reworks.map((t) => t.raceId)).size).toBe(1);
+    expect(reworks.every((t) => t.modelChoice?.role === "rework" && t.modelChoice.tier === "frontier")).toBe(true);
+    expect(new Set(reworks.map((t) => t.model)).size).toBe(2);
+
+    const pinned = new Sim();
+    pinned.race = s.race;
+    pinned.pin = KIMI;
+    pinned.submit("A");
+    pinned.completeForks();
+    pinned.build("A");
+    pinned.result("A", false, "nope");
+    expect([...pinned.trains.values()].filter((t) => isActiveRow(t) && t.action === "REWORK")).toHaveLength(1);
+  });
+});
+
+function isActiveRow(t: TrainRecord): boolean {
+  return t.phase !== "MERGED" && t.phase !== "EJECTED";
+}
+
+const none = (): QueueDecision => ({ patches: [], cars: [], failures: [], effects: [], events: [] });
+
+/** Fake queue.ts: boards every waiting passed build (at least `min`) onto one car; mergeResult moves the car on. */
+function fakeQueue(min = 1) {
+  const formCars = vi.fn((trains: readonly TrainRecord[], ctx: { newId: () => string }): QueueDecision => {
+    const waiting = trains.filter((t) => t.lane !== "QUEUE" && t.phase === "PASSED" && !t.carId);
+    if (waiting.length < min) return none();
+    const carId = ctx.newId();
+    return {
+      ...none(),
+      cars: [{ carId, members: waiting.map((t) => t.trainId), includedPrompts: waiting.map((t) => t.promptId), predecessorCarId: null, bisectOf: null }],
+      patches: waiting.map((t) => ({ trainId: t.trainId, patch: { carId } })),
+    };
+  });
+  const mergeResult = vi.fn((car: TrainRecord, r: { headSha?: string; merged: string[]; fastForward: boolean; conflicts: { trainId: string; paths: string[]; kind: "content"; summary: string }[] }): QueueDecision => ({
+    ...none(),
+    patches: [
+      { trainId: car.trainId, patch: { phase: r.fastForward ? "PASSED" : "DEPLOYING", headSha: r.headSha ?? null, members: r.merged, dispatched: false } },
+      ...r.conflicts.map((c) => ({ trainId: c.trainId, patch: { carId: null, conflict: c } })),
+    ],
+    failures: r.conflicts.map((c) => ({ trainId: c.trainId, summary: `Merge conflict: ${c.paths.join(", ")}`, cause: "conflict" as const, waitForCarSeq: car.seq, conflict: c, claimPaths: c.paths })),
+  }));
+  const carFailed = vi.fn((): QueueDecision => none());
+  const carLanded = vi.fn((car: TrainRecord, sha: string): QueueDecision => ({
+    ...none(),
+    patches: [car.trainId, ...(car.members ?? [])].map((id) => ({ trainId: id, patch: { phase: "MERGED" as const, landedSha: sha } })),
+  }));
+  return { formCars, mergeResult, carFailed, carLanded };
+}
+
+function queueSim(min = 1) {
+  const s = new Sim();
+  const hooks = fakeQueue(min);
+  s.queue = { settings: { maxQueueBatch: 4, maxQueueDepth: 3 }, hooks: hooks as unknown as QueueOptions["hooks"] };
+  return { s, hooks };
+}
+
+describe("planner: merge-queue hooks (queue.ts injected)", () => {
+  it("a pass calls formCars; the CarDraft becomes a QUEUE car forked from main; its fork dispatches the MERGE drone with the members", () => {
+    const { s, hooks } = queueSim();
+    s.submit("A");
+    s.completeForks();
+    s.build("A");
+    s.take("dispatchDrone");
+    s.run((p) => p.trainResult({ trainId: "t1", passed: true, summary: "ok" }));
+    expect(hooks.formCars).toHaveBeenCalled();
+    expect(s.trains.get("t1")).toMatchObject({ phase: "PASSED", passedSeq: 1, carId: "t2" });
+    expect(s.trains.get("t2")).toMatchObject({ lane: "QUEUE", members: ["t1"], includedPrompts: ["A"], phase: "BUILDING", forkState: "PENDING", forkSource: "hive" });
+    const [fork] = s.takeOp("FORK");
+    expect(fork).toEqual({ op: "FORK", commandId: "t2-fork-1", hive: "hive", trainId: "t2", sourceRepo: "hive", forkName: "hive-train-t2" }); // no recallQuery
+    s.run((p) => p.provisionResult({ commandId: "t2-fork-1", op: "FORK", trainId: "t2", ok: true, artifactRepo: "hive-train-t2", baseSha: "m0" }));
+    const [merge] = s.take("dispatchDrone");
+    expect(merge!.task).toMatchObject({
+      trainId: "t2",
+      action: "MERGE",
+      role: "LANDER",
+      promptText: "queue car t2: 1 members",
+      members: [{ trainId: "t1", promptId: "A", artifactRepo: "hive-train-t1", headSha: "head:A", title: "do A" }],
+    });
+    expect(s.run((p) => p.buildResult({ trainId: "t2", headSha: "x" })).outcome).toBe("ignored:unknown");
+  });
+
+  it("mergeResult: DEPLOYING car gets a preview, the next car forks from it; the PASSED head lands with the LANDER; carLanded fans out to members", () => {
+    const { s, hooks } = queueSim();
+    s.submit("A", "B");
+    s.completeForks();
+    s.build("A");
+    s.build("B");
+    s.take("dispatchDrone");
+    s.run((p) => p.trainResult({ trainId: "t1", passed: true, summary: "ok" })); // car t3 [t1]
+    s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "ok" })); // car t4 [t2], waits for t3's push
+    expect(s.trains.get("t4")).toMatchObject({ lane: "QUEUE", phase: "WAITING_PARENT" });
+    s.completeForks();
+    const m = { trainId: "t3", ok: true, headSha: "k1", baseSha: "m0", merged: ["t1"], conflicts: [], fastForward: false, summary: "" };
+    expect(s.run((p) => p.mergeResult(m)).outcome).toBe("applied");
+    expect(hooks.mergeResult).toHaveBeenCalledTimes(1);
+    expect(s.trains.get("t3")).toMatchObject({ phase: "DEPLOYING", headSha: "k1", deployState: "PENDING" });
+    expect(s.takeOp("FORK")).toEqual([expect.objectContaining({ trainId: "t4", sourceRepo: "hive-train-t3" })]);
+    expect(s.run((p) => p.mergeResult(m)).outcome).toBe("ignored:duplicate");
+    s.completeDeploys();
+    s.take("dispatchDrone");
+    s.run((p) => p.trainResult({ trainId: "t3", passed: true, summary: "integration ok" }));
+    const [lander] = s.take("dispatchDrone").filter((d) => d.task.action === "LAND");
+    expect(lander!.task).toMatchObject({ trainId: "t3", role: "LANDER", baseRef: "k1", members: [expect.objectContaining({ trainId: "t1" })] });
+    s.effects = [];
+    const landed = s.run((p) => p.landResult({ trainId: "t3", landed: true, mainSha: "main-1", summary: "" }));
+    expect(hooks.carLanded).toHaveBeenCalledWith(expect.objectContaining({ trainId: "t3" }), "main-1", expect.anything(), expect.anything());
+    expect(landed.landed).toEqual({ sha: "main-1", trainIds: ["t1"] });
+    expect([s.trains.get("t3")!.phase, s.trains.get("t1")!.phase, s.status("A")]).toEqual(["MERGED", "MERGED", "MERGED"]);
+    expect(s.takeOp("DELETE").map((d) => d.trainId).sort()).toEqual(["t1", "t3"]);
+  });
+
+  it("a conflict reworks the member (conflicts + 1, not attempts) and holds it WAITING_PARENT until the car is terminal", () => {
+    const { s } = queueSim(2);
+    s.submit("A", "B");
+    s.completeForks();
+    s.build("A");
+    s.build("B");
+    s.run((p) => p.trainResult({ trainId: "t1", passed: true, summary: "ok" }));
+    s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "ok" })); // car t3 [t1, t2]
+    expect(s.trains.get("t3")!.members).toEqual(["t1", "t2"]);
+    s.completeForks();
+    s.effects = [];
+    const conflict = { trainId: "t2", kind: "content" as const, paths: ["src/theme.js"], summary: "" };
+    const r = s.run((p) => p.mergeResult({ trainId: "t3", ok: true, headSha: "k1", merged: ["t1"], conflicts: [conflict], fastForward: false, summary: "" }));
+    expect(s.trains.get("t2")).toMatchObject({ phase: "EJECTED", reason: "failed: Merge conflict: src/theme.js", conflict });
+    expect(s.prompts.get("B")).toMatchObject({ attempts: 0, summary: "Merge conflict: src/theme.js" });
+    expect(r.itemConflicts).toEqual([{ itemId: "B", conflicts: 1 }]);
+    expect(r.conflictClaims).toEqual([{ itemId: "B", paths: ["src/theme.js"] }]);
+    const rework = s.trainOf("B");
+    expect(rework).toMatchObject({ action: "REWORK", waitForCarSeq: 3, phase: "WAITING_PARENT" });
+    expect(s.takeOp("FORK").filter((f) => f.trainId === rework.trainId)).toEqual([]);
+    s.run((p) => p.reconcile());
+    expect(s.trainOf("B").phase).toBe("WAITING_PARENT");
+    s.completeDeploys();
+    s.run((p) => p.trainResult({ trainId: "t3", passed: true, summary: "ok" }));
+    s.run((p) => p.landResult({ trainId: "t3", landed: true, mainSha: "main-2", summary: "" }));
+    expect(s.trainOf("B")).toMatchObject({ phase: "BUILDING", forkState: "PENDING", forkSource: "hive" });
+  });
+
+  it("past maxConflictReworks a conflicting item is FAILED", () => {
+    const { s } = queueSim(2);
+    s.items = [{ itemId: "B", conflicts: 2 }];
+    s.submit("A", "B");
+    s.completeForks();
+    s.build("A");
+    s.build("B");
+    s.run((p) => p.trainResult({ trainId: "t1", passed: true, summary: "ok" }));
+    s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "ok" }));
+    s.completeForks();
+    const r = s.run((p) =>
+      p.mergeResult({ trainId: "t3", ok: true, headSha: "k1", merged: ["t1"], conflicts: [{ trainId: "t2", kind: "content", paths: ["a"], summary: "" }], fastForward: false, summary: "" }),
+    );
+    expect(r.itemConflicts).toEqual([{ itemId: "B", conflicts: 3 }]);
+    expect(s.status("B")).toBe("FAILED");
+  });
+
+  it("car failures route to carFailed: a gate verdict as 'gate', a preview failure as 'infra'; the car is ejected", () => {
+    for (const how of ["gate", "infra"] as const) {
+      const { s, hooks } = queueSim();
+      s.submit("A");
+      s.completeForks();
+      s.build("A");
+      s.run((p) => p.trainResult({ trainId: "t1", passed: true, summary: "ok" }));
+      s.completeForks();
+      s.run((p) => p.mergeResult({ trainId: "t2", ok: true, headSha: "k1", merged: ["t1"], conflicts: [], fastForward: false, summary: "" }));
+      if (how === "gate") {
+        s.completeDeploys();
+        s.run((p) => p.trainResult({ trainId: "t2", passed: false, summary: "smoke /x 500" }));
+      } else {
+        s.run((p) => p.deployResult({ commandId: "t2-deploy-1", op: "DEPLOY", environment: "preview", trainId: "t2", ok: false, summary: "boom" }));
+      }
+      expect(hooks.carFailed).toHaveBeenCalledWith(expect.objectContaining({ trainId: "t2" }), expect.any(String), how, expect.anything(), expect.anything());
+      expect(s.trains.get("t2")!.phase).toBe("EJECTED");
+      expect(s.prompts.get("A")!.attempts).toBe(0); // the car's failure is not the member's
+    }
+  });
+});
+
+describe("planner: trace stamping and events", () => {
+  it("every command and drone task carries the item's trace, with span = spanIdFor(command / drone instance id)", () => {
+    const s = new Sim();
+    const trace = "a".repeat(32);
+    s.items = [{ itemId: "A", traceId: trace }];
+    s.submit("A", "B");
+    const forks = s.take("provision").map((e) => e.command);
+    expect(forks[0]!.trace).toEqual({ traceparent: traceparent(trace, spanIdFor("t1-fork-1")) });
+    expect(forks[1]!.trace).toEqual({ traceparent: traceparent(traceIdFromUuid("B"), spanIdFor("t2-fork-1")) });
+    expect([s.trains.get("t1")!.traceId, s.trains.get("t2")!.traceId]).toEqual([trace, traceIdFromUuid("B")]);
+    s.run((p) => p.provisionResult({ commandId: "t1-fork-1", op: "FORK", trainId: "t1", ok: true, artifactRepo: "hive-train-t1" }));
+    const [d] = s.take("dispatchDrone");
+    expect(d!.task.trace).toEqual({ traceparent: traceparent(trace, spanIdFor("t1-build")) });
+  });
+
+  it("enqueue emits train.enqueued; each phase change emits train.phase as a child of the item span (EJECTED is a warning)", () => {
+    const s = new Sim();
+    const r = s.run((p) => p.submit({ promptId: "A", promptText: "do A" }));
+    expect(r.events.map((e) => [e.type, e.summary])).toEqual([
+      ["train.enqueued", "BUILD train t1 for A"],
+      ["train.phase", "train t1 WAITING_PARENT → BUILDING"],
+    ]);
+    expect(r.events[1]).toMatchObject({ actor: "queen", traceId: traceIdFromUuid("A"), spanId: spanIdFor("t1"), parentSpanId: spanIdFor("A"), itemId: "A", trainId: "t1", data: { from: "WAITING_PARENT", to: "BUILDING", lane: "BUILD" } });
+    s.completeForks();
+    s.build("A");
+    const f = s.result("A", false, "nope");
+    expect(f.events.find((e) => e.type === "train.phase" && e.trainId === "t1")).toMatchObject({ severity: "warn", summary: "train t1 TESTING → EJECTED: failed: nope" });
+  });
+
+  it("a car's events are recorded in each member's trace, as a child of that member's build span", () => {
+    const { s } = queueSim(2);
+    s.items = [{ itemId: "A", traceId: "a".repeat(32) }, { itemId: "B", traceId: "b".repeat(32) }];
+    s.submit("A", "B");
+    s.completeForks();
+    s.build("A");
+    s.build("B");
+    s.run((p) => p.trainResult({ trainId: "t1", passed: true, summary: "ok" }));
+    const r = s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "ok" }));
+    const carEvents = r.events.filter((e) => e.trainId === "t3" && e.type === "train.phase");
+    expect(carEvents.map((e) => [e.traceId, e.spanId, e.parentSpanId, e.itemId])).toEqual([
+      ["a".repeat(32), spanIdFor("t3"), spanIdFor("t1"), "A"],
+      ["b".repeat(32), spanIdFor("t3"), spanIdFor("t2"), "B"],
+    ]);
+  });
+});
+
+describe("planner: War Room views", () => {
+  it("toMergeTrain stays v1-shaped; toMergeTrainV2 adds the v2 fields that are set (lane only for cars)", () => {
+    const s = raceSim(2);
+    s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "ok", score: score() }));
+    const t = s.trains.get("t2")!;
+    expect(toMergeTrain(t)).not.toHaveProperty("raceId");
+    expect(toMergeTrainV2(t)).toMatchObject({ trainId: "t2", raceId: "t1", candidate: 0, raceOutcome: "PASSED", traceId: traceIdFromUuid("A"), score: score() });
+    expect(toMergeTrainV2(t)).not.toHaveProperty("lane");
+    expect(toMergeTrainV2({ ...t, lane: "QUEUE", members: ["x"] })).toMatchObject({ lane: "QUEUE", members: ["x"] });
   });
 });

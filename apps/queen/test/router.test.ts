@@ -9,7 +9,9 @@ import {
   chooseModel,
   floorAfter,
   route,
+  routeRace,
   toRouterFloor,
+  vendorOf,
   type FloorState,
   type RouterStats,
 } from "../src/models/router";
@@ -323,5 +325,56 @@ describe("router: tier floor (AIMD + probes)", () => {
     expect(RouterFloorSchema.parse(toRouterFloor(INITIAL_FLOOR))).toEqual({ tier: "fast", streak: 0, backoffAfter: 3, probeIn: null });
     expect(toRouterFloor({ tier: "frontier", passStreak: 2, aboveStreak: 3, note: null })).toEqual({ tier: "frontier", streak: 2, backoffAfter: 3, probeIn: 1 });
     expect(toRouterFloor({ tier: "light", passStreak: 0, aboveStreak: 0, note: null }).tier).toBe("fast");
+  });
+});
+
+describe("router: routeRace (best-of-N)", () => {
+  const base = { role: "builder" as const, attempt: 1, promptChars: 1000, stats: [] as RouterStats[] };
+
+  it("returns distinct models: the value pick at the floor, then the next best preferring a new vendor", () => {
+    const choices = routeRace(base, 3);
+    expect(choices.map((c) => c.model)).toEqual([DS_FLASH, GLM_FLASH, KIMI]);
+    expect(new Set(choices.map((c) => vendorOf(c.model))).size).toBe(3);
+    expect(choices.map((c) => c.reason.slice(0, 8))).toEqual(["race 1/3", "race 2/3", "race 3/3"]);
+    expect(choices.every((c) => c.role === "builder")).toBe(true);
+  });
+
+  it("each candidate's fallbacks exclude every sibling's model", () => {
+    const choices = routeRace(base, 3);
+    const ids = choices.map((c) => c.model);
+    for (const c of choices) {
+      expect(c.fallbacks.some((f) => ids.includes(f))).toBe(false);
+      expect(c.fallbacks.length).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it("a rework race starts at frontier; tiers below are used only when the frontier is exhausted", () => {
+    const choices = routeRace({ ...base, role: "rework", attempt: 2 }, 4);
+    expect(choices.slice(0, 3).map((c) => c.tier)).toEqual(["frontier", "frontier", "frontier"]);
+    expect(new Set(choices.slice(0, 3).map((c) => c.model))).toEqual(new Set([DS_PRO, KIMI, GLM]));
+    expect(choices[3]).toMatchObject({ model: DS_FLASH, tier: "fast" });
+  });
+
+  it("never probes or explores, whatever the floor counters and dispatch index", () => {
+    const floor: FloorState = { tier: "frontier", passStreak: 0, aboveStreak: 99, note: null };
+    const choices = routeRace({ ...base, floor, dispatchIndex: EXPLORE_EVERY }, 2);
+    expect(choices.map((c) => c.tier)).toEqual(["frontier", "frontier"]);
+    expect(choices[0]!.reason).not.toMatch(/probe: trying|exploring least-tried/);
+  });
+
+  it("a pin cannot race: one choice; width 1 is route()'s pick; no tool-loop-less model is ever chosen", () => {
+    expect(routeRace({ ...base, pin: KIMI }, 3).map((c) => c.model)).toEqual([KIMI]);
+    expect(routeRace(base, 1).map((c) => c.model)).toEqual([route(base).choice.model]);
+    expect(routeRace(base, 5).map((c) => c.model)).not.toContain(QWEN);
+  });
+
+  it("narrows to the distinct models available", () => {
+    const tiny: CatalogModel[] = MODEL_CATALOG.filter((m) => m.id === DS_FLASH || m.id === GLM_FLASH);
+    expect(routeRace({ ...base, catalog: tiny }, 3).map((c) => c.model)).toEqual([DS_FLASH, GLM_FLASH]);
+  });
+
+  it("prefers the better track record within the starting tier", () => {
+    const stats = [stat(GLM_FLASH, 10, 10), stat(DS_FLASH, 10, 2)];
+    expect(routeRace({ ...base, stats }, 2).map((c) => c.model)).toEqual([GLM_FLASH, DS_FLASH]);
   });
 });
