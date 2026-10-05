@@ -30,7 +30,10 @@ A <hive_memory> section, when present, holds outcomes of earlier changes to this
 1. Look before you edit: list, find, grep and read the files that implement what the request talks about. Read the router first.
 2. Make the smallest edit that does the job. Prefer "edit" over rewriting whole files; write complete files when you create them.
 3. Call "verify": it loads the edited Worker in a sandbox and shows what "/" and "/health" (and any paths you pass) really return, plus template problems. If it is not ok, fix and verify again.
-4. Call "finish" exactly once, after a passing verify of your final edit, with a short summary, 2-6 reasoning steps and any approaches you rejected. Do not stop without calling finish.`;
+4. Call "finish" exactly once, after a passing verify of your final edit, with a short summary, 2-6 reasoning steps and any approaches you rejected. Do not stop without calling finish.
+
+# Follow-ups
+In "finish", "followUps" may list up to 3 real problems you noticed OUTSIDE your task (a bug in code you did not need to change, a broken route, an inconsistency). Only problems outside your task: never your own unfinished work, never a style opinion, never something you could fix within the request. Give each a kind ("bug" or "chore"), a short title, a body that says what is wrong and where, and the paths involved. Leave it empty when you saw nothing: an empty list is the normal case.`;
 
 const MAX_RAG_SNIPPETS = 8;
 const MAX_RAG_CHARS = 2_000;

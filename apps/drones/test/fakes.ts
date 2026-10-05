@@ -10,6 +10,7 @@ import type {
   BuildResult,
   DroneTaskInput,
   LandResultInput,
+  MergeResultInput,
   TrainResult,
 } from "@queenos/queen-types";
 import {
@@ -20,7 +21,7 @@ import {
   type PushInput,
   type PushOutcome,
 } from "@queenos/hive-kit";
-import type { ArtifactsPort, CloneRequest, DronePorts, GitPort, GitSession, LlmPort, QueenPort, RepoAccess } from "../src/ports";
+import type { ArtifactsPort, CloneRequest, DronePorts, MergeCarFn, GitPort, GitSession, LlmPort, QueenPort, RepoAccess } from "../src/ports";
 import type { StepRunner } from "../src/orchestrate";
 import type { AgentBuildInput, AgentBuildResult, AgentPort } from "../src/agent/contract";
 
@@ -104,6 +105,7 @@ type QueenCall =
   | { method: "reportBuildResult"; input: BuildResult }
   | { method: "reportLandResult"; input: LandResultInput }
   | { method: "reportTrainResult"; input: TrainResult }
+  | { method: "reportMergeResult"; input: MergeResultInput }
   | { method: "appendAudit"; input: AppendAuditInput };
 
 export class FakeQueen implements QueenPort {
@@ -120,6 +122,10 @@ export class FakeQueen implements QueenPort {
   }
   async reportTrainResult(input: TrainResult) {
     this.calls.push({ method: "reportTrainResult", input, namespace: this.namespace });
+    return { outcome: "applied" };
+  }
+  async reportMergeResult(input: MergeResultInput) {
+    this.calls.push({ method: "reportMergeResult", input, namespace: this.namespace });
     return { outcome: "applied" };
   }
   async appendAudit(input: AppendAuditInput) {
@@ -149,6 +155,9 @@ export class FakeWorld {
   readonly queens = new Map<string, FakeQueen>();
   llm: LlmPort | null = null;
   agent: FakeAgent | null = null;
+  mergeCar: MergeCarFn | undefined;
+  /** Analytics Engine stand-in: every point written. */
+  readonly points: { indexes: string[]; blobs: string[]; doubles: number[] }[] = [];
 
   queen(namespace: string): FakeQueen {
     let q = this.queens.get(namespace);
@@ -157,7 +166,7 @@ export class FakeWorld {
   }
 
   ports(): DronePorts {
-    return { artifacts: this.artifacts, git: this.git, queen: (ns) => this.queen(ns), llm: this.llm, agent: this.agent };
+    return { artifacts: this.artifacts, git: this.git, queen: (ns) => this.queen(ns), llm: this.llm, agent: this.agent, analytics: { writeDataPoint: (p) => void this.points.push(p) }, mergeCar: this.mergeCar };
   }
 }
 

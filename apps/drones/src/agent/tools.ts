@@ -13,10 +13,23 @@ import { MAX_VERIFY_PATHS, verifyWorker, type LoaderLike, type VerifyResult } fr
 
 export const MAX_VERIFY_CALLS = 6;
 
+/** Max out-of-scope problems a build may file (the Queen's guardrail clamps further). */
+export const MAX_FOLLOW_UPS = 3;
+
+/** A problem outside the task that the builder noticed while working (never its own unfinished work). */
+export interface FinishFollowUp {
+  kind: "bug" | "chore";
+  title: string;
+  body: string;
+  paths?: string[] | undefined;
+  priority?: number | undefined;
+}
+
 export interface FinishArgs {
   summary: string;
   reasoningSteps: string[];
   discardedPaths: string[];
+  followUps?: FinishFollowUp[] | undefined;
 }
 
 export interface ToolState {
@@ -48,6 +61,19 @@ export const FinishInputSchema = z.object({
   summary: z.string().min(1).max(500).describe("What you changed, in one or two sentences."),
   reasoningSteps: z.array(z.string().max(300)).min(1).max(6).describe("2-6 short steps: what you found and why you changed what you changed."),
   discardedPaths: z.array(z.string().max(200)).max(10).default([]).describe("Approaches you considered and rejected (may be empty)."),
+  followUps: z
+    .array(
+      z.object({
+        kind: z.enum(["bug", "chore"]),
+        title: z.string().min(1).max(120),
+        body: z.string().max(1000).describe("What is wrong, where, and how you saw it."),
+        paths: z.array(z.string().max(200)).max(10).default([]),
+        priority: z.number().int().min(1).max(3).default(2).describe("1 = urgent, 3 = low."),
+      }),
+    )
+    .max(MAX_FOLLOW_UPS)
+    .default([])
+    .describe("At most 3 real problems OUTSIDE your task that you noticed (may be empty). Never your own unfinished work."),
 });
 
 export async function runVerify(deps: DroneToolDeps, paths: string[] | undefined): Promise<VerifyResult | { ok: false; error: string }> {
@@ -88,7 +114,7 @@ export function droneTools(deps: DroneToolDeps): ToolSet {
     finish: tool({
       description: "Call exactly once when the change is done and the last verify (after your final edit) passed. Ends the task.",
       inputSchema: FinishInputSchema,
-      execute: async (args) => runFinish(deps, { ...args, discardedPaths: args.discardedPaths ?? [] }),
+      execute: async (args) => runFinish(deps, { ...args, discardedPaths: args.discardedPaths ?? [], followUps: args.followUps ?? [] }),
     }),
   };
 }

@@ -65,7 +65,7 @@ describe("BUILD (scripted)", () => {
     // Queen: RUNNING audit, build result, PASSED audit carrying the same ledger.
     const q = w.queen("hive");
     expect(q.calls.map((c) => c.method)).toEqual(["appendAudit", "reportBuildResult", "appendAudit"]);
-    expect(q.calls[1]!.input).toEqual({ trainId: "train-1", headSha: out.headSha, model: SCRIPTED_MODEL, buildMs: expect.any(Number) });
+    expect(q.calls[1]!.input).toEqual({ trainId: "train-1", headSha: out.headSha, model: SCRIPTED_MODEL, buildMs: expect.any(Number), changedPaths: expect.arrayContaining(["src/features/index.js"]) });
     const [running, passed] = q.audits();
     expect(running).toMatchObject({ promptId: "prompt-1", droneRole: "BUILDER", status: "RUNNING", gitNotesPayload: null });
     expect(passed).toMatchObject({ droneRole: "BUILDER", status: "PASSED", gitNotesPayload: note });
@@ -125,7 +125,7 @@ describe("BUILD (scripted)", () => {
     const input2 = { ...input, task: t2, changeSet: (await generateChangeSet(t2, w.ports(), scripted)).changeSet };
     const fb = await commitAndPush(w.ports(), input2);
     const again = await commitAndPush(w.ports(), input2);
-    expect(again).toEqual({ headSha: fb.headSha, codeSha: fb.codeSha, ledgerStore: "ledger-file", resumed: true });
+    expect(again).toEqual({ headSha: fb.headSha, codeSha: fb.codeSha, ledgerStore: "ledger-file", resumed: true, changedPaths: fb.changedPaths });
   });
 
   it("fixed timestamps give the same SHA for the same task on the same base", async () => {

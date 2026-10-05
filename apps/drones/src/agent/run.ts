@@ -4,6 +4,7 @@
  * it as a change set (overlay + ledger reasoning). Commit/push stay in their own step.
  */
 import { supportsToolLoop, type DroneTask } from "@queenos/queen-types";
+import { AiGatewayError, isRateLimited, withRateLimitRetry, type BackoffOptions } from "@queenos/hive-kit";
 import { templateFitProblems, validateChangeSet } from "../change-set";
 import type { DroneConfig } from "../config";
 import { AllModelsFailedError, modelsFor, type Generated } from "../generate";
@@ -11,6 +12,8 @@ import type { DronePorts } from "../ports";
 import { branchOf } from "../build";
 import type { AgentBuildResult, AgentUsage } from "./contract";
 import { MAX_SEED_FILE_CHARS } from "./limits";
+import type { FinishFollowUp } from "./tools";
+import { MAX_FOLLOW_UPS } from "./tools";
 import { diffTrees, overlayProblems } from "./overlay";
 import { ledgerDiscarded, ledgerReasoning } from "./trace";
 
@@ -25,6 +28,10 @@ export const MAX_SEED_FILES = 400;
 export interface AgentGenerated extends Generated {
   trace: string[];
   agentUsage: AgentUsage;
+  /** The accepted run's last verify passed and its finish was accepted (finish is refused otherwise). */
+  verified: boolean;
+  /** Out-of-scope problems the builder reported in `finish` (≤ MAX_FOLLOW_UPS). */
+  followUps: FinishFollowUp[];
 }
 
 export interface AgentRunOptions {
@@ -33,6 +40,8 @@ export interface AgentRunOptions {
   /** Absolute ms deadline for the whole agent phase. */
   deadlineMs: number;
   now?: () => number;
+  /** Rate-limit (429) retry policy; tests inject `sleep` and `random`. */
+  backoff?: BackoffOptions;
 }
 
 /** Tool-loop model order: the Queen's choice + fallbacks minus models that cannot drive a tool loop. */
@@ -76,7 +85,8 @@ export function rejectReason(r: AgentBuildResult, base: Record<string, string>):
 const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
 
 export async function runAgentBuild(task: DroneTask, ports: Pick<DronePorts, "agent" | "artifacts" | "git">, config: DroneConfig, opts: AgentRunOptions): Promise<AgentGenerated> {
-  if (!ports.agent) throw new Error("UNAVAILABLE: no BuilderAgent port (BUILDER binding missing?)");
+  const agent = ports.agent;
+  if (!agent) throw new Error("UNAVAILABLE: no BuilderAgent port (BUILDER binding missing?)");
   const now = opts.now ?? Date.now;
   const base = await readBaseTree(task, ports);
   const failures: { model: string; reason: string }[] = [];
@@ -90,21 +100,29 @@ export async function runAgentBuild(task: DroneTask, ports: Pick<DronePorts, "ag
     }
     // A thrown error here (DO reset by a deploy, RPC failure) propagates: the step retries and
     // re-attaches to the same submission through the same name + idempotency key.
-    const r = await ports.agent.build(`${opts.instanceId}|${model}`, {
-      base,
-      task: {
-        promptId: task.promptId,
-        trainId: task.trainId,
-        action: task.action,
-        promptText: task.promptText,
-        ragContext: task.ragContext,
-        ...(task.scribeSummary ? { scribeSummary: task.scribeSummary } : {}),
-      },
-      model,
-      idempotencyKey: `${opts.instanceId}:${model}`,
-      timeoutMs: Math.min(PER_MODEL_MS, remaining),
-      skipCache: task.action === "REWORK",
-    });
+    // A 429 inside the agent run is the platform's problem, not the model's: back off and run the same
+    // model again (a fresh submission key, so it does not re-attach to the rate-limited one). If it
+    // outlasts the retries it propagates as a retryable error: the step retries, and the model is
+    // never added to `failedModels`.
+    const r = await withRateLimitRetry(async (attempt) => {
+      const res = await agent.build(`${opts.instanceId}|${model}`, {
+        base,
+        task: {
+          promptId: task.promptId,
+          trainId: task.trainId,
+          action: task.action,
+          promptText: task.promptText,
+          ragContext: task.ragContext,
+          ...(task.scribeSummary ? { scribeSummary: task.scribeSummary } : {}),
+        },
+        model,
+        idempotencyKey: attempt === 0 ? `${opts.instanceId}:${model}` : `${opts.instanceId}:${model}:rl${attempt}`,
+        timeoutMs: Math.min(PER_MODEL_MS, Math.max(0, opts.deadlineMs - now())),
+        skipCache: task.action === "REWORK",
+      });
+      if (res.status === "error" && !res.finish && isRateLimited(res.error ?? "")) throw new AiGatewayError(clip(`rate limited: ${res.error}`, 300), 429, true);
+      return res;
+    }, opts.backoff);
     total.inputTokens += r.usage.inputTokens;
     total.outputTokens += r.usage.outputTokens;
     total.steps += r.usage.steps;
@@ -131,6 +149,8 @@ export async function runAgentBuild(task: DroneTask, ports: Pick<DronePorts, "ag
       usage: { inputTokens: total.inputTokens, outputTokens: total.outputTokens },
       trace: r.trace,
       agentUsage: total,
+      verified: r.lastVerify?.ok === true,
+      followUps: (r.finish?.followUps ?? []).slice(0, MAX_FOLLOW_UPS),
     };
   }
   const why = failures.map((f) => `${f.model}: ${f.reason}`).join(" | ");

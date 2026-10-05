@@ -153,6 +153,58 @@ export function classifyError(e: unknown): AiGatewayError {
   return new AiGatewayError(`AI run failed: ${message}`, status, retryable);
 }
 
+// --- rate limits ---------------------------------------------------------
+
+const RATE_LIMIT_RE = /(?:^|\D)429(?:\D|$)|rate[\s_-]?limit|too many requests/i;
+
+/**
+ * True for a 429 / rate-limit failure, from an AiGatewayError, an error with a `status`, an error
+ * message, or a plain string (e.g. the `error` of a failed agent run). A rate limit says nothing
+ * about the model's output, so callers retry it and must NOT count the model as failed.
+ */
+export function isRateLimited(e: unknown): boolean {
+  if (typeof e === "string") return RATE_LIMIT_RE.test(e);
+  const err = e as { status?: number; statusCode?: number; message?: string } | null;
+  if (err?.status === 429 || err?.statusCode === 429) return true;
+  return RATE_LIMIT_RE.test(err?.message ?? "");
+}
+
+export interface BackoffOptions {
+  /** Total tries including the first (default 4). */
+  maxAttempts?: number;
+  /** Backoff ceiling doubles from this (default 1000 ms). */
+  baseMs?: number;
+  /** Never wait longer than this (default 20_000 ms). */
+  maxMs?: number;
+  /** [0, 1); injectable for tests. */
+  random?: () => number;
+  /** Injectable for tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Equal-jitter exponential backoff: half the ceiling plus a random half, so waits spread out but never collapse to 0. */
+export function jitteredBackoffMs(attempt: number, opts: Pick<BackoffOptions, "baseMs" | "maxMs" | "random"> = {}): number {
+  const ceiling = Math.min(opts.maxMs ?? 20_000, (opts.baseMs ?? 1_000) * 2 ** Math.max(0, attempt));
+  return Math.round(ceiling / 2 + ((opts.random ?? Math.random)() * ceiling) / 2);
+}
+
+/**
+ * Run `fn(attempt)` (attempt counts from 0); on a rate limit wait with jittered backoff and retry.
+ * Anything else, or the last attempt's rate limit, is rethrown unchanged.
+ */
+export async function withRateLimitRetry<T>(fn: (attempt: number) => Promise<T>, opts: BackoffOptions = {}): Promise<T> {
+  const max = Math.max(1, opts.maxAttempts ?? 4);
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (e) {
+      if (!isRateLimited(e) || attempt + 1 >= max) throw e;
+      await sleep(jitteredBackoffMs(attempt, opts));
+    }
+  }
+}
+
 export interface AiClientOptions {
   /** `env.AI`, or a fake. */
   ai: AiRunner;

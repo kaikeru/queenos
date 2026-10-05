@@ -6,7 +6,9 @@ import type {
   AppendAuditInput,
   AuditEvent,
   BuildResult,
+  DroneTask,
   LandResultInput,
+  MergeResultInput,
   TrainResult,
 } from "@queenos/queen-types";
 import {
@@ -15,6 +17,7 @@ import {
   cloneRepo,
   type CompletionRequest,
   type CompletionResult,
+  type DataPointWriter,
   type GitRepo,
 } from "@queenos/hive-kit";
 import { getAgentByName } from "agents";
@@ -95,6 +98,8 @@ export interface QueenPort {
   reportBuildResult(input: BuildResult): Promise<{ outcome: string }>;
   reportLandResult(input: LandResultInput): Promise<{ outcome: string }>;
   reportTrainResult(input: TrainResult): Promise<{ outcome: string }>;
+  /** v2: the MERGE drone's report for a car (`trainId` = car id). Phase 2 (QueenNode) implements it. */
+  reportMergeResult(input: MergeResultInput): Promise<{ outcome: string }>;
   appendAudit(input: AppendAuditInput): Promise<Pick<AuditEvent, "eventId">>;
 }
 
@@ -111,6 +116,19 @@ export interface LlmPort {
   complete(req: CompletionRequest): Promise<CompletionResult>;
 }
 
+// ── merge ────────────────────────────────────────────────────────────────
+
+/**
+ * WP1.12's `mergeCar(ports, task, ts)` (src/merge.ts): 3-way merge a car's members onto its fork and
+ * push. `trainId` may be omitted from the result (the drone fills in the car id). Idempotent for a
+ * fixed `timestamp`.
+ */
+export type MergeCarFn = (
+  ports: Pick<DronePorts, "artifacts" | "git">,
+  task: DroneTask,
+  timestamp: number,
+) => Promise<Omit<MergeResultInput, "trainId"> & { trainId?: string }>;
+
 // ── bundle ───────────────────────────────────────────────────────────────
 
 export interface DronePorts {
@@ -121,6 +139,10 @@ export interface DronePorts {
   llm: LlmPort | null;
   /** The tool-loop BuilderAgent (live + DRONE_HARNESS=agent); null otherwise. */
   agent: AgentPort | null;
+  /** Analytics Engine `queenos_events`; absent in sim and tests (writes are no-ops). */
+  analytics?: DataPointWriter | undefined;
+  /** The MERGE implementation; absent = the default adapter (src/merge-adapter.ts). */
+  mergeCar?: MergeCarFn | undefined;
 }
 
 export interface DroneEnvBindings {
@@ -128,6 +150,7 @@ export interface DroneEnvBindings {
   ARTIFACTS?: Artifacts;
   QUEEN?: DurableObjectNamespace;
   BUILDER?: DurableObjectNamespace<BuilderAgent>;
+  ANALYTICS?: DataPointWriter;
 }
 
 /** BuilderAgent DOs by name (`<instanceId>|<model>`), via the Agents SDK so `this.name` is set. */
@@ -153,5 +176,6 @@ export function createProdPorts(env: DroneEnvBindings, config: DroneConfig): Dro
     queen: (namespace) => queenRpc(env.QUEEN, namespace),
     llm: config.llmMode === "live" ? liveLlm(env.AI, config) : null,
     agent: config.llmMode === "live" && config.harness === "agent" ? builderAgentPort(env.BUILDER) : null,
+    analytics: env.ANALYTICS,
   };
 }

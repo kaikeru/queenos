@@ -21,6 +21,12 @@
   // Workers AI binding: LLM calls go through AI Gateway "queenos" (pre-authenticated, no token).
   "ai": { "binding": "AI" },
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
+  // Build/merge points (fire-and-forget; the dataset appears after the first write). Layout: v2 design §2.8.
+  "analytics_engine_datasets": [{ "binding": "ANALYTICS", "dataset": "queenos_events" }],
+  // Structured logs carry trace_id / span_id (§2.6), so Workers Logs can filter a whole trace across
+  // Workflows. Traces stay off (early beta); to opt in:
+  // "observability": { "enabled": true, "head_sampling_rate": 1, "traces": { "enabled": true } },
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
   "durable_objects": {
     "bindings": [
       // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen").

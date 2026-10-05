@@ -17,14 +17,18 @@ import {
   type BuildUsage,
   type DroneRole,
   type DroneTask,
+  type FollowUp,
   type GitNotesPayload,
+  type MergeResult,
+  MergeResultSchema,
 } from "@queenos/queen-types";
-import { AiGatewayError, LedgerError, buildGitNotesPayload } from "@queenos/hive-kit";
+import { AiGatewayError, LedgerError, buildGitNotesPayload, structuredLog, traceFields, writeMetric, type BackoffOptions } from "@queenos/hive-kit";
 import { commitAndPush, generateChangeSet, type CommitPushResult, type Generated, type LedgerStore } from "./build";
 import { ChangeSetError } from "./change-set";
 import { AllModelsFailedError } from "./generate";
 import { ConfigError, type DroneConfig } from "./config";
 import { landTrain, type LandOutcome } from "./land";
+import { defaultMergeCar } from "./merge-adapter";
 import type { DronePorts, QueenPort } from "./ports";
 import { SCRIPTED_MODEL } from "./scripted";
 import { AGENT_PHASE_MS, runAgentBuild, type AgentGenerated } from "./agent/run";
@@ -42,6 +46,8 @@ export const AGENT_STEP: WorkflowStepConfig = { retries: { limit: 1, delay: "5 s
 export const CLOCK_STEP: WorkflowStepConfig = { retries: { limit: 2, delay: "1 second" }, timeout: "10 seconds" };
 
 export const LANDER_MODEL = "queenos/lander-git-push";
+/** The MERGE drone is deterministic git, audited under the LANDER role. */
+export const MERGE_MODEL = "queenos/merge-git";
 const MAX_SUMMARY = 500;
 
 export type DroneRunResult =
@@ -53,6 +59,18 @@ export type DroneRunResult =
       codeSha: string;
       ledgerStore: LedgerStore;
       notesError?: string;
+      queenOutcome: string;
+    }
+  | {
+      action: "MERGE";
+      /** The car id. */
+      trainId: string;
+      status: "merged" | "failed";
+      headSha?: string;
+      merged: number;
+      conflicts: number;
+      fastForward: boolean;
+      summary: string;
       queenOutcome: string;
     }
   | {
@@ -96,6 +114,8 @@ function isPermanentQueenError(e: unknown): boolean {
 export interface DroneRunMeta {
   /** Workflow instance id; names the BuilderAgent DOs. Defaults to the Queen's `<trainId>-<action>`. */
   instanceId?: string;
+  /** Rate-limit (429) retry policy for model calls; tests inject `sleep` and `random`. */
+  backoff?: BackoffOptions;
 }
 
 export async function runDrone(payload: unknown, step: StepRunner, ports: DronePorts, config: DroneConfig, meta: DroneRunMeta = {}): Promise<DroneRunResult> {
@@ -105,16 +125,17 @@ export async function runDrone(payload: unknown, step: StepRunner, ports: DroneP
     throw new DroneFailedError(`invalid DroneTask: ${parsed.error.issues.map((i) => i.path.join(".")).join(", ")}`);
   }
   const task = parsed.data;
-  const role: DroneRole = task.action === "LAND" ? "LANDER" : "BUILDER";
+  const role: DroneRole = task.action === "LAND" || task.action === "MERGE" ? "LANDER" : "BUILDER";
   const queen = () => ports.queen(task.namespace);
   const instanceId = meta.instanceId ?? `${task.trainId}-${task.action.toLowerCase()}`;
-  const ctx: RunCtx = { task, role, step, ports, config, queen, instanceId };
+  const ctx: RunCtx = { task, role, step, ports, config, queen, instanceId, ...(meta.backoff ? { backoff: meta.backoff } : {}) };
 
   const { startedAtMs } = await step.do("clock: start", CLOCK_STEP, async () => ({ startedAtMs: Date.now() }));
   ctx.startedAtMs = startedAtMs;
+  note(ctx, "drone: start", "started");
   await audit(ctx, "audit: running", "RUNNING", null);
 
-  return task.action === "LAND" ? runLand(ctx) : runBuild(ctx);
+  return task.action === "LAND" ? runLand(ctx) : task.action === "MERGE" ? runMerge(ctx) : runBuild(ctx);
 }
 
 interface RunCtx {
@@ -126,7 +147,47 @@ interface RunCtx {
   queen: () => QueenPort;
   instanceId: string;
   startedAtMs?: number;
+  backoff?: BackoffOptions;
 }
+
+/**
+ * One structured log line per drone step (design §2.6 (b)): trace fields from `DroneTask.trace`
+ * (empty for a v1 Queen), `command_id` = the Workflow instance id. Never throws.
+ */
+function note(ctx: RunCtx, stepName: string, outcome: string, extra: Record<string, unknown> = {}): void {
+  try {
+    const { task, instanceId } = ctx;
+    structuredLog({
+      ...traceFields(task.trace, instanceId, stepName),
+      hive: task.namespace,
+      command_id: instanceId,
+      step: stepName,
+      outcome,
+      action: task.action,
+      train_id: task.trainId,
+      ...(ctx.startedAtMs !== undefined ? { ms: Math.max(0, Date.now() - ctx.startedAtMs) } : {}),
+      ...extra,
+    });
+  } catch {
+    /* logging must never break a drone */
+  }
+}
+
+/** One Analytics Engine point (design §2.8); fire-and-forget, a missing binding is a no-op. */
+function metric(ctx: RunCtx, p: { type: string; model?: string; outcome: string; valueMs?: number; tokensIn?: number; tokensOut?: number }): void {
+  writeMetric(ctx.ports.analytics, {
+    hive: ctx.task.namespace,
+    kindOrRole: ctx.role,
+    environment: "drone",
+    ...(ctx.task.trace ? traceIdOf(ctx.task.trace.traceparent) : {}),
+    ...p,
+  });
+}
+
+const traceIdOf = (tp: string): { traceId: string } | Record<string, never> => {
+  const f = traceFields({ traceparent: tp }, "x");
+  return f.trace_id ? { traceId: f.trace_id } : {};
+};
 
 async function elapsed(ctx: RunCtx, name: string): Promise<number> {
   const { atMs } = await ctx.step.do(name, CLOCK_STEP, async () => ({ atMs: Date.now() }));
@@ -152,7 +213,7 @@ async function audit(ctx: RunCtx, name: string, status: AuditStatus, gitNotesPay
 }
 
 async function report(ctx: RunCtx, name: string, call: (q: QueenPort) => Promise<{ outcome: string }>): Promise<string> {
-  return ctx.step.do(name, REPORT_STEP, async () => {
+  const outcome = await ctx.step.do(name, REPORT_STEP, async () => {
     try {
       return String((await call(ctx.queen())).outcome);
     } catch (e) {
@@ -160,6 +221,8 @@ async function report(ctx: RunCtx, name: string, call: (q: QueenPort) => Promise
       return `rejected: ${clip(messageOf(e), 200)}`;
     }
   });
+  note(ctx, name, outcome);
+  return outcome;
 }
 
 // ── BUILD / REWORK ─────────────────────────────────────────────────────────
@@ -176,14 +239,14 @@ async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
       const deadlineMs = (ctx.startedAtMs ?? Date.now()) + AGENT_PHASE_MS;
       gen = await step.do("agent: build", AGENT_STEP, async () => {
         const t0 = Date.now();
-        const g = await runAgentBuild(task, ports, config, { instanceId: ctx.instanceId, deadlineMs }).catch((e) => Promise.reject(toStepError(e, config)));
+        const g = await runAgentBuild(task, ports, config, { instanceId: ctx.instanceId, deadlineMs, ...(ctx.backoff ? { backoff: ctx.backoff } : {}) }).catch((e) => Promise.reject(toStepError(e, config)));
         console.log(`drone: agent ${g.model} built ${task.trainId} in ${g.agentUsage.steps} step(s), ${g.agentUsage.inputTokens}/${g.agentUsage.outputTokens} tokens`);
         return { ...g, genMs: Date.now() - t0 };
       });
     } else {
       gen = await step.do("generate change set", GENERATE_STEP, async () => {
         const t0 = Date.now();
-        const g = await generateChangeSet(task, ports, config).catch((e) => Promise.reject(toStepError(e, config)));
+        const g = await generateChangeSet(task, ports, config, ctx.backoff).catch((e) => Promise.reject(toStepError(e, config)));
         return { ...g, genMs: Date.now() - t0 };
       });
     }
@@ -216,6 +279,9 @@ async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
   }
 
   const buildMs = Math.max(0, Math.round(gen.genMs + pushed.pushMs));
+  const agentGen = gen as Partial<AgentGenerated>;
+  const verified = agentGen.verified;
+  const followUps = normalizeFollowUps(agentGen.followUps);
   const queenOutcome = await report(ctx, "report: build result", (q) =>
     q.reportBuildResult({
       trainId: task.trainId,
@@ -224,8 +290,12 @@ async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
       ...(gen.failedModels.length ? { failedModels: gen.failedModels.slice(0, 5) } : {}),
       buildMs,
       ...(config.llmMode === "live" ? { usage: buildUsage(gen) } : {}),
+      ...(verified !== undefined ? { verified } : {}),
+      ...(followUps.length ? { followUps } : {}),
+      ...(pushed.changedPaths.length ? { changedPaths: pushed.changedPaths } : {}),
     }),
   );
+  metric(ctx, { type: "drone.build", model: gen.model, outcome: "built", valueMs: buildMs, tokensIn: gen.usage.inputTokens, tokensOut: gen.usage.outputTokens });
   await audit(ctx, "audit: passed", "PASSED", ledger);
   return {
     action: task.action === "REWORK" ? "REWORK" : "BUILD",
@@ -237,6 +307,17 @@ async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
     ...(pushed.notesError ? { notesError: pushed.notesError } : {}),
     queenOutcome,
   };
+}
+
+/** The builder's `finish.followUps` as the Queen's FollowUp shape (≤3; defaults filled, strings clipped). */
+function normalizeFollowUps(raw: AgentGenerated["followUps"] | undefined): FollowUp[] {
+  return (raw ?? []).slice(0, 3).map((f) => ({
+    kind: f.kind,
+    title: clip(f.title, 120),
+    body: clip(f.body, 1_000),
+    paths: (f.paths ?? []).slice(0, 10).map((p) => p.slice(0, 200)),
+    priority: f.priority ?? 2,
+  }));
 }
 
 /** Tokens across every model tried; the agent harness also reports its tool-loop steps. */
@@ -259,6 +340,7 @@ async function failBuild(ctx: RunCtx, stage: string, err: unknown, model?: strin
     executionTimeMs,
   });
   await report(ctx, "report: build failure", (q) => q.reportTrainResult({ trainId: task.trainId, passed: false, summary }));
+  metric(ctx, { type: "drone.build", ...(model ? { model } : {}), outcome: "failed", valueMs: executionTimeMs });
   await audit(ctx, "audit: rejected", "REJECTED", ledger);
   throw new DroneFailedError(summary);
 }
@@ -297,6 +379,7 @@ async function runLand(ctx: RunCtx): Promise<DroneRunResult> {
         : { trainId: task.trainId, landed: false, summary: clip(outcome.summary) },
     ),
   );
+  metric(ctx, { type: "drone.land", model: LANDER_MODEL, outcome: outcome.landed ? "landed" : "not-landed", valueMs: executionTimeMs });
   await audit(ctx, outcome.landed ? "audit: passed" : "audit: rejected", outcome.landed ? "PASSED" : "REJECTED", ledger);
   return {
     action: "LAND",
@@ -306,6 +389,64 @@ async function runLand(ctx: RunCtx): Promise<DroneRunResult> {
     summary: outcome.summary,
     notesCarried: outcome.notesCarried,
     ...(outcome.notesError ? { notesError: outcome.notesError } : {}),
+    queenOutcome,
+  };
+}
+
+// ── MERGE ──────────────────────────────────────────────────────────────────
+
+/**
+ * The merge-queue drone (design §2.3.4): `mergeCar` (WP1.12) 3-way merges the car's members onto its fork
+ * and pushes. Deterministic and idempotent for the fixed step timestamp; no LLM. An infrastructure failure
+ * is reported as `ok: false` (the Queen decides about bisect/infra), never thrown, so the Queen always hears.
+ */
+async function runMerge(ctx: RunCtx): Promise<DroneRunResult> {
+  const { task, step, ports, config } = ctx;
+  const mergeCar = ports.mergeCar ?? defaultMergeCar;
+  let result: MergeResult;
+  try {
+    result = await step.do("merge: members onto the car fork", GIT_STEP, async () => {
+      const t0 = Date.now();
+      const r = await mergeCar(ports, task, commitTimestamp(ctx)).catch((e) => Promise.reject(toStepError(e, config)));
+      return MergeResultSchema.parse({ ...r, trainId: task.trainId, mergeMs: r.mergeMs ?? Date.now() - t0 });
+    });
+  } catch (e) {
+    result = MergeResultSchema.parse({ trainId: task.trainId, ok: false, summary: clip(`Merge drone failed: ${messageOf(e)}`) });
+  }
+  result = { ...result, summary: clip(result.summary) };
+
+  const executionTimeMs = await elapsed(ctx, "clock: merged");
+  const ok = result.ok;
+  const ledger = buildGitNotesPayload({
+    taskPrompt: task.promptText,
+    model: MERGE_MODEL,
+    temperature: 0,
+    reasoningSteps: [
+      `Merge ${task.members?.length ?? 0} member(s) onto car fork ${task.artifactRepo}.`,
+      ...(ok
+        ? [
+            `Merged ${result.merged.length}: ${result.merged.join(", ") || "none"}.`,
+            ...result.conflicts.map((c) => `Conflict (${c.kind}) in ${c.trainId}: ${c.paths.join(", ") || "n/a"}`),
+            ...(result.fastForward ? ["Fast-forwarded the single member."] : []),
+          ]
+        : [result.summary]),
+    ].map((r) => clip(r, 2_000)),
+    result: ok ? "success" : "failure",
+    executionTimeMs,
+  });
+
+  const queenOutcome = await report(ctx, "report: merge result", (q) => q.reportMergeResult({ ...result, mergeMs: result.mergeMs ?? executionTimeMs }));
+  metric(ctx, { type: "drone.merge", model: MERGE_MODEL, outcome: ok ? (result.merged.length ? "merged" : "empty") : "failed", valueMs: result.mergeMs ?? executionTimeMs });
+  await audit(ctx, ok ? "audit: passed" : "audit: rejected", ok ? "PASSED" : "REJECTED", ledger);
+  return {
+    action: "MERGE",
+    trainId: task.trainId,
+    status: ok ? "merged" : "failed",
+    ...(result.headSha ? { headSha: result.headSha } : {}),
+    merged: result.merged.length,
+    conflicts: result.conflicts.length,
+    fastForward: result.fastForward,
+    summary: result.summary,
     queenOutcome,
   };
 }

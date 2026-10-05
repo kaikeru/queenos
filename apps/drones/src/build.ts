@@ -4,7 +4,7 @@
  * and only SHAs come back out (Workflows step results are capped at 1 MiB).
  */
 import type { DroneTask, GitNotesPayload } from "@queenos/queen-types";
-import { ledgerFilePath, serializeLedger } from "@queenos/hive-kit";
+import { ledgerFilePath, serializeLedger, type BackoffOptions } from "@queenos/hive-kit";
 import type { ChangeSet } from "./change-set";
 import type { DroneConfig } from "./config";
 import type { DronePorts, GitSession } from "./ports";
@@ -21,13 +21,14 @@ export async function generateChangeSet(
   task: DroneTask,
   ports: Pick<DronePorts, "llm" | "artifacts" | "git">,
   config: DroneConfig,
+  backoff?: BackoffOptions,
 ): Promise<Generated> {
   if (config.llmMode === "scripted") {
     return { changeSet: scriptedChangeSet(task), model: SCRIPTED_MODEL, failedModels: [], repaired: false, temperature: 0, usage: { inputTokens: 0, outputTokens: 0 } };
   }
   if (!ports.llm) throw new Error("UNAVAILABLE: no LLM port in live mode");
   const context = await gatherRepoContext(task, branchOf(task.baseRef), ports);
-  return generateLive({ llm: ports.llm, task, config, context });
+  return generateLive({ llm: ports.llm, task, config, context, ...(backoff ? { backoff } : {}) });
 }
 
 /** Marks every commit a drone makes, so a retried step can recognise its own pushed work. */
@@ -69,6 +70,13 @@ export interface CommitPushResult {
   notesError?: string;
   /** True if an earlier attempt had already pushed the code commit. */
   resumed: boolean;
+  /** Paths the code commit changed against the fork base (written files incl. the merged registry, plus deletes). */
+  changedPaths: string[];
+}
+
+/** Sorted, de-duplicated changed paths (BuildResult caps: 200 paths of ≤200 chars). */
+export function changedPathsOf(files: readonly { path: string }[], deletes: readonly string[] = []): string[] {
+  return [...new Set([...files.map((f) => f.path), ...deletes])].filter((p) => p.length <= 200).sort().slice(0, 200);
 }
 
 /**
@@ -105,6 +113,7 @@ export async function commitAndPush(ports: Pick<DronePorts, "artifacts" | "git">
   const branch = branchOf(task.baseRef);
   const repo = await ports.git.clone({ remote: access.remote, token: access.token, ref: branch, depth: 1 });
   const marker = droneTrailer(task);
+  let changedPaths = changedPathsOf(changeSet.files, changeSet.deletes ?? []);
 
   let codeSha: string;
   let resumed = false;
@@ -113,11 +122,13 @@ export async function commitAndPush(ports: Pick<DronePorts, "artifacts" | "git">
     // A previous attempt already pushed. If it also pushed the ledger-file fallback, we are done.
     resumed = true;
     const ledgerFor = LEDGER_FOR_RE.exec(head.message)?.[1];
-    if (ledgerFor) return { headSha: head.oid, codeSha: ledgerFor, ledgerStore: "ledger-file", resumed };
+    if (ledgerFor) return { headSha: head.oid, codeSha: ledgerFor, ledgerStore: "ledger-file", resumed, changedPaths };
     codeSha = head.oid;
   } else {
     const deletes = changeSet.deletes ?? [];
-    await repo.writeFiles([...(await withMergedRegistry(repo, changeSet.files, deletes)), ...deletes.map((path) => ({ path, delete: true as const }))]);
+    const written = await withMergedRegistry(repo, changeSet.files, deletes);
+    changedPaths = changedPathsOf(written, deletes);
+    await repo.writeFiles([...written, ...deletes.map((path) => ({ path, delete: true as const }))]);
     codeSha = await repo.commitAll({ message: commitMessage(task, changeSet), timestamp });
   }
 
@@ -127,7 +138,7 @@ export async function commitAndPush(ports: Pick<DronePorts, "artifacts" | "git">
 
   try {
     await repo.pushNotes();
-    return { headSha: codeSha, codeSha, ledgerStore: "git-notes", resumed };
+    return { headSha: codeSha, codeSha, ledgerStore: "git-notes", resumed, changedPaths };
   } catch (e) {
     // UNVERIFIED whether Artifacts accepts refs/notes/*: fall back to an in-tree ledger file.
     const notesError = String((e as Error)?.message ?? e).slice(0, 300);
@@ -138,6 +149,6 @@ export async function commitAndPush(ports: Pick<DronePorts, "artifacts" | "git">
       timestamp,
     });
     await repo.push({ ref: branch });
-    return { headSha: ledgerSha, codeSha, ledgerStore: "ledger-file", notesError, resumed };
+    return { headSha: ledgerSha, codeSha, ledgerStore: "ledger-file", notesError, resumed, changedPaths };
   }
 }

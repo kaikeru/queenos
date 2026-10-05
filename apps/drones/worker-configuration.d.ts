@@ -11,6 +11,7 @@ interface __BaseEnv_Env {
 	ARTIFACTS?: Artifacts;
 	LOADER?: WorkerLoader;
 	AI?: Ai;
+	ANALYTICS?: AnalyticsEngineDataset;
 	QUEEN?: DurableObjectNamespace /* QueenNode from queen */;
 }
 declare namespace Cloudflare {

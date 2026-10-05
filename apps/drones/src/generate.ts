@@ -8,7 +8,7 @@
  *   4. still invalid -> record the model in `failedModels` and try the next one.
  */
 import type { DroneTask } from "@queenos/queen-types";
-import { AiGatewayError, type ChatMessage, type CompletionResult } from "@queenos/hive-kit";
+import { AiGatewayError, isRateLimited, withRateLimitRetry, type BackoffOptions, type ChatMessage, type CompletionResult } from "@queenos/hive-kit";
 import { ChangeSetError, parseChangeSet, templateFitProblems, type ChangeSet } from "./change-set";
 import type { DroneConfig } from "./config";
 import type { LlmPort } from "./ports";
@@ -59,6 +59,8 @@ export interface GenerateOptions {
   context: RepoContext | null;
   now?: () => number;
   budgetMs?: number;
+  /** Rate-limit (429) retry policy; tests inject `sleep` and `random`. */
+  backoff?: BackoffOptions;
 }
 
 export async function generateLive(opts: GenerateOptions): Promise<Generated> {
@@ -75,15 +77,20 @@ export async function generateLive(opts: GenerateOptions): Promise<Generated> {
   let onlyTransient = true;
 
   const call = async (model: string, messages: ChatMessage[], useFormat: boolean): Promise<CompletionResult> => {
-    const res = await llm.complete({
-      model,
-      system: BUILDER_SYSTEM_PROMPT,
-      messages,
-      maxTokens: MAX_OUTPUT_TOKENS,
-      ...(useFormat ? { responseFormat: CHANGE_SET_RESPONSE_FORMAT } : {}),
-      ...(config.sendTemperature ? { temperature: config.temperature } : {}),
-      metadata: { promptId: task.promptId, trainId: task.trainId, action: task.action, role: "builder" },
-    });
+    // A 429 is the platform's problem, not the model's: back off and retry in place.
+    const res = await withRateLimitRetry(
+      () =>
+        llm.complete({
+          model,
+          system: BUILDER_SYSTEM_PROMPT,
+          messages,
+          maxTokens: MAX_OUTPUT_TOKENS,
+          ...(useFormat ? { responseFormat: CHANGE_SET_RESPONSE_FORMAT } : {}),
+          ...(config.sendTemperature ? { temperature: config.temperature } : {}),
+          metadata: { promptId: task.promptId, trainId: task.trainId, action: task.action, role: "builder" },
+        }),
+      opts.backoff,
+    );
     usage.inputTokens += res.usage?.inputTokens ?? 0;
     usage.outputTokens += res.usage?.outputTokens ?? 0;
     return res;
@@ -135,13 +142,16 @@ export async function generateLive(opts: GenerateOptions): Promise<Generated> {
       lastError = e;
       if (e instanceof ChangeSetError) onlyTransient = false;
       else if (!(e instanceof AiGatewayError) || !e.retryable) onlyTransient = false;
-      failedModels.push(model);
+      // Still rate-limited after the in-place retries: skip this model for now, but it did nothing wrong.
+      if (!isRateLimited(e)) failedModels.push(model);
       console.warn(`drone: model ${model} failed for ${task.trainId}: ${String((e as Error)?.message ?? e).slice(0, 300)}`);
     }
   }
 
   // Every model transiently failed (429/5xx): let the step retry. Otherwise retrying cannot help.
   if (onlyTransient && lastError instanceof AiGatewayError) throw lastError;
+  // A rate limit that outlasted the in-place retries is retried by the step, never reported as a failed model.
+  if (lastError instanceof AiGatewayError && isRateLimited(lastError)) throw lastError;
   const why = String((lastError as Error | null)?.message ?? "no model available").slice(0, 400);
   throw new AllModelsFailedError(`no usable change set from ${failedModels.join(", ") || "any model"}: ${why}`, failedModels);
 }

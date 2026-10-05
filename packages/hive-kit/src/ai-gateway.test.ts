@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AiGatewayError, createAiClient, modelForRole, type AiRunner } from "./ai-gateway.js";
+import { AiGatewayError, createAiClient, isRateLimited, jitteredBackoffMs, modelForRole, withRateLimitRetry, type AiRunner } from "./ai-gateway.js";
 
 type Call = { model: string; input: Record<string, unknown>; options: unknown };
 
@@ -120,5 +120,49 @@ describe("output shapes and structured output", () => {
     expect(calls[0]!.input).toMatchObject({ response_format: fmt, reasoning_effort: "low" });
     const plain = await complete({ response: "{}" });
     expect(plain.calls[0]!.input).not.toHaveProperty("response_format");
+  });
+});
+
+describe("rate limits", () => {
+  it("recognises 429s and rate-limit text, and nothing else", () => {
+    expect(isRateLimited(new AiGatewayError("x", 429, true))).toBe(true);
+    expect(isRateLimited(new Error("AI run failed: 429 Too Many Requests"))).toBe(true);
+    expect(isRateLimited("Rate limit exceeded")).toBe(true);
+    expect(isRateLimited(Object.assign(new Error("slow down"), { status: 429 }))).toBe(true);
+    expect(isRateLimited(new Error("upstream 503"))).toBe(false);
+    expect(isRateLimited("build 4290 files")).toBe(false);
+  });
+
+  it("jitters within [ceiling/2, ceiling) and grows exponentially up to the cap", () => {
+    expect(jitteredBackoffMs(0, { baseMs: 1000, random: () => 0 })).toBe(500);
+    expect(jitteredBackoffMs(0, { baseMs: 1000, random: () => 0.999 })).toBe(1000);
+    expect(jitteredBackoffMs(2, { baseMs: 1000, random: () => 0 })).toBe(2000);
+    expect(jitteredBackoffMs(10, { baseMs: 1000, maxMs: 8000, random: () => 0.999 })).toBeLessThanOrEqual(8000);
+  });
+
+  it("retries a 429 with backoff, then succeeds", async () => {
+    const waits: number[] = [];
+    let n = 0;
+    const out = await withRateLimitRetry(
+      async (attempt) => {
+        n++;
+        if (attempt < 2) throw new AiGatewayError("429", 429, true);
+        return "ok";
+      },
+      { random: () => 0, sleep: async (ms) => void waits.push(ms) },
+    );
+    expect(out).toBe("ok");
+    expect(n).toBe(3);
+    expect(waits).toEqual([500, 1000]);
+  });
+
+  it("rethrows the 429 after maxAttempts and never retries other errors", async () => {
+    const sleep = async () => undefined;
+    let n = 0;
+    await expect(withRateLimitRetry(async () => (n++, Promise.reject(new AiGatewayError("429", 429, true))), { maxAttempts: 3, sleep })).rejects.toMatchObject({ status: 429 });
+    expect(n).toBe(3);
+    n = 0;
+    await expect(withRateLimitRetry(async () => (n++, Promise.reject(new AiGatewayError("bad", 400, false))), { sleep })).rejects.toMatchObject({ status: 400 });
+    expect(n).toBe(1);
   });
 });
