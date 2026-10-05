@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { GitNotesPayloadSchema } from "./ledger.js";
+import { RecalledMemorySchema } from "./memory.js";
 import { TrainPhaseSchema, TrainStateSchema } from "./train.js";
 
 export const PromptStatusSchema = z.enum([
@@ -54,6 +55,7 @@ export const MergeTrainSchema = z.object({
   previewUrl: z.string().nullable().optional(), // preview_url (Herald's Worker Preview URL; set when DEPLOYING -> TESTING)
   model: z.string().nullable().optional(), // model (router's choice for this train's builder, or the model actually used)
   modelReason: z.string().max(200).nullable().optional(), // model_reason (why the router chose it)
+  memories: z.array(RecalledMemorySchema).optional(), // memories (JSON; hive memories the Provisioner recalled for this train)
 });
 export type MergeTrain = z.infer<typeof MergeTrainSchema>;
 
