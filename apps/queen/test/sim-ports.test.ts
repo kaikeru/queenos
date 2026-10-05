@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MODEL_CATALOG } from "@queenos/queen-types";
 import type { AppendAuditInput, BuildResult, DeployResult, ModelChoice, DroneTask, MergeTrain, PromptRun, ProvisionResult, Release, SentinelCommand, SentinelVerdict } from "@queenos/queen-types";
 import {
   SimExecutors,
@@ -182,7 +183,12 @@ describe("sim drones", () => {
     expect(h.audits.some((a) => a.droneRole === "BUILDER" && a.status === "PASSED" && a.gitNotesPayload?.reasoningSteps.length)).toBe(true);
     const smoke = h.audits.find((a) => a.droneRole === "GATEKEEPER" && a.status === "PASSED");
     expect(smoke?.gitNotesPayload?.reasoningSteps[0]).toContain("https://t1-preview.sim.queenos.dev");
-    expect(h.audits.filter((a) => a.droneRole !== "REVIEWER").every((a) => !a.gitNotesPayload || a.gitNotesPayload.model === "claude-opus-5-5")).toBe(true);
+    const ids = new Set(MODEL_CATALOG.map((m) => m.id));
+    for (const a of h.audits) {
+      const m = a.gitNotesPayload?.model;
+      if (m) expect(ids.has(m) || m.startsWith("queenos/")).toBe(true);
+    }
+    expect(smoke?.gitNotesPayload?.model).toBe("@cf/zai-org/glm-4.7-flash");
   });
 
   it("[fail] prompts fail once; REWORK passes; dispatch is idempotent", async () => {
@@ -193,6 +199,8 @@ describe("sim drones", () => {
     await h.advance(100);
     expect(h.calls).toEqual(["build:t1", "test:t1:false"]);
     expect(h.audits.some((a) => a.droneRole === "SECURITY" && a.status === "REJECTED")).toBe(true);
+    expect(h.audits.find((a) => a.droneRole === "POLICY" && a.gitNotesPayload)?.gitNotesPayload?.model).toBe("queenos/policy-scan-v1");
+    expect(h.audits.find((a) => a.droneRole === "SECURITY" && a.gitNotesPayload)?.gitNotesPayload?.model).toBe("queenos/security-scan-v1");
 
     await h.sim.drones.dispatch(task({ trainId: "t2", action: "REWORK", promptText: "flaky retry [fail]" }));
     await h.advance(100);
@@ -207,7 +215,7 @@ describe("sim drones", () => {
     await h.advance(100);
     const reviewer = h.audits.filter((a) => a.droneRole === "REVIEWER");
     expect(reviewer.map((a) => a.status)).toEqual(["RUNNING", "PASSED"]);
-    expect(reviewer[1]!.gitNotesPayload!.model).toBe("claude-sonnet-5-5");
+    expect(reviewer[1]!.gitNotesPayload!.model).toBe("@cf/deepseek-ai/deepseek-v4-flash-0731");
     expect(reviewer[1]!.gitNotesPayload!.reasoningSteps[0]).toBe("verdict: APPROVE");
     expect(reviewer[1]!.gitNotesPayload!.reasoningSteps.some((x) => x.startsWith("feedback: "))).toBe(true);
     expect(h.scribes).toEqual([]);
@@ -420,5 +428,15 @@ describe("sim drones: models", () => {
     await h.sim.drones.dispatch(task({}));
     await h.advance(100);
     expect(h.builds[0]).toEqual({ trainId: "t1", headSha: fakeSha("head:t1") });
+  });
+
+  it("builder notes name the routed model, else the catalog's default builder", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({ modelChoice: fast }));
+    await h.sim.drones.dispatch(task({ trainId: "t2" }));
+    await h.advance(100);
+    const notes = h.audits.filter((a) => a.droneRole === "BUILDER" && a.gitNotesPayload);
+    expect(notes[0]!.gitNotesPayload!.model).toBe(fast.model);
+    expect(notes[1]!.gitNotesPayload!.model).toBe(MODEL_CATALOG.find((m) => m.roles.includes("builder"))!.id);
   });
 });

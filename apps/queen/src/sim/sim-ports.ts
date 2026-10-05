@@ -64,7 +64,7 @@ import type {
   ScribeSummary,
   TrainResult,
 } from "@queenos/queen-types";
-import { MAX_MEMORY_TEXT, MAX_RECALLED_MEMORIES, MIN_RECALL_SCORE } from "@queenos/queen-types";
+import { MAX_MEMORY_TEXT, MODEL_CATALOG, MAX_RECALLED_MEMORIES, MIN_RECALL_SCORE } from "@queenos/queen-types";
 import type { DroneDispatcher } from "../drones";
 import { droneInstanceId } from "../drones";
 import type { DeployDispatcher, ProvisionerDispatcher, SentinelDispatcher } from "../executors";
@@ -143,10 +143,21 @@ const DONE_KEY = "sim:done";
 const TEARDOWNS_KEY = "sim:teardowns";
 const STABLE_KEY = (hive: string) => `sim:stable:${hive}`;
 const DONE_LIMIT = 2000;
-/** Model named in non-builder ledger notes (gatekeepers / Scribe keep their env model). */
-const MODEL = "claude-opus-5-5";
-/** Model named in the sim REVIEWER's ledger notes. */
-const REVIEWER_MODEL = "claude-sonnet-5-5";
+/** Catalog model by id; throws at load if the catalog drifts so the sim never invents a model name. */
+const catalogId = (id: string): string => {
+  const m = MODEL_CATALOG.find((c) => c.id === id);
+  if (!m) throw new Error(`sim: ${id} is not in MODEL_CATALOG`);
+  return m.id;
+};
+/** Fallback builder model when a task has no `modelChoice`: the catalog's first builder entry (the router's default preference). */
+const DEFAULT_BUILDER_MODEL = (MODEL_CATALOG.find((m) => m.roles.includes("builder")) ?? MODEL_CATALOG[0]!).id;
+/** Live defaults: apps/gatekeepers/wrangler.jsonc vars MODEL_SCRIBE / MODEL_REVIEWER (also used for the gatekeeper smoke note, which live stamps with the gateway model). */
+const SCRIBE_MODEL = catalogId("@cf/zai-org/glm-4.7-flash");
+const REVIEWER_MODEL = catalogId("@cf/deepseek-ai/deepseek-v4-flash-0731");
+/** Non-LLM scanner / lander ids, same as live (apps/gatekeepers orchestrate.ts POLICY_MODEL / SECURITY_MODEL, apps/drones LANDER_MODEL). */
+const POLICY_MODEL = "queenos/policy-scan-v1";
+const SECURITY_MODEL = "queenos/security-scan-v1";
+const LANDER_MODEL = "queenos/lander-git-push";
 const REVIEW_FEEDBACK =
   "The change adds a route but never renders the requested content: the page body is a placeholder. Rework should render real content and cover it with a test.";
 
@@ -573,7 +584,7 @@ function builderNote(task: DroneTask, headSha: string, build: SimBuild = {}): Gi
   const failed = build.failedModels ?? [];
   return {
     taskPrompt: task.promptText,
-    model: build.model ?? MODEL,
+    model: build.model ?? task.modelChoice?.model ?? DEFAULT_BUILDER_MODEL,
     temperature: 0.2,
     reasoningSteps: [
       ...(task.modelChoice ? [`Queen routed this build to ${task.modelChoice.model} (${task.modelChoice.reason}).`] : []),
@@ -597,7 +608,7 @@ function reviewNote(task: DroneTask, kind: "policy" | "security", ok: boolean): 
   const failing = !ok;
   return {
     taskPrompt: task.promptText,
-    model: MODEL,
+    model: kind === "policy" ? POLICY_MODEL : SECURITY_MODEL,
     temperature: 0,
     reasoningSteps:
       kind === "policy"
@@ -639,7 +650,7 @@ function reviewerNote(task: DroneTask, approve: boolean): GitNotesPayload {
 function smokeNote(task: DroneTask, url: string): GitNotesPayload {
   return {
     taskPrompt: task.promptText,
-    model: MODEL,
+    model: SCRIBE_MODEL,
     temperature: 0,
     reasoningSteps: [`Smoke-tested the train's Worker Preview: GET ${url}/ -> 200.`, "Preview serves the train head; no 5xx in the sampled requests."],
     result: "success",
@@ -651,7 +662,7 @@ function smokeNote(task: DroneTask, url: string): GitNotesPayload {
 function scribeNote(task: DroneTask, summary: string): GitNotesPayload {
   return {
     taskPrompt: task.promptText,
-    model: MODEL,
+    model: SCRIBE_MODEL,
     temperature: 0.1,
     reasoningSteps: [summary],
     result: summary.startsWith("Security scan rejected") ? "failure" : "success",
@@ -663,7 +674,7 @@ function scribeNote(task: DroneTask, summary: string): GitNotesPayload {
 function landerNote(task: DroneTask, ok: boolean): GitNotesPayload {
   return {
     taskPrompt: task.promptText,
-    model: MODEL,
+    model: LANDER_MODEL,
     temperature: 0,
     reasoningSteps: ["Confirmed the train head is the head of the queue.", ok ? "Pushed the head to the hive's main branch." : "Push was refused."],
     result: ok ? "success" : "failure",
