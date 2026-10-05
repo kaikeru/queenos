@@ -2,8 +2,6 @@
  * Analytics Engine points for executors (v2 design §2.8). Fire-and-forget:
  * `writeDataPoint` is non-blocking and never awaited; a missing binding is a
  * no-op (sim and tests).
- *
- * WP0 seam; WP1.4 implements it.
  */
 import type { AnalyticsPoint } from "@queenos/queen-types";
 
@@ -25,13 +23,35 @@ export interface DataPointWriter {
  * [valueMs, tokensIn, tokensOut, credits, count].
  */
 export function metricPoint(p: AnalyticsPoint): DataPoint {
-  void p;
-  throw new Error("not implemented");
+  const num = (n: number | undefined, dflt = 0) => (typeof n === "number" && Number.isFinite(n) ? n : dflt);
+  return {
+    indexes: [clipBytes(p.hive, MAX_INDEX_BYTES)],
+    blobs: [p.type, p.hive, p.kindOrRole ?? "", p.model ?? "", p.outcome ?? "", p.environment ?? "", p.traceId ?? "", p.itemId ?? ""].map((b) =>
+      b.slice(0, MAX_BLOB_CHARS),
+    ),
+    doubles: [num(p.valueMs), num(p.tokensIn), num(p.tokensOut), num(p.credits), num(p.count, 1)],
+  };
+}
+
+/** AE limits an index to 96 bytes. */
+const MAX_INDEX_BYTES = 96;
+/** Keeps 8 blobs far under the 16 KB total. */
+const MAX_BLOB_CHARS = 512;
+
+function clipBytes(s: string, max: number): string {
+  const enc = new TextEncoder();
+  if (enc.encode(s).length <= max) return s;
+  let out = s;
+  while (out.length > 0 && enc.encode(out).length > max) out = out.slice(0, -1);
+  return out;
 }
 
 /** Write one point if the binding exists; never throws. */
 export function writeMetric(dataset: DataPointWriter | undefined, p: AnalyticsPoint): void {
-  void dataset;
-  void p;
-  throw new Error("not implemented");
+  if (!dataset) return;
+  try {
+    dataset.writeDataPoint(metricPoint(p));
+  } catch {
+    /* telemetry must never break an executor */
+  }
 }
