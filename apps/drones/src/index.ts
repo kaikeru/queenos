@@ -6,18 +6,19 @@
 import { readConfig } from "./config";
 
 export { DroneWorkflow } from "./workflow";
+export { BuilderAgent } from "./agent/builder-agent";
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      let mode: string;
+      let config: ReturnType<typeof readConfig>;
       try {
-        mode = readConfig(env).llmMode;
+        config = readConfig(env);
       } catch (e) {
         return Response.json({ ok: false, service: "drones", error: (e as Error).message }, { status: 500 });
       }
-      return Response.json({ ok: true, service: "drones", llmMode: mode });
+      return Response.json({ ok: true, service: "drones", llmMode: config.llmMode, harness: config.harness });
     }
     return new Response("Not found", { status: 404 });
   },

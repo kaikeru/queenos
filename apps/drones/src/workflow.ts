@@ -27,6 +27,6 @@ export class DroneWorkflow extends WorkflowEntrypoint<Env, DroneTask> {
 
   override async run(event: Readonly<WorkflowEvent<DroneTask>>, step: WorkflowStep): Promise<DroneRunResult> {
     const config = readConfig(this.env);
-    return runDrone(event.payload, stepRunner(step), this.createPorts(this.env, config), config);
+    return runDrone(event.payload, stepRunner(step), this.createPorts(this.env, config), config, { instanceId: event.instanceId });
   }
 }

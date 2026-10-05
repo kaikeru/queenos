@@ -26,6 +26,7 @@ import { ConfigError, type DroneConfig } from "./config";
 import { landTrain, type LandOutcome } from "./land";
 import type { DronePorts, QueenPort } from "./ports";
 import { SCRIPTED_MODEL } from "./scripted";
+import { AGENT_PHASE_MS, runAgentBuild } from "./agent/run";
 
 export interface StepRunner {
   do<T>(name: string, config: WorkflowStepConfig, fn: () => Promise<T>): Promise<T>;
@@ -35,6 +36,8 @@ export interface StepRunner {
 export const GENERATE_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }, timeout: "5 minutes" };
 export const GIT_STEP: WorkflowStepConfig = { retries: { limit: 4, delay: "5 seconds", backoff: "exponential" }, timeout: "5 minutes" };
 export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
+/** The tool-loop agent: one retry, which re-attaches to the same BuilderAgent submissions. */
+export const AGENT_STEP: WorkflowStepConfig = { retries: { limit: 1, delay: "5 seconds", backoff: "constant" }, timeout: "8 minutes" };
 export const CLOCK_STEP: WorkflowStepConfig = { retries: { limit: 2, delay: "1 second" }, timeout: "10 seconds" };
 
 export const LANDER_MODEL = "queenos/lander-git-push";
@@ -89,7 +92,12 @@ function isPermanentQueenError(e: unknown): boolean {
   return /^(INVALID_INPUT|NOT_FOUND|CONFLICT): /.test(messageOf(e));
 }
 
-export async function runDrone(payload: unknown, step: StepRunner, ports: DronePorts, config: DroneConfig): Promise<DroneRunResult> {
+export interface DroneRunMeta {
+  /** Workflow instance id; names the BuilderAgent DOs. Defaults to the Queen's `<trainId>-<action>`. */
+  instanceId?: string;
+}
+
+export async function runDrone(payload: unknown, step: StepRunner, ports: DronePorts, config: DroneConfig, meta: DroneRunMeta = {}): Promise<DroneRunResult> {
   const parsed = DroneTaskSchema.safeParse(payload);
   if (!parsed.success) {
     // Outside any step, so never retried. (A NonRetryableError here aborts the engine and loses the message.)
@@ -98,7 +106,8 @@ export async function runDrone(payload: unknown, step: StepRunner, ports: DroneP
   const task = parsed.data;
   const role: DroneRole = task.action === "LAND" ? "LANDER" : "BUILDER";
   const queen = () => ports.queen(task.namespace);
-  const ctx: RunCtx = { task, role, step, ports, config, queen };
+  const instanceId = meta.instanceId ?? `${task.trainId}-${task.action.toLowerCase()}`;
+  const ctx: RunCtx = { task, role, step, ports, config, queen, instanceId };
 
   const { startedAtMs } = await step.do("clock: start", CLOCK_STEP, async () => ({ startedAtMs: Date.now() }));
   ctx.startedAtMs = startedAtMs;
@@ -114,6 +123,7 @@ interface RunCtx {
   ports: DronePorts;
   config: DroneConfig;
   queen: () => QueenPort;
+  instanceId: string;
   startedAtMs?: number;
 }
 
@@ -160,11 +170,22 @@ async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
     if (config.llmMode === "scripted" && config.scriptedDelayMs > 0) {
       await step.sleep("scripted: thinking", config.scriptedDelayMs);
     }
-    gen = await step.do("generate change set", GENERATE_STEP, async () => {
-      const t0 = Date.now();
-      const g = await generateChangeSet(task, ports, config).catch((e) => Promise.reject(toStepError(e, config)));
-      return { ...g, genMs: Date.now() - t0 };
-    });
+    if (config.llmMode === "live" && config.harness === "agent") {
+      // The Think tool loop replaces the single-shot generator; everything after this step is unchanged.
+      const deadlineMs = (ctx.startedAtMs ?? Date.now()) + AGENT_PHASE_MS;
+      gen = await step.do("agent: build", AGENT_STEP, async () => {
+        const t0 = Date.now();
+        const g = await runAgentBuild(task, ports, config, { instanceId: ctx.instanceId, deadlineMs }).catch((e) => Promise.reject(toStepError(e, config)));
+        console.log(`drone: agent ${g.model} built ${task.trainId} in ${g.agentUsage.steps} step(s), ${g.agentUsage.inputTokens}/${g.agentUsage.outputTokens} tokens`);
+        return { ...g, genMs: Date.now() - t0 };
+      });
+    } else {
+      gen = await step.do("generate change set", GENERATE_STEP, async () => {
+        const t0 = Date.now();
+        const g = await generateChangeSet(task, ports, config).catch((e) => Promise.reject(toStepError(e, config)));
+        return { ...g, genMs: Date.now() - t0 };
+      });
+    }
   } catch (e) {
     return failBuild(ctx, "generation", e);
   }

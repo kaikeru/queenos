@@ -10,7 +10,7 @@ import { SCRIPTED_MODEL, registryModules, renderRegistry } from "../src/scripted
 import { FakeLlm, FakeWorld, InlineSteps, task } from "./fakes";
 import { runDrone } from "../src/orchestrate";
 
-const live = readConfig({ DRONE_LLM_MODE: "live", MODEL_BUILDER: "@cf/default/model" });
+const live = readConfig({ DRONE_LLM_MODE: "live", DRONE_HARNESS: "single-shot", MODEL_BUILDER: "@cf/default/model" });
 const parsed = (o: Partial<DroneTaskInput> = {}) => DroneTaskSchema.parse(task(o));
 const choice = (model: string, fallbacks: string[] = []) => ({ model, tier: "fast" as const, role: "builder" as const, reason: "test", fallbacks });
 

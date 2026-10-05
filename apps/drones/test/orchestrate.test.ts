@@ -8,7 +8,7 @@ import { SCRIPTED_MODEL, scriptedChangeSet } from "../src/scripted";
 import { FakeLlm, FakeWorld, InlineSteps, remoteOf, task } from "./fakes";
 
 const scripted = readConfig({ DRONE_LLM_MODE: "scripted", DRONE_SCRIPTED_DELAY_MS: "1500" });
-const live = readConfig({ DRONE_LLM_MODE: "live", AI_GATEWAY_ID: "gw" });
+const live = readConfig({ DRONE_LLM_MODE: "live", DRONE_HARNESS: "single-shot", AI_GATEWAY_ID: "gw" });
 
 async function world(repo = "hive-train-aaaaaaaaaaaa") {
   const w = new FakeWorld();

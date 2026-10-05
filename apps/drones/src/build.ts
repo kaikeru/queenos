@@ -10,7 +10,7 @@ import type { DroneConfig } from "./config";
 import type { DronePorts, GitSession } from "./ports";
 import { generateLive, type Generated } from "./generate";
 import { gatherRepoContext } from "./repo-context";
-import { FEATURE_REGISTRY_PATH, SCRIPTED_MODEL, featureModuleName, mergeRegistry, registryModules, scriptedChangeSet } from "./scripted";
+import { FEATURE_REGISTRY_PATH, SCRIPTED_MODEL, featureModuleName, registryModules, renderRegistry, scriptedChangeSet } from "./scripted";
 
 export type LedgerStore = "git-notes" | "ledger-file";
 
@@ -47,7 +47,7 @@ export function branchOf(baseRef: string): string {
 export function commitMessage(task: DroneTask, changeSet: ChangeSet): string {
   const first = (task.promptText.split("\n").find((l) => l.trim()) ?? "change").trim();
   const subject = `queen(${task.action.toLowerCase()}): ${first.length > 60 ? `${first.slice(0, 59)}…` : first}`;
-  const files = changeSet.files.map((f) => `- ${f.path}`).join("\n");
+  const files = [...changeSet.files.map((f) => `- ${f.path}`), ...(changeSet.deletes ?? []).map((p) => `- ${p} (deleted)`)].join("\n");
   return `${subject}\n\n${files}\n\nQueen-Prompt: ${task.promptId}\nQueen-Train: ${task.trainId}\n${droneTrailer(task)}\n`;
 }
 
@@ -78,15 +78,23 @@ export interface CommitPushResult {
  * imports PLUS every new `src/features/<name>.js` the change set adds (a model that forgot to
  * register its module still ships a working feature).
  */
-export async function withMergedRegistry(repo: Pick<GitSession, "readFiles">, files: ChangeSet["files"]): Promise<ChangeSet["files"]> {
+export async function withMergedRegistry(
+  repo: Pick<GitSession, "readFiles">,
+  files: ChangeSet["files"],
+  deletes: readonly string[] = [],
+): Promise<ChangeSet["files"]> {
   const entry = files.find((f) => f.path === FEATURE_REGISTRY_PATH);
   const added = files.flatMap((f) => {
     const m = featureModuleName(f.path);
     return m ? [m] : [];
   });
-  if (!entry && added.length === 0) return files;
+  const removed = new Set(deletes.flatMap((p) => featureModuleName(p) ?? []));
+  if (!entry && added.length === 0 && removed.size === 0) return files;
   const existing = (await repo.readFiles([FEATURE_REGISTRY_PATH]).catch(() => ({}) as Record<string, string>))[FEATURE_REGISTRY_PATH] ?? null;
-  const merged = mergeRegistry(existing, [...(entry ? registryModules(entry.content) : []), ...added]);
+  if (existing === null && !entry && added.length === 0) return files;
+  const merged = renderRegistry(
+    [...registryModules(existing ?? ""), ...(entry ? registryModules(entry.content) : []), ...added].filter((m) => !removed.has(m)),
+  );
   return entry ? files.map((f) => (f === entry ? { ...f, content: merged } : f)) : [...files, { path: FEATURE_REGISTRY_PATH, content: merged }];
 }
 
@@ -108,7 +116,8 @@ export async function commitAndPush(ports: Pick<DronePorts, "artifacts" | "git">
     if (ledgerFor) return { headSha: head.oid, codeSha: ledgerFor, ledgerStore: "ledger-file", resumed };
     codeSha = head.oid;
   } else {
-    await repo.writeFiles(await withMergedRegistry(repo, changeSet.files));
+    const deletes = changeSet.deletes ?? [];
+    await repo.writeFiles([...(await withMergedRegistry(repo, changeSet.files, deletes)), ...deletes.map((path) => ({ path, delete: true as const }))]);
     codeSha = await repo.commitAll({ message: commitMessage(task, changeSet), timestamp });
   }
 

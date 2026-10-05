@@ -17,7 +17,10 @@ import {
   type CompletionResult,
   type GitRepo,
 } from "@queenos/hive-kit";
+import { getAgentByName } from "agents";
 import type { DroneConfig } from "./config";
+import type { AgentBuildInput, AgentBuildResult, AgentPort } from "./agent/contract";
+import type { BuilderAgent } from "./agent/builder-agent";
 
 // ── Artifacts ────────────────────────────────────────────────────────────
 
@@ -116,12 +119,26 @@ export interface DronePorts {
   queen(namespace: string): QueenPort;
   /** Null in scripted mode. */
   llm: LlmPort | null;
+  /** The tool-loop BuilderAgent (live + DRONE_HARNESS=agent); null otherwise. */
+  agent: AgentPort | null;
 }
 
 export interface DroneEnvBindings {
   AI?: Ai;
   ARTIFACTS?: Artifacts;
   QUEEN?: DurableObjectNamespace;
+  BUILDER?: DurableObjectNamespace<BuilderAgent>;
+}
+
+/** BuilderAgent DOs by name (`<instanceId>|<model>`), via the Agents SDK so `this.name` is set. */
+export function builderAgentPort(ns: DurableObjectNamespace<BuilderAgent> | undefined): AgentPort {
+  if (!ns) throw new Error("UNAVAILABLE: BUILDER binding is not configured");
+  return {
+    async build(name: string, input: AgentBuildInput): Promise<AgentBuildResult> {
+      const stub = await getAgentByName(ns, name);
+      return (await stub.build(input)) as AgentBuildResult;
+    },
+  };
 }
 
 function liveLlm(ai: Ai | undefined, config: DroneConfig): LlmPort {
@@ -135,5 +152,6 @@ export function createProdPorts(env: DroneEnvBindings, config: DroneConfig): Dro
     git: isomorphicGitPort,
     queen: (namespace) => queenRpc(env.QUEEN, namespace),
     llm: config.llmMode === "live" ? liveLlm(env.AI, config) : null,
+    agent: config.llmMode === "live" && config.harness === "agent" ? builderAgentPort(env.BUILDER) : null,
   };
 }

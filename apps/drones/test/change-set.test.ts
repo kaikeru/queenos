@@ -8,7 +8,7 @@ const ok = { files: [{ path: "src/a.ts", content: "export {};\n" }], reasoningSt
 
 describe("change set validation", () => {
   it("accepts a valid set and defaults the optional arrays", () => {
-    expect(validateChangeSet({ files: ok.files })).toEqual({ files: ok.files, reasoningSteps: [], discardedPaths: [] });
+    expect(validateChangeSet({ files: ok.files })).toEqual({ files: ok.files, deletes: [], reasoningSteps: [], discardedPaths: [] });
   });
 
   it("normalizes ./ paths", () => {

@@ -17,6 +17,11 @@ export const MAX_DISCARDED_PATHS = 50;
 /** Reserved for the ledger fallback; the LLM may not write there. */
 export const RESERVED_PREFIXES = [".queen/", ".git/"];
 
+/** Paths a coding agent may read but never change: platform config, deploy contract, git internals. */
+export function isProtectedPath(path: string): boolean {
+  return RESERVED_PREFIXES.some((r) => path.startsWith(r)) || path === "package.json" || /^wrangler\.(?:jsonc?|toml)$/.test(path);
+}
+
 const byteLength = (s: string) => new TextEncoder().encode(s).byteLength;
 
 const RepoPath = z
@@ -44,13 +49,16 @@ export const FileWriteSchema = z.object({
 
 export const ChangeSetSchema = z
   .object({
-    files: z.array(FileWriteSchema).min(1).max(MAX_FILES),
+    files: z.array(FileWriteSchema).max(MAX_FILES),
+    /** Paths to delete (the tool-loop agent can remove files; the single-shot JSON contract never does). */
+    deletes: z.array(RepoPath).max(MAX_FILES).default([]),
     reasoningSteps: z.array(z.string().max(2_000)).max(MAX_REASONING_STEPS).default([]),
     discardedPaths: z.array(z.string().max(MAX_PATH_CHARS)).max(MAX_DISCARDED_PATHS).default([]),
   })
   .superRefine((cs, ctx) => {
+    if (cs.files.length + cs.deletes.length === 0) ctx.addIssue({ code: "custom", message: "change set is empty", path: ["files"] });
     const seen = new Set<string>();
-    for (const f of cs.files) {
+    for (const f of [...cs.files, ...cs.deletes.map((path) => ({ path }))]) {
       if (seen.has(f.path)) ctx.addIssue({ code: "custom", message: `duplicate path "${f.path}"`, path: ["files"] });
       seen.add(f.path);
     }
@@ -201,17 +209,21 @@ function resolveRelative(fromFile: string, spec: string): string {
   return parts.join("/");
 }
 
+/** `export const path = "/status"`: a feature module that owns a top-level route (worker-starter router). */
+const FEATURE_PATH_RE = /export\s+const\s+path\s*=\s*["'`]([^"'`]*)["'`]/;
+
 const exportsName = (code: string, name: string) =>
   new RegExp(`export\\s+(?:async\\s+)?(?:const|let|var|function\\*?|class)\\s+${name}\\b`).test(code) ||
   new RegExp(`export\\s*\\{[^}]*\\b${name}\\b[^}]*\\}`).test(code);
 
 /**
  * Problems that would make the change set not run on the no-build template. Static and conservative:
- * relative-only imports that resolve, no TypeScript/JSX, feature modules export `slug` and `handle`,
- * and a rewritten router keeps `/health`. Returns human-readable messages (fed to the repair turn).
+ * relative-only imports that resolve, no TypeScript/JSX, feature modules export `slug` and `handle`
+ * (and optionally a literal top-level `path`), and a rewritten router keeps `/health`. Returns human-readable messages (fed to the repair turn).
  */
-export function templateFitProblems(cs: ChangeSet, repoFiles: Iterable<string> = []): string[] {
-  const known = new Set<string>([...repoFiles, ...cs.files.map((f) => f.path)]);
+export function templateFitProblems(cs: Pick<ChangeSet, "files"> & { deletes?: string[] }, repoFiles: Iterable<string> = []): string[] {
+  const deleted = new Set(cs.deletes ?? []);
+  const known = new Set<string>([...[...repoFiles].filter((f) => !deleted.has(f)), ...cs.files.map((f) => f.path)]);
   const problems: string[] = [];
   for (const f of cs.files) {
     if (/^src\/.*\.(?:ts|tsx|jsx|mts|cts)$/.test(f.path)) problems.push(`${f.path}: only plain .js files are allowed under src/ (no TypeScript/JSX, there is no build step)`);
@@ -229,6 +241,12 @@ export function templateFitProblems(cs: ChangeSet, repoFiles: Iterable<string> =
     if (isModule) {
       if (!exportsName(f.content, "slug")) problems.push(`${f.path}: feature modules must export const slug = "<slug>"`);
       if (!exportsName(f.content, "handle")) problems.push(`${f.path}: feature modules must export function handle(request)`);
+      const route = FEATURE_PATH_RE.exec(f.content)?.[1];
+      if (exportsName(f.content, "path") && route === undefined) {
+        problems.push(`${f.path}: export the route as a string literal, e.g. export const path = "/status"`);
+      } else if (route !== undefined && (!/^\/[A-Za-z0-9._~/-]*$/.test(route) || route === "/" || route === "/health" || route.startsWith("/features/"))) {
+        problems.push(`${f.path}: path "${route}" is not allowed (must start with "/", and "/", "/health" and /features/* are owned by the router)`);
+      }
     }
     if (f.path === "src/index.js" && !(/\/health/.test(f.content) && /export\s+default/.test(f.content))) {
       problems.push(`src/index.js: must keep "export default { fetch }" with the "/" and "/health" routes working`);

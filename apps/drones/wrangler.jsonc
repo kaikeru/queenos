@@ -25,13 +25,20 @@
     "bindings": [
       // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen").
       // One QueenNode per hive: QUEEN.idFromName(namespace).
-      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" }
+      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" },
+      // The tool-loop coding agent (@cloudflare/think): one DO per (Workflow instance, model).
+      { "name": "BUILDER", "class_name": "BuilderAgent" }
     ]
   },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BuilderAgent"] }],
+  // Dynamic Workers: the agent's verify tool loads the edited Worker here (no network, 100 ms CPU).
+  "worker_loaders": [{ "binding": "LOADER" }],
   "vars": {
     // "live" calls the LLM via the AI binding through AI Gateway; "scripted" returns a deterministic
     // change set (demo video, tests). Git + Artifacts run for real in both.
     "DRONE_LLM_MODE": "live",
+    // Live builder: "agent" (Think tool loop + Dynamic Worker verify) or "single-shot" (legacy JSON change set).
+    "DRONE_HARNESS": "agent",
     // Artificial "thinking" time in scripted mode (durable step.sleep).
     "DRONE_SCRIPTED_DELAY_MS": "4000",
     "AI_GATEWAY_ID": "queenos",
@@ -44,7 +51,11 @@
     // has no dev registry). Tests inject fake ports via test/worker.ts.
     "test": {
       "workflows": [{ "name": "drone-workflow", "binding": "DRONE_WORKFLOW", "class_name": "DroneWorkflow" }],
+      // The smoke test drives a real BuilderAgent (test/worker.ts subclass) with a mock model.
+      "durable_objects": { "bindings": [{ "name": "BUILDER", "class_name": "BuilderAgent" }] },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BuilderAgent"] }],
       "vars": {
+        "DRONE_HARNESS": "agent",
         "DRONE_LLM_MODE": "scripted",
         "DRONE_SCRIPTED_DELAY_MS": "0",
         "AI_GATEWAY_ID": "queenos",
