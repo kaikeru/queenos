@@ -23,18 +23,51 @@
  *
  * Command ids: `<releaseId>-<op>-<attempt>`, op one of `staging`, `validate`,
  * `canary<p>`, `verify<p>`, `rollback`.
+ *
+ * v2 autonomy (design §2.4, §2.5):
+ * - Staging PROMOTE with `ctx.autoShip` runs the tap body with AUTO_SHIP_ACTOR
+ *   (straight to CANARY); otherwise the release parks at AWAITING_TAP and an
+ *   APPROVAL_REQUIRED escalation opens. `ctx.paused` parks without one (no new
+ *   canary starts, and taps are refused, until the hive is unpaused).
+ * - An `inconclusive` staging verdict parks at AWAITING_TAP even when
+ *   autonomous and opens SENTINEL_INCONCLUSIVE; an inconclusive canary verdict
+ *   takes the normal rollback path and opens SENTINEL_INCONCLUSIVE (ack only).
+ * - `reconcile()` auto-taps a parked release once `autoShip` is true, unless it
+ *   has an open SENTINEL_INCONCLUSIVE or a human chose `hold`; in a supervised
+ *   hive it opens APPROVAL_REQUIRED for a parked release that never had one.
+ * - Each ROLLED_BACK or canary-FAILED release bumps `rollbackStreak`
+ *   (ROLLBACK_STREAK at 2); SHIPPED resets it. A failed Herald rollback opens
+ *   ROLLBACK_FAILED. Superseding a parked release resolves its escalations as
+ *   `superseded`; a tap resolves them as `ship`.
  */
 import {
+  AUTO_SHIP_ACTOR,
   CANARY_STEPS,
   type DeployCommand,
   type DeployResult,
   type Deployment,
+  type Escalation,
+  type EscalationAction,
+  type EscalationReason,
+  type EventDraft,
   type QueenServerMessage,
   type Release,
   type ReleasePhase,
   type SentinelCommand,
   type SentinelVerdict,
 } from "@queenos/queen-types";
+import {
+  PARKED_RELEASE_REASONS,
+  QUEEN_ACTOR,
+  SUPERSEDED_RESOLUTION,
+  escalationOpenedEvent,
+  escalationResolvedEvent,
+  isAbout,
+  newEscalation,
+  resolutionAction,
+  resolvedEscalation,
+} from "../autonomy/escalation";
+import { ROLLBACK_STREAK_LIMIT } from "../autonomy/policy";
 import { DEFAULT_COMMAND_TIMEOUT_MS, MAX_COMMAND_ATTEMPTS, commandAttempt, nextCommandId } from "../train/planner";
 
 /** What the release is waiting on right now (null: nothing outstanding). */
@@ -80,6 +113,17 @@ export interface ReleaseContext {
   /** Watchdog timeout for Herald commands (and the floor for Sentinel). Default 10 min. */
   commandTimeoutMs?: number;
   sentinel?: SentinelSettings;
+  /** v2: effective autonomy is `autonomous` (policy.ts). Default false (v1: every release waits for a tap). */
+  autoShip?: boolean;
+  /** v2: effective autonomy is `paused`: no new canary starts (auto or tapped). Default false. */
+  paused?: boolean;
+  /** v2: `hive_settings.rollback_streak` before this plan. Default 0. */
+  rollbackStreak?: number;
+  /**
+   * v2: the hive's OPEN escalations plus every escalation (any status) whose
+   * subject is a release in `state.releases`; a resolved `hold` blocks auto-ship.
+   */
+  escalations?: readonly Escalation[];
 }
 
 export const DEFAULT_SENTINEL: SentinelSettings = { windowSeconds: 60, minRequests: 100 };
@@ -106,6 +150,12 @@ export interface ReleasePlanResult {
   releases: ReleaseRecord[];
   deployments: Deployment[];
   effects: ReleaseEffect[];
+  /** v2: escalation rows opened or resolved by this plan (upsert them). */
+  escalations: Escalation[];
+  /** v2: `release.phase`, `release.autoshipped` and escalation events. */
+  events: EventDraft[];
+  /** v2: `hive_settings.rollback_streak` after this plan. */
+  rollbackStreak: number;
 }
 
 const IN_FLIGHT: ReadonlySet<ReleasePhase> = new Set(["STAGING", "VALIDATING", "AWAITING_TAP", "CANARY"]);
@@ -192,6 +242,10 @@ export class ReleasePlanner {
   private maxSeq: number;
   private readonly timeoutMs: number;
   private readonly sentinel: SentinelSettings;
+  private readonly escalations: Escalation[];
+  private readonly dirtyEscalations = new Set<string>();
+  private events: EventDraft[] = [];
+  private streak: number;
 
   constructor(
     state: ReleaseState,
@@ -202,6 +256,8 @@ export class ReleasePlanner {
     this.maxSeq = state.maxSeq;
     this.timeoutMs = ctx.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
     this.sentinel = ctx.sentinel ?? DEFAULT_SENTINEL;
+    this.escalations = (ctx.escalations ?? []).map((e) => ({ ...e, subject: { ...e.subject }, actions: [...e.actions] }));
+    this.streak = ctx.rollbackStreak ?? 0;
   }
 
   // ── public transitions ────────────────────────────────────────────────
@@ -221,6 +277,7 @@ export class ReleasePlanner {
     if (cur && SUPERSEDABLE.has(cur.phase)) {
       const next = this.create(input.headSha, [...base, input.trainId]);
       this.set(cur, { phase: "SUPERSEDED", pending: null, summary: clip(`Superseded by release ${next.releaseId} (main ${short(input.headSha)}).`) });
+      this.resolveParked(cur, QUEEN_ACTOR, SUPERSEDED_RESOLUTION);
       this.stage(next);
       return this.finish("applied");
     }
@@ -258,15 +315,25 @@ export class ReleasePlanner {
     if (v.environment !== expected) return this.finish("ignored:stale");
     this.effects.push({ type: "broadcast", message: { type: "sentinel.verdict", verdict: v } });
     if (rel.phase === "VALIDATING") {
-      if (v.verdict === "PROMOTE") {
+      if (v.inconclusive) {
+        // Parked even when autonomous: nobody measured staging.
+        this.set(rel, { phase: "AWAITING_TAP", pending: null, summary: clip(`Sentinel inconclusive on staging: ${v.summary}`) });
+        this.openEscalation("SENTINEL_INCONCLUSIVE", rel, `Sentinel could not measure staging for release ${rel.releaseId} (main ${short(rel.headSha)}): ${v.summary}`);
+      } else if (v.verdict === "PROMOTE") {
         this.set(rel, { phase: "AWAITING_TAP", pending: null, summary: clip(v.summary) });
+        if (this.ctx.autoShip && !this.ctx.paused) this.autoShip(rel);
+        else if (!this.ctx.paused) this.openApproval(rel);
       } else {
         this.stagingFailed(rel, `Staging validation failed: ${v.summary}`);
       }
-    } else if (v.verdict === "PROMOTE") {
+    } else if (v.verdict === "PROMOTE" && !v.inconclusive) {
       this.promoteCanary(rel, v.summary);
     } else {
-      this.startRollback(rel, `Canary at ${rel.canaryPercent ?? 0}% failed: ${v.summary}`);
+      const percent = rel.canaryPercent ?? 0;
+      this.startRollback(rel, `Canary at ${percent}% ${v.inconclusive ? "inconclusive" : "failed"}: ${v.summary}`);
+      if (v.inconclusive) {
+        this.openEscalation("SENTINEL_INCONCLUSIVE", rel, `Sentinel could not measure the ${percent}% canary of release ${rel.releaseId}, so it was rolled back: ${v.summary}`, ["ack"]);
+      }
     }
     return this.finish("applied");
   }
@@ -275,10 +342,52 @@ export class ReleasePlanner {
   tap(releaseId: string, user: string): ReleasePlanResult {
     const rel = this.releases.find((r) => r.releaseId === releaseId);
     if (!rel) return this.finish("ignored:unknown");
-    if (rel.phase !== "AWAITING_TAP") return this.finish("conflict");
-    this.set(rel, { tappedBy: user, tappedAt: this.ctx.now, phase: "CANARY", step: 0, summary: clip(`Tapped to ship by ${user}.`) });
-    this.deployCanary(rel);
+    // Paused: no new canary starts until the hive is unpaused.
+    if (rel.phase !== "AWAITING_TAP" || this.ctx.paused) return this.finish("conflict");
+    this.startCanary(rel, user);
+    this.resolveParked(rel, user, "ship");
     return this.finish("applied");
+  }
+
+  /** The tap body: record who/when and start the 1% canary. */
+  private startCanary(rel: ReleaseRecord, actor: string): void {
+    this.set(rel, { tappedBy: actor, tappedAt: this.ctx.now, phase: "CANARY", step: 0, summary: clip(`Tapped to ship by ${actor}.`) });
+    this.deployCanary(rel);
+  }
+
+  /** The Queen taps on its own (autonomous hive). */
+  private autoShip(rel: ReleaseRecord): void {
+    this.startCanary(rel, AUTO_SHIP_ACTOR);
+    this.resolveParked(rel, AUTO_SHIP_ACTOR, "auto-shipped");
+    this.events.push({
+      type: "release.autoshipped",
+      actor: AUTO_SHIP_ACTOR,
+      traceId: rel.traceId ?? null,
+      releaseId: rel.releaseId,
+      summary: clip(`Release ${rel.releaseId} (main ${short(rel.headSha)}) auto-shipped: canary started at ${CANARY_STEPS[0]}%.`),
+      data: { headSha: rel.headSha, trainIds: rel.trainIds },
+    });
+  }
+
+  /** AWAITING_TAP and parked: an open SENTINEL_INCONCLUSIVE, or a human chose `hold`. */
+  private parkedByHuman(rel: ReleaseRecord): boolean {
+    return this.escalationsOf(rel).some(
+      (e) => (e.status === "OPEN" && e.reason === "SENTINEL_INCONCLUSIVE") || (PARKED_RELEASE_REASONS.has(e.reason) && resolutionAction(e) === "hold"),
+    );
+  }
+
+  /**
+   * Autonomy changed (or the Queen restarted): an AWAITING_TAP release ships on
+   * its own once autoShip holds, unless parked; a supervised hive asks once.
+   */
+  private reconcileParked(): void {
+    const rel = this.inFlight();
+    if (rel?.phase !== "AWAITING_TAP" || this.ctx.paused) return;
+    if (this.ctx.autoShip) {
+      if (!this.parkedByHuman(rel)) this.autoShip(rel);
+      return;
+    }
+    if (!this.escalationsOf(rel).some((e) => PARKED_RELEASE_REASONS.has(e.reason))) this.openApproval(rel);
   }
 
   /**
@@ -288,6 +397,7 @@ export class ReleasePlanner {
    */
   reconcile(): ReleasePlanResult {
     this.watchdog();
+    this.reconcileParked();
     const rel = this.inFlight();
     if (rel?.pending === "DEPLOY") this.emitDeploy(rel);
     else if (rel?.pending === "SENTINEL") this.emitSentinel(rel);
@@ -399,6 +509,10 @@ export class ReleasePlanner {
     this.set(rel, { phase: "SHIPPED", pending: null, canaryPercent: 100, summary: clip(summary) });
     this.setEnv("prod", { status: "LIVE", url: rel.prodUrl, versionId: rel.candidateVersionId, commitSha: rel.headSha, percent: 100, summary: clip(`Shipped release ${rel.releaseId}.`) });
     this.setEnv("canary", { status: "TORN_DOWN", percent: null, summary: null });
+    this.streak = 0;
+    for (const e of this.escalations) {
+      if (e.status === "OPEN" && e.reason === "ROLLBACK_STREAK") this.resolveEscalation(e, QUEEN_ACTOR, `cleared: release ${rel.releaseId} shipped`);
+    }
     this.cutQueued(rel, false);
   }
 
@@ -415,6 +529,7 @@ export class ReleasePlanner {
         this.setEnv("prod", { status: "LIVE", url: rel.prodUrl, versionId: live, commitSha: rel.headSha, percent: 100, summary: clip(`Release ${rel.releaseId} failed its canary, but this version is still live: no prior version to roll back to.`) });
         this.setEnv("canary", { status: "TORN_DOWN", percent: null });
       }
+      this.countRollback(rel);
       this.cutQueued(rel, true);
       return;
     }
@@ -437,12 +552,15 @@ export class ReleasePlanner {
     this.set(rel, { phase: "ROLLED_BACK", pending: null, canaryPercent: 0 });
     this.setEnv("prod", { status: "LIVE", url: rel.prodUrl, versionId: rel.stableVersionId, percent: 100, summary: clip(`Rolled back release ${rel.releaseId}: ${rel.summary ?? ""}`) });
     this.setEnv("canary", { status: "TORN_DOWN", percent: null });
+    this.countRollback(rel);
     this.cutQueued(rel, true);
   }
 
   private rollbackFailed(rel: ReleaseRecord, why: string): void {
     this.set(rel, { phase: "FAILED", pending: null, summary: clip(`${rel.summary ?? "Canary failed."} ${why}; prod may still split traffic, roll back manually.`) });
     this.setEnv("prod", { status: "FAILED", summary: clip(why) });
+    this.openEscalation("ROLLBACK_FAILED", rel, `Release ${rel.releaseId}: ${why}. Prod may still split traffic between ${rel.stableVersionId ?? "?"} and ${rel.candidateVersionId ?? "?"}; roll back by hand, then ack.`);
+    this.countRollback(rel);
     this.cutQueued(rel, true);
   }
 
@@ -523,6 +641,65 @@ export class ReleasePlanner {
     });
   }
 
+  // ── autonomy: escalations and the rollback streak ─────────────────────
+
+  /** A canary ended in ROLLED_BACK or FAILED: the streak grows; at the limit the hive is asked. */
+  private countRollback(rel: ReleaseRecord): void {
+    this.streak += 1;
+    if (this.streak < ROLLBACK_STREAK_LIMIT) return;
+    const hive = this.ctx.namespace;
+    if (this.escalations.some((e) => e.status === "OPEN" && e.reason === "ROLLBACK_STREAK")) return;
+    this.pushEscalation(
+      newEscalation(hive, this.ctx.now, {
+        reason: "ROLLBACK_STREAK",
+        subject: { type: "hive", id: hive },
+        traceId: rel.traceId ?? null,
+        summary: `${this.streak} releases in a row were rolled back or failed their canary (latest ${rel.releaseId}); the hive runs supervised.`,
+      }),
+    );
+  }
+
+  private openApproval(rel: ReleaseRecord): void {
+    this.openEscalation("APPROVAL_REQUIRED", rel, `Release ${rel.releaseId} (main ${short(rel.headSha)}, ${rel.trainIds.length} train${rel.trainIds.length === 1 ? "" : "s"}) passed staging: ${rel.summary ?? "healthy"}`);
+  }
+
+  /** Open `reason` about `rel` unless one is already open. */
+  private openEscalation(reason: EscalationReason, rel: ReleaseRecord, summary: string, actions?: EscalationAction[]): void {
+    if (this.escalationsOf(rel).some((e) => e.status === "OPEN" && e.reason === reason)) return;
+    this.pushEscalation(
+      newEscalation(this.ctx.namespace, this.ctx.now, {
+        reason,
+        subject: { type: "release", id: rel.releaseId },
+        traceId: rel.traceId ?? null,
+        summary,
+        ...(actions ? { actions } : {}),
+      }),
+    );
+  }
+
+  private pushEscalation(e: Escalation): void {
+    this.escalations.push(e);
+    this.dirtyEscalations.add(e.escalationId);
+    this.events.push(escalationOpenedEvent(e));
+  }
+
+  /** Resolve the open APPROVAL_REQUIRED / SENTINEL_INCONCLUSIVE (ship/hold kind) of a parked release. */
+  private resolveParked(rel: ReleaseRecord, by: string, resolution: string): void {
+    for (const e of this.escalationsOf(rel)) {
+      if (e.status === "OPEN" && PARKED_RELEASE_REASONS.has(e.reason) && e.actions.includes("ship")) this.resolveEscalation(e, by, resolution);
+    }
+  }
+
+  private resolveEscalation(e: Escalation, by: string, resolution: string): void {
+    Object.assign(e, resolvedEscalation(e, by, resolution, this.ctx.now));
+    this.dirtyEscalations.add(e.escalationId);
+    this.events.push(escalationResolvedEvent(e));
+  }
+
+  private escalationsOf(rel: ReleaseRecord): Escalation[] {
+    return this.escalations.filter((e) => isAbout(e, "release", rel.releaseId));
+  }
+
   // ── internals ─────────────────────────────────────────────────────────
 
   private inFlight(): ReleaseRecord | undefined {
@@ -583,8 +760,21 @@ export class ReleasePlanner {
     for (const [idField, clock] of Object.entries(ISSUED_AT) as [keyof typeof ISSUED_AT, (typeof ISSUED_AT)[keyof typeof ISSUED_AT]][]) {
       if (idField in patch && patch[idField] !== rel[idField] && !(clock in patch)) stamped[clock] = patch[idField] ? this.ctx.now : null;
     }
+    const from = rel.phase;
     // Strictly increasing: the War Room drops updates older than (or equal to) the one it holds.
     Object.assign(rel, patch, stamped, { updatedAt: Math.max(this.ctx.now, rel.updatedAt + 1) });
+    if (patch.phase !== undefined && patch.phase !== from) {
+      const bad = rel.phase === "FAILED" || rel.phase === "ROLLED_BACK";
+      this.events.push({
+        type: "release.phase",
+        severity: bad ? "warn" : "info",
+        actor: rel.phase === "CANARY" && rel.tappedBy ? rel.tappedBy : QUEEN_ACTOR,
+        traceId: rel.traceId ?? null,
+        releaseId: rel.releaseId,
+        summary: clip(`Release ${rel.releaseId}: ${from} → ${rel.phase}${rel.summary ? `. ${rel.summary}` : ""}`),
+        data: { from, to: rel.phase, headSha: rel.headSha, canaryPercent: rel.canaryPercent },
+      });
+    }
     this.dirty.set(rel.releaseId, (this.dirty.get(rel.releaseId) ?? false) || visible);
   }
 
@@ -625,10 +815,24 @@ export class ReleasePlanner {
       ...releases.filter((r) => this.dirty.get(r.releaseId)).map((r): ReleaseEffect => ({ type: "broadcast", message: { type: "release.updated", release: toRelease(r) } })),
       ...deployments.map((d): ReleaseEffect => ({ type: "broadcast", message: { type: "deployment.updated", deployment: d } })),
     ];
-    const result: ReleasePlanResult = { outcome, releases, deployments, effects: [...effects, ...broadcasts] };
+    const escalations = [...this.dirtyEscalations].map((id) => {
+      const e = this.escalations.find((x) => x.escalationId === id)!;
+      return { ...e, subject: { ...e.subject }, actions: [...e.actions] };
+    });
+    const result: ReleasePlanResult = {
+      outcome,
+      releases,
+      deployments,
+      effects: [...effects, ...broadcasts],
+      escalations,
+      events: this.events,
+      rollbackStreak: this.streak,
+    };
     this.dirty.clear();
     this.dirtyDeployments.clear();
+    this.dirtyEscalations.clear();
     this.effects = [];
+    this.events = [];
     return result;
   }
 }

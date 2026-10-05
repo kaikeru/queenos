@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DeployCommand, DeployResult, Deployment, SentinelCommand, SentinelVerdict } from "@queenos/queen-types";
+import { AUTO_SHIP_ACTOR, type DeployCommand, type DeployResult, type Deployment, type Escalation, type EventDraft, type SentinelCommand, type SentinelVerdict } from "@queenos/queen-types";
 import {
   ReleasePlanner,
   SENTINEL_GRACE_MS,
@@ -27,15 +27,33 @@ class RSim {
   effects: ReleaseEffect[] = [];
   now = 1000;
   sentinel: SentinelSettings = { windowSeconds: 60, minRequests: 100 };
+  /** v2 autonomy inputs, persisted the way the Queen would. */
+  autoShip = false;
+  paused = false;
+  streak = 0;
+  escalations = new Map<string, Escalation>();
+  events: EventDraft[] = [];
   private ids = 0;
   private maxSeq = 0;
 
   run(fn: (p: ReleasePlanner) => ReleasePlanResult): ReleasePlanResult {
     const planner = new ReleasePlanner(
       { releases: [...this.releases.values()], deployments: [...this.deployments.values()], maxSeq: this.maxSeq },
-      { namespace: "hive", now: this.now, newId: () => `r${++this.ids}`, sentinel: this.sentinel },
+      {
+        namespace: "hive",
+        now: this.now,
+        newId: () => `r${++this.ids}`,
+        sentinel: this.sentinel,
+        autoShip: this.autoShip,
+        paused: this.paused,
+        rollbackStreak: this.streak,
+        escalations: [...this.escalations.values()],
+      },
     );
     const r = fn(planner);
+    for (const e of r.escalations) this.escalations.set(e.escalationId, e);
+    this.streak = r.rollbackStreak;
+    this.events.push(...r.events);
     for (const rel of r.releases) {
       this.releases.set(rel.releaseId, rel);
       this.maxSeq = Math.max(this.maxSeq, rel.seq);
@@ -82,7 +100,12 @@ class RSim {
     return this.run((p) => p.deployResult({ commandId: c.commandId, op: c.op ?? "DEPLOY", environment: c.environment ?? "staging", ok: true, ...extra }));
   }
 
-  verdict(c: SentinelCommand, verdict: "PROMOTE" | "ROLLBACK", summary = verdict === "PROMOTE" ? "healthy" : "5xx spike"): ReleasePlanResult {
+  /** Open escalations (reason:subject id). */
+  open(): string[] {
+    return [...this.escalations.values()].filter((e) => e.status === "OPEN").map((e) => `${e.reason}:${e.subject.id}`);
+  }
+
+  verdict(c: SentinelCommand, verdict: "PROMOTE" | "ROLLBACK", summary = verdict === "PROMOTE" ? "healthy" : "5xx spike", inconclusive = false): ReleasePlanResult {
     const v: SentinelVerdict = {
       commandId: c.commandId,
       releaseId: c.releaseId,
@@ -90,13 +113,16 @@ class RSim {
       verdict,
       metrics: { requests: 300, errorRate: verdict === "PROMOTE" ? 0 : 0.2, p99Ms: 80, baselineErrorRate: null },
       summary,
+      ...(inconclusive ? { inconclusive: true } : {}),
     };
     return this.run((p) => p.sentinelVerdict(v));
   }
 
-  /** Land t1 and drive the release to AWAITING_TAP. */
-  static awaitingTap(): RSim {
+  /** Land t1 and drive the release to AWAITING_TAP (or CANARY when `opts.autoShip`). */
+  static awaitingTap(opts: { autoShip?: boolean; paused?: boolean } = {}): RSim {
     const s = new RSim();
+    s.autoShip = opts.autoShip ?? false;
+    s.paused = opts.paused ?? false;
     s.land("t1");
     const [d] = s.deploys();
     s.deployResult(d!, { url: STAGING_URL, releaseId: "r1" });
@@ -525,5 +551,216 @@ describe("release planner: watchdog and reconcile", () => {
     expect(releaseWatchdogDeadline([...s.releases.values()], T, 3600, 0)).toBe(2000 + 3600_000 + SENTINEL_GRACE_MS);
     s.verdict(s.sentinels()[0]!, "PROMOTE");
     expect(releaseWatchdogDeadline([...s.releases.values()], T, 60, 0)).toBeNull(); // AWAITING_TAP waits on a human
+  });
+});
+
+// ── v2 autonomy (§2.4, §2.5) ─────────────────────────────────────────────
+
+/** Land `train` and bring its release to the staging verdict (Sentinel validate command pending). */
+function toValidating(s: RSim, train: string): SentinelCommand {
+  s.land(train);
+  s.deployResult(s.deploys().at(-1)!, { url: STAGING_URL });
+  return s.sentinels().at(-1)!;
+}
+
+/** Drive the in-flight canary release to its end: ship, rollback, or a rollback that fails after the cap. */
+function endCanary(s: RSim, how: "ship" | "rollback" | "rollback-failed"): void {
+  if (how === "ship") {
+    for (let i = 0; i < 4; i++) s.promoteStep();
+    return;
+  }
+  s.verdict(s.sentinels().at(-1)!, "ROLLBACK");
+  if (how === "rollback") {
+    s.deployResult({ ...s.herald().at(-1)!, op: "ROLLBACK", environment: "canary" });
+    return;
+  }
+  for (let n = 1; n <= MAX_COMMAND_ATTEMPTS; n++) {
+    s.deployResult({ ...s.herald().at(-1)!, op: "ROLLBACK", environment: "canary" }, { ok: false, summary: "API 500" });
+  }
+}
+
+/** A full cycle from landing `train`: staging PROMOTE, tap (unless auto-shipped), canary 1%, then `how`. */
+function cycle(s: RSim, train: string, how: "ship" | "rollback" | "rollback-failed"): string {
+  const v = toValidating(s, train);
+  s.verdict(v, "PROMOTE");
+  const id = v.releaseId;
+  if (s.rel(id).phase === "AWAITING_TAP") s.run((p) => p.tap(id, "kyle@kaikeru.com"));
+  s.deployResult(s.deploys().at(-1)!, { environment: "canary", url: PROD_URL, versionId: "v-cand", stableVersionId: "v-stable" });
+  endCanary(s, how);
+  return id;
+}
+
+describe("release planner: autonomy levels × staging verdicts", () => {
+  const table = [
+    // level, verdict, inconclusive → phase, tappedBy, open escalations
+    { level: "autonomous", verdict: "PROMOTE", inconclusive: false, phase: "CANARY", tappedBy: AUTO_SHIP_ACTOR, open: [] },
+    { level: "supervised", verdict: "PROMOTE", inconclusive: false, phase: "AWAITING_TAP", tappedBy: null, open: ["APPROVAL_REQUIRED:r1"] },
+    { level: "paused", verdict: "PROMOTE", inconclusive: false, phase: "AWAITING_TAP", tappedBy: null, open: [] },
+    { level: "autonomous", verdict: "ROLLBACK", inconclusive: true, phase: "AWAITING_TAP", tappedBy: null, open: ["SENTINEL_INCONCLUSIVE:r1"] },
+    { level: "supervised", verdict: "ROLLBACK", inconclusive: true, phase: "AWAITING_TAP", tappedBy: null, open: ["SENTINEL_INCONCLUSIVE:r1"] },
+    { level: "paused", verdict: "ROLLBACK", inconclusive: true, phase: "AWAITING_TAP", tappedBy: null, open: ["SENTINEL_INCONCLUSIVE:r1"] },
+    { level: "autonomous", verdict: "PROMOTE", inconclusive: true, phase: "AWAITING_TAP", tappedBy: null, open: ["SENTINEL_INCONCLUSIVE:r1"] },
+    { level: "autonomous", verdict: "ROLLBACK", inconclusive: false, phase: "FAILED", tappedBy: null, open: [] },
+    { level: "supervised", verdict: "ROLLBACK", inconclusive: false, phase: "FAILED", tappedBy: null, open: [] },
+    { level: "paused", verdict: "ROLLBACK", inconclusive: false, phase: "FAILED", tappedBy: null, open: [] },
+  ] as const;
+  for (const row of table) {
+    it(`${row.level} + ${row.verdict}${row.inconclusive ? " (inconclusive)" : ""} → ${row.phase}`, () => {
+      const s = new RSim();
+      s.autoShip = row.level === "autonomous";
+      s.paused = row.level === "paused";
+      const v = toValidating(s, "t1");
+      expect(s.verdict(v, row.verdict, "summary", row.inconclusive).outcome).toBe("applied");
+      expect(s.rel("r1")).toMatchObject({ phase: row.phase, tappedBy: row.tappedBy });
+      expect(s.open()).toEqual(row.open);
+      const canary = s.deploys().filter((d) => d.environment === "canary");
+      expect(canary.length).toBe(row.phase === "CANARY" ? 1 : 0);
+      expect(s.streak).toBe(0); // staging failures never count against the streak
+    });
+  }
+
+  it("auto-ship records release.autoshipped and the phase events, and starts the 1% canary", () => {
+    const s = RSim.awaitingTap({ autoShip: true });
+    expect(s.rel("r1")).toMatchObject({ phase: "CANARY", tappedBy: AUTO_SHIP_ACTOR, tappedAt: 1000, step: 0, summary: `Tapped to ship by ${AUTO_SHIP_ACTOR}.` });
+    expect(s.events.map((e) => e.type)).toEqual(["release.phase", "release.phase", "release.phase", "release.autoshipped"]);
+    expect(s.events.find((e) => e.type === "release.autoshipped")).toMatchObject({ actor: AUTO_SHIP_ACTOR, releaseId: "r1" });
+  });
+
+  it("supervised: APPROVAL_REQUIRED offers ship/hold; a human tap resolves it as ship", () => {
+    const s = RSim.awaitingTap();
+    const [e] = [...s.escalations.values()];
+    expect(e).toMatchObject({ reason: "APPROVAL_REQUIRED", status: "OPEN", subject: { type: "release", id: "r1" }, actions: ["ship", "hold"], hive: "hive" });
+    expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("applied");
+    expect(s.escalations.get(e!.escalationId)).toMatchObject({ status: "RESOLVED", resolvedBy: "kyle@kaikeru.com", resolution: "ship", resolvedAt: 1000 });
+  });
+
+  it("paused: a tap is refused (no new canary) and works once unpaused", () => {
+    const s = RSim.awaitingTap({ paused: true });
+    expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("conflict");
+    expect(s.rel("r1").phase).toBe("AWAITING_TAP");
+    s.paused = false;
+    expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("applied");
+    expect(s.rel("r1").phase).toBe("CANARY");
+  });
+
+  it("paused: an in-flight canary still finishes", () => {
+    const s = RSim.canary1();
+    s.paused = true;
+    endCanary(s, "ship");
+    expect(s.rel("r1").phase).toBe("SHIPPED");
+  });
+
+  it("superseding a parked release resolves its APPROVAL_REQUIRED as superseded and asks about the new one", () => {
+    const s = RSim.awaitingTap();
+    s.land("t2");
+    expect(s.rel("r1").phase).toBe("SUPERSEDED");
+    expect([...s.escalations.values()].find((e) => e.subject.id === "r1")).toMatchObject({ status: "RESOLVED", resolution: "superseded", resolvedBy: "queen" });
+    s.deployResult(s.deploys().at(-1)!, { url: STAGING_URL });
+    s.verdict(s.sentinels().at(-1)!, "PROMOTE");
+    expect(s.open()).toEqual(["APPROVAL_REQUIRED:r2"]);
+  });
+});
+
+describe("release planner: reconcile auto-tap", () => {
+  it("a parked release auto-taps when autoShip turns true; its APPROVAL_REQUIRED resolves as auto-shipped", () => {
+    const s = RSim.awaitingTap();
+    s.run((p) => p.reconcile());
+    expect(s.rel("r1").phase).toBe("AWAITING_TAP");
+    s.autoShip = true;
+    s.run((p) => p.reconcile());
+    expect(s.rel("r1")).toMatchObject({ phase: "CANARY", tappedBy: AUTO_SHIP_ACTOR });
+    expect(s.deploys()).toEqual([expect.objectContaining({ environment: "canary", percent: 1, commandId: "r1-canary1-1" })]);
+    expect(s.open()).toEqual([]);
+    expect([...s.escalations.values()][0]).toMatchObject({ resolution: "auto-shipped", resolvedBy: AUTO_SHIP_ACTOR });
+  });
+
+  it("no auto-tap while an open SENTINEL_INCONCLUSIVE stands, nor after a human chose hold", () => {
+    const s = new RSim();
+    s.autoShip = true;
+    s.verdict(toValidating(s, "t1"), "ROLLBACK", "readiness timeout", true);
+    s.run((p) => p.reconcile());
+    expect(s.rel("r1").phase).toBe("AWAITING_TAP");
+    // A human holds it: still parked.
+    const [e] = [...s.escalations.values()];
+    s.escalations.set(e!.escalationId, { ...e!, status: "RESOLVED", resolution: "hold", resolvedBy: "kyle@kaikeru.com", resolvedAt: 1000 });
+    s.run((p) => p.reconcile());
+    expect(s.rel("r1").phase).toBe("AWAITING_TAP");
+    // ...but a human can still ship it.
+    expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("applied");
+  });
+
+  it("no auto-tap while paused", () => {
+    const s = RSim.awaitingTap({ paused: true });
+    s.autoShip = true;
+    s.run((p) => p.reconcile());
+    expect(s.rel("r1").phase).toBe("AWAITING_TAP");
+  });
+
+  it("supervised: reconcile asks once for a parked release that never had an escalation (the migrated demo hive)", () => {
+    const s = RSim.awaitingTap({ paused: true }); // parked with no escalation
+    s.paused = false;
+    s.run((p) => p.reconcile());
+    expect(s.open()).toEqual(["APPROVAL_REQUIRED:r1"]);
+    s.run((p) => p.reconcile());
+    expect(s.escalations.size).toBe(1);
+    // Held: never re-asked.
+    const [e] = [...s.escalations.values()];
+    s.escalations.set(e!.escalationId, { ...e!, status: "RESOLVED", resolution: "hold" });
+    expect(s.run((p) => p.reconcile()).escalations).toEqual([]);
+  });
+});
+
+describe("release planner: rollback streak and escalations", () => {
+  it("each rollback bumps the streak; the 2nd opens ROLLBACK_STREAK; a ship resets it and resolves the escalation", () => {
+    const s = new RSim();
+    cycle(s, "t1", "rollback");
+    expect(s.streak).toBe(1);
+    expect(s.open()).toEqual([]);
+    cycle(s, "t2", "rollback");
+    expect(s.streak).toBe(2);
+    expect(s.open()).toEqual(["ROLLBACK_STREAK:hive"]);
+    const streakEsc = [...s.escalations.values()].find((e) => e.reason === "ROLLBACK_STREAK")!;
+    expect(streakEsc.actions).toEqual(["resume_autonomy", "ack"]);
+    cycle(s, "t3", "rollback");
+    expect(s.streak).toBe(3);
+    expect([...s.escalations.values()].filter((e) => e.reason === "ROLLBACK_STREAK")).toHaveLength(1); // still the one open
+    cycle(s, "t4", "ship");
+    expect(s.streak).toBe(0);
+    expect(s.escalations.get(streakEsc.escalationId)).toMatchObject({ status: "RESOLVED", resolution: expect.stringMatching(/^cleared: release r\d+ shipped$/) });
+  });
+
+  it("a canary FAILED with no stable version counts toward the streak; a staging failure does not", () => {
+    const s = RSim.awaitingTap();
+    s.run((p) => p.tap("r1", "kyle@kaikeru.com"));
+    s.deployResult(s.deploys()[0]!, { environment: "canary", ok: false, summary: "upload 500" });
+    expect(s.rel("r1").phase).toBe("FAILED");
+    expect(s.streak).toBe(1);
+    s.verdict(toValidating(s, "t2"), "ROLLBACK");
+    expect(s.streak).toBe(1);
+  });
+
+  it("a failed Herald rollback opens ROLLBACK_FAILED (ack only) and counts toward the streak", () => {
+    const s = new RSim();
+    const id = cycle(s, "t1", "rollback-failed");
+    expect(s.rel(id).phase).toBe("FAILED");
+    expect(s.streak).toBe(1);
+    const e = [...s.escalations.values()].find((x) => x.reason === "ROLLBACK_FAILED")!;
+    expect(e).toMatchObject({ status: "OPEN", subject: { type: "release", id }, actions: ["ack"] });
+    expect(s.events.find((x) => x.type === "escalation.opened" && x.summary.startsWith("ROLLBACK_FAILED"))).toMatchObject({ severity: "error", releaseId: id });
+  });
+
+  it("an inconclusive canary verdict rolls back and opens an informational SENTINEL_INCONCLUSIVE", () => {
+    const s = RSim.canary1();
+    s.verdict(s.sentinels().at(-1)!, "ROLLBACK", "too few requests", true);
+    expect(s.rel("r1").summary).toBe("Canary at 1% inconclusive: too few requests");
+    expect(s.herald()).toEqual([expect.objectContaining({ op: "ROLLBACK" })]);
+    expect(s.open()).toEqual(["SENTINEL_INCONCLUSIVE:r1"]);
+    expect([...s.escalations.values()].find((e) => e.reason === "SENTINEL_INCONCLUSIVE")).toMatchObject({ actions: ["ack"] });
+  });
+
+  it("the streak passes through untouched when nothing ends", () => {
+    const s = new RSim();
+    s.streak = 5;
+    expect(s.land("t1").rollbackStreak).toBe(5);
   });
 });
