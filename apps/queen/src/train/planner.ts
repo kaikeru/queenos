@@ -51,7 +51,7 @@ import type {
   TrainResult,
   TrainState,
 } from "@queenos/queen-types";
-import { memoryToRagSnippet } from "@queenos/queen-types";
+import { MAX_RECALL_QUERY, memoryToRagSnippet } from "@queenos/queen-types";
 import { DEFAULT_POLICY, INITIAL_FLOOR, floorAfter, isCatalogModel, route, type FloorOutcome, type FloorState, type RouterPolicy, type RouterRole, type RouterStats } from "../models/router";
 
 /**
@@ -73,8 +73,6 @@ export const MAX_FORK_ATTEMPTS = 3;
  * failure path as an `ok:false` result. Same value as the fork cap.
  */
 export const MAX_COMMAND_ATTEMPTS = MAX_FORK_ATTEMPTS;
-/** Max chars of a FORK's `recallQuery` (the train's prompt; ProvisionCommandSchema caps it). */
-export const MAX_RECALL_QUERY = 4_000;
 /** Default for COMMAND_TIMEOUT_MS: how long a dispatched command may stay unreported. */
 export const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
 

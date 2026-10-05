@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { MAX_RECALLED_MEMORIES, RecalledMemorySchema } from "./memory.js";
+import { MAX_RECALLED_MEMORIES, MAX_RECALL_QUERY, RecalledMemorySchema } from "./memory.js";
 
 /**
  * Executor contracts. The Queen only decides and records. Every external side
@@ -24,7 +24,7 @@ export const ProvisionCommandSchema = z.discriminatedUnion("op", [
     /** Fork name chosen by the Queen up front (`<ns>-train-<12hex>`). */
     forkName: z.string().min(1),
     /** The train's prompt: the Provisioner recalls hive memories for it (absent: no recall). */
-    recallQuery: z.string().max(4_000).optional(),
+    recallQuery: z.string().max(MAX_RECALL_QUERY).optional(),
   }),
   z.object({
     op: z.literal("DELETE"),

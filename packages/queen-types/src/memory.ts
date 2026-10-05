@@ -21,6 +21,8 @@ export const MAX_RECALLED_MEMORIES = 5;
 export const MIN_RECALL_SCORE = 0.6;
 /** Max chars of `MemoryRecord.text` (also the embedded text). */
 export const MAX_MEMORY_TEXT = 1_200;
+/** Max chars of a FORK's recallQuery (the train's prompt). */
+export const MAX_RECALL_QUERY = 4_000;
 
 /** How the gate judged the change the memory is about. */
 export const MemoryOutcomeSchema = z.enum(["PASSED", "FAILED", "REJECTED_BY_REVIEW"]);
