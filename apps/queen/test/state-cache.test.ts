@@ -239,7 +239,7 @@ describe("StateCache", () => {
       expect(loadReads).toBeGreaterThan(0);
 
       // One reportBuildResult-shaped apply: a train moves on, another is evicted.
-      cache.apply({ trains: [{ ...train(7), phase: "PASSED", status: "PASSED" }, { ...train(8), phase: "MERGED", status: "MERGED" }] });
+      cache.apply({ trains: [{ ...train(7), phase: "PASSED", status: "TESTING" }, { ...train(8), phase: "MERGED", status: "MERGED" }] });
       const s = cache.get()!;
       expect(s.trains).toHaveLength(499);
       expect(s.prompts).toHaveLength(499);
