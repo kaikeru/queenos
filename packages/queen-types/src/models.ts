@@ -10,7 +10,8 @@ import { z } from "zod";
 export const ModelTierSchema = z.enum(["light", "fast", "frontier"]);
 export type ModelTier = z.infer<typeof ModelTierSchema>;
 
-export const ModelRoleSchema = z.enum(["builder", "rework", "scribe", "genesis"]);
+/** v2: `planner` = the Oracle's decomposition / path-prediction call. */
+export const ModelRoleSchema = z.enum(["builder", "rework", "scribe", "genesis", "planner"]);
 export type ModelRole = z.infer<typeof ModelRoleSchema>;
 
 export const CatalogModelSchema = z.object({
@@ -44,8 +45,8 @@ export const MODEL_CATALOG: readonly CatalogModel[] = [
   { id: "@cf/deepseek-ai/deepseek-v4-pro-0813", label: "DeepSeek V4 Pro", tier: "frontier", contextWindow: 1048576, cost: 9, roles: ["builder", "rework"] },
   { id: "@cf/moonshotai/kimi-k2.7-code", label: "Kimi K2.7 Code", tier: "frontier", contextWindow: 262144, cost: 8, roles: ["builder", "rework"] },
   { id: "@cf/zai-org/glm-5.3", label: "GLM-5.3", tier: "frontier", contextWindow: 1048576, cost: 8, roles: ["builder", "rework", "genesis"], slow: true },
-  { id: "@cf/deepseek-ai/deepseek-v4-flash-0731", label: "DeepSeek V4 Flash", tier: "fast", contextWindow: 1048576, cost: 3, roles: ["builder", "rework"] },
-  { id: "@cf/zai-org/glm-5.3-flash", label: "GLM-5.3 Flash", tier: "fast", contextWindow: 1048576, cost: 3, roles: ["builder", "genesis", "scribe"] },
+  { id: "@cf/deepseek-ai/deepseek-v4-flash-0731", label: "DeepSeek V4 Flash", tier: "fast", contextWindow: 1048576, cost: 3, roles: ["builder", "rework", "planner"] },
+  { id: "@cf/zai-org/glm-5.3-flash", label: "GLM-5.3 Flash", tier: "fast", contextWindow: 1048576, cost: 3, roles: ["builder", "genesis", "scribe", "planner"] },
   { id: "@cf/qwen/qwen3.8-27b", label: "Qwen 3.8 27B", tier: "fast", contextWindow: 262144, cost: 2, roles: ["builder", "genesis"], toolLoop: false },
   { id: "@cf/zai-org/glm-4.7-flash", label: "GLM-4.7 Flash", tier: "light", contextWindow: 131072, cost: 1, roles: ["scribe", "genesis"] },
   { id: "@cf/ibm-granite/granite-4.0-h-micro", label: "Granite 4.0 Micro", tier: "light", contextWindow: 131000, cost: 1, roles: ["scribe"] },

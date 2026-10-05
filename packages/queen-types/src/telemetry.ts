@@ -4,9 +4,18 @@ import { ReleaseSchema, SentinelVerdictSchema } from "./releases.js";
 import { ModelStatsSchema, RouterFloorSchema } from "./models.js";
 import { AuditEventSchema, MergeTrainSchema, PromptRunSchema } from "./state.js";
 import { SubmitPromptSchema } from "./train.js";
+import { EscalationSchema, HiveStatusSchema } from "./autonomy.js";
+import { QueenEventSchema } from "./observability.js";
+import { RaceSchema, WorkItemSchema } from "./work.js";
 
-/** Server -> client messages (Queen to War Room). */
-export const QueenServerMessageSchema = z.discriminatedUnion("type", [
+/** Max messages in one coalesced `batch` frame (§4.3). */
+export const MAX_BATCH_MESSAGES = 200;
+
+/**
+ * Every server message except `batch`. A `batch` frame carries these (never a
+ * nested batch), so the union stays non-recursive.
+ */
+export const QueenServerUnitMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("snapshot"),
     promptRuns: z.array(PromptRunSchema),
@@ -24,6 +33,15 @@ export const QueenServerMessageSchema = z.discriminatedUnion("type", [
     routerFloor: RouterFloorSchema.optional(),
     /** Latest Sentinel verdict per (release, environment) for the snapshot's releases. Optional for back-compat. */
     verdicts: z.array(SentinelVerdictSchema).optional(),
+    // v2 (optional; absent from v1 Queens).
+    /** Non-terminal work items plus recent terminal ones. */
+    items: z.array(WorkItemSchema).optional(),
+    /** Open escalations plus recently resolved ones. */
+    escalations: z.array(EscalationSchema).optional(),
+    races: z.array(RaceSchema).optional(),
+    hive: HiveStatusSchema.optional(),
+    /** The last 50 info+ events, oldest first. */
+    recentEvents: z.array(QueenEventSchema).optional(),
   }),
   z.object({ type: z.literal("prompt.updated"), promptRun: PromptRunSchema }),
   z.object({ type: z.literal("train.updated"), train: MergeTrainSchema }),
@@ -35,6 +53,23 @@ export const QueenServerMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("error"), message: z.string(), code: z.string().optional() }),
   /** Reply to a JSON `{"type":"ping"}`. (The literal string "ping" is auto-answered with "pong".) */
   z.object({ type: z.literal("pong") }),
+  // v2 deltas. Merge-queue cars travel as ordinary train.updated messages with lane "QUEUE".
+  z.object({ type: z.literal("item.updated"), item: WorkItemSchema }),
+  z.object({ type: z.literal("race.updated"), race: RaceSchema }),
+  z.object({ type: z.literal("escalation.updated"), escalation: EscalationSchema }),
+  z.object({ type: z.literal("hive.updated"), hive: HiveStatusSchema }),
+  z.object({ type: z.literal("event.appended"), event: QueenEventSchema }),
+]);
+export type QueenServerUnitMessage = z.infer<typeof QueenServerUnitMessageSchema>;
+
+/**
+ * Server -> client messages (Queen to War Room). v2 adds `batch`: the Queen
+ * coalesces broadcasts into one frame per <= 100 ms, applied atomically by the
+ * client. (v1 dashboards fail to parse it and show the "updated, reload" banner.)
+ */
+export const QueenServerMessageSchema = z.discriminatedUnion("type", [
+  ...QueenServerUnitMessageSchema.options,
+  z.object({ type: z.literal("batch"), messages: z.array(QueenServerUnitMessageSchema).max(MAX_BATCH_MESSAGES) }),
 ]);
 export type QueenServerMessage = z.infer<typeof QueenServerMessageSchema>;
 

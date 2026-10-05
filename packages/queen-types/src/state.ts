@@ -1,7 +1,9 @@
 import { z } from "zod";
 import { GitNotesPayloadSchema } from "./ledger.js";
 import { RecalledMemorySchema } from "./memory.js";
-import { TrainPhaseSchema, TrainStateSchema } from "./train.js";
+import { MergeConflictSchema, TrainLaneSchema } from "./queue.js";
+import { TraceIdSchema } from "./trace.js";
+import { GateScoreSchema, TrainPhaseSchema, TrainStateSchema } from "./train.js";
 
 export const PromptStatusSchema = z.enum([
   "QUEUED",
@@ -38,6 +40,10 @@ export const PromptRunSchema = z.object({
 });
 export type PromptRun = z.infer<typeof PromptRunSchema>;
 
+/** A race candidate's standing (§2.3.6). */
+export const RaceOutcomeSchema = z.enum(["RACING", "PASSED", "FAILED", "WON", "LOST"]);
+export type RaceOutcome = z.infer<typeof RaceOutcomeSchema>;
+
 /** Row of `merge_trains`. */
 export const MergeTrainSchema = z.object({
   trainId: z.string(), // train_id (PK)
@@ -56,6 +62,19 @@ export const MergeTrainSchema = z.object({
   model: z.string().nullable().optional(), // model (router's choice for this train's builder, or the model actually used)
   modelReason: z.string().max(200).nullable().optional(), // model_reason (why the router chose it)
   memories: z.array(RecalledMemorySchema).optional(), // memories (JSON; hive memories the Provisioner recalled for this train)
+  // v2 (all optional; absent on v1 Queens and in v1 snapshots).
+  traceId: TraceIdSchema.nullable().optional(), // trace_id (the item's trace)
+  raceId: z.string().nullable().optional(), // race_id (best-of-N candidate)
+  candidate: z.number().int().min(0).nullable().optional(), // candidate (index within the race)
+  raceOutcome: RaceOutcomeSchema.nullable().optional(), // race_outcome
+  score: GateScoreSchema.nullable().optional(), // gate_score (JSON)
+  lane: TrainLaneSchema.optional(), // lane (absent = BUILD)
+  members: z.array(z.string()).optional(), // members (QUEUE: JSON trainIds, merge order)
+  carId: z.string().nullable().optional(), // car_id (BUILD: the car carrying it)
+  passedSeq: z.number().int().nullable().optional(), // passed_seq (BUILD: queue ticket)
+  conflict: MergeConflictSchema.nullable().optional(), // conflict (BUILD: JSON MergeConflict that ejected it)
+  changedPaths: z.array(z.string()).optional(), // changed_paths (BUILD: JSON, from BuildResult)
+  waitForCarSeq: z.number().int().nullable().optional(), // wait_for_car_seq (BUILD: conflict/integration rework)
 });
 export type MergeTrain = z.infer<typeof MergeTrainSchema>;
 

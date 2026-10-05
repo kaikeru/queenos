@@ -1,9 +1,12 @@
 import { z } from "zod";
 import { DroneRoleSchema } from "./state.js";
 import { ModelChoiceSchema } from "./models.js";
+import { MergeMemberSchema } from "./queue.js";
+import { TraceContextSchema } from "./trace.js";
 
 /** What a drone workflow instance must do with its train fork. */
-export const DroneActionSchema = z.enum(["BUILD", "LAND", "REWORK"]);
+/** v2: MERGE = the merge-queue drone that 3-way merges a car's members (deterministic, no LLM). */
+export const DroneActionSchema = z.enum(["BUILD", "LAND", "REWORK", "MERGE"]);
 export type DroneAction = z.infer<typeof DroneActionSchema>;
 
 /** Workflow instance params for a Drone. */
@@ -22,6 +25,10 @@ export const DroneTaskSchema = z.object({
   scribeSummary: z.string().max(500).optional(),
   /** The Queen's model choice for this task (absent: the drone's env default). */
   modelChoice: ModelChoiceSchema.optional(),
+  /** v2: W3C trace context for structured logs (absent from v1 Queens). */
+  trace: TraceContextSchema.optional(),
+  /** v2: MERGE and LAND of a car: its members, in merge order. `promptText` is "queue car <carId>: <n> members". */
+  members: z.array(MergeMemberSchema).max(16).optional(),
 });
 export type DroneTask = z.infer<typeof DroneTaskSchema>;
 export type DroneTaskInput = z.input<typeof DroneTaskSchema>;

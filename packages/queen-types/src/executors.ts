@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { MAX_RECALLED_MEMORIES, MAX_RECALL_QUERY, RecalledMemorySchema } from "./memory.js";
+import { TraceContextSchema } from "./trace.js";
 
 /**
  * Executor contracts. The Queen only decides and records. Every external side
@@ -10,6 +11,8 @@ import { MAX_RECALLED_MEMORIES, MAX_RECALL_QUERY, RecalledMemorySchema } from ".
 
 const CommandId = z.string().min(1).max(128);
 const Summary = z.string().max(500);
+/** v2: optional W3C trace context on every command (absent from v1 Queens). */
+const Trace = TraceContextSchema.optional();
 
 // ---------- Provisioner (Artifacts fork / delete) ----------
 
@@ -17,6 +20,7 @@ export const ProvisionCommandSchema = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("FORK"),
     commandId: CommandId,
+    trace: Trace,
     hive: z.string().min(1),
     trainId: z.string().min(1),
     /** Repo to fork from: the hive repo, or the predecessor train's fork. */
@@ -29,6 +33,7 @@ export const ProvisionCommandSchema = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("DELETE"),
     commandId: CommandId,
+    trace: Trace,
     hive: z.string().min(1),
     trainId: z.string().min(1),
     repo: z.string().min(1),
@@ -37,6 +42,7 @@ export const ProvisionCommandSchema = z.discriminatedUnion("op", [
     /** Genesis: create the hive repo, seed templates/<template> plus .queen/charter.json, push main. */
     op: z.literal("CREATE_HIVE"),
     commandId: CommandId,
+    trace: Trace,
     hive: z.string().min(1),
     template: z.literal("worker-starter"),
     /** Serialized Charter JSON, committed as .queen/charter.json. */
@@ -80,6 +86,7 @@ export const DeployCommandSchema = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("DEPLOY"),
     commandId: CommandId,
+    trace: Trace,
     hive: z.string().min(1),
     environment: DeployEnvironmentSchema,
     /** Set for preview deploys (one Worker Preview per train). */
@@ -99,6 +106,7 @@ export const DeployCommandSchema = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("TEARDOWN"),
     commandId: CommandId,
+    trace: Trace,
     hive: z.string().min(1),
     environment: DeployEnvironmentSchema,
     trainId: z.string().min(1).optional(),
@@ -106,6 +114,7 @@ export const DeployCommandSchema = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("ROLLBACK"),
     commandId: CommandId,
+    trace: Trace,
     hive: z.string().min(1),
     environment: DeployEnvironmentSchema,
     /** Version to restore at 100%. */

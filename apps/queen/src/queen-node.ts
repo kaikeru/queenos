@@ -54,8 +54,9 @@ import {
   listModelStats,
   listRouterStats,
   listVerdicts,
+  appendAuditRow,
+  listRecentAudit,
   migrate,
-  rowToAudit,
   rowToDeployment,
   rowToPrompt,
   rowToRelease,
@@ -360,7 +361,8 @@ export class QueenNode extends DurableObject<Env> {
     if (notes !== null && new TextEncoder().encode(notes).byteLength > MAX_GIT_NOTES_BYTES) {
       throw new QueenError("INVALID_INPUT", `gitNotesPayload exceeds ${MAX_GIT_NOTES_BYTES} bytes; send a Scribe compaction`);
     }
-    if (!this.loadPrompt(a.promptId)) throw new QueenError("NOT_FOUND", `prompt ${a.promptId} not found`);
+    const prompt = this.loadPrompt(a.promptId);
+    if (!prompt) throw new QueenError("NOT_FOUND", `prompt ${a.promptId} not found`);
     const event: AuditEvent = {
       eventId: crypto.randomUUID(),
       promptId: a.promptId,
@@ -369,15 +371,8 @@ export class QueenNode extends DurableObject<Env> {
       gitNotesPayload: a.gitNotesPayload,
       createdAt: Date.now(),
     };
-    this.sql.exec(
-      "INSERT INTO audit_trail (event_id, prompt_id, drone_role, status, git_notes_payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-      event.eventId,
-      event.promptId,
-      event.droneRole,
-      event.status,
-      notes,
-      event.createdAt,
-    );
+    // event_log (drone.audit) is the source of truth since v10; audit_trail is still written for a v1 rollback.
+    this.ctx.storage.transactionSync(() => appendAuditRow(this.sql, event, prompt.namespace));
     this.broadcast({ type: "audit.appended", event });
     return event;
   }
@@ -415,12 +410,7 @@ export class QueenNode extends DurableObject<Env> {
       trains: desc(
         this.sql.exec("SELECT * FROM merge_trains ORDER BY seq DESC LIMIT ?", SNAPSHOT_LIMIT).toArray().map(rowToTrain),
       ).map(toMergeTrain),
-      recentAudit: desc(
-        this.sql
-          .exec("SELECT * FROM audit_trail ORDER BY created_at DESC, rowid DESC LIMIT ?", AUDIT_SNAPSHOT_LIMIT)
-          .toArray()
-          .map(rowToAudit),
-      ),
+      recentAudit: listRecentAudit(this.sql, AUDIT_SNAPSHOT_LIMIT),
       deployments: this.listDeployments(),
       releases,
       verdicts: listVerdicts(this.sql, releases.map((r) => r.releaseId)),

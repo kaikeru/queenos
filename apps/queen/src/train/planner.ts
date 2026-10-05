@@ -128,6 +128,12 @@ export interface TrainRecord extends MergeTrain {
   modelProbe: boolean;
   /** Hive memories the Provisioner recalled when it forked this train (best first). Feeds `ragContext`. */
   memories: RecalledMemory[];
+  // v2 internals (migrations v9 / v11; optional until WP1.2 / WP1.11 populate them).
+  // The visible v2 fields (traceId, raceId, lane, members, carId, passedSeq, ...) come from MergeTrain.
+  /** Build credits (budget + race ranking). */
+  credits?: number | null;
+  /** QUEUE: the failed car this bisect composition came from. */
+  bisectOf?: string | null;
 }
 
 export type ModelOutcome = "BUILT" | "PASSED" | "FAILED";

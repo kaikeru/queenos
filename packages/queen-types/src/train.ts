@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { FollowUpSchema, PrioritySchema } from "./work.js";
 
 export const TrainStateSchema = z.enum(["BUILDING", "TESTING", "MERGED", "EJECTED"]);
 export type TrainState = z.infer<typeof TrainStateSchema>;
@@ -28,6 +29,15 @@ export type TrainPhase = z.infer<typeof TrainPhaseSchema>;
 export const SubmitPromptSchema = z.object({
   namespace: z.string().min(1),
   promptText: z.string().min(1),
+  /**
+   * v2: file one `goal` item and let the Oracle decompose it. Absent = false
+   * (v1 semantics: one `feature` item), so old payloads parse unchanged.
+   */
+  decompose: z.boolean().optional(),
+  /** v2: explicit race width (best-of-N) for the filed item(s). */
+  bestOf: z.number().int().min(1).max(5).optional(),
+  /** v2: item priority (0..3 = P0..P3; default 2). */
+  priority: PrioritySchema.optional(),
 });
 export type SubmitPrompt = z.infer<typeof SubmitPromptSchema>;
 
@@ -42,6 +52,22 @@ export const ScribeSummarySchema = z.object({
 });
 export type ScribeSummary = z.infer<typeof ScribeSummarySchema>;
 
+/**
+ * v2: how well a gated change scored (race ranking, §2.3.6). Cars report
+ * `review: "skipped"` (the integration gate has no reviewer).
+ */
+export const GateScoreSchema = z.object({
+  review: z.enum(["approved", "skipped", "off"]),
+  /** Acceptance criteria the reviewer found satisfied / missing. */
+  satisfied: z.number().int().min(0),
+  missing: z.number().int().min(0),
+  changedFiles: z.number().int().min(0),
+  changedBytes: z.number().int().min(0),
+  /** Gate checks run. */
+  checks: z.number().int().min(0),
+});
+export type GateScore = z.infer<typeof GateScoreSchema>;
+
 /** A drone or gatekeeper reporting a train's TESTING outcome. */
 export const TrainResultSchema = z.object({
   trainId: z.string().min(1),
@@ -49,6 +75,10 @@ export const TrainResultSchema = z.object({
   /** Scribe's <=2-sentence compaction. */
   summary: z.string().max(500),
   commitSha: z.string().min(1).optional(),
+  /** v2: the gate's score (absent from pre-v2 gatekeepers: the Queen decides on pass/fail alone). */
+  score: GateScoreSchema.optional(),
+  /** v2: findings in paths outside the diff, filed as bugs (they do not fail the gate). */
+  followUps: z.array(FollowUpSchema).max(3).optional(),
 });
 export type TrainResult = z.infer<typeof TrainResultSchema>;
 
@@ -73,6 +103,12 @@ export const BuildResultSchema = z.object({
   buildMs: z.number().int().min(0).optional(),
   /** LLM tokens spent on the whole build, across every model tried (absent for scripted drones). */
   usage: BuildUsageSchema.optional(),
+  /** v2: the builder's own `verify` tool passed. */
+  verified: z.boolean().optional(),
+  /** v2: out-of-scope problems the builder noticed (never its own unfinished work). */
+  followUps: z.array(FollowUpSchema).max(5).optional(),
+  /** v2: paths changed vs the fork base; they widen the item's path claims. */
+  changedPaths: z.array(z.string().max(200)).max(200).optional(),
 });
 export type BuildResult = z.infer<typeof BuildResultSchema>;
 

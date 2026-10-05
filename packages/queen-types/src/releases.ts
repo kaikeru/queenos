@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { TraceContextSchema, TraceIdSchema } from "./trace.js";
 
 /**
  * Release train (P3). Landed trains accumulate into a release. The Queen walks
@@ -50,6 +51,8 @@ export const ReleaseSchema = z.object({
   summary: Summary.nullable(),
   createdAt: z.number().int(),
   updatedAt: z.number().int(),
+  /** v2: the release's own trace (minted from releaseId), linked to its items' traces. */
+  traceId: TraceIdSchema.nullable().optional(),
 });
 export type Release = z.infer<typeof ReleaseSchema>;
 
@@ -79,6 +82,8 @@ export const SentinelCommandSchema = z.object({
   windowSeconds: z.number().int().min(5).default(300),
   /** Readiness gate cap: seconds to wait for 3 consecutive 2xx on GET / before measuring. Default 90. */
   readyTimeoutSeconds: z.number().int().min(1).max(600).optional(),
+  /** v2: W3C trace context for structured logs. */
+  trace: TraceContextSchema.optional(),
 });
 export type SentinelCommand = z.infer<typeof SentinelCommandSchema>;
 export type SentinelCommandInput = z.input<typeof SentinelCommandSchema>;
@@ -96,5 +101,10 @@ export const SentinelVerdictSchema = z.object({
     baselineErrorRate: z.number().min(0).max(1).nullable(),
   }),
   summary: Summary,
+  /**
+   * v2: the verdict could not be measured (readiness timeout, or < half of
+   * minRequests). The verdict stays ROLLBACK, so a v1 Queen treats it safely.
+   */
+  inconclusive: z.boolean().optional(),
 });
 export type SentinelVerdict = z.infer<typeof SentinelVerdictSchema>;

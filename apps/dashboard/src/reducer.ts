@@ -204,6 +204,15 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
   switch (msg.type) {
     case "pong":
       return state;
+    // v2 messages (work ledger, races, escalations, hive status, events, coalesced batches):
+    // accepted and ignored until the v2 data layer (WP1.10) handles them.
+    case "item.updated":
+    case "race.updated":
+    case "escalation.updated":
+    case "hive.updated":
+    case "event.appended":
+    case "batch":
+      return state;
     case "error":
       return pushTicker(state, "error", `Queen: ${msg.message}${msg.code ? ` (${msg.code})` : ""}`, at);
     case "snapshot": {

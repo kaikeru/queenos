@@ -4,3 +4,7 @@ export * from "./ai-gateway.js";
 export * from "./ledger.js";
 export * from "./cloudflare.js";
 export * from "./memory.js";
+export * from "./registry.js";
+export * from "./merge-driver.js";
+export * from "./log.js";
+export * from "./metrics.js";
