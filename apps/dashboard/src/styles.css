@@ -80,7 +80,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .lanes { display: flex; flex-direction: column; gap: 12px; }
 .empty { text-align: center; padding: 80px 20px; border: 1px dashed var(--line-2); border-radius: 14px; color: var(--dim); }
 .empty h2 { color: var(--text); margin-bottom: 8px; font-family: var(--mono); }
-.lane { display: grid; grid-template-columns: 1fr; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--faint); border-radius: 12px; padding: 14px 16px; transition: border-color 0.4s, box-shadow 0.4s, background 0.4s; animation: slide-in 0.45s ease; }
+.lane { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--faint); border-radius: 12px; padding: 14px 16px; transition: border-color 0.4s, box-shadow 0.4s, background 0.4s; animation: slide-in 0.45s ease; }
 .lane--building, .lane--in_train, .lane--queued { border-left-color: var(--yellow); }
 .lane--in_train { border-left-color: var(--cyan); }
 .lane--merged { border-left-color: var(--green); box-shadow: 0 0 0 1px rgba(53, 242, 160, 0.15), 0 0 28px rgba(53, 242, 160, 0.08); }
