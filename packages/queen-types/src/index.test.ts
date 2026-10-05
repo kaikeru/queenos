@@ -115,6 +115,12 @@ describe("audit + results", () => {
   it("build result needs a head sha", () => {
     expect(BuildResultSchema.safeParse({ trainId: "t" }).success).toBe(false);
   });
+  it("build result carries optional token usage", () => {
+    const base = { trainId: "t", headSha: "abc", model: "@cf/m" };
+    expect(BuildResultSchema.parse(base).usage).toBeUndefined();
+    expect(BuildResultSchema.parse({ ...base, usage: { inputTokens: 27_100, outputTokens: 2_400, steps: 8 } }).usage).toEqual({ inputTokens: 27_100, outputTokens: 2_400, steps: 8 });
+    expect(BuildResultSchema.safeParse({ ...base, usage: { inputTokens: -1, outputTokens: 0 } }).success).toBe(false);
+  });
 });
 
 describe("MergeTrain train internals", () => {

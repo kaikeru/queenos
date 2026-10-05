@@ -14,6 +14,7 @@ import {
   DroneTaskSchema,
   type AppendAuditInput,
   type AuditStatus,
+  type BuildUsage,
   type DroneRole,
   type DroneTask,
   type GitNotesPayload,
@@ -26,7 +27,7 @@ import { ConfigError, type DroneConfig } from "./config";
 import { landTrain, type LandOutcome } from "./land";
 import type { DronePorts, QueenPort } from "./ports";
 import { SCRIPTED_MODEL } from "./scripted";
-import { AGENT_PHASE_MS, runAgentBuild } from "./agent/run";
+import { AGENT_PHASE_MS, runAgentBuild, type AgentGenerated } from "./agent/run";
 
 export interface StepRunner {
   do<T>(name: string, config: WorkflowStepConfig, fn: () => Promise<T>): Promise<T>;
@@ -222,6 +223,7 @@ async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
       model: gen.model,
       ...(gen.failedModels.length ? { failedModels: gen.failedModels.slice(0, 5) } : {}),
       buildMs,
+      ...(config.llmMode === "live" ? { usage: buildUsage(gen) } : {}),
     }),
   );
   await audit(ctx, "audit: passed", "PASSED", ledger);
@@ -235,6 +237,12 @@ async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
     ...(pushed.notesError ? { notesError: pushed.notesError } : {}),
     queenOutcome,
   };
+}
+
+/** Tokens across every model tried; the agent harness also reports its tool-loop steps. */
+function buildUsage(gen: Generated): BuildUsage {
+  const steps = (gen as Partial<AgentGenerated>).agentUsage?.steps;
+  return { inputTokens: gen.usage.inputTokens, outputTokens: gen.usage.outputTokens, ...(steps !== undefined ? { steps } : {}) };
 }
 
 /** Report the failure (train result + REJECTED audit), then fail the instance. */

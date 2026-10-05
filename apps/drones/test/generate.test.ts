@@ -203,6 +203,8 @@ describe("through the workflow body", () => {
     expect(out.status).toBe("built");
     const q = w.queen("hive");
     expect(q.calls.find((c) => c.method === "reportBuildResult")?.input).toMatchObject({ model: "@cf/second", failedModels: ["@cf/first"], buildMs: expect.any(Number) });
+    // Single-shot: tokens of every call (both models, repair turns included), no step count.
+    expect(q.calls.find((c) => c.method === "reportBuildResult")?.input.usage).toEqual({ inputTokens: 30, outputTokens: 60 });
     expect(q.audits()[1]!.gitNotesPayload).toMatchObject({ model: "@cf/second", result: "success" });
   });
 });

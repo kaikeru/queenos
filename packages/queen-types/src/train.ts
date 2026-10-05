@@ -52,6 +52,15 @@ export const TrainResultSchema = z.object({
 });
 export type TrainResult = z.infer<typeof TrainResultSchema>;
 
+/** Token usage of one build. The tool-loop agent re-sends its transcript every step, so input dominates. */
+export const BuildUsageSchema = z.object({
+  inputTokens: z.number().int().min(0),
+  outputTokens: z.number().int().min(0),
+  /** Tool-loop steps (model calls) for the agent harness; absent for single-shot builds. */
+  steps: z.number().int().min(0).optional(),
+});
+export type BuildUsage = z.infer<typeof BuildUsageSchema>;
+
 /** A builder drone reporting that it pushed the train head to its fork. */
 export const BuildResultSchema = z.object({
   trainId: z.string().min(1),
@@ -62,6 +71,8 @@ export const BuildResultSchema = z.object({
   failedModels: z.array(z.string()).max(5).optional(),
   /** Wall time of generation + commit + push. */
   buildMs: z.number().int().min(0).optional(),
+  /** LLM tokens spent on the whole build, across every model tried (absent for scripted drones). */
+  usage: BuildUsageSchema.optional(),
 });
 export type BuildResult = z.infer<typeof BuildResultSchema>;
 

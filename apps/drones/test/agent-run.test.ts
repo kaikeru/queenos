@@ -145,6 +145,8 @@ describe("runDrone with the agent harness", () => {
 
     const report = w.queen("hive").calls.find((c) => c.method === "reportBuildResult");
     expect(report?.input).toMatchObject({ trainId: "train-1", model: "m-b", failedModels: ["m-a"], buildMs: expect.any(Number) });
+    // Usage covers every model tried (the timed-out m-a run and the accepted m-b run).
+    expect(report?.input.usage).toEqual({ inputTokens: 200, outputTokens: 20, steps: 6 });
   });
 
   it("a retried agent step re-attaches to the same submissions instead of starting new ones", async () => {
@@ -192,6 +194,9 @@ describe("runDrone with the agent harness", () => {
     const out = await runDrone(task(), new InlineSteps(), w.ports(), readConfig({ DRONE_LLM_MODE: "scripted" }));
     expect(out.status).toBe("built");
     expect(agent.calls).toEqual([]);
+    // Scripted builds spend no tokens and report no usage.
+    const report = w.queen("hive").calls.find((c) => c.method === "reportBuildResult");
+    expect(report?.input).not.toHaveProperty("usage");
     expect(readConfig({ DRONE_LLM_MODE: "live", DRONE_HARNESS: "single-shot" }).harness).toBe("single-shot");
     expect(() => readConfig({ DRONE_HARNESS: "both" })).toThrow(/DRONE_HARNESS/);
   });
