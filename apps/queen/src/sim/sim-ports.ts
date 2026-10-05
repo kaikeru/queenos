@@ -30,7 +30,10 @@
  *
  * Deterministic outcomes: a prompt containing "[fail]" fails its first build
  * test (SECURITY rejects it); the REWORK attempt (escalated to the frontier
- * tier by the Queen's model router) passes.
+ * tier by the Queen's model router) passes. A prompt containing "[review-fail]"
+ * passes policy, security and tests, but the REVIEWER rejects the first build
+ * (its feedback becomes the Scribe summary, as in the live gate); REWORK is
+ * approved. Every other build is approved by the REVIEWER.
  *
  * Models: the sim builder reports `model` = the Queen's choice
  * (`task.modelChoice`) and a plausible `buildMs` (frontier slower than fast;
@@ -58,6 +61,7 @@ import type {
   ProvisionCommand,
   ProvisionResult,
   RecalledMemory,
+  ScribeSummary,
   TrainResult,
 } from "@queenos/queen-types";
 import { MAX_MEMORY_TEXT, MAX_RECALLED_MEMORIES, MIN_RECALL_SCORE } from "@queenos/queen-types";
@@ -70,6 +74,7 @@ export interface SimQueen {
   appendAudit(a: AppendAuditInput): Promise<AuditEvent>;
   reportBuildResult(r: BuildResult): Promise<{ outcome: string }>;
   reportTrainResult(r: TrainResult): Promise<{ outcome: string }>;
+  recordScribeSummary(s: ScribeSummary): Promise<unknown>;
   reportLandResult(r: LandResultInput): Promise<{ outcome: string }>;
   reportProvisionResult(r: ProvisionResult): Promise<{ outcome: string }>;
   reportDeployResult(r: DeployResult): Promise<{ outcome: string }>;
@@ -114,6 +119,8 @@ export const DEFAULT_SIM_DELAYS: SimDelays = {
 };
 
 export const FAIL_MARKER = "[fail]";
+/** The first BUILD passes policy, security and tests, but the sim REVIEWER rejects it (review-rejection demo). */
+export const REVIEW_FAIL_MARKER = "[review-fail]";
 /** The chosen model "returns unusable JSON" on a BUILD; the first fallback succeeds (failedModels demo). */
 export const BAD_JSON_MARKER = "[bad-json]";
 /** Build time per model tier, relative to `delays.build`. */
@@ -138,6 +145,10 @@ const STABLE_KEY = (hive: string) => `sim:stable:${hive}`;
 const DONE_LIMIT = 2000;
 /** Model named in non-builder ledger notes (gatekeepers / Scribe keep their env model). */
 const MODEL = "claude-opus-5-5";
+/** Model named in the sim REVIEWER's ledger notes. */
+const REVIEWER_MODEL = "claude-sonnet-5-5";
+const REVIEW_FEEDBACK =
+  "The change adds a route but never renders the requested content: the page body is a placeholder. Rework should render real content and cover it with a test.";
 
 /** Small deterministic string hash, rendered as a 40-char hex "git SHA". */
 export function fakeSha(seed: string): string {
@@ -442,20 +453,28 @@ export class SimExecutors {
           return;
         }
         const shouldFail = task.promptText.includes(FAIL_MARKER) && task.action === "BUILD";
+        const reviewFail = !shouldFail && task.promptText.includes(REVIEW_FAIL_MARKER) && task.action === "BUILD";
         const url = train?.previewUrl ?? simPreviewUrl(task.trainId);
         await this.audit(task, "GATEKEEPER", "PASSED", smokeNote(task, url));
         await this.audit(task, "POLICY", "PASSED", reviewNote(task, "policy", true));
         await this.audit(task, "SECURITY", shouldFail ? "REJECTED" : "PASSED", reviewNote(task, "security", !shouldFail));
+        const commitSha = fakeSha(`head:${task.trainId}`);
+        if (!shouldFail) {
+          // Like the live gate: the reviewer only sees working code (policy, security and smoke passed).
+          await this.audit(task, "REVIEWER", "RUNNING", null);
+          await this.audit(task, "REVIEWER", reviewFail ? "REJECTED" : "PASSED", reviewerNote(task, !reviewFail));
+          if (reviewFail) {
+            // The reviewer's feedback is the Scribe summary, so the REWORK carries it to the next builder.
+            await this.queen().recordScribeSummary({ promptId: task.promptId, trainId: task.trainId, summary: REVIEW_FEEDBACK });
+            await this.queen().reportTrainResult({ trainId: task.trainId, passed: false, summary: REVIEW_FEEDBACK, commitSha });
+            return;
+          }
+        }
         const summary = shouldFail
           ? "Security scan rejected the change: an unbounded retry loop swallows errors. Rework should add a retry cap and surface the failure."
-          : "Policy and security checks passed and the preview answered its smoke test; the change is scoped to the requested module with tests.";
+          : "Policy and security checks passed and the preview answered its smoke test; the change is scoped to the requested module with tests. The reviewer approved the change.";
         await this.audit(task, "SCRIBE", "PASSED", scribeNote(task, summary));
-        await this.queen().reportTrainResult({
-          trainId: task.trainId,
-          passed: !shouldFail,
-          summary,
-          commitSha: fakeSha(`head:${task.trainId}`),
-        });
+        await this.queen().reportTrainResult({ trainId: task.trainId, passed: !shouldFail, summary, commitSha });
         return;
       }
       case "land": {
@@ -534,7 +553,7 @@ export function simRecall(snap: SimSnapshot, trainId: string, query: string): Re
 
 // ── plausible Cognitive Ledger payloads ──────────────────────────────────
 
-const subject = (task: DroneTask) => task.promptText.replace(FAIL_MARKER, "").replace(BAD_JSON_MARKER, "").trim().slice(0, 80);
+const subject = (task: DroneTask) => task.promptText.replace(FAIL_MARKER, "").replace(REVIEW_FAIL_MARKER, "").replace(BAD_JSON_MARKER, "").trim().slice(0, 80);
 
 const badJson = (task: DroneTask) => task.action === "BUILD" && task.promptText.includes(BAD_JSON_MARKER) && (task.modelChoice?.fallbacks.length ?? 0) > 0;
 
@@ -593,6 +612,27 @@ function reviewNote(task: DroneTask, kind: "policy" | "security", ok: boolean): 
     result: ok ? "success" : "failure",
     executionTimeMs: 900 + (task.promptText.length % 5) * 120,
     discardedPaths: failing ? ["Waive the finding (rejected: no policy exception exists)."] : [],
+  };
+}
+
+/** Same shape as the live reviewer: `verdict: …`, `satisfied: …`, `missing: …`, `feedback: …`. */
+function reviewerNote(task: DroneTask, approve: boolean): GitNotesPayload {
+  const reasoning = approve
+    ? ["verdict: APPROVE", "satisfied: the change implements what the prompt asks for", "satisfied: a focused test covers the new behaviour", "feedback: The change satisfies the prompt."]
+    : [
+        "verdict: REJECT",
+        "satisfied: the route is registered",
+        "missing: the page renders real content instead of a placeholder",
+        `feedback: ${REVIEW_FEEDBACK}`,
+      ];
+  return {
+    taskPrompt: task.promptText,
+    model: REVIEWER_MODEL,
+    temperature: 0,
+    reasoningSteps: reasoning,
+    result: approve ? "success" : "failure",
+    executionTimeMs: 1100 + (task.promptText.length % 5) * 90,
+    discardedPaths: [],
   };
 }
 
