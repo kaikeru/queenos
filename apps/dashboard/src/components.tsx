@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Link } from "./router";
 import { ApiError, api, errorMessage } from "./api";
-import { useEscape } from "./hooks";
-import { phaseHeadline, shortVersion, tapButtonState, tapErrorMessage, timelineSteps, type SiteReleaseView } from "./releases";
+import { useEscape, usePersistedBool } from "./hooks";
+import { earlierSummary, groupLanes, relativeTime } from "./lanes";
+import { phaseHeadline, phaseHint, releaseSummary, shortVersion, tapButtonState, tapErrorMessage, timelineSteps, type SiteReleaseView } from "./releases";
 import { CANARY_STEPS, type ModelStats, type RecalledMemory, type ModelTier, type Release, type RouterFloor, type SentinelVerdict } from "@queenos/queen-types";
 import {
   PHASE_FLOW,
@@ -104,27 +105,40 @@ function Stat(props: { label: string; value: number; tone: "ok" | "warn" | "bad"
 
 // ── main track ────────────────────────────────────────────────────────────
 
+/** Landed commits shown on the rail; older ones fold into a "+N earlier" marker. */
+const MAX_COMMITS = 12;
+
 export function MainTrack({ landed, state }: { landed: LandedCommit[]; state: State }) {
+  const railRef = useRef<HTMLDivElement>(null);
+  const hidden = Math.max(0, landed.length - MAX_COMMITS);
+  const shown = landed.slice(hidden);
+  // Keep the newest landing in view.
+  useEffect(() => {
+    const el = railRef.current;
+    if (el) el.scrollLeft = el.scrollWidth;
+  }, [landed.length]);
   return (
     <section className="main-track" aria-label="main branch">
       <div className="main-track__label">
         <b>main</b>
         <span>{landed.length} landed</span>
       </div>
-      <div className="main-track__rail">
-        <div className="commit commit--root" title="initial commit">
+      <div className="main-track__rail" ref={railRef}>
+        <div className="commit commit--root" title={hidden ? `initial commit · ${hidden} earlier commits not shown` : "initial commit"}>
           <i />
-          <span>root</span>
+          <span>{hidden ? `+${hidden} earlier` : "root"}</span>
         </div>
-        {landed.map((c) => (
-          <div className="commit commit--landed" key={c.trainId} title={`train ${c.trainId}`}>
-            <i />
-            <code>{short(c.sha)}</code>
-            <span>
-              {letterOf(state, c.promptId)} · {excerpt(state.prompts[c.promptId]?.promptText ?? "", 22)}
-            </span>
-          </div>
-        ))}
+        {shown.map((c) => {
+          const text = state.prompts[c.promptId]?.promptText ?? "";
+          const label = `${letterOf(state, c.promptId)} · ${text.replace(/\s+/g, " ").trim()}`;
+          return (
+            <div className="commit commit--landed" key={c.trainId} title={`${short(c.sha)}  ${label}\ntrain ${c.trainId}`} tabIndex={0}>
+              <i />
+              <code>{short(c.sha)}</code>
+              <span>{label}</span>
+            </div>
+          );
+        })}
         {landed.length === 0 && <div className="main-track__empty">waiting for the first landing…</div>}
       </div>
     </section>
@@ -134,6 +148,8 @@ export function MainTrack({ landed, state }: { landed: LandedCommit[]; state: St
 // ── swimlanes ─────────────────────────────────────────────────────────────
 
 export function Lanes(props: { lanes: Lane[]; selected: string | null; onSelect: (card: AuditCard, lane: Lane) => void }) {
+  const [showEarlier, setShowEarlier] = useState(false);
+  const { visible, earlier } = groupLanes(props.lanes);
   if (props.lanes.length === 0) {
     return (
       <div className="empty">
@@ -146,14 +162,26 @@ export function Lanes(props: { lanes: Lane[]; selected: string | null; onSelect:
   }
   return (
     <div className="lanes">
-      {props.lanes.map((lane) => (
+      {visible.map((lane) => (
         <LaneRow key={lane.prompt.promptId} {...props} lane={lane} />
       ))}
+      {earlier.length > 0 && (
+        <div className="earlier">
+          <button type="button" className="earlier__toggle" aria-expanded={showEarlier} onClick={() => setShowEarlier((o) => !o)}>
+            <b>{earlier.length} earlier {earlier.length === 1 ? "run" : "runs"}</b>
+            <span>{earlierSummary(earlier)}</span>
+            <span className="earlier__letters">{earlier.map((l) => l.letter).join(" ")}</span>
+            <span aria-hidden="true">{showEarlier ? "▴" : "▾"}</span>
+          </button>
+          {showEarlier && earlier.map((lane) => <LaneRow key={lane.prompt.promptId} {...props} lane={lane} />)}
+        </div>
+      )}
     </div>
   );
 }
 
 function LaneRow({ lane, selected, onSelect }: { lane: Lane; selected: string | null; onSelect: (c: AuditCard, l: Lane) => void }) {
+  const now = useNow(15000);
   const attempts = Math.max(1, ...lane.cards.map((c) => c.attempt));
   const cardsByAttempt = new Map<number, AuditCard[]>();
   for (const c of lane.cards) cardsByAttempt.set(c.attempt, [...(cardsByAttempt.get(c.attempt) ?? []), c]);
@@ -164,7 +192,10 @@ function LaneRow({ lane, selected, onSelect }: { lane: Lane; selected: string | 
         <div className="lane__title">
           <h3 title={lane.prompt.promptText}>{lane.prompt.promptText}</h3>
           <p>
-            <code>{lane.prompt.promptId.slice(0, 8)}</code> · queued {clock(lane.prompt.createdAt)}
+            <code>{lane.prompt.promptId.slice(0, 8)}</code> ·{" "}
+            <time dateTime={new Date(lane.prompt.createdAt).toISOString()} title={new Date(lane.prompt.createdAt).toLocaleString()}>
+              queued {relativeTime(lane.prompt.createdAt, now)}
+            </time>
             {attempts > 1 && <b className="rework-tag"> · ATTEMPT {attempts}</b>}
           </p>
         </div>
@@ -174,7 +205,7 @@ function LaneRow({ lane, selected, onSelect }: { lane: Lane; selected: string | 
       <div className="cars">
         {lane.trains.length === 0 && <span className="cars__empty">no train yet</span>}
         {lane.trains.map((lt) => (
-          <TrainCar key={lt.train.trainId} lt={lt} />
+          <TrainCar key={lt.train.trainId} lt={lt} attempts={lane.trains.length} />
         ))}
       </div>
 
@@ -246,7 +277,8 @@ function phaseClass(status: string, i: number, idx: number): string {
 }
 
 /** One speculative train: cumulative cars (A+B+C), status chip and phase pipeline. */
-function TrainCar({ lt }: { lt: LaneTrain }) {
+function TrainCar({ lt, attempts }: { lt: LaneTrain; attempts: number }) {
+  const [showReason, setShowReason] = useState(false);
   const { train } = lt;
   const phase = train.phase;
   const idx = phase ? PHASE_FLOW.indexOf(phase as (typeof PHASE_FLOW)[number]) : -1;
@@ -255,7 +287,7 @@ function TrainCar({ lt }: { lt: LaneTrain }) {
     <article className={cls.join(" ")}>
       <div className="car__top">
         <Chip value={train.status} />
-        {lt.generation > 1 && <span className="car__gen">REBUILD #{lt.generation - 1}</span>}
+        {attempts > 1 && <span className="car__gen">ATTEMPT {lt.generation}{lt.generation > 1 ? " · REBUILD" : ""}</span>}
         {lt.ejectKind && <span className="car__eject">{lt.ejectKind === "superseded" ? "SUPERSEDED" : "FAILED"}</span>}
       </div>
       {train.model && <ModelChip model={train.model} reason={train.modelReason} escalated={lt.escalated} />}
@@ -278,8 +310,23 @@ function TrainCar({ lt }: { lt: LaneTrain }) {
         {train.headSha && <code> · {short(train.headSha)}</code>}
       </div>
       <PreviewLink lt={lt} />
-      {train.status === "EJECTED" && train.reason && <div className="car__reason">{excerpt(train.reason.replace(/prompt [0-9a-f-]{36}/, "a prompt"), 70)}</div>}
+      {train.status === "EJECTED" && train.reason && <FailureReason text={train.reason.replace(/prompt [0-9a-f-]{36}/, "a prompt")} open={showReason} onToggle={() => setShowReason((o) => !o)} />}
     </article>
+  );
+}
+
+/** Failure reason: clamped to two lines, click to read the whole message. */
+function FailureReason({ text, open, onToggle }: { text: string; open: boolean; onToggle: () => void }) {
+  const long = text.length > 80;
+  return (
+    <div className="car__reason">
+      <p className={open ? "" : "car__reason-text--clamp"}>{text}</p>
+      {long && (
+        <button type="button" className="car__reason-more" aria-expanded={open} onClick={onToggle}>
+          {open ? "show less" : "show full reason"}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -351,7 +398,13 @@ function CardView({ card, active, onClick }: { card: AuditCard; active: boolean;
   const now = useNow();
   const elapsed = Math.max(0, Math.round(((card.endedAt ?? now) - card.startedAt) / 1000));
   return (
-    <button type="button" className={`acard acard--${card.status.toLowerCase()}${active ? " acard--active" : ""}`} onClick={onClick}>
+    <button
+      type="button"
+      className={`acard acard--${card.status.toLowerCase()}${active ? " acard--active" : ""}`}
+      onClick={onClick}
+      aria-label={`${ROLE_LABEL[card.role]}, attempt ${card.attempt}, ${card.status.toLowerCase()}. Open ledger`}
+      aria-pressed={active}
+    >
       <span className="acard__glyph" aria-hidden>
         {ROLE_GLYPH[card.role]}
       </span>
@@ -461,20 +514,21 @@ export function Composer(props: { disabled: boolean; onSubmit: (text: string) =>
   return (
     <form className="composer panel" onSubmit={submit}>
       <p className="eyebrow">PROMPT COMPOSER</p>
+      {props.disabled && <p className="composer__hint">Waiting for the Queen link. Prompts are disabled until it opens.</p>}
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
-        placeholder="Describe a change for the swarm…  (add [fail] to make the sim fail it once)"
+        placeholder="Describe a change for the swarm…  (sim only: add [fail] to make it fail once)"
         rows={3}
         onKeyDown={(e) => {
           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(e);
         }}
       />
       <div className="composer__row">
-        <button type="submit" className="btn btn--primary" disabled={props.disabled || !text.trim()}>
+        <button type="submit" className="btn btn--primary" disabled={props.disabled || !text.trim()} title={props.disabled ? "Waiting for the Queen link" : !text.trim() ? "Type a prompt first" : "Submit (Cmd/Ctrl+Enter)"}>
           Submit prompt
         </button>
-        <button type="button" className="btn btn--swarm" disabled={props.disabled || props.swarming} onClick={props.onSwarm}>
+        <button type="button" className="btn btn--swarm" title={`Queues ${DEMO_PROMPTS.length} sample prompts at once so several agents share the merge train`} disabled={props.disabled || props.swarming} onClick={props.onSwarm}>
           {props.swarming ? "Launching…" : `Launch demo swarm (${DEMO_PROMPTS.length})`}
         </button>
       </div>
@@ -522,9 +576,10 @@ function UrlLink({ url }: { url: string | null }) {
 export function Sites({ rows, state, view }: { rows: SiteRow[]; state: State; view: SiteReleaseView }) {
   const byEnv = Object.fromEntries(rows.map((r) => [r.environment, r]));
   const preview = byEnv.preview;
+  const [open, setOpen] = usePersistedBool("queenos.side.sites", true);
+  const live = [preview?.deployments.length ? "preview" : "", view.staging ? "staging" : "", view.canary ? "canary" : "", view.prod ? "prod" : ""].filter(Boolean);
   return (
-    <section className="sites panel" aria-label="sites">
-      <p className="eyebrow">SITES</p>
+    <SideSection className="sites" label="sites" title="SITES" count={live.length ? live.join(" · ") : "none yet"} open={open} onToggle={() => setOpen((o) => !o)}>
       <ul className="sites__list">
         {preview && (
           <li className="site">
@@ -605,6 +660,22 @@ export function Sites({ rows, state, view }: { rows: SiteRow[]; state: State; vi
           )}
         </li>
       </ul>
+    </SideSection>
+  );
+}
+
+/** A collapsible right-sidebar panel: sticky header, body scrolls on its own when space runs out. */
+function SideSection(props: { className: string; label: string; title: string; count?: string; open: boolean; onToggle: () => void; children: ReactNode }) {
+  return (
+    <section className={`${props.className} side-section panel${props.open ? "" : " side-section--closed"}`} aria-label={props.label}>
+      <button type="button" className="side-section__toggle" aria-expanded={props.open} onClick={props.onToggle}>
+        <span className="eyebrow">{props.title}</span>
+        {props.count && <span className="side-section__count">{props.count}</span>}
+        <span className="side-section__caret" aria-hidden>
+          {props.open ? "▾" : "▸"}
+        </span>
+      </button>
+      {props.open && <div className="side-section__body">{props.children}</div>}
     </section>
   );
 }
@@ -717,7 +788,8 @@ export function ReleaseTimeline(props: { hive: string; state: State; release: Re
         ))}
       </ol>
 
-      {release.summary && <p className="rtl__summary">{release.summary}</p>}
+      <p className="rtl__hint">{phaseHint(release)}</p>
+      {releaseSummary(release) && <p className="rtl__summary">{releaseSummary(release)}</p>}
       {release.phase === "ROLLED_BACK" && <div className="rtl__banner rtl__banner--bad">ROLLED BACK{release.stableVersionId ? ` to ${shortVersion(release.stableVersionId)}` : ""}</div>}
       {release.phase === "SHIPPED" && <div className="rtl__banner rtl__banner--ok">SHIPPED{release.tappedBy ? ` by ${release.tappedBy}` : ""}</div>}
       {sentFor === release.releaseId && error === null && release.phase === "AWAITING_TAP" && <p className="muted">Tap sent. Waiting for the Queen to start the canary…</p>}
@@ -831,23 +903,15 @@ function FloorLine({ floor }: { floor: RouterFloor }) {
 }
 
 export function ModelBoard({ stats, floor }: { stats: ModelStats[]; floor?: RouterFloor | null }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = usePersistedBool("queenos.side.models", true);
   const groups: TierGroup[] = buildModelBoard(stats);
   const tried = groups.reduce((n, g) => n + g.rows.filter((r) => !r.untried).length, 0);
   return (
-    <section className="models panel" aria-label="model board">
-      <button type="button" className="models__toggle" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
-        <span className="eyebrow">MODEL BOARD</span>
-        <span className="models__count">{tried} in play</span>
-        <span className="models__caret" aria-hidden>
-          {open ? "▾" : "▸"}
-        </span>
-      </button>
+    <SideSection className="models" label="model board" title="MODEL BOARD" count={`${tried} in play`} open={open} onToggle={() => setOpen((o) => !o)}>
       <p className="models__tag">Queen routes each build to the best model on AI Gateway</p>
       {floor && <FloorLine floor={floor} />}
-      {open &&
-        groups.map((g) => (
-          <div className="mtier" key={g.tier}>
+      {groups.map((g) => (
+        <div className="mtier" key={g.tier}>
             <div className="mtier__head">
               <TierBadge tier={g.tier} />
               <span>{TIER_META[g.tier].hint}</span>
@@ -890,7 +954,7 @@ export function ModelBoard({ stats, floor }: { stats: ModelStats[]; floor?: Rout
               ))}
             </ul>
           </div>
-        ))}
-    </section>
+      ))}
+    </SideSection>
   );
 }

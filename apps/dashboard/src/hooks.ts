@@ -54,3 +54,30 @@ export function useEscape(onEscape: () => void, enabled = true): void {
     return () => window.removeEventListener("keydown", h);
   }, [enabled]);
 }
+
+/** A boolean kept in localStorage (per-viewer convenience). Falls back to in-memory when storage is blocked. */
+export function usePersistedBool(key: string, initial: boolean): [boolean, (next: boolean | ((prev: boolean) => boolean)) => void] {
+  const [value, setValue] = useState<boolean>(() => {
+    try {
+      const raw = window.localStorage.getItem(key);
+      return raw === null ? initial : raw === "1";
+    } catch {
+      return initial;
+    }
+  });
+  const set = useCallback(
+    (next: boolean | ((prev: boolean) => boolean)) => {
+      setValue((prev) => {
+        const v = typeof next === "function" ? next(prev) : next;
+        try {
+          window.localStorage.setItem(key, v ? "1" : "0");
+        } catch {
+          /* storage blocked: keep the in-memory value */
+        }
+        return v;
+      });
+    },
+    [key],
+  );
+  return [value, set];
+}

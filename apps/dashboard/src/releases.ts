@@ -92,6 +92,34 @@ export function phaseHeadline(r: Release): string {
   }
 }
 
+/** Plain "what happens next / what you need to do" line for the current phase. */
+export function phaseHint(r: Release): string {
+  switch (r.phase) {
+    case "STAGING":
+    case "VALIDATING":
+      return "Nothing to do: this advances on its own.";
+    case "AWAITING_TAP":
+      return "Your move: review staging, then press TAP TO SHIP to start the canary.";
+    case "CANARY":
+      return `Nothing to do: the Sentinel checks each step and promotes automatically (${CANARY_STEPS.join(" → ")}%), or rolls back on a bad verdict.`;
+    case "SHIPPED":
+      return "Done: every request now hits the new version.";
+    case "ROLLED_BACK":
+      return "Production is back on the stable version. Fix the issue and land a new release.";
+    case "FAILED":
+      return "Nothing shipped. Check the summary below, then land a new release.";
+    case "SUPERSEDED":
+      return "A newer release replaced this one. No action needed.";
+  }
+}
+
+/** The release summary, only where it describes the current phase (a stale canary step's line is hidden mid-canary). */
+export function releaseSummary(r: Release): string | null {
+  if (!r.summary) return null;
+  if (r.phase === "CANARY" || r.phase === "STAGING" || r.phase === "VALIDATING") return null;
+  return r.summary;
+}
+
 // ── tap to ship ───────────────────────────────────────────────────────────
 
 export interface TapButtonState {

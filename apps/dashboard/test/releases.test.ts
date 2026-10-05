@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import { initialState, reducer, releaseLetters, type Action, type State } from "../src/reducer";
-import { currentRelease, siteReleaseView, tapButtonState, tapErrorMessage, timelineSteps } from "../src/releases";
+import { currentRelease, phaseHint, releaseSummary, siteReleaseView, tapButtonState, tapErrorMessage, timelineSteps } from "../src/releases";
 
 const release = (over: Record<string, unknown> = {}) => ({
   releaseId: "r1",
@@ -161,4 +161,13 @@ test("snapshot.verdicts hydrates the per-release verdicts; a snapshot without th
   // a snapshot that carries verdicts replaces them
   s = reducer(s, snap({ verdicts: [] }));
   expect(s.verdicts).toEqual({});
+});
+
+test("mid-canary hides the stale step summary and says nothing needs doing; awaiting tap says what to do", () => {
+  const canary = release({ phase: "CANARY", canaryPercent: 50, summary: "Canary 10%: 0/100 errors; ready after 4s → promote" }) as never;
+  expect(releaseSummary(canary)).toBeNull();
+  expect(phaseHint(canary)).toMatch(/Nothing to do/);
+  const tap = release({ phase: "AWAITING_TAP", summary: "Staging is healthy." }) as never;
+  expect(releaseSummary(tap)).toBe("Staging is healthy.");
+  expect(phaseHint(tap)).toMatch(/TAP TO SHIP/);
 });
