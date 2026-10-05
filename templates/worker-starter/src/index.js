@@ -22,6 +22,10 @@ export default {
       }
       if (url.pathname === "/health") return json({ ok: true });
 
+      // A feature may own a top-level route: export const path = "/status".
+      const routed = features.find((f) => typeof f.path === "string" && f.path === url.pathname);
+      if (routed) return await routed.handle(request);
+
       const match = /^\/features\/([a-z0-9-]+)\/?$/.exec(url.pathname);
       if (match) {
         const feature = features.find((f) => f.slug === match[1]);

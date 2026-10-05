@@ -18,6 +18,8 @@ describe("CREATE_HIVE", () => {
 
     const files = w.git.files[0]!;
     for (const [path, content] of Object.entries(TEMPLATES["worker-starter"]!)) expect(files[path]).toBe(content);
+    // The router lets feature modules own a top-level route (export const path = "/status").
+    expect(files["src/index.js"]).toContain('typeof f.path === "string"');
     expect(files[".queen/charter.json"]).toBe(`${JSON.stringify({ version: 1, hive: "my-hive", name: "My Hive" }, null, 2)}\n`);
     expect(w.artifacts.mains.get("my-hive")![0]!.message).toContain("Queen-Genesis: cmd-3");
   });

@@ -12,11 +12,12 @@ The no-build template QueenOS deploys in P1 (see `docs/deploy-discovery.md` §1,
 
 ## Features
 
-`src/index.js` is a tiny router: `/`, `/health` and `/features/<slug>`.
+`src/index.js` is a tiny router: `/`, `/health`, top-level feature paths, and `/features/<slug>`.
 
 Each feature is a module in `src/features/` that exports:
 
 - `slug` (string, `[a-z0-9-]+`) and `handle(request)` returning a `Response`.
+- optionally `path` (a string literal such as `"/status"`): the feature is also served at that top-level path. `/`, `/health` and `/features/*` belong to the router and can't be claimed.
 - optionally `guard(request)`, run on every request before routing. If it throws, the router answers HTTP 500.
 
 `src/features/index.js` is the registry: one `import * as fN from "./<module>.js"` per feature and an exported `features` array. The builder drone regenerates it (merging with the existing imports) each time it adds a feature.

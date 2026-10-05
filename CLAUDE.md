@@ -9,7 +9,7 @@ QueenOS is an autonomous, agentic Git platform built entirely on Cloudflare prim
 - **apps/dashboard** — React + Vite SPA
 - **apps/queen** — Hono Worker + QueenNode Durable Object (SQLite-backed, WebSocket hibernation). `pnpm --filter @queenos/queen dev:sim` runs it in sim mode: fake executors (provisioner, herald, drones, gatekeepers) that auto-advance, no Cloudflare credentials needed
 - **apps/gatekeepers** — Worker handling Artifacts push events
-- **apps/drones** — Cloudflare Workflows
+- **apps/drones** — Cloudflare Workflows; live builds run a `@cloudflare/think` coding agent (BuilderAgent DO) with Dynamic Worker verify (docs/harness-design.md)
 - **packages/hive-kit** — Worker-safe git (isomorphic-git + in-memory fs), AI Gateway client and Cognitive Ledger helpers shared by drones and gatekeepers (@queenos/hive-kit)
 - **packages/queen-types** — shared Zod schemas and TS interfaces (@queenos/queen-types)
 - **packages/tsconfig, packages/eslint-config** — shared configs
@@ -19,6 +19,7 @@ QueenOS is an autonomous, agentic Git platform built entirely on Cloudflare prim
 - This is QueenOS, an OS for agents, not a GitHub clone.
 - All packages must import shared types from `@queenos/queen-types`.
 - Never use Node.js built-ins. We deploy to Cloudflare V8 isolates.
+  - Dependency exception: `@cloudflare/think` / `agents` (the drones' BuilderAgent) import `node:*` modules and rely on the `nodejs_compat` that compat date 2026-10-02 implies. Our own code still never imports Node built-ins.
 - The Queen DO manages state via SQLite and broadcasts via WebSockets.
 - Drones are ephemeral. They fork Artifacts repos programmatically.
 
