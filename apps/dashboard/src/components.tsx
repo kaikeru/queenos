@@ -238,6 +238,13 @@ export function Chip({ value }: { value: string }) {
   return <span className={`chip chip--${value.toLowerCase()}`}>{value.replace("_", " ")}</span>;
 }
 
+/** Segment state: finished trains are fully done (green) or red up to the failure; only live trains pulse. */
+function phaseClass(status: string, i: number, idx: number): string {
+  if (status === "MERGED") return "done";
+  if (status === "EJECTED") return i <= idx ? "done" : "";
+  return i < idx ? "done" : i === idx ? "now" : "";
+}
+
 /** One speculative train: cumulative cars (A+B+C), status chip and phase pipeline. */
 function TrainCar({ lt }: { lt: LaneTrain }) {
   const { train } = lt;
@@ -262,7 +269,7 @@ function TrainCar({ lt }: { lt: LaneTrain }) {
       {phase && (
         <ol className="phases" aria-label={`phase ${phase}`}>
           {PHASE_FLOW.map((p, i) => (
-            <li key={p} className={train.status === "EJECTED" ? (i <= idx ? "done" : "") : i < idx ? "done" : i === idx ? "now" : ""} title={p} />
+            <li key={p} className={phaseClass(train.status, i, idx)} title={p} />
           ))}
         </ol>
       )}
