@@ -9,7 +9,19 @@
         "dist/**"
       ]
     },
+    "@queenos/provisioner#build": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", "../../templates/**"],
+      "outputs": ["src/templates.generated.ts"]
+    },
     "dev": {
+      "cache": false,
+      "persistent": true,
+      "dependsOn": [
+        "^build"
+      ]
+    },
+    "dev:sim": {
       "cache": false,
       "persistent": true,
       "dependsOn": [

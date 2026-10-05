@@ -23,6 +23,7 @@ function harness() {
   const deploys: DeployResult[] = [];
   const verdicts: SentinelVerdict[] = [];
   const builds: BuildResult[] = [];
+  const scribes: { promptId?: string | undefined; trainId?: string | undefined; summary: string }[] = [];
   /** What the fake Queen's snapshot says about releases and prompts (for the sim Sentinel). */
   const world: { releases: Release[]; promptRuns: PromptRun[]; trains: MergeTrain[] } = { releases: [], promptRuns: [], trains: [] };
   /** Phase the fake Queen reports for every train (the sim gatekeeper waits for TESTING). */
@@ -40,6 +41,7 @@ function harness() {
     },
     reportBuildResult: async (r) => (builds.push(r), calls.push(`build:${r.trainId}`), { outcome: "applied" }),
     reportTrainResult: async (r) => (calls.push(`test:${r.trainId}:${r.passed}`), { outcome: "applied" }),
+    recordScribeSummary: async (x) => (scribes.push(x), null),
     reportLandResult: async (r) => (calls.push(`land:${r.trainId}:${r.landed}`), { outcome: "applied" }),
     reportProvisionResult: async (r) => (provisions.push(r), calls.push(`provision:${r.op}:${r.commandId}`), { outcome: "applied" }),
     reportDeployResult: async (r) => (deploys.push(r), calls.push(`deploy:${r.op}:${r.commandId}`), { outcome: "applied" }),
@@ -59,7 +61,7 @@ function harness() {
     clock += ms;
     return sim.runDue();
   };
-  return { sim, advance, calls, audits, provisions, deploys, verdicts, builds, world, phase, alarm: () => alarm };
+  return { sim, scribes, advance, calls, audits, provisions, deploys, verdicts, builds, world, phase, alarm: () => alarm };
 }
 
 const task = (over: Partial<DroneTask>): DroneTask => ({
@@ -180,7 +182,7 @@ describe("sim drones", () => {
     expect(h.audits.some((a) => a.droneRole === "BUILDER" && a.status === "PASSED" && a.gitNotesPayload?.reasoningSteps.length)).toBe(true);
     const smoke = h.audits.find((a) => a.droneRole === "GATEKEEPER" && a.status === "PASSED");
     expect(smoke?.gitNotesPayload?.reasoningSteps[0]).toContain("https://t1-preview.sim.queenos.dev");
-    expect(h.audits.every((a) => !a.gitNotesPayload || a.gitNotesPayload.model === "claude-opus-5-5")).toBe(true);
+    expect(h.audits.filter((a) => a.droneRole !== "REVIEWER").every((a) => !a.gitNotesPayload || a.gitNotesPayload.model === "claude-opus-5-5")).toBe(true);
   });
 
   it("[fail] prompts fail once; REWORK passes; dispatch is idempotent", async () => {
@@ -196,6 +198,51 @@ describe("sim drones", () => {
     await h.advance(100);
     await h.advance(100);
     expect(h.calls.slice(2)).toEqual(["build:t2", "test:t2:true"]);
+  });
+
+  it("a clean prompt gets REVIEWER RUNNING then PASSED in the live gate's note shape", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({}));
+    await h.advance(100);
+    await h.advance(100);
+    const reviewer = h.audits.filter((a) => a.droneRole === "REVIEWER");
+    expect(reviewer.map((a) => a.status)).toEqual(["RUNNING", "PASSED"]);
+    expect(reviewer[1]!.gitNotesPayload!.model).toBe("claude-sonnet-5-5");
+    expect(reviewer[1]!.gitNotesPayload!.reasoningSteps[0]).toBe("verdict: APPROVE");
+    expect(reviewer[1]!.gitNotesPayload!.reasoningSteps.some((x) => x.startsWith("feedback: "))).toBe(true);
+    expect(h.scribes).toEqual([]);
+  });
+
+  it("[review-fail]: first BUILD passes policy/security, REVIEWER rejects, feedback is the scribe summary, REWORK is approved", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({ promptText: "add a changelog [review-fail]" }));
+    await h.advance(100);
+    await h.advance(100);
+    expect(h.calls).toEqual(["build:t1", "test:t1:false"]);
+    const status = (role: string) => h.audits.filter((a) => a.droneRole === role).map((a) => a.status);
+    expect(status("POLICY")).toContain("PASSED");
+    expect(status("SECURITY")).toEqual(["RUNNING", "PASSED"]);
+    expect(status("REVIEWER")).toEqual(["RUNNING", "REJECTED"]);
+    const rej = h.audits.find((a) => a.droneRole === "REVIEWER" && a.status === "REJECTED")!;
+    expect(rej.gitNotesPayload!.reasoningSteps.map((x) => x.split(":")[0])).toEqual(["verdict", "satisfied", "missing", "feedback"]);
+    expect(rej.gitNotesPayload!.reasoningSteps[0]).toBe("verdict: REJECT");
+    expect(h.scribes).toHaveLength(1);
+    expect(h.scribes[0]).toMatchObject({ promptId: "p1", trainId: "t1" });
+    expect(rej.gitNotesPayload!.reasoningSteps.at(-1)).toBe(`feedback: ${h.scribes[0]!.summary}`);
+
+    await h.sim.drones.dispatch(task({ trainId: "t2", action: "REWORK", promptText: "add a changelog [review-fail]" }));
+    await h.advance(100);
+    await h.advance(100);
+    expect(h.calls.slice(2)).toEqual(["build:t2", "test:t2:true"]);
+    expect(h.scribes).toHaveLength(1);
+  });
+
+  it("[fail] still ejects via SECURITY and never reaches the REVIEWER", async () => {
+    const h = harness();
+    await h.sim.drones.dispatch(task({ promptText: "flaky retry [fail]" }));
+    await h.advance(100);
+    await h.advance(100);
+    expect(h.audits.some((a) => a.droneRole === "REVIEWER")).toBe(false);
   });
 
   it("the LAND flow auto-completes", async () => {
@@ -322,11 +369,11 @@ describe("sim release executors", () => {
 
 describe("sim drones: models", () => {
   const fast: ModelChoice = {
-    model: "@cf/qwen/qwen3.8-27b",
+    model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
     tier: "fast",
     role: "builder",
     reason: "fast tier · no track record yet; lowest cost · floor: fast",
-    fallbacks: ["@cf/zai-org/glm-5.3-flash", "@cf/deepseek-ai/deepseek-v4-flash-0731"],
+    fallbacks: ["@cf/zai-org/glm-5.3-flash", "@cf/moonshotai/kimi-k2.7-code"],
   };
   const frontier: ModelChoice = { model: "@cf/moonshotai/kimi-k2.7-code", tier: "frontier", role: "rework", reason: "rework → escalated to frontier", fallbacks: ["@cf/zai-org/glm-5.3"] };
 

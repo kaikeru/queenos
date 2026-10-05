@@ -48,3 +48,20 @@ export const requireInternalAuth: MiddlewareHandler<{ Bindings: AuthBindings }> 
   }
   return next();
 };
+
+export const SIM_USER = "sim@localhost";
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Identity for user routes (tap to ship). Production: only the edge's verified
+ * `x-queen-user` counts. Sim only (`QUEEN_INTERNAL_AUTH="disabled"`, set solely in
+ * wrangler env.sim, AND a localhost request), a missing header defaults to
+ * `sim@localhost` so the dashboard works against a queen-only `dev:sim`.
+ */
+export function resolveUser(env: object, requestUrl: string, header: string | undefined): string | undefined {
+  const given = header?.trim();
+  if (given) return given;
+  // An explicitly sent blank header is still a missing identity, but only the sim may default it.
+  const sim = (env as AuthBindings).QUEEN_INTERNAL_AUTH === "disabled" && LOCAL_HOSTS.has(new URL(requestUrl).hostname);
+  return sim ? SIM_USER : undefined;
+}

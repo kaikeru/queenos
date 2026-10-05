@@ -805,7 +805,7 @@ describe("hibernation-ish", () => {
 });
 
 describe("model router (DO)", () => {
-  const QWEN = "@cf/qwen/qwen3.8-27b";
+  const DS_FLASH = "@cf/deepseek-ai/deepseek-v4-flash-0731";
   const GLM_FLASH = "@cf/zai-org/glm-5.3-flash";
 
   it("dispatches with a modelChoice, persists model stats once per result, and broadcasts models.updated + the floor", async () => {
@@ -819,20 +819,20 @@ describe("model router (DO)", () => {
     await settle(ns, reported);
     let s = await inspect(ns);
     const task = s.tasks.find((t) => t.role === "BUILDER")!;
-    expect(task.modelChoice).toMatchObject({ model: QWEN, tier: "fast", role: "builder" });
+    expect(task.modelChoice).toMatchObject({ model: DS_FLASH, tier: "fast", role: "builder" });
     const trainId = s.trains[0]!.train_id;
     let row = (await runInDurableObject(stubFor(ns), (q: QueenNode) => q.sql.exec("SELECT model, model_reason FROM merge_trains").one())) as { model: string; model_reason: string };
-    expect(row).toEqual({ model: QWEN, model_reason: task.modelChoice!.reason });
+    expect(row).toEqual({ model: DS_FLASH, model_reason: task.modelChoice!.reason });
 
     // The chosen model returned junk; the first fallback built the head.
-    const built = await post(ns, "/internal/webhook/build-result", { trainId, headSha: "h1", model: GLM_FLASH, failedModels: [QWEN], buildMs: 4100 });
+    const built = await post(ns, "/internal/webhook/build-result", { trainId, headSha: "h1", model: GLM_FLASH, failedModels: [DS_FLASH], buildMs: 4100 });
     expect(await built.json()).toMatchObject({ outcome: "applied", train: { model: GLM_FLASH } });
     const upd = await next((m) => m.type === "models.updated");
     expect(upd).toMatchObject({ type: "models.updated", floor: { tier: "frontier", streak: 0, probeIn: 4 } });
     if (upd.type === "models.updated") {
       expect(upd.stats).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ model: QWEN, role: "builder", attempts: 1, passes: 0, failures: 1 }),
+          expect.objectContaining({ model: DS_FLASH, role: "builder", attempts: 1, passes: 0, failures: 1 }),
           expect.objectContaining({ model: GLM_FLASH, role: "builder", attempts: 1, passes: 0, failures: 0, avgBuildMs: 4100 }),
         ]),
       );
@@ -850,7 +850,7 @@ describe("model router (DO)", () => {
     expect(snap.modelStats).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ model: GLM_FLASH, attempts: 1, passes: 1, failures: 0, avgBuildMs: 4100 }),
-        expect.objectContaining({ model: QWEN, attempts: 1, passes: 0, failures: 1 }),
+        expect.objectContaining({ model: DS_FLASH, attempts: 1, passes: 0, failures: 1 }),
       ]),
     );
     expect(snap.modelStats).toHaveLength(2);

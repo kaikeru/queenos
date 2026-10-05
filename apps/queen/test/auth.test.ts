@@ -1,7 +1,7 @@
 import { exports } from "cloudflare:workers";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
-import { requireInternalAuth, safeEqual, type AuthBindings } from "../src/auth";
+import { SIM_USER, requireInternalAuth, resolveUser, safeEqual, type AuthBindings } from "../src/auth";
 
 const worker = exports.default;
 const hive = () => `hive-${crypto.randomUUID().slice(0, 8)}`;
@@ -103,5 +103,29 @@ describe("safeEqual", () => {
     expect(await safeEqual("abc", "abd")).toBe(false);
     expect(await safeEqual("abc", "abcd")).toBe(false);
     expect(await safeEqual("", "")).toBe(true);
+  });
+});
+
+describe("resolveUser (tap-to-ship identity)", () => {
+  const local = "http://localhost:8787/hives/h/releases/r/tap";
+  it("always prefers the edge-provided header", () => {
+    expect(resolveUser({}, local, " kyle@kaikeru.com ")).toBe("kyle@kaikeru.com");
+  });
+  it("defaults to the sim user only for the sim env on localhost", () => {
+    expect(resolveUser({ QUEEN_INTERNAL_AUTH: "disabled" }, local, undefined)).toBe(SIM_USER);
+    expect(resolveUser({ QUEEN_INTERNAL_AUTH: "disabled" }, "http://127.0.0.1:8787/x", "  ")).toBe(SIM_USER);
+  });
+  it("never defaults in prod: not sim env, or not localhost", () => {
+    expect(resolveUser({}, local, undefined)).toBeUndefined();
+    expect(resolveUser({ QUEEN_INTERNAL_TOKEN: "s" }, local, undefined)).toBeUndefined();
+    expect(resolveUser({ QUEEN_INTERNAL_AUTH: "disabled" }, "https://queen.example.com/x", undefined)).toBeUndefined();
+  });
+});
+
+describe("tap route without x-queen-user", () => {
+  it("is rejected 401 in a non-sim env, even from localhost", async () => {
+    const res = await worker.fetch(`http://localhost:8787/hives/${hive()}/releases/r1/tap`, { method: "POST", body: "{}" });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ error: { code: "UNAUTHORIZED" } });
   });
 });

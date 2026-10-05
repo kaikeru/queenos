@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseLedger } from "@queenos/hive-kit";
-import { DroneTaskSchema } from "@queenos/queen-types";
+import { DroneTaskSchema, MODEL_CATALOG } from "@queenos/queen-types";
 import { readConfig } from "../src/config";
 import { AllModelsFailedError } from "../src/generate";
 import { AGENT_PHASE_MS, PER_MODEL_MS, agentModelsFor, runAgentBuild } from "../src/agent/run";
@@ -30,6 +30,19 @@ describe("agentModelsFor", () => {
     ]);
     expect(agentModelsFor(t(choice("@cf/qwen/qwen3.8-27b")), agentCfg)).toEqual(["@cf/zai-org/glm-5.3-flash"]);
     expect(agentModelsFor(t(), agentCfg)).toEqual(["@cf/zai-org/glm-5.3-flash"]);
+  });
+
+  it("reads the catalog toolLoop flag: only models with toolLoop: false are dropped; unknown ids stay", () => {
+    expect(MODEL_CATALOG.filter((m) => m.toolLoop === false).map((m) => m.id)).toEqual(["@cf/qwen/qwen3.8-27b"]);
+    const t = DroneTaskSchema.parse(task({ modelChoice: choice("custom/unknown-model", "@cf/deepseek-ai/deepseek-v4-flash-0731") }));
+    expect(agentModelsFor(t, agentCfg)).toEqual(["custom/unknown-model", "@cf/deepseek-ai/deepseek-v4-flash-0731"]);
+  });
+
+  it("when the configured default cannot tool-loop, the fallback is GLM-5.3 Flash; otherwise the default", () => {
+    const t = DroneTaskSchema.parse(task({}));
+    const cfg = (model: string) => ({ aiGateway: { ...agentCfg.aiGateway, model } });
+    expect(agentModelsFor(t, cfg("@cf/qwen/qwen3.8-27b"))).toEqual(["@cf/zai-org/glm-5.3-flash"]);
+    expect(agentModelsFor(t, cfg("@cf/moonshotai/kimi-k2.7-code"))).toEqual(["@cf/moonshotai/kimi-k2.7-code"]);
   });
 });
 

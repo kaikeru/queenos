@@ -154,7 +154,7 @@ The Queen picks each builder drone's model; `src/models/router.ts` is pure and u
 - **Tiers:**
   - A first BUILD routes at the hive's **floor** (starts at `fast`).
   - REWORK, or any attempt of 2 or more (including a watchdog re-dispatch), escalates to `frontier`. Escalation is local to that prompt and never moves the floor.
-- **Ranking:** candidates are the fitting models (`chars / 3` plus 64k tokens of headroom must fit the context window) in the tier or above. They are ranked by expected cost per success, `((passes + 1) / (attempts + 2) − 0.05 × min(failStreak, 3)) / cost`. A slow model scores ×0.8: GLM-5.3 by hint, or any model averaging over 120 s. Ties go to the lower cost, then catalog order.
+- **Ranking:** candidates are the fitting models in the tier or above: the catalog role matches, the model can drive the tool loop (`toolLoop` is not `false`, which excludes Qwen 3.8), and `chars / 3` plus 64k tokens of headroom fits the context window. They are ranked by expected cost per success, `((passes + 1) / (attempts + 2) − 0.05 × min(failStreak, 3)) / cost`. A slow model scores ×0.8: one flagged `slow` in the catalog (GLM-5.3), or any model averaging over 120 s. Ties go to the lower cost, then catalog order.
 - **Exploration:** every 5th router decision tries the least-tried model in the chosen tier.
 - **Fallbacks:** up to 2. The rest of the chosen tier comes first, then the best model one tier up.
 - **Floor (AIMD with probing), persisted in `model_router`:**

@@ -6,6 +6,7 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
+    "dev:sim": "turbo run dev:sim --filter=@queenos/queen --filter=@queenos/dashboard",
     "lint": "turbo run lint",
     "test": "turbo run test",
     "typecheck": "turbo run typecheck"
@@ -13,6 +14,13 @@
   "devDependencies": {
     "turbo": "^2.11.7",
     "typescript": "^5.9.3"
+  },
+  "pnpm": {
+    "ignoredBuiltDependencies": [
+      "@mongodb-js/zstd",
+      "core-js-pure",
+      "node-liblzma"
+    ]
   },
   "engines": {
     "node": ">=22"

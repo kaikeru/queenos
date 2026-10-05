@@ -808,9 +808,9 @@ export function Ticker({ items }: { items: TickerItem[] }) {
 // ── model board ───────────────────────────────────────────────────────────
 
 export function floorLine(f: RouterFloor): string {
-  const parts = [`${f.streak}/${f.backoffAfter} clean builds to back off`];
-  if (f.probeIn !== null) parts.push(`probe in ${f.probeIn}`);
-  return parts.join(" · ");
+  // probeIn is null exactly when the floor is already at the lowest builder tier: nothing to back off to.
+  if (f.probeIn === null) return "at the lowest tier";
+  return `${f.streak}/${f.backoffAfter} clean builds to back off · probe in ${f.probeIn}`;
 }
 
 /** Compact router floor line; flashes red when raised, green when backed off. */

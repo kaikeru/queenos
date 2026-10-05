@@ -11,7 +11,7 @@ import {
   TapToShipSchema,
   TrainResultSchema,
 } from "@queenos/queen-types";
-import { requireInternalAuth } from "./auth";
+import { requireInternalAuth, resolveUser } from "./auth";
 import { QueenError, asQueenError, parseOrThrow } from "./errors";
 import { DEFAULT_HIVE, HIVE_HEADER, USER_HEADER, assertNamespace } from "./queen-node";
 
@@ -90,9 +90,10 @@ hive.post("/prompts", async (c) => {
 
 // Tap to ship: a USER route. The edge verifies Cloudflare Access and sets
 // x-queen-user (stripping any client-supplied value); it is not behind the
-// internal bearer token. 401 without a user, 409 outside AWAITING_TAP.
+// internal bearer token. 401 without a user, 409 outside AWAITING_TAP. Only the
+// localhost sim env defaults a missing user (resolveUser).
 hive.post("/releases/:releaseId/tap", async (c) => {
-  const user = c.req.header(USER_HEADER)?.trim();
+  const user = resolveUser(c.env, c.req.url, c.req.header(USER_HEADER));
   if (!user) {
     return c.json({ error: { code: "UNAUTHORIZED", message: `missing ${USER_HEADER} (sign in through Cloudflare Access)` } }, 401);
   }

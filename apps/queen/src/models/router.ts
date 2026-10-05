@@ -6,6 +6,8 @@
  * route() / chooseModel():
  * 1. Candidates: catalog models whose `roles` include the role and whose
  *    context window fits: ceil(promptChars / 3) + CONTEXT_HEADROOM_TOKENS.
+ *    Models whose catalog `toolLoop` is false (cannot drive the drone's tool
+ *    loop) are never candidates, fallbacks or the largest-context fallback.
  * 2. Starting tier:
  *    - first BUILD attempt (role builder, attempt 1): the hive's *floor* tier
  *      (see below), or one tier under it when a probe is due;
@@ -15,7 +17,7 @@
  *      rate  = (passes + 1) / (attempts + 2)                (Laplace-smoothed)
  *              - STREAK_PENALTY * min(failStreak, MAX_STREAK_PENALIZED)
  *      value = max(rate, MIN_RATE) / cost  (x SLOW_FACTOR for slow models)
- *    A model is slow when listed in SLOW_MODEL_HINTS (real-account bake-off:
+ *    A model is slow when its catalog `slow` flag is set (real-account bake-off:
  *    GLM-5.3 reasons for up to ~150 s against the drones' 200 s generation
  *    budget) or when its hive avgBuildMs exceeds SLOW_BUILD_MS.
  *    Candidates are every fitting model in the starting tier *or above*,
@@ -107,8 +109,10 @@ export const MIN_RATE = 0.01;
 export const EXPLORE_EVERY = 5;
 export const SLOW_FACTOR = 0.8;
 export const SLOW_BUILD_MS = 120_000;
-export const SLOW_MODEL_HINTS: ReadonlySet<string> = new Set(["@cf/zai-org/glm-5.3"]);
 export const MAX_FALLBACKS = 2;
+
+/** Builder and rework run the drone tool loop; the catalog says which models can. */
+const canToolLoop = (m: CatalogModel) => m.toolLoop !== false;
 
 const tierIdx = (t: ModelTier) => TIERS.indexOf(t);
 
@@ -118,7 +122,7 @@ export function estimateTokens(promptChars: number): number {
 
 /** Cheapest tier holding a builder model: the floor's lower bound. */
 export function cheapestBuilderTier(catalog: readonly CatalogModel[] = MODEL_CATALOG): ModelTier {
-  return TIERS.find((t) => catalog.some((m) => m.tier === t && m.roles.includes("builder"))) ?? "fast";
+  return TIERS.find((t) => catalog.some((m) => m.tier === t && m.roles.includes("builder") && canToolLoop(m))) ?? "fast";
 }
 
 function clampFloor(tier: ModelTier, catalog: readonly CatalogModel[]): ModelTier {
@@ -142,7 +146,7 @@ function rank(models: { model: CatalogModel; index: number }[], role: RouterRole
       const passes = s?.passes ?? 0;
       const streak = Math.min(s?.failStreak ?? 0, MAX_STREAK_PENALIZED);
       const rate = Math.max(MIN_RATE, (passes + 1) / (attempts + 2) - STREAK_PENALTY * streak);
-      const slow = SLOW_MODEL_HINTS.has(model.id) || (s?.avgBuildMs ?? 0) > SLOW_BUILD_MS;
+      const slow = model.slow === true || (s?.avgBuildMs ?? 0) > SLOW_BUILD_MS;
       return { model, index, attempts, passes, value: (rate / model.cost) * (slow ? SLOW_FACTOR : 1) };
     })
     .sort((a, b) => b.value - a.value || a.model.cost - b.model.cost || a.index - b.index);
@@ -208,7 +212,7 @@ export function route(input: ChooseModelInput): RouteResult {
 
   // ── candidates ──
   const need = estimateTokens(input.promptChars);
-  const fits = catalog.map((model, index) => ({ model, index })).filter(({ model }) => model.roles.includes(role) && model.contextWindow >= need);
+  const fits = catalog.map((model, index) => ({ model, index })).filter(({ model }) => model.roles.includes(role) && canToolLoop(model) && model.contextWindow >= need);
   const w = tierIdx(wanted);
   let pool = probe ? fits.filter((c) => c.model.tier === wanted) : fits.filter((c) => tierIdx(c.model.tier) >= w);
   if (probe && pool.length === 0) {
@@ -223,7 +227,7 @@ export function route(input: ChooseModelInput): RouteResult {
   const join = (...parts: (string | null)[]) => clip(parts.filter(Boolean).join(" · "));
 
   if (pool.length === 0) {
-    const roleModels = catalog.filter((m) => m.roles.includes(role));
+    const roleModels = catalog.filter((m) => m.roles.includes(role) && canToolLoop(m));
     const biggest = [...(roleModels.length ? roleModels : catalog)].sort((a, b) => b.contextWindow - a.contextWindow)[0]!;
     const model = pin ?? biggest.id;
     return {
