@@ -6,9 +6,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --env=\"\"",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
     "lint": "eslint .",
-    "cf-typegen": "wrangler types --include-runtime=false"
+    "cf-typegen": "wrangler types --include-runtime=false",
+    "test": "vitest run"
   },
   "dependencies": {
     "@queenos/hive-kit": "workspace:*",

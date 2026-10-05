@@ -11,8 +11,10 @@ import {
   MIN_RECALL_SCORE,
   MemoryOutcomeSchema,
   MemoryRecordSchema,
+  WORK_ITEM_VECTOR_KIND,
   type MemoryRecord,
   type RecalledMemory,
+  type SimilarItem,
 } from "@queenos/queen-types";
 import type { AiRunner } from "./ai-gateway.js";
 
@@ -101,12 +103,13 @@ export class HiveMemory {
   async recall(namespace: string, query: string, opts: { topK?: number; excludeTrainId?: string } = {}): Promise<RecalledMemory[]> {
     const topK = Math.min(opts.topK ?? MAX_RECALLED_MEMORIES, MAX_RECALLED_MEMORIES);
     const [vector] = await this.embed([clip(query, 2_000)]);
-    // Over-fetch: the self-train and low scores are filtered out below.
-    const res = await this.index!.query(vector!, { topK: topK + 3, filter: { namespace }, returnMetadata: "all" });
+    // Over-fetch: the self-train, work-item vectors (they share the index) and low scores are filtered out below.
+    const res = await this.index!.query(vector!, { topK: Math.min(topK + 10, 20), filter: { namespace }, returnMetadata: "all" });
     const out: RecalledMemory[] = [];
     for (const m of res.matches) {
       if (m.score < MIN_RECALL_SCORE) continue;
       const md = m.metadata ?? {};
+      if (md.kind === WORK_ITEM_VECTOR_KIND) continue;
       const outcome = MemoryOutcomeSchema.safeParse(md.outcome);
       if (!outcome.success || typeof md.text !== "string" || typeof md.trainId !== "string" || typeof md.promptId !== "string") continue;
       if (opts.excludeTrainId && md.trainId === opts.excludeTrainId) continue;
@@ -123,5 +126,62 @@ export class HiveMemory {
       if (out.length >= topK) break;
     }
     return out;
+  }
+
+  /**
+   * For each text, the closest work-item vectors in `namespace` (best first),
+   * as `{itemId, score}`. Filters on `kind = work-item` (needs the `kind`
+   * metadata index). Ids in `excludeIds` are dropped (an item must not match
+   * itself). Throws on trouble; the Oracle treats that as "no similar items".
+   */
+  async findSimilarItems(
+    namespace: string,
+    texts: string[],
+    opts: { topK?: number; minScore?: number; excludeIds?: string[] } = {},
+  ): Promise<SimilarItem[][]> {
+    if (texts.length === 0) return [];
+    const topK = Math.min(opts.topK ?? 5, 10);
+    const exclude = new Set(opts.excludeIds ?? []);
+    const vectors = await this.embed(texts.map((t) => clip(t, 2_000)));
+    const out: SimilarItem[][] = [];
+    for (const v of vectors) {
+      const res = await this.index!.query(v, {
+        topK: Math.min(topK + exclude.size, 20),
+        filter: { namespace, kind: WORK_ITEM_VECTOR_KIND },
+        returnMetadata: "all",
+      });
+      const items: SimilarItem[] = [];
+      for (const m of res.matches) {
+        if (exclude.has(m.id) || m.score < (opts.minScore ?? 0)) continue;
+        const md = m.metadata ?? {};
+        items.push({ itemId: typeof md.itemId === "string" ? md.itemId : m.id, score: m.score });
+        if (items.length >= topK) break;
+      }
+      out.push(items);
+    }
+    return out;
+  }
+
+  /**
+   * Embed and upsert work-item vectors (id = the item id or `<goalId>-c<n>`;
+   * idempotent). Metadata carries `kind = work-item` so gate memories never
+   * mix with them.
+   */
+  async indexItems(namespace: string, items: { id: string; text: string; title?: string }[]): Promise<void> {
+    if (items.length === 0) return;
+    const vectors = await this.embed(items.map((i) => clip(i.text, 2_000)));
+    await this.index!.upsert(
+      items.map((it, n) => ({
+        id: it.id,
+        values: vectors[n]!,
+        metadata: {
+          namespace,
+          kind: WORK_ITEM_VECTOR_KIND,
+          itemId: it.id,
+          title: clip(it.title ?? it.text, 120),
+          createdAt: Date.now(),
+        },
+      })),
+    );
   }
 }

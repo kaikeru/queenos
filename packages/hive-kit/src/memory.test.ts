@@ -71,3 +71,41 @@ describe("hive memory", () => {
     await expect(new HiveMemory(undefined, undefined).recall("demo", "q")).rejects.toBeInstanceOf(MemoryError);
   });
 });
+
+describe("hive memory: work items", () => {
+  it("recall drops kind=work-item vectors", async () => {
+    const md = (kind?: string) => ({ trainId: "t9", promptId: "p", outcome: "PASSED", promptText: "q", text: "memory", createdAt: 5, ...(kind ? { kind } : {}) });
+    const f = fakes([
+      { id: "w", score: 0.99, metadata: md("work-item") },
+      { id: "m", score: 0.8, metadata: md() },
+    ]);
+    const out = await new HiveMemory(f.ai, f.index).recall("demo", "q");
+    expect(out.map((m) => m.memoryId)).toEqual(["m"]);
+  });
+
+  it("indexItems upserts kind=work-item vectors in the namespace", async () => {
+    const f = fakes();
+    await new HiveMemory(f.ai, f.index).indexItems("demo", [{ id: "g1-c1", text: "Add a footer", title: "Footer" }]);
+    expect(f.upserts).toEqual([
+      expect.objectContaining({ id: "g1-c1", values: [12, 1], metadata: expect.objectContaining({ namespace: "demo", kind: "work-item", itemId: "g1-c1", title: "Footer" }) }),
+    ]);
+    await new HiveMemory(f.ai, f.index).indexItems("demo", []);
+    expect(f.upserts).toHaveLength(1);
+  });
+
+  it("findSimilarItems filters on kind, excludes ids and maps scores per text", async () => {
+    const f = fakes([
+      { id: "self", score: 1, metadata: { itemId: "self" } },
+      { id: "i1", score: 0.9, metadata: { itemId: "item-1" } },
+      { id: "i2", score: 0.5 },
+    ]);
+    const out = await new HiveMemory(f.ai, f.index).findSimilarItems("demo", ["a", "bb"], { excludeIds: ["self"], minScore: 0.6 });
+    expect(out).toEqual([[{ itemId: "item-1", score: 0.9 }], [{ itemId: "item-1", score: 0.9 }]]);
+    expect(f.queries[0]![1]).toMatchObject({ filter: { namespace: "demo", kind: "work-item" } });
+    expect(await new HiveMemory(f.ai, f.index).findSimilarItems("demo", [])).toEqual([]);
+  });
+
+  it("throws MemoryError without bindings", async () => {
+    await expect(new HiveMemory(undefined, undefined).findSimilarItems("demo", ["a"])).rejects.toBeInstanceOf(MemoryError);
+  });
+});
