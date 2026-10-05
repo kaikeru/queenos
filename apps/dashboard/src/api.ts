@@ -1,11 +1,34 @@
 import {
+  EscalationSchema,
+  HiveStatusSchema,
+  HourlyMetricSchema,
+  MergeTrainSchema,
   ProjectSchema,
+  QueenEventSchema,
+  RaceSchema,
+  ReleaseSchema,
+  TraceViewSchema,
   VaultStatusSchema,
   WizardStateSchema,
+  WorkItemSchema,
   type Charter,
+  type Escalation,
+  type EventQueryInput,
+  type FileWorkItemInput,
+  type HiveStatus,
+  type HourlyMetric,
+  type MergeTrain,
   type Project,
+  type QueenEvent,
+  type Race,
+  type Release,
+  type ResolveEscalation,
+  type TraceView,
+  type UpdateHiveSettings,
   type VaultStatus,
   type WizardState,
+  type WorkAction,
+  type WorkItem,
 } from "@queenos/queen-types";
 
 export const AUTH_MESSAGE = "Not signed in: reload to sign in with Cloudflare Access";
@@ -87,10 +110,113 @@ const ProjectsParser: Parser<Project[]> = { parse: (v) => ProjectSchema.array().
 
 const AnyParser: Parser<unknown> = { parse: (v) => v };
 
+// ── v2 REST: items, events, traces, metrics, queue (design §3.6) ──────────
+
+const obj = (v: unknown): Record<string, unknown> => (v && typeof v === "object" ? (v as Record<string, unknown>) : {});
+const arr = <T>(schema: { parse(v: unknown): T }, v: unknown): T[] => (v === undefined || v === null ? [] : parseArray(schema, v));
+function parseArray<T>(schema: { parse(v: unknown): T }, v: unknown): T[] {
+  if (!Array.isArray(v)) throw new Error("expected an array");
+  return v.map((x) => schema.parse(x));
+}
+
+/** GET /hives/:hive/items/:id */
+export interface ItemDetail {
+  item: WorkItem;
+  children: WorkItem[];
+  trains: MergeTrain[];
+  races: Race[];
+  release: Release | null;
+  escalations: Escalation[];
+}
+const ItemDetailParser: Parser<ItemDetail> = {
+  parse(v) {
+    const o = obj(v);
+    return {
+      item: WorkItemSchema.parse(o.item),
+      children: arr(WorkItemSchema, o.children),
+      trains: arr(MergeTrainSchema, o.trains),
+      races: arr(RaceSchema, o.races),
+      release: o.release ? ReleaseSchema.parse(o.release) : null,
+      escalations: arr(EscalationSchema, o.escalations),
+    };
+  },
+};
+const WorkItemParser: Parser<WorkItem> = { parse: (v) => WorkItemSchema.parse("item" in obj(v) ? obj(v).item : v) };
+
+/** GET /hives/:hive/events: a bare array or `{events}`. */
+const EventsParser: Parser<QueenEvent[]> = { parse: (v) => arr(QueenEventSchema, Array.isArray(v) ? v : obj(v).events) };
+
+/** GET /hives/:hive/metrics?window=24h|7d: hourly rollups plus the current HiveStatus. */
+export interface MetricsView {
+  rollups: HourlyMetric[];
+  hive: HiveStatus | null;
+  /** Where the numbers came from (the edge labels AE vs the Queen's rollups). */
+  source: string;
+}
+export type MetricsWindow = "24h" | "7d";
+const MetricsParser: Parser<MetricsView> = {
+  parse(v) {
+    const o = obj(v);
+    const hive = o.hive ?? o.status;
+    return {
+      rollups: arr(HourlyMetricSchema, o.rollups),
+      hive: hive ? HiveStatusSchema.parse(hive) : null,
+      source: typeof o.source === "string" ? o.source : "rollups",
+    };
+  },
+};
+
+/** GET /hives/:hive/queue: active cars, passed builds waiting to board, the last 20 conflicts and bisects. */
+export interface QueueView {
+  cars: MergeTrain[];
+  waiting: MergeTrain[];
+  conflicts: QueenEvent[];
+  bisects: QueenEvent[];
+}
+const QueueParser: Parser<QueueView> = {
+  parse(v) {
+    const o = obj(v);
+    return {
+      cars: arr(MergeTrainSchema, o.cars),
+      waiting: arr(MergeTrainSchema, o.waiting),
+      conflicts: arr(QueenEventSchema, o.conflicts),
+      bisects: arr(QueenEventSchema, o.bisects),
+    };
+  },
+};
+
+/** Query string for GET /hives/:hive/events (the Queen's `?trace=&item=&release=&type=&before=&limit=`). */
+export function eventsQuery(q: EventQueryInput = {}): string {
+  const p = new URLSearchParams();
+  if (q.traceId) p.set("trace", q.traceId);
+  if (q.itemId) p.set("item", q.itemId);
+  if (q.releaseId) p.set("release", q.releaseId);
+  if (q.typePrefix) p.set("type", q.typePrefix);
+  if (q.before !== undefined) p.set("before", String(q.before));
+  if (q.limit !== undefined) p.set("limit", String(q.limit));
+  const s = p.toString();
+  return s ? `?${s}` : "";
+}
+
 export const api = {
   /** The edge adds the signed-in user's identity; we only need to send the cookie. */
   tapRelease: (hive: string, releaseId: string) =>
     request("POST", `/hives/${enc(hive)}/releases/${enc(releaseId)}/tap`, AnyParser, { releaseId }, "include"),
+  // v2: REST drill-downs. Live state arrives over the WebSocket; these fetch history and detail.
+  item: (hive: string, itemId: string): Promise<ItemDetail> => request("GET", `/hives/${enc(hive)}/items/${enc(itemId)}`, ItemDetailParser),
+  fileItem: (hive: string, body: FileWorkItemInput): Promise<WorkItem> =>
+    request("POST", `/hives/${enc(hive)}/items`, WorkItemParser, body, "include"),
+  itemAction: (hive: string, itemId: string, action: WorkAction) =>
+    request("POST", `/hives/${enc(hive)}/items/${enc(itemId)}/actions`, AnyParser, action, "include"),
+  events: (hive: string, query: EventQueryInput = {}): Promise<QueenEvent[]> =>
+    request("GET", `/hives/${enc(hive)}/events${eventsQuery(query)}`, EventsParser),
+  trace: (hive: string, traceId: string): Promise<TraceView> => request("GET", `/hives/${enc(hive)}/traces/${enc(traceId)}`, TraceViewSchema),
+  metrics: (hive: string, window: MetricsWindow = "24h"): Promise<MetricsView> =>
+    request("GET", `/hives/${enc(hive)}/metrics?window=${window}`, MetricsParser),
+  queue: (hive: string): Promise<QueueView> => request("GET", `/hives/${enc(hive)}/queue`, QueueParser),
+  resolveEscalation: (hive: string, escalationId: string, body: ResolveEscalation) =>
+    request("POST", `/hives/${enc(hive)}/escalations/${enc(escalationId)}/resolve`, AnyParser, body, "include"),
+  updateSettings: (hive: string, body: UpdateHiveSettings) => request("PATCH", `/hives/${enc(hive)}/settings`, AnyParser, body, "include"),
   me: () => request("GET", "/api/me", MeParser),
   projects: () => request("GET", "/api/projects", ProjectsParser),
   startGenesis: (hive: string, name: string) => request("POST", "/api/genesis", WizardStateSchema, { hive, name }),

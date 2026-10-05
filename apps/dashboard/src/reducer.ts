@@ -12,14 +12,20 @@ import type {
   DeployEnvironment,
   Deployment,
   DroneRole,
+  Escalation,
   GitNotesPayload,
+  HiveStatus,
   MergeTrain,
   ModelStats,
   PromptRun,
+  QueenEvent,
   QueenServerMessage,
+  QueenServerUnitMessage,
+  Race,
   RouterFloor,
   Release,
   SentinelVerdict,
+  WorkItem,
 } from "@queenos/queen-types";
 
 import { isEscalation, modelLabel, tierRank } from "./models";
@@ -64,6 +70,21 @@ export interface State {
   /** Hive-wide builder tier floor (AIMD); null until the Queen reports one. */
   routerFloor: RouterFloor | null;
   audit: AuditEvent[];
+  // v2 (empty against a v1 Queen).
+  /** Work items by itemId (non-terminal plus recent terminal; `item.updated` upserts). */
+  items: Record<string, WorkItem>;
+  /** Item ids in creation order. */
+  itemOrder: string[];
+  /** Races by raceId. */
+  races: Record<string, Race>;
+  /** Escalations by escalationId. */
+  escalations: Record<string, Escalation>;
+  /** Escalation ids, newest first. */
+  escalationOrder: string[];
+  /** Hive status (autonomy, budget, SLO, counts, throughput, concurrency); null until the Queen reports one. */
+  hive: HiveStatus | null;
+  /** Event log tail by seq, oldest first, capped at EVENT_LIMIT. */
+  events: QueenEvent[];
   /** Newest first. */
   ticker: TickerItem[];
   /** Commits on main, in landing order. */
@@ -80,6 +101,7 @@ export type Action =
 
 export const AUDIT_LIMIT = 600;
 export const TICKER_LIMIT = 80;
+export const EVENT_LIMIT = 500;
 
 export const initialState: State = {
   loaded: false,
@@ -95,6 +117,13 @@ export const initialState: State = {
   modelStats: [],
   routerFloor: null,
   audit: [],
+  items: {},
+  itemOrder: [],
+  races: {},
+  escalations: {},
+  escalationOrder: [],
+  hive: null,
+  events: [],
   ticker: [],
   landed: [],
   tickerSeq: 0,
@@ -180,6 +209,22 @@ function reasonLabel(reason: string | null | undefined): string {
   return reason.startsWith("superseded") ? "superseded by an upstream ejection" : reason.replace(/^failed:\s*/, "failed: ");
 }
 
+function snapshotV2(msg: Extract<QueenServerUnitMessage, { type: "snapshot" }>): Partial<State> {
+  const out: Partial<State> = {};
+  if (msg.items) {
+    out.items = Object.fromEntries(msg.items.map((i) => [i.itemId, i]));
+    out.itemOrder = byCreatedAt(msg.items).map((i) => i.itemId);
+  }
+  if (msg.races) out.races = Object.fromEntries(msg.races.map((r) => [r.raceId, r]));
+  if (msg.escalations) {
+    out.escalations = Object.fromEntries(msg.escalations.map((e) => [e.escalationId, e]));
+    out.escalationOrder = sortEscalations(out.escalations);
+  }
+  if (msg.hive) out.hive = msg.hive;
+  if (msg.recentEvents) out.events = [...msg.recentEvents].sort((a, b) => a.seq - b.seq).slice(-EVENT_LIMIT);
+  return out;
+}
+
 function hydrateVerdicts(list: SentinelVerdict[]): State["verdicts"] {
   const out: State["verdicts"] = {};
   for (const v of list) out[v.releaseId] = { ...out[v.releaseId], [v.environment]: v };
@@ -200,19 +245,78 @@ export function reducer(state: State, action: Action): State {
   }
 }
 
+function byCreatedAt<T extends { createdAt: number }>(rows: T[]): T[] {
+  return [...rows].sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function insertEvent(events: QueenEvent[], e: QueenEvent): QueenEvent[] {
+  if (events.some((x) => x.eventId === e.eventId)) return events;
+  const next = [...events];
+  let i = next.length;
+  while (i > 0 && next[i - 1]!.seq > e.seq) i--;
+  next.splice(i, 0, e);
+  return next.length > EVENT_LIMIT ? next.slice(next.length - EVENT_LIMIT) : next;
+}
+
+function sortEscalations(all: Record<string, Escalation>): string[] {
+  return Object.values(all)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .map((e) => e.escalationId);
+}
+
+/** A `batch` frame is folded into one new state, so the UI never renders half a frame. */
+function applyBatch(state: State, messages: readonly QueenServerUnitMessage[], at: number): State {
+  return messages.reduce<State>((s, m) => serverMessage(s, m, at), state);
+}
+
 function serverMessage(state: State, msg: QueenServerMessage, at: number): State {
   switch (msg.type) {
     case "pong":
       return state;
-    // v2 messages (work ledger, races, escalations, hive status, events, coalesced batches):
-    // accepted and ignored until the v2 data layer (WP1.10) handles them.
-    case "item.updated":
-    case "race.updated":
-    case "escalation.updated":
-    case "hive.updated":
-    case "event.appended":
     case "batch":
-      return state;
+      return applyBatch(state, msg.messages, at);
+    case "item.updated": {
+      const it = msg.item;
+      const prev = state.items[it.itemId];
+      if (prev && prev.updatedAt > it.updatedAt) return state; // out-of-order frame
+      const items = { ...state.items, [it.itemId]: it };
+      let next: State = { ...state, items, itemOrder: upsertOrdered(state.itemOrder, it.itemId, it.createdAt, items) };
+      if (prev && prev.status !== it.status && (it.status === "FAILED" || it.status === "SHIPPED")) {
+        next = pushTicker(next, it.status === "FAILED" ? "error" : "status", `${it.kind} "${excerpt(it.title, 40)}" ${it.status}`, at);
+      }
+      return next;
+    }
+    case "race.updated": {
+      const r = msg.race;
+      const prev = state.races[r.raceId];
+      let next: State = { ...state, races: { ...state.races, [r.raceId]: r } };
+      if (prev?.state !== r.state && r.state !== "RACING") {
+        const item = state.items[r.itemId];
+        const what = item ? `"${excerpt(item.title, 40)}"` : r.itemId;
+        next = pushTicker(next, "status", r.state === "DECIDED" ? `Race for ${what} decided${r.reason ? `: ${excerpt(r.reason, 80)}` : ""}` : `Race for ${what} abandoned`, at);
+      }
+      return next;
+    }
+    case "escalation.updated": {
+      const e = msg.escalation;
+      const prev = state.escalations[e.escalationId];
+      const escalations = { ...state.escalations, [e.escalationId]: e };
+      let next: State = { ...state, escalations, escalationOrder: sortEscalations(escalations) };
+      if (!prev && e.status === "OPEN") next = pushTicker(next, "error", `Needs you: ${e.reason}: ${excerpt(e.summary, 100)}`, at);
+      else if (prev?.status === "OPEN" && e.status === "RESOLVED") next = pushTicker(next, "system", `Resolved ${e.reason}${e.resolution ? `: ${excerpt(e.resolution, 80)}` : ""}`, at);
+      return next;
+    }
+    case "hive.updated": {
+      let next: State = { ...state, hive: msg.hive };
+      if (state.hive && state.hive.effectiveAutonomy !== msg.hive.effectiveAutonomy) {
+        next = pushTicker(next, "system", `Autonomy is now ${msg.hive.effectiveAutonomy}${msg.hive.degradedBy.length ? ` (${msg.hive.degradedBy.join(", ")})` : ""}`, at);
+      }
+      return next;
+    }
+    case "event.appended": {
+      const events = insertEvent(state.events, msg.event);
+      return events === state.events ? state : { ...state, events };
+    }
     case "error":
       return pushTicker(state, "error", `Queen: ${msg.message}${msg.code ? ` (${msg.code})` : ""}`, at);
     case "snapshot": {
@@ -220,7 +324,7 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
       for (const p of msg.promptRuns) prompts[p.promptId] = p;
       const trains: Record<string, MergeTrain> = {};
       for (const t of msg.trains) trains[t.trainId] = t;
-      const byCreated = <T extends { createdAt: number }>(rows: T[]) => [...rows].sort((a, b) => a.createdAt - b.createdAt);
+      const byCreated = byCreatedAt;
       let next: State = {
         ...state,
         loaded: true,
@@ -237,6 +341,8 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
         modelStats: msg.modelStats ?? state.modelStats,
         routerFloor: msg.routerFloor ?? state.routerFloor,
         landed: [],
+        // v2 fields: an older Queen omits them, so keep what live frames gave us.
+        ...snapshotV2(msg),
         // Older Queens omit verdicts: keep whatever live frames gave us.
         verdicts: msg.verdicts ? hydrateVerdicts(msg.verdicts) : state.verdicts,
       };

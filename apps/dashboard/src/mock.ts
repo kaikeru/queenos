@@ -301,6 +301,15 @@ export function installMockApi(): void {
       const r = activeMockQueen()!.tap(decodeURIComponent(tap[1]!));
       return new Response(JSON.stringify(r.body), { status: r.status, headers: { "content-type": "application/json" } });
     }
+    // v2 GET drill-downs, answered from the mock Queen's state.
+    const v2 = url.pathname.match(/^\/hives\/[^/]+\/((?:items|traces)\/[^/]+|events|metrics|queue)$/);
+    if (v2 && activeMockQueen() && (init?.method ?? "GET").toUpperCase() === "GET") {
+      const r = activeMockQueen()!.rest(v2[1]!, url.searchParams);
+      if (r) {
+        await sleep(120);
+        return new Response(JSON.stringify(r.body), { status: r.status, headers: { "content-type": "application/json" } });
+      }
+    }
     if (!url.pathname.startsWith("/api/")) return real(input, init);
     const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
     await sleep(200 + Math.random() * 350);
