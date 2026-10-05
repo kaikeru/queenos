@@ -7,6 +7,16 @@ import {
   type VaultStatus,
 } from "@queenos/queen-types";
 import { AccessError, createVerifier, extractToken, type Verifier } from "./access";
+import {
+  DEFAULT_WINDOW,
+  METRIC_TEMPLATE_NAMES,
+  METRIC_WINDOWS,
+  buildQuery,
+  isTemplate,
+  isWindow,
+  runQuery,
+  type Fetcher,
+} from "./metrics";
 import type { HiveRegistry } from "./registry";
 
 /** Vault RPC surface (apps/vault WorkerEntrypoint VaultWriter). */
@@ -33,6 +43,9 @@ export interface Bindings {
   VAULT: VaultPort;
   GENESIS: { fetch(req: Request): Promise<Response> };
   QUEEN: { fetch(req: Request): Promise<Response> };
+  /** Cloudflare account id (a var) and the Account Analytics Read token (a secret) for the AE SQL API. */
+  ACCOUNT_ID?: string;
+  ANALYTICS_API_TOKEN?: string;
   ASSETS?: { fetch(req: Request): Promise<Response> };
 }
 
@@ -43,7 +56,7 @@ const defaultVerifier = createVerifier();
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
-export function createApp(verifier: Verifier = defaultVerifier) {
+export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher = (url, init) => fetch(url, init)) {
   const app = new Hono<AppEnv>();
 
   app.get("/health", (c) => c.json({ ok: true, service: "edge" }));
@@ -133,6 +146,29 @@ export function createApp(verifier: Verifier = defaultVerifier) {
     }
   });
 
+  // ---- Analytics Engine metrics: allowlisted templates only, never client SQL ----
+  app.get("/api/metrics/:hive", async (c) => {
+    const hive = HiveSlugSchema.safeParse(c.req.param("hive"));
+    if (!hive.success) return c.json({ error: "invalid hive" }, 400);
+    const params = new URL(c.req.url).searchParams;
+    for (const key of params.keys()) {
+      if (key !== "q" && key !== "window") return c.json({ error: `unknown parameter "${key}"` }, 400);
+    }
+    const q = params.get("q") ?? "";
+    if (!isTemplate(q)) return c.json({ error: "unknown metric template", templates: METRIC_TEMPLATE_NAMES }, 400);
+    const window = params.get("window") ?? DEFAULT_WINDOW;
+    if (!isWindow(window)) return c.json({ error: "unknown window", windows: METRIC_WINDOWS }, 400);
+    // No secret or account: the dashboard falls back to the Queen's rollups.
+    if (!c.env.ANALYTICS_API_TOKEN || !c.env.ACCOUNT_ID) return c.json({ error: "analytics not configured" }, 503);
+    try {
+      const rows = await runQuery(c.env, buildQuery(q, hive.data, window), fetcher);
+      return c.json({ source: "ae", hive: hive.data, template: q, window, rows });
+    } catch (e) {
+      console.warn(`analytics query failed template=${q} err=${e instanceof Error ? e.name : "unknown"}`);
+      return c.json({ error: "analytics unavailable" }, 503);
+    }
+  });
+
   // ---- Forwarding to internal Workers over service bindings ----
   const forward = (target: "GENESIS" | "QUEEN") => (c: Ctx) => {
     const headers = new Headers(c.req.raw.headers);
@@ -145,6 +181,9 @@ export function createApp(verifier: Verifier = defaultVerifier) {
 
   app.all("/api/genesis", forward("GENESIS"));
   app.all("/api/genesis/*", forward("GENESIS"));
+  // Every Queen route goes through here: the v2 user routes (PATCH settings, escalation resolve,
+  // POST items and item actions, tap) and reads (items, events, traces, metrics, queue), and the
+  // internal webhooks (build-result, merge-result, ...), which carry their own bearer token.
   app.all("/hives/*", forward("QUEEN"));
 
   app.all("/api/*", (c) => c.json({ error: "not found" }, 404));

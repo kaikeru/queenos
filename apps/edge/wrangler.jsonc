@@ -32,7 +32,10 @@
     "ACCESS_TEAM": "kaikeru",
     "ALLOWED_EMAIL_DOMAINS": "kaikeru.com",
     // Application Audience (AUD) tag of the Access app. Empty fails closed (503).
-    "ACCESS_AUD": "1fc3935ae323fe3c704a8d98d8d1951edde4cd6c56e54f8249ebebf8feaf544a"
+    "ACCESS_AUD": "1fc3935ae323fe3c704a8d98d8d1951edde4cd6c56e54f8249ebebf8feaf544a",
+    // For GET /api/metrics (Analytics Engine SQL API). Secret ANALYTICS_API_TOKEN (Account
+    // Analytics Read): wrangler secret put ANALYTICS_API_TOKEN. Unset => 503, dashboard uses rollups.
+    "ACCOUNT_ID": "4773fbabdff038e3b907b14cd212c062"
   },
   "env": {
     // Local dev (`wrangler dev --env dev`): skips Access verification. Never deploy.
@@ -59,6 +62,7 @@
         "ACCESS_TEAM": "kaikeru",
         "ALLOWED_EMAIL_DOMAINS": "kaikeru.com",
         "ACCESS_AUD": "1fc3935ae323fe3c704a8d98d8d1951edde4cd6c56e54f8249ebebf8feaf544a",
+        "ACCOUNT_ID": "4773fbabdff038e3b907b14cd212c062",
         "ACCESS_MODE": "dev",
         "DEV_USER_EMAIL": "dev@kaikeru.com"
       }
