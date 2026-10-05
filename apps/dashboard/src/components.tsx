@@ -7,6 +7,7 @@ import { CANARY_STEPS, type ModelStats, type RecalledMemory, type ModelTier, typ
 import {
   PHASE_FLOW,
   excerpt,
+  lanesNewestFirst,
   letterOf,
   previewView,
   releaseLetters,
@@ -146,7 +147,7 @@ export function Lanes(props: { lanes: Lane[]; selected: string | null; onSelect:
   }
   return (
     <div className="lanes">
-      {props.lanes.map((lane) => (
+      {lanesNewestFirst(props.lanes).map((lane) => (
         <LaneRow key={lane.prompt.promptId} {...props} lane={lane} />
       ))}
     </div>

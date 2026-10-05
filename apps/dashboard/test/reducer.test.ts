@@ -9,6 +9,7 @@ import {
   initialState,
   isUnknownFrameType,
   letterFor,
+  lanesNewestFirst,
   previewView,
   reducer,
   type Action,
@@ -383,4 +384,34 @@ test("memory presentation helpers", () => {
   expect(memoryChipLabel(3)).toBe("3 memories recalled");
   expect(OUTCOME_META.REJECTED_BY_REVIEW.label).toBe("rejected by review");
   expect(OUTCOME_META.PASSED.cls).toBe("passed");
+});
+
+test("lanesNewestFirst orders lanes by queue time, newest on top, without mutating input", () => {
+  const lanes = buildLanes(run(snapshot));
+  const ordered = lanesNewestFirst(lanes);
+  expect(ordered.map((l) => l.prompt.promptId)).toEqual(["p2", "p1"]);
+  expect(lanes.map((l) => l.prompt.promptId)).toEqual(["p1", "p2"]);
+});
+
+test("lanesNewestFirst puts a newly arriving prompt at the top and keeps ties stable", () => {
+  const s = run(
+    snapshot,
+    server({ type: "prompt.updated", promptRun: prompt("p3", 30) }),
+  );
+  const ids = (st: State) => lanesNewestFirst(buildLanes(st)).map((l) => l.prompt.promptId);
+  expect(ids(s)).toEqual(["p3", "p2", "p1"]);
+  const tied = { ...s, prompts: { ...s.prompts, p2: { ...s.prompts.p2!, createdAt: 30 } } };
+  expect(ids(tied)).toEqual(["p2", "p3", "p1"]);
+});
+
+test("lanesNewestFirst keeps attempts chronological within a lane", () => {
+  const s = run(
+    snapshot,
+    server({ type: "snapshot", promptRuns: [prompt("p1", 10)], trains: [], recentAudit: [
+      audit("e1", "p1", "BUILDER", "PASSED", 11, { attempt: 1 }),
+      audit("e2", "p1", "BUILDER", "PASSED", 12, { attempt: 2 }),
+    ] }),
+  );
+  const [lane] = lanesNewestFirst(buildLanes(s));
+  expect(lane!.cards.map((c) => c.attempt)).toEqual([...lane!.cards.map((c) => c.attempt)].sort());
 });
