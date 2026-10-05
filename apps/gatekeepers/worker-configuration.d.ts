@@ -10,6 +10,8 @@ interface __BaseEnv_Env {
 	GATE_PHASE_WAIT_MS: "0" | "5000";
 	AI_GATEWAY_ID: "queenos";
 	MODEL_SCRIBE: "anthropic/claude-haiku-4-5";
+	REVIEW_MODE: "llm" | "scripted";
+	MODEL_REVIEWER: "@cf/deepseek-ai/deepseek-v4-flash-0731";
 	GATEKEEPER_WORKFLOW: Workflow<Parameters<import("./src/index").GatekeeperWorkflow['run']>[0]['payload']>;
 	VECTORIZE?: VectorizeIndex;
 	ARTIFACTS?: Artifacts;
@@ -30,6 +32,8 @@ declare namespace Cloudflare {
 		GATE_PHASE_WAIT_MS: "0";
 		AI_GATEWAY_ID: "queenos";
 		MODEL_SCRIBE: "anthropic/claude-haiku-4-5";
+		REVIEW_MODE: "scripted";
+		MODEL_REVIEWER: "@cf/deepseek-ai/deepseek-v4-flash-0731";
 		GATEKEEPER_WORKFLOW: Workflow<Parameters<import("./src/index").GatekeeperWorkflow['run']>[0]['payload']>;
 	}
 	interface Env extends __BaseEnv_Env {}
@@ -39,5 +43,5 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "GATE_TEST_MODE" | "SCRIBE_MODE" | "ARTIFACTS_NAMESPACE" | "POLICY_ALLOWED_DEPS" | "SECURITY_ALLOWED_HOSTS" | "GATE_PHASE_RETRIES" | "GATE_PHASE_WAIT_MS" | "AI_GATEWAY_ID" | "MODEL_SCRIBE">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "GATE_TEST_MODE" | "SCRIBE_MODE" | "ARTIFACTS_NAMESPACE" | "POLICY_ALLOWED_DEPS" | "SECURITY_ALLOWED_HOSTS" | "GATE_PHASE_RETRIES" | "GATE_PHASE_WAIT_MS" | "AI_GATEWAY_ID" | "MODEL_SCRIBE" | "REVIEW_MODE" | "MODEL_REVIEWER">> {}
 }

@@ -6,6 +6,7 @@ import type { AppendAuditInput, AuditEvent, QueenServerMessage, ScribeSummary, T
 import { cloneRepo, createAiClient, type AiRunner, type GitRepo } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import type { GateTask } from "./event";
+import type { ReviewLlm } from "./review";
 import type { ScribeLlm } from "./scribe";
 import { FetchSmokeProbe, type SmokeProbe } from "./smoke";
 import { createTestRunner, type TestRunner } from "./test-runner";
@@ -146,6 +147,8 @@ export interface GatekeeperPorts {
   queen(hive: string): QueenPort;
   /** Null: extractive Scribe. */
   llm: ScribeLlm | null;
+  /** The REVIEWER's model client. Null in REVIEW_MODE llm means no AI binding: the review fails open. */
+  reviewLlm: ReviewLlm | null;
   tests: TestRunner;
   /** `GET <previewUrl>/` against the train's Worker Preview. */
   smoke: SmokeProbe;
@@ -169,6 +172,7 @@ export function createProdPorts(env: GateEnvBindings, config: GateConfig): Gatek
     git: isomorphicGitPort,
     queen: (hive) => queenRpc(env.QUEEN, hive),
     llm: useLlm ? createAiClient({ ai: env.AI as unknown as AiRunner, gatewayId: config.aiGateway.gatewayId }) : null,
+    reviewLlm: config.reviewMode === "llm" && env.AI ? createAiClient({ ai: env.AI as unknown as AiRunner, gatewayId: config.aiGateway.gatewayId }) : null,
     tests: createTestRunner(config.testMode),
     smoke: new FetchSmokeProbe(),
     failures: new VectorizeFailureStore(env.AI, env.VECTORIZE),

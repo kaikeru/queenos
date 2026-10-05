@@ -8,3 +8,5 @@
 # SCRIBE_MODE=llm
 # MODEL_SCRIBE=@cf/zai-org/glm-4.7-flash
 # POLICY_ALLOWED_DEPS=hono,zod,@queenos/*
+# REVIEW_MODE=llm   # llm | scripted | off
+# MODEL_REVIEWER=@cf/deepseek-ai/deepseek-v4-flash-0731

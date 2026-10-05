@@ -1,6 +1,7 @@
 /** Gatekeeper configuration from vars + secrets (wrangler.jsonc, .dev.vars). */
 import { modelForRole } from "@queenos/hive-kit";
 import type { AiGatewayConfig } from "@queenos/queen-types";
+import { DEFAULT_MODEL_REVIEWER, type ReviewMode } from "./review";
 
 export type TestMode = "scripted" | "sandbox";
 export type ScribeMode = "auto" | "llm" | "extractive";
@@ -27,6 +28,12 @@ export interface GateConfig {
   phaseWaitMs: number;
   /** Gateway id and the Scribe model (MODEL_SCRIBE). */
   aiGateway: AiGatewayConfig;
+  /** "llm" (production), "scripted" (deterministic, tests/sim) or "off". Unset = "off". */
+  reviewMode: ReviewMode;
+  /** MODEL_REVIEWER. */
+  reviewModel: string;
+  /** Per-call reviewer timeout; the call is retried once, then the gate fails open. */
+  reviewTimeoutMs: number;
 }
 
 export interface GateVars {
@@ -39,6 +46,9 @@ export interface GateVars {
   GATE_PHASE_WAIT_MS?: string;
   AI_GATEWAY_ID?: string;
   MODEL_SCRIBE?: string;
+  REVIEW_MODE?: string;
+  MODEL_REVIEWER?: string;
+  REVIEW_TIMEOUT_MS?: string;
 }
 
 export class ConfigError extends Error {
@@ -65,6 +75,10 @@ export function readConfig(env: GateVars): GateConfig {
   if (scribeMode !== "auto" && scribeMode !== "llm" && scribeMode !== "extractive") {
     throw new ConfigError(`SCRIBE_MODE must be "auto", "llm" or "extractive", got "${scribeMode}"`);
   }
+  const reviewMode = (env.REVIEW_MODE ?? "off").trim().toLowerCase() || "off";
+  if (reviewMode !== "llm" && reviewMode !== "off" && reviewMode !== "scripted") {
+    throw new ConfigError(`REVIEW_MODE must be "llm", "off" or "scripted", got "${reviewMode}"`);
+  }
   return {
     testMode,
     scribeMode,
@@ -74,6 +88,9 @@ export function readConfig(env: GateVars): GateConfig {
     phaseRetries: int(env.GATE_PHASE_RETRIES, 24, 1, 60),
     phaseWaitMs: int(env.GATE_PHASE_WAIT_MS, 5000, 0, 60_000),
     aiGateway: { gatewayId: env.AI_GATEWAY_ID?.trim() || "queenos", model: modelForRole("SCRIBE", env) },
+    reviewMode,
+    reviewModel: env.MODEL_REVIEWER?.trim() || DEFAULT_MODEL_REVIEWER,
+    reviewTimeoutMs: int(env.REVIEW_TIMEOUT_MS, 60_000, 1, 300_000),
   };
 }
 

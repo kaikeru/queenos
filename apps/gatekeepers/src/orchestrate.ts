@@ -21,6 +21,7 @@ import { classifyPush, gateInstanceId, parsePushEvent, type GateTask } from "./e
 import { formatFinding, type ScanReport } from "./findings";
 import { inspectPush, type Inspection } from "./inspect";
 import type { FailureChunk, GatekeeperPorts, QueenPort } from "./ports";
+import { MAX_PROMPT_CHARS, SCRIPTED_REVIEW_MODEL, runReview, scriptedReview, type ReviewOutcome, type ReviewPacket } from "./review";
 import { MAX_SUMMARY_CHARS, clip, extractiveSummary, summarizeFailure, type ScribeResult } from "./scribe";
 import { NotImplementedError } from "./test-runner";
 
@@ -33,6 +34,8 @@ export const LOOKUP_STEP: WorkflowStepConfig = { retries: { limit: 4, delay: "2 
 export const INSPECT_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" }, timeout: "5 minutes" };
 export const SCRIBE_STEP: WorkflowStepConfig = { retries: { limit: 2, delay: "3 seconds", backoff: "exponential" }, timeout: "2 minutes" };
 export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
+/** The reviewer retries internally (and fails open), so Workflows must not retry it again. */
+export const REVIEW_STEP: WorkflowStepConfig = { retries: { limit: 0, delay: "1 second" }, timeout: "3 minutes" };
 export const BEST_EFFORT_STEP: WorkflowStepConfig = { retries: { limit: 1, delay: "2 seconds" }, timeout: "1 minute" };
 export const DISPATCH_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
 
@@ -75,7 +78,7 @@ export async function handlePush(payload: unknown, step: StepRunner, ports: Gate
 // ── the gate ────────────────────────────────────────────────────────────────
 
 export type Lookup =
-  | { status: "ready"; trainId: string; promptId: string; promptText: string; previewUrl: string | null }
+  | { status: "ready"; trainId: string; promptId: string; promptText: string; /** Up to 4 KB, for the reviewer. */ promptFull: string; previewUrl: string | null }
   | { status: "waiting"; phase: string }
   | { status: "ignored"; reason: string };
 
@@ -95,7 +98,7 @@ export async function lookupTrain(queen: QueenPort, task: Pick<GateTask, "repo" 
   const promptText = snap.promptRuns.find((p) => p.promptId === promptId)?.promptText ?? promptId;
   // `previewUrl` is absent in sim mode and on trains from before the Herald existed.
   const previewUrl = (train as { previewUrl?: string | null }).previewUrl || null;
-  return { status: "ready", trainId: train.trainId, promptId, promptText: promptText.slice(0, 500), previewUrl };
+  return { status: "ready", trainId: train.trainId, promptId, promptText: promptText.slice(0, 500), promptFull: promptText.slice(0, MAX_PROMPT_CHARS), previewUrl };
 }
 
 export type GateRunResult =
@@ -106,6 +109,8 @@ export type GateRunResult =
       passed: boolean;
       summary: string;
       queenOutcome: string;
+      /** REVIEWER outcome; absent when review is off or did not run. */
+      review?: "approved" | "rejected" | "skipped";
       scribe?: ScribeResult["method"];
       vectorized?: number;
     };
@@ -141,7 +146,7 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   let inspection: Inspection;
   try {
     inspection = await step.do("inspect: clone, scan, test", INSPECT_STEP, () =>
-      inspectPush(ports, task, config, train.trainId, train.previewUrl).catch((e) => Promise.reject(toStepError(e))),
+      inspectPush(ports, task, config, train.trainId, train.previewUrl, train.promptFull).catch((e) => Promise.reject(toStepError(e))),
     );
   } catch (e) {
     return failInfra(ctx, e);
@@ -152,6 +157,14 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   await audit(ctx, "audit: policy result", "POLICY", inspection.policy.passed ? "PASSED" : "REJECTED", ledgerFor(ctx, POLICY_MODEL, ms, scanSteps("policy", inspection.policy), inspection.policy.passed));
   await audit(ctx, "audit: security result", "SECURITY", inspection.security.passed ? "PASSED" : "REJECTED", ledgerFor(ctx, SECURITY_MODEL, ms, scanSteps("security", inspection.security), inspection.security.passed));
 
+  // 2b. REVIEWER: does the change satisfy the prompt? Only for working code (policy, security, smoke passed).
+  let reviewState: "approved" | "skipped" | undefined;
+  if (inspection.review) {
+    const r = await reviewGate(ctx, inspection.review);
+    if (r.rejected) return failReview(ctx, r.feedback, r.report);
+    reviewState = r.skipped ? "skipped" : "approved";
+  }
+
   const passed = inspection.policy.passed && inspection.security.passed && (inspection.tests?.passed ?? false);
   if (passed) {
     const summary = clip(
@@ -159,7 +172,7 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
       MAX_SUMMARY_CHARS,
     );
     const queenOutcome = await report(ctx, true, summary);
-    return { status: "gated", trainId: train.trainId, passed: true, summary, queenOutcome };
+    return { status: "gated", trainId: train.trainId, passed: true, summary, queenOutcome, ...(reviewState ? { review: reviewState } : {}) };
   }
 
   // 3. Failure: the Scribe compacts the raw log; the Queen only ever sees the summary.
@@ -194,7 +207,77 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
 
   const vectorized = await vectorize(ctx, rawLog);
   const queenOutcome = await report(ctx, false, summary);
-  return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, scribe: scribe.method, vectorized };
+  return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, ...(reviewState ? { review: reviewState } : {}), scribe: scribe.method, vectorized };
+}
+
+// ── reviewer ──────────────────────────────────────────────────────────────
+
+type ReviewGate = { rejected: false; skipped: boolean } | { rejected: true; feedback: string; report: string };
+
+async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
+  const { config, ports, step, train } = ctx;
+  await audit(ctx, "audit: reviewer running", "REVIEWER", "RUNNING", null);
+
+  let outcome: ReviewOutcome & { ms: number };
+  if (config.reviewMode === "scripted") {
+    outcome = { kind: "verdict", verdict: scriptedReview(train.promptFull, packet.rework), model: SCRIPTED_REVIEW_MODEL, ms: 0 };
+  } else {
+    try {
+      outcome = await step.do("review: llm", REVIEW_STEP, async () => {
+        const t0 = Date.now();
+        const o = await runReview({
+          llm: ports.reviewLlm,
+          model: config.reviewModel,
+          input: packet.text,
+          timeoutMs: config.reviewTimeoutMs,
+          metadata: { trainId: train.trainId, promptId: train.promptId, role: "REVIEWER" },
+        });
+        return { ...o, ms: Date.now() - t0 };
+      });
+    } catch (e) {
+      outcome = { kind: "unavailable", reason: clip(messageOf(e), 300), model: config.reviewModel, ms: 0 };
+    }
+  }
+
+  if (outcome.kind === "unavailable") {
+    // Fail open: infrastructure hiccups must not eject trains.
+    console.warn("gatekeeper: reviewer unavailable; continuing", outcome.reason);
+    await audit(ctx, "audit: reviewer result", "REVIEWER", "PASSED", ledgerFor(ctx, outcome.model, outcome.ms, [`warning: reviewer unavailable, failing open: ${outcome.reason}`], true));
+    return { rejected: false, skipped: true };
+  }
+
+  const v = outcome.verdict;
+  const reasoning = [
+    `verdict: ${v.verdict}`,
+    ...v.satisfied.map((x) => `satisfied: ${x}`),
+    ...v.missing.map((x) => `missing: ${x}`),
+    `feedback: ${v.feedback}`,
+  ];
+  if (v.verdict === "APPROVE") {
+    await audit(ctx, "audit: reviewer result", "REVIEWER", "PASSED", ledgerFor(ctx, outcome.model, outcome.ms, reasoning, true));
+    return { rejected: false, skipped: false };
+  }
+  await audit(ctx, "audit: reviewer result", "REVIEWER", "REJECTED", ledgerFor(ctx, outcome.model, outcome.ms, reasoning, false));
+  const report = [`REVIEWER rejected the change: it does not satisfy the prompt.`, `Prompt: ${train.promptFull}`, ...reasoning.slice(1)].join("\n");
+  return { rejected: true, feedback: v.feedback, report };
+}
+
+/** The reviewer's feedback is the Scribe summary, so the Queen's REWORK carries it to the next builder. */
+async function failReview(ctx: Ctx, feedback: string, rawLog: string): Promise<GateRunResult> {
+  const { task, train, ports } = ctx;
+  const summary = clip(feedback, MAX_SUMMARY_CHARS);
+  await ctx.step.do("scribe: record summary", REPORT_STEP, async () => {
+    try {
+      await ports.queen(task.hive).recordScribeSummary({ promptId: train.promptId, trainId: train.trainId, summary });
+    } catch (e) {
+      if (!isPermanentQueenError(e)) throw e;
+      console.warn("gatekeeper: Queen rejected the reviewer summary", messageOf(e));
+    }
+    return { recorded: true };
+  });
+  const vectorized = await vectorize(ctx, rawLog);
+  const queenOutcome = await report(ctx, false, summary);
+  return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, review: "rejected", vectorized };
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────

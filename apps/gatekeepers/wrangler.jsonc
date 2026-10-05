@@ -62,7 +62,11 @@
     "GATE_PHASE_WAIT_MS": "5000",
     "AI_GATEWAY_ID": "queenos",
     // Fast + cheap model for the Scribe (Workers AI via AI Gateway).
-    "MODEL_SCRIBE": "@cf/zai-org/glm-4.7-flash"
+    "MODEL_SCRIBE": "@cf/zai-org/glm-4.7-flash",
+    // REVIEWER: does the change satisfy the prompt? "llm" = AI binding via the gateway, fail-open on
+    // model trouble; "scripted" = deterministic ([review-fail] marker); "off" = no review.
+    "REVIEW_MODE": "llm",
+    "MODEL_REVIEWER": "@cf/deepseek-ai/deepseek-v4-flash-0731"
   },
   "env": {
     // Used only by vitest (see vitest.config.ts). Named envs do not inherit
@@ -79,7 +83,9 @@
         "GATE_PHASE_RETRIES": "3",
         "GATE_PHASE_WAIT_MS": "0",
         "AI_GATEWAY_ID": "queenos",
-        "MODEL_SCRIBE": "@cf/zai-org/glm-4.7-flash"
+        "MODEL_SCRIBE": "@cf/zai-org/glm-4.7-flash",
+        "REVIEW_MODE": "scripted",
+        "MODEL_REVIEWER": "@cf/deepseek-ai/deepseek-v4-flash-0731"
       }
     }
   }

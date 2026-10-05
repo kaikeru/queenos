@@ -10,8 +10,9 @@ import { formatFinding, isCodePath, isSkippedPath, toReport, type Finding, type 
 import type { GatekeeperPorts, GitSession } from "./ports";
 import { scanPolicy } from "./policy";
 import { scanSecurity, MAX_SCAN_BYTES } from "./security";
+import { renderReviewInput, type ReviewPacket } from "./review";
 import { SMOKE_CHECK } from "./smoke";
-import type { TestRun } from "./test-runner";
+import { isRework, type TestRun } from "./test-runner";
 
 export const MAX_FILES = 3_000;
 export const MAX_TOTAL_BYTES = 12 * 1024 * 1024;
@@ -39,6 +40,8 @@ export type Inspection =
       /** Null when static checks already failed (fail fast) . */
       tests: TestSummary | null;
       changedPaths: string[];
+      /** Evidence for the REVIEWER; null when review is off or the code did not get as far as a working preview. */
+      review: ReviewPacket | null;
       /** Raw failure log for the Scribe; null when everything passed. */
       failureLog: string | null;
       failingCheck: string | null;
@@ -113,6 +116,8 @@ export async function inspectPush(
   trainId: string,
   /** The train's Worker Preview URL. Absent (sim mode, old trains): the smoke test is skipped with a warning. */
   previewUrl: string | null = null,
+  /** The train's prompt, for the reviewer's evidence document. */
+  prompt = "",
 ): Promise<Inspection> {
   const startedAtMs = Date.now();
   const access = await ports.artifacts.access(task.repo, "read");
@@ -139,12 +144,28 @@ export async function inspectPush(
   let tests: TestSummary | null = null;
   let failureLog: string | null = null;
   let failingCheck: string | null = null;
+  let review: ReviewPacket | null = null;
 
   if (policy.passed && security.passed) {
     // 1. The real check: the deployed preview must answer GET / with 2xx.
     const smoke = previewUrl ? await ports.smoke.check(previewUrl) : null;
     const changedFiles: Record<string, string> = {};
     for (const p of changed) if (files[p] !== undefined) changedFiles[p] = files[p];
+    // 1b. Review evidence: only for code that works (policy, security and smoke passed).
+    if (config.reviewMode !== "off" && (!smoke || smoke.passed)) {
+      const rework = isRework({ commitMessages: messages, changedFiles });
+      review = {
+        rework,
+        text: renderReviewInput({
+          prompt,
+          commitMessages: messages,
+          changedFiles,
+          tree: Object.keys(files).sort(),
+          rework,
+          preview: smoke ? { ...(smoke.status !== undefined ? { status: smoke.status } : {}), ...(smoke.contentType ? { contentType: smoke.contentType } : {}), ...(smoke.body !== undefined ? { body: smoke.body } : {}) } : null,
+        }),
+      };
+    }
     // 2. The scripted/sandbox runner, only when the smoke test did not already fail the train.
     const run: TestRun =
       smoke && !smoke.passed
@@ -191,6 +212,7 @@ export async function inspectPush(
     security,
     tests,
     changedPaths: [...changed].sort().slice(0, 50),
+    review,
     failureLog,
     failingCheck,
   };

@@ -13,6 +13,10 @@ export interface SmokeResult {
   passed: boolean;
   /** Final HTTP status, absent when every attempt failed at the network level. */
   status?: number;
+  /** `content-type` of the final response (evidence for the LLM reviewer). */
+  contentType?: string;
+  /** First ~1 KB of the final response body (evidence for the LLM reviewer). */
+  body?: string;
   /** Raw log; kept as the failure log for the Scribe. */
   log: string;
   firstError?: string;
@@ -35,6 +39,7 @@ export interface SmokeOptions {
 
 export const SMOKE_CHECK = "preview smoke > GET / returns 2xx";
 const BODY_SNIPPET_CHARS = 500;
+export const EVIDENCE_BODY_CHARS = 1_024;
 
 export class FetchSmokeProbe implements SmokeProbe {
   private readonly fetchFn: SmokeFetch;
@@ -56,6 +61,7 @@ export class FetchSmokeProbe implements SmokeProbe {
     const lines = [`> smoke: GET ${url} (timeout ${this.timeoutMs}ms, up to ${this.attempts} attempts)`];
     let status: number | undefined;
     let body = "";
+    let contentType: string | undefined;
     let networkError: string | undefined;
 
     for (let i = 1; i <= this.attempts; i++) {
@@ -65,9 +71,10 @@ export class FetchSmokeProbe implements SmokeProbe {
       try {
         const res = await this.fetchFn(url, { method: "GET", redirect: "manual", signal: ctl.signal, headers: { "user-agent": "queenos-gatekeeper-smoke" } });
         status = res.status;
-        body = (await res.text().catch(() => "")).slice(0, BODY_SNIPPET_CHARS);
+        contentType = res.headers.get("content-type") ?? undefined;
+        body = (await res.text().catch(() => "")).slice(0, EVIDENCE_BODY_CHARS);
         lines.push(`smoke attempt ${i}/${this.attempts}: HTTP ${status}`);
-        if (status >= 200 && status < 300) return { passed: true, status, log: [...lines, `smoke: ok, body: ${oneLine(body)}`].join("\n") };
+        if (status >= 200 && status < 300) return { passed: true, status, ...evidence(contentType, body), log: [...lines, `smoke: ok, body: ${oneLine(body.slice(0, BODY_SNIPPET_CHARS))}`].join("\n") };
       } catch (e) {
         status = undefined;
         networkError = ctl.signal.aborted ? `timed out after ${this.timeoutMs}ms` : String((e as Error)?.message ?? e);
@@ -83,9 +90,10 @@ export class FetchSmokeProbe implements SmokeProbe {
         ? `AssertionError: preview smoke failed: GET / returned HTTP ${status} (expected 2xx)`
         : `AssertionError: preview smoke failed: GET / unreachable after ${this.attempts} attempts (${networkError})`;
     lines.push("", ` FAIL  ${SMOKE_CHECK}`, firstError);
-    if (status !== undefined) lines.push(`response body: ${oneLine(body) || "(empty)"}`);
+    if (status !== undefined) lines.push(`response body: ${oneLine(body.slice(0, BODY_SNIPPET_CHARS)) || "(empty)"}`);
     return { passed: false, ...(status !== undefined ? { status } : {}), log: lines.join("\n"), firstError };
   }
 }
 
+const evidence = (contentType: string | undefined, body: string) => ({ ...(contentType ? { contentType } : {}), body });
 const oneLine = (s: string) => s.replace(/\s+/g, " ").trim();

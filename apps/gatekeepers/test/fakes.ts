@@ -204,6 +204,7 @@ export class FakeWorld {
   readonly dispatcher = new FakeDispatcher();
   readonly smoke = new FakeSmoke();
   llm: ScribeLlm | null = null;
+  reviewLlm: ScribeLlm | null = null;
   tests: TestRunner = new ScriptedTestRunner();
 
   ports(): GatekeeperPorts {
@@ -212,6 +213,7 @@ export class FakeWorld {
       git: this.git,
       queen: () => this.queen,
       llm: this.llm,
+      reviewLlm: this.reviewLlm,
       tests: this.tests,
       smoke: this.smoke,
       failures: this.failures,
