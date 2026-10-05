@@ -116,15 +116,16 @@ export function MainTrack({ landed, state }: { landed: LandedCommit[]; state: St
           <i />
           <span>root</span>
         </div>
-        {landed.map((c) => (
-          <div className="commit commit--landed" key={c.trainId} title={`train ${c.trainId}`}>
-            <i />
-            <code>{short(c.sha)}</code>
-            <span>
-              {letterOf(state, c.promptId)} · {excerpt(state.prompts[c.promptId]?.promptText ?? "", 22)}
-            </span>
-          </div>
-        ))}
+        {landed.map((c) => {
+          const label = `${letterOf(state, c.promptId)} · ${state.prompts[c.promptId]?.promptText ?? ""}`;
+          return (
+            <div className="commit commit--landed" key={c.trainId} title={`train ${c.trainId}: ${label}`}>
+              <i />
+              <code>{short(c.sha)}</code>
+              <span title={label}>{label}</span>
+            </div>
+          );
+        })}
         {landed.length === 0 && <div className="main-track__empty">waiting for the first landing…</div>}
       </div>
     </section>

@@ -64,12 +64,12 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .main-track__label span { font: 12px var(--mono); color: var(--dim); }
 .main-track__rail { position: relative; display: flex; align-items: center; gap: 0; padding: 14px 24px; overflow-x: auto; flex: 1; }
 .main-track__rail::before { content: ""; position: absolute; left: 24px; right: 24px; top: 31px; height: 2px; background: linear-gradient(90deg, var(--violet), rgba(167, 139, 250, 0.2)); }
-.commit { position: relative; display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 150px; animation: land 0.7s cubic-bezier(0.2, 1.4, 0.4, 1); }
+.commit { position: relative; display: flex; flex-direction: column; align-items: center; gap: 2px; flex: none; width: 150px; padding: 0 8px; animation: land 0.7s cubic-bezier(0.2, 1.4, 0.4, 1); }
 .commit i { width: 14px; height: 14px; border-radius: 50%; background: var(--bg); border: 3px solid var(--violet); z-index: 1; }
 .commit--landed i { background: var(--green); border-color: var(--green); box-shadow: 0 0 16px var(--green); }
 .commit code { font-size: 14px; color: var(--green); }
-.commit span { font-size: 12px; color: var(--dim); white-space: nowrap; }
-.commit--root { min-width: 70px; animation: none; } .commit--root span { font-family: var(--mono); }
+.commit span { font-size: 12px; color: var(--dim); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.commit--root { width: 70px; animation: none; } .commit--root span { font-family: var(--mono); }
 .main-track__empty { font: 13px var(--mono); color: var(--faint); margin-left: 24px; padding: 2px 10px; background: var(--panel); z-index: 1; }
 
 /* layout */
