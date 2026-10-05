@@ -590,7 +590,7 @@ export function Sites({ rows, state, view }: { rows: SiteRow[]; state: State; vi
           )}
         </li>
 
-        <li className={`site site--prod${view.prod ? "" : " site--off"}`}>
+        <li className={`site site--prod${view.prod ? "" : " site--off"}`} title={view.prod?.tappedBy ? `shipped by ${view.prod.tappedBy}` : undefined}>
           <div className="site__head">
             <b>prod</b>
             {!view.prod && <span className="site__muted">nothing shipped yet</span>}
@@ -600,7 +600,6 @@ export function Sites({ rows, state, view }: { rows: SiteRow[]; state: State; vi
               <div className="site__row site__row--url"><UrlLink url={view.prod.url} /></div>
               <div className="site__versions">
                 <span>stable <code>{view.prod.stable ?? "n/a"}</code></span>
-                {view.prod.tappedBy && <span>shipped by <b>{view.prod.tappedBy}</b></span>}
               </div>
             </>
           )}
