@@ -8,7 +8,7 @@
  *
  * WP0 seam; WP1.13 implements it, WP2.1 wires it into QueenNode.apply().
  */
-import type { QueenServerMessage, QueenServerUnitMessage } from "@queenos/queen-types";
+import { MAX_BATCH_MESSAGES, type QueenServerMessage, type QueenServerUnitMessage } from "@queenos/queen-types";
 
 /** Minimum gap between frames. */
 export const FRAME_INTERVAL_MS = 100;
@@ -27,31 +27,80 @@ export interface CoalescerOptions {
 
 /** The dedupe key of a message, or null when every copy must be kept (events, errors, verdicts). */
 export function entityKey(m: QueenServerUnitMessage): string | null {
-  void m;
-  throw new Error("not implemented");
+  switch (m.type) {
+    case "train.updated":
+      return `train:${m.train.trainId}`;
+    case "prompt.updated":
+      return `prompt:${m.promptRun.promptId}`;
+    case "deployment.updated":
+      return `deployment:${m.deployment.deploymentId}`;
+    case "release.updated":
+      return `release:${m.release.releaseId}`;
+    case "item.updated":
+      return `item:${m.item.itemId}`;
+    case "race.updated":
+      return `race:${m.race.raceId}`;
+    case "escalation.updated":
+      return `escalation:${m.escalation.escalationId}`;
+    case "hive.updated":
+      return "hive";
+    case "models.updated":
+      return "models";
+    default:
+      return null;
+  }
 }
 
 export class Coalescer {
+  private queue = new Map<string, QueenServerUnitMessage>();
+  private unkeyed = 0;
+  private lastFrameAt: number | null = null;
+  private cancel: (() => void) | null = null;
+
   constructor(readonly options: CoalescerOptions) {}
 
   /** Queue the messages of one apply. */
   push(messages: readonly QueenServerUnitMessage[]): void {
-    void messages;
-    throw new Error("not implemented");
+    for (const m of messages) {
+      const key = entityKey(m) ?? `#${this.unkeyed++}`;
+      // Last write wins, and the survivor takes the latest position.
+      this.queue.delete(key);
+      this.queue.set(key, m);
+    }
   }
 
   /** End of an apply: send a frame now if the interval has passed, else schedule one. */
   endApply(): void {
-    throw new Error("not implemented");
+    if (this.queue.size === 0) return;
+    const interval = this.options.intervalMs ?? FRAME_INTERVAL_MS;
+    const elapsed = this.lastFrameAt === null ? Infinity : this.options.now() - this.lastFrameAt;
+    if (elapsed >= interval) {
+      this.flush();
+    } else if (!this.cancel) {
+      this.cancel = this.options.schedule(interval - elapsed, () => {
+        this.cancel = null;
+        this.flush();
+      });
+    }
   }
 
   /** Send everything queued now (one `batch` frame; a single message may be sent bare). */
   flush(): void {
-    throw new Error("not implemented");
+    this.cancel?.();
+    this.cancel = null;
+    if (this.queue.size === 0) return;
+    const all = [...this.queue.values()];
+    this.queue.clear();
+    this.lastFrameAt = this.options.now();
+    const max = this.options.maxBatch ?? MAX_BATCH_MESSAGES;
+    for (let i = 0; i < all.length; i += max) {
+      const chunk = all.slice(i, i + max);
+      this.options.send(chunk.length === 1 ? chunk[0]! : { type: "batch", messages: chunk });
+    }
   }
 
   /** Messages queued and not yet sent. */
   get pending(): number {
-    throw new Error("not implemented");
+    return this.queue.size;
   }
 }
