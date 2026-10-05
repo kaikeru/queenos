@@ -468,6 +468,11 @@ export function buildLanes(state: State): Lane[] {
   });
 }
 
+/** Render order for the War Room: newest prompt (by queue time) first. Stable for ties; does not mutate state order. */
+export function lanesNewestFirst(lanes: readonly Lane[]): Lane[] {
+  return [...lanes].sort((a, b) => b.prompt.createdAt - a.prompt.createdAt);
+}
+
 export const PHASE_FLOW = ["WAITING_PARENT", "BUILDING", "DEPLOYING", "TESTING", "PASSED", "LANDING", "MERGED"] as const;
 
 /** How a train card shows its preview. */
