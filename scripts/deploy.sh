@@ -18,6 +18,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Wrangler and Vite need the Node in .nvmrc. nvm is a shell function, so load it here;
+# nvm.sh is not safe under `set -eu`.
+if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+  set +eu
+  . "${NVM_DIR:-$HOME/.nvm}/nvm.sh"
+  nvm use >/dev/null || nvm install >/dev/null
+  set -eu
+fi
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+if [ "$NODE_MAJOR" -lt "$(cut -d. -f1 .nvmrc)" ]; then
+  echo "Node $(node -v) is too old; .nvmrc wants $(cat .nvmrc). Install nvm or switch Node, then re-run." >&2
+  exit 1
+fi
+
 DRY_RUN=0
 BOOTSTRAP=0
 ONLY=""
