@@ -77,14 +77,34 @@ Results arrive in any order and webhooks can be retried: duplicate or late resul
 
 Sim mode runs the real Queen Worker and Durable Object with fake Artifacts and auto-advancing fake drones, so the whole merge train plays out on your laptop.
 
+Prerequisites: Node 22+ (`.nvmrc` pins 24), pnpm 10.15 via `corepack enable` (it reads `packageManager`), and ports 8787 (Queen) and 5173 (dashboard) free.
+
 ```bash
 nvm use                                    # Node 24 (22+ works)
+corepack enable                            # pnpm 10.15 from package.json
 pnpm install
-pnpm --filter @queenos/queen dev:sim       # terminal 1: Queen on :8787
-pnpm --filter @queenos/dashboard dev       # terminal 2: dashboard on :5173
+pnpm dev:sim                               # Queen on :8787 and dashboard on :5173, together
 ```
 
-Open <http://localhost:5173/?hive=demo> and click **Launch demo swarm**. The dashboard proxies `/hives` to the Queen at `localhost:8787` (override with `QUEEN_DEV_URL`).
+Open <http://localhost:5173/?hive=demo> and click **Launch demo swarm**. The dashboard proxies `/hives` to the Queen at `localhost:8787` (override with `QUEEN_DEV_URL`). To run them separately instead: `pnpm --filter @queenos/queen dev:sim` and `pnpm --filter @queenos/dashboard dev`.
+
+**What you should see:** in sim, each train goes TESTING then MERGED within about 15 seconds. **Launch demo swarm** submits 4 prompts; the one containing `[fail]` is ejected once and reworked (the rework passes), and all four are MERGED after roughly 30 seconds.
+
+Smoke check the Queen (returns a JSON snapshot):
+
+```bash
+curl localhost:8787/hives/demo/snapshot
+```
+
+Submit your own prompt (`namespace` must match the hive in the URL; include `[fail]` in the text to watch an ejection and rework):
+
+```bash
+curl -X POST localhost:8787/hives/demo/prompts \
+  -H 'content-type: application/json' \
+  -d '{"namespace":"demo","promptText":"Add a health check endpoint"}'
+```
+
+It returns `201` with the new `promptRun`.
 
 ## Tests
 
@@ -92,6 +112,8 @@ Open <http://localhost:5173/?hive=demo> and click **Launch demo swarm**. The das
 pnpm test                                  # everything, via Turborepo
 pnpm turbo run build typecheck lint test   # the full gate
 ```
+
+Some "uncaught exception ..." and "Worker's code had hung" lines in the output come from deliberate negative-path tests; the summary line is the verdict.
 
 | Package | Covers |
 |---|---|
@@ -101,9 +123,9 @@ pnpm turbo run build typecheck lint test   # the full gate
 | `apps/dashboard` (vitest, node) | The War Room reducer: snapshots, train lanes, audit cards, rework attempts. |
 | `packages/hive-kit`, `packages/queen-types` | Git on isomorphic-git + in-memory fs, ledger payloads, AI Gateway client, Zod schemas. |
 
-## Full stack locally (no Cloudflare calls)
+## Full stack locally (optional, not needed for the demo)
 
-Runs the edge (dev auth), Genesis (scripted LLM, fake provisioner), the Vault (against a local fake Cloudflare API) and the Queen (sim) together.
+The Quickstart above is all the demo needs. This section is optional. It uses port 8787 for the edge, so stop the sim (`pnpm dev:sim`) first. It runs the edge (dev auth), Genesis (scripted LLM, fake provisioner), the Vault (against a local fake Cloudflare API) and the Queen (sim) together.
 
 One-time setup (both files are gitignored):
 - `apps/vault/.dev.vars`: `VAULT_KEK=<openssl rand -base64 32>` and `VAULT_DEV_CF_BASE=http://127.0.0.1:8799`

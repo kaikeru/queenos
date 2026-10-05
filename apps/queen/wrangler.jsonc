@@ -85,7 +85,16 @@
       "durable_objects": {
         "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
       },
-      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["QueenNode"] }]
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["QueenNode"] }],
+      // Mirrors the top-level workflow bindings only to silence wrangler's
+      // "workflows exists at the top level, but not on env.sim" warning. They
+      // are never invoked: src/sim/worker.ts injects fake executors instead.
+      "workflows": [
+        { "binding": "DRONES", "name": "drone-workflow", "class_name": "DroneWorkflow", "script_name": "queenos-drones" },
+        { "binding": "PROVISIONER", "name": "provisioner-workflow", "class_name": "ProvisionerWorkflow", "script_name": "queenos-provisioner" },
+        { "binding": "HERALD", "name": "herald-workflow", "class_name": "HeraldWorkflow", "script_name": "queenos-herald" },
+        { "binding": "SENTINEL", "name": "sentinel-workflow", "class_name": "SentinelWorkflow", "script_name": "queenos-sentinel" }
+      ]
     },
     // Used only by vitest (see vitest.config.ts): the DO without Workflows
     // (wrangler warns about that on every test run; it is intentional).
