@@ -404,11 +404,17 @@ export class ReleasePlanner {
 
   private startRollback(rel: ReleaseRecord, summary: string): void {
     if (!rel.stableVersionId) {
-      this.set(rel, {
-        phase: "FAILED",
-        pending: null,
-        summary: clip(`${summary} No stable version to roll back to (first prod deploy), so nothing was rolled back.`),
-      });
+      // The candidate (if it got uploaded) is serving 100% of prod and Herald reads the live
+      // deployment for the next release's stable version, so state that honestly.
+      const live = rel.candidateVersionId;
+      const tail = live
+        ? ` Candidate ${live.slice(0, 8)} is still serving 100% of prod because there was no prior version to roll back to; it becomes the stable version for the next release.`
+        : " No stable version to roll back to (first prod deploy), so nothing was rolled back.";
+      this.set(rel, { phase: "FAILED", pending: null, canaryPercent: live ? 100 : rel.canaryPercent, summary: clip(`${summary.length + tail.length > 500 ? `${summary.slice(0, Math.max(0, 497 - tail.length))}...` : summary}${tail}`) });
+      if (live) {
+        this.setEnv("prod", { status: "LIVE", url: rel.prodUrl, versionId: live, commitSha: rel.headSha, percent: 100, summary: clip(`Release ${rel.releaseId} failed its canary, but this version is still live: no prior version to roll back to.`) });
+        this.setEnv("canary", { status: "TORN_DOWN", percent: null });
+      }
       this.cutQueued(rel, true);
       return;
     }

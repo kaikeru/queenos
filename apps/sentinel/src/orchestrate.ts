@@ -10,7 +10,7 @@
 import type { WorkflowStepConfig } from "cloudflare:workers";
 import { SentinelCommandSchema, type SentinelCommand, type SentinelVerdict } from "@queenos/queen-types";
 import type { SentinelPorts } from "./ports";
-import { decide, emptyTally, mergeTallies, type Tally } from "./verdict";
+import { decide, emptyTally, gateTimeoutVerdict, mergeTallies, type Tally } from "./verdict";
 
 export interface StepRunner {
   do<T>(name: string, config: WorkflowStepConfig, fn: () => Promise<T>): Promise<T>;
@@ -23,7 +23,13 @@ export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 
 export const CANDIDATE_PER_BATCH = 30;
 export const BASELINE_PER_BATCH = 15;
 export const MAX_BATCHES = 30;
-/** Override propagation lag before the first canary batch (docs/deploy-discovery.md §3). */
+/** Readiness gate: consecutive 2xx on GET / required before measuring, poll spacing, default cap. */
+export const READY_CONSECUTIVE = 3;
+export const READY_POLL_MS = 2_000;
+export const READY_TIMEOUT_DEFAULT_SECONDS = 90;
+/** One probe per step; the probe never throws, so a single retry is plenty. */
+export const GATE_STEP: WorkflowStepConfig = { retries: { limit: 1, delay: "1 second" }, timeout: "30 seconds" };
+/** Override propagation lag after the gate, before the first canary batch (docs/deploy-discovery.md §3). */
 export const CANARY_SETTLE_MS = 5_000;
 export const OVERRIDES_HEADER = "Cloudflare-Workers-Version-Overrides";
 
@@ -72,6 +78,33 @@ export async function probeBatch(ports: SentinelPorts, baseUrl: string, paths: s
   return tally;
 }
 
+export type GateResult = { ready: true; readyMs: number } | { ready: false; lastStatus: number | null };
+
+/**
+ * Readiness gate: poll `GET /` (pinned to the candidate when headers are given)
+ * until READY_CONSECUTIVE 2xx in a row, READY_POLL_MS apart. Elapsed time is
+ * derived from step results (probe latency + sleeps), never a clock, so it is
+ * replay-safe. Each poll is its own step and the gap a step.sleep, so the cap
+ * (up to 600s => ~300 polls) stays well inside Workflows' step limit. Warm-up
+ * responses are discarded: nothing here reaches the metrics.
+ */
+export async function readinessGate(ports: SentinelPorts, step: StepRunner, baseUrl: string, headers: Record<string, string>, timeoutSeconds: number): Promise<GateResult> {
+  const capMs = timeoutSeconds * 1000;
+  let elapsed = 0;
+  let streak = 0;
+  let last: number | null = null;
+  for (let attempt = 1; ; attempt++) {
+    const r = await step.do(`ready poll ${attempt}`, GATE_STEP, () => ports.probe(joinUrl(baseUrl, "/"), headers));
+    elapsed += r.ms;
+    last = r.status;
+    streak = r.status !== null && r.status >= 200 && r.status < 300 ? streak + 1 : 0;
+    if (streak >= READY_CONSECUTIVE) return { ready: true, readyMs: elapsed };
+    if (elapsed + READY_POLL_MS > capMs) return { ready: false, lastStatus: last };
+    await step.sleep(`ready wait ${attempt}`, READY_POLL_MS);
+    elapsed += READY_POLL_MS;
+  }
+}
+
 export async function runSentinel(payload: unknown, step: StepRunner, ports: SentinelPorts): Promise<SentinelRunResult> {
   const parsed = SentinelCommandSchema.safeParse(payload);
   if (!parsed.success) {
@@ -88,29 +121,36 @@ export async function runSentinel(payload: unknown, step: StepRunner, ports: Sen
   const baseHeaders: Record<string, string> = withBaseline ? pin(cmd.stableVersionId!) : {};
 
   const plan = planBatches(cmd.minRequests, cmd.windowSeconds);
-  if (canary) await step.sleep("settle: version override propagation", CANARY_SETTLE_MS);
+  const timeoutSeconds = cmd.readyTimeoutSeconds ?? READY_TIMEOUT_DEFAULT_SECONDS;
 
-  const candidate: Tally[] = [];
-  const baseline: Tally[] = [];
-  let offset = 0;
-  for (let i = 0; i < plan.perBatch.length; i++) {
-    const n = plan.perBatch[i]!;
-    const first = i === 0;
-    const off = offset;
-    const result = await step.do(`probe batch ${i + 1}/${plan.perBatch.length}`, PROBE_STEP, async () => {
-      const [c, b] = await Promise.all([
-        probeBatch(ports, cmd.url, cmd.paths, n, off, candHeaders, first),
-        withBaseline ? probeBatch(ports, cmd.url, cmd.paths, Math.min(BASELINE_PER_BATCH, Math.max(1, Math.ceil(n / 2))), off, baseHeaders, false) : Promise.resolve(null),
-      ]);
-      return { c, b };
-    });
-    candidate.push(result.c);
-    if (result.b) baseline.push(result.b);
-    offset += n;
-    if (i < plan.perBatch.length - 1) await step.sleep(`wait before batch ${i + 2}`, plan.gapMs);
+  const gate = await readinessGate(ports, step, cmd.url, candHeaders, timeoutSeconds);
+  let verdict: SentinelVerdict;
+  if (!gate.ready) {
+    verdict = gateTimeoutVerdict(cmd, timeoutSeconds, gate.lastStatus);
+  } else {
+    if (canary) await step.sleep("settle: version override propagation", CANARY_SETTLE_MS);
+
+    const candidate: Tally[] = [];
+    const baseline: Tally[] = [];
+    let offset = 0;
+    for (let i = 0; i < plan.perBatch.length; i++) {
+      const n = plan.perBatch[i]!;
+      const first = i === 0;
+      const off = offset;
+      const result = await step.do(`probe batch ${i + 1}/${plan.perBatch.length}`, PROBE_STEP, async () => {
+        const [c, b] = await Promise.all([
+          probeBatch(ports, cmd.url, cmd.paths, n, off, candHeaders, first),
+          withBaseline ? probeBatch(ports, cmd.url, cmd.paths, Math.min(BASELINE_PER_BATCH, Math.max(1, Math.ceil(n / 2))), off, baseHeaders, false) : Promise.resolve(null),
+        ]);
+        return { c, b };
+      });
+      candidate.push(result.c);
+      if (result.b) baseline.push(result.b);
+      offset += n;
+      if (i < plan.perBatch.length - 1) await step.sleep(`wait before batch ${i + 2}`, plan.gapMs);
+    }
+    verdict = decide(cmd, mergeTallies(candidate), withBaseline ? mergeTallies(baseline) : null, gate.readyMs);
   }
-
-  const verdict = decide(cmd, mergeTallies(candidate), withBaseline ? mergeTallies(baseline) : null);
 
   const queenOutcome = await step.do("report: sentinel verdict", REPORT_STEP, async () => {
     try {

@@ -45,6 +45,7 @@ import {
   type TrainResult,
 } from "@queenos/queen-types";
 import {
+  listVerdicts,
   migrate,
   rowToAudit,
   rowToDeployment,
@@ -55,6 +56,7 @@ import {
   upsertPrompt,
   upsertRelease,
   upsertTrain,
+  upsertVerdict,
 } from "./db";
 import { WorkflowDroneDispatcher, type DroneDispatcher } from "./drones";
 import { WorkflowCommandDispatcher, type DeployDispatcher, type ProvisionerDispatcher, type SentinelDispatcher } from "./executors";
@@ -365,6 +367,10 @@ export class QueenNode extends DurableObject<Env> {
 
   getSnapshot(): Snapshot {
     const desc = <T>(rows: T[]) => rows.reverse();
+    const releases = this.sql
+      .exec("SELECT * FROM releases ORDER BY seq DESC LIMIT ?", RELEASE_SNAPSHOT_LIMIT)
+      .toArray()
+      .map((r) => toRelease(rowToRelease(r)));
     return {
       type: "snapshot",
       promptRuns: desc(
@@ -380,10 +386,8 @@ export class QueenNode extends DurableObject<Env> {
           .map(rowToAudit),
       ),
       deployments: this.listDeployments(),
-      releases: this.sql
-        .exec("SELECT * FROM releases ORDER BY seq DESC LIMIT ?", RELEASE_SNAPSHOT_LIMIT)
-        .toArray()
-        .map((r) => toRelease(rowToRelease(r))),
+      releases,
+      verdicts: listVerdicts(this.sql, releases.map((r) => r.releaseId)),
     };
   }
 
@@ -647,6 +651,7 @@ export class QueenNode extends DurableObject<Env> {
         for (const t of plan.trains) upsertTrain(this.sql, t);
         for (const d of plan.deployments) upsertDeployment(this.sql, d);
         for (const r of plan.releases) upsertRelease(this.sql, r);
+        for (const e of plan.effects) if (e.type === "broadcast" && e.message.type === "sentinel.verdict") upsertVerdict(this.sql, e.message.verdict, this.now());
       });
     }
     for (const e of plan.effects) if (e.type === "broadcast") this.broadcast(e.message);

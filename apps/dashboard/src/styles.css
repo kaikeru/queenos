@@ -32,6 +32,8 @@ code, pre, .eyebrow, dt, .chip, time { font-family: var(--mono); }
 h1, h2, h3, h4, p { margin: 0; }
 button { font: inherit; color: inherit; cursor: pointer; }
 
+.update-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--amber, #f5b942); background: rgba(245, 185, 66, 0.12); font: 600 14px var(--mono); }
+.update-banner button { font: inherit; padding: 4px 12px; border-radius: 6px; border: 1px solid currentColor; background: transparent; color: inherit; cursor: pointer; }
 .app { max-width: 1900px; margin: 0 auto; padding: 18px 24px 40px; display: flex; flex-direction: column; gap: 16px; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
 .eyebrow { font-size: 12px; letter-spacing: 0.18em; color: var(--dim); margin-bottom: 10px; }

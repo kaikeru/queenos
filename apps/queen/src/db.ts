@@ -8,8 +8,10 @@ import {
   MergeTrainSchema,
   PromptRunSchema,
   ReleaseSchema,
+  SentinelVerdictSchema,
   type AuditEvent,
   type Deployment,
+  type SentinelVerdict,
 } from "@queenos/queen-types";
 import type { ReleasePending, ReleaseRecord } from "./release/planner";
 import type { DeployState, ForkState, PromptRecord, TrainAction, TrainPhase, TrainRecord } from "./train/planner";
@@ -164,6 +166,16 @@ const MIGRATIONS: readonly string[] = [
   );
   CREATE INDEX releases_phase ON releases(phase, seq);
   CREATE INDEX releases_seq ON releases(seq);
+  `,
+  `
+  -- v5: latest Sentinel verdict per (release, environment), so a reloaded War Room can show it.
+  CREATE TABLE sentinel_verdicts (
+    release_id TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    verdict TEXT NOT NULL /* JSON SentinelVerdict */,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (release_id, environment)
+  );
   `,
 ];
 
@@ -433,4 +445,27 @@ export function upsertRelease(sql: SqlStorage, r: ReleaseRecord): void {
     r.nextHeadSha,
     JSON.stringify(r.nextTrainIds),
   );
+}
+
+export function upsertVerdict(sql: SqlStorage, v: SentinelVerdict, now: number): void {
+  sql.exec(
+    `INSERT INTO sentinel_verdicts (release_id, environment, verdict, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(release_id, environment) DO UPDATE SET verdict = excluded.verdict, updated_at = excluded.updated_at`,
+    v.releaseId,
+    v.environment,
+    JSON.stringify(v),
+    now,
+  );
+}
+
+/** Latest verdicts for the given releases (rows that no longer validate are skipped). */
+export function listVerdicts(sql: SqlStorage, releaseIds: string[]): SentinelVerdict[] {
+  if (releaseIds.length === 0) return [];
+  const rows = sql
+    .exec(`SELECT verdict FROM sentinel_verdicts WHERE release_id IN (${releaseIds.map(() => "?").join(",")}) ORDER BY updated_at`, ...releaseIds)
+    .toArray();
+  return rows.flatMap((r) => {
+    const parsed = SentinelVerdictSchema.safeParse(JSON.parse(String(r.verdict)));
+    return parsed.success ? [parsed.data] : [];
+  });
 }

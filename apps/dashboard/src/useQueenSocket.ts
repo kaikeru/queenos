@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch } from "react";
 import { QueenClientMessageSchema, QueenServerMessageSchema, type QueenClientMessage } from "@queenos/queen-types";
-import type { Action } from "./reducer";
+import { isUnknownFrameType, type Action } from "./reducer";
 
 export type ConnStatus = "connecting" | "open" | "reconnecting";
 
@@ -79,7 +79,12 @@ export function useQueenSocket(namespace: string, dispatch: Dispatch<Action>) {
         const parsed = QueenServerMessageSchema.safeParse(json);
         if (!parsed.success) {
           console.warn("war-room: invalid frame", parsed.error.issues);
-          dispatch({ type: "invalid_frame", detail: parsed.error.issues[0]?.message ?? "schema mismatch", at: Date.now() });
+          dispatch({
+            type: "invalid_frame",
+            detail: parsed.error.issues[0]?.message ?? "schema mismatch",
+            at: Date.now(),
+            ...(isUnknownFrameType(parsed.error.issues, json) ? { outdated: true } : {}),
+          });
           return;
         }
         dispatch({ type: "server", message: parsed.data, at: Date.now() });

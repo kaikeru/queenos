@@ -568,6 +568,20 @@ describe("release train", () => {
     ws.close(1000, "done");
   });
 
+  it("persists the latest verdict per (release, environment) and serves it in the snapshot", async () => {
+    const ns = newHive();
+    const { staging } = await mergedRelease(ns);
+    await post(ns, "/internal/webhook/deploy-result", { commandId: staging.commandId, op: "DEPLOY", environment: "staging", ok: true, url: "https://s.test.dev" });
+    const [validate] = (await inspect(ns)).sentinels;
+    await post(ns, "/internal/webhook/sentinel-verdict", verdict(validate!));
+    // A fresh connection (page reload) gets the verdict in its snapshot.
+    const { ws, next } = await connect(`/hives/${ns}/room`);
+    const snap = (await next()) as { type: string; verdicts?: { releaseId: string; environment: string; verdict: string }[] };
+    expect(snap.type).toBe("snapshot");
+    expect(snap.verdicts).toEqual([expect.objectContaining({ releaseId: staging.releaseId, environment: "staging", verdict: "PROMOTE" })]);
+    ws.close(1000, "done");
+  });
+
   it("the watchdog alarm covers release commands", async () => {
     const ns = newHive();
     const { staging } = await mergedRelease(ns);
@@ -717,8 +731,8 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([4, 4, 4]);
-    expect(state.tables).toEqual(["audit_trail", "deployments", "merge_trains", "prompt_runs", "releases"]);
+    expect([state.before, state.after, state.version]).toEqual([5, 5, 5]);
+    expect(state.tables).toEqual(["audit_trail", "deployments", "merge_trains", "prompt_runs", "releases", "sentinel_verdicts"]);
     ws.close(1000, "done");
   });
 });

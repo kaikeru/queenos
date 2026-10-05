@@ -372,8 +372,22 @@ describe("release planner: canary", () => {
     const s = RSim.canary1(null);
     s.verdict(s.sentinels()[0]!, "ROLLBACK", "500s");
     expect(s.rel("r1")).toMatchObject({ phase: "FAILED", pending: null });
-    expect(s.rel("r1").summary).toBe("Canary at 100% failed: 500s No stable version to roll back to (first prod deploy), so nothing was rolled back.");
+    expect(s.rel("r1").summary).toBe(
+      "Canary at 100% failed: 500s Candidate v-cand is still serving 100% of prod because there was no prior version to roll back to; it becomes the stable version for the next release.",
+    );
     expect(s.herald()).toEqual([]);
+    // the prod row reflects what is actually live
+    expect(s.deployments.get("prod")).toMatchObject({ status: "LIVE", versionId: "v-cand", percent: 100, commitSha: "sha-t1" });
+    expect(s.deployments.get("canary")).toMatchObject({ status: "TORN_DOWN" });
+  });
+
+  it("first prod deploy whose upload failed: nothing is live, so the summary says nothing was rolled back", () => {
+    const s = RSim.awaitingTap();
+    s.run((p) => p.tap("r1", "kyle@kaikeru.com"));
+    s.deployResult(s.deploys()[0]!, { environment: "canary", ok: false, summary: "upload 500" });
+    expect(s.rel("r1")).toMatchObject({ phase: "FAILED" });
+    expect(s.rel("r1").summary).toMatch(/No stable version to roll back to \(first prod deploy\), so nothing was rolled back\.$/);
+    expect(s.deployments.get("prod")).toBeUndefined();
   });
 
   it("a canary step-1 deploy without a version id fails into a rollback when Herald named the stable version", () => {

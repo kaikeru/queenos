@@ -1,11 +1,13 @@
 /** Reducer tests (vitest, plain node environment; the reducer has no runtime imports). */
 import { expect, test } from "vitest";
+import { QueenServerMessageSchema } from "@queenos/queen-types";
 import {
   PHASE_FLOW,
   buildCards,
   buildLanes,
   buildSites,
   initialState,
+  isUnknownFrameType,
   letterFor,
   previewView,
   reducer,
@@ -221,4 +223,27 @@ test("sites list previews by environment; staging, canary and prod are not confi
   ]);
   expect(sites[0]).toMatchObject({ retired: 1 });
   expect(sites[0]!.deployments.map((d) => d.trainId)).toEqual(["t2"]);
+});
+
+test("an unknown frame type from a newer Queen sets the outdated flag, with no error line", () => {
+  const parsed = QueenServerMessageSchema.safeParse({ type: "brand.new.frame", x: 1 });
+  expect(parsed.success).toBe(false);
+  if (parsed.success) return;
+  expect(isUnknownFrameType(parsed.error.issues, { type: "brand.new.frame" })).toBe(true);
+  const s = reducer(initialState, { type: "invalid_frame", detail: "x", at: 1, outdated: true });
+  expect(s.outdated).toBe(true);
+  expect(s.ticker).toEqual([]);
+  // idempotent
+  expect(reducer(s, { type: "invalid_frame", detail: "x", at: 2, outdated: true })).toBe(s);
+});
+
+test("genuine malformed frames are not classed as outdated", () => {
+  const knownTypeBadShape = QueenServerMessageSchema.safeParse({ type: "train.updated", train: { nope: true } });
+  expect(knownTypeBadShape.success).toBe(false);
+  if (!knownTypeBadShape.success) expect(isUnknownFrameType(knownTypeBadShape.error.issues, { type: "train.updated" })).toBe(false);
+  const noType = QueenServerMessageSchema.safeParse({});
+  if (!noType.success) expect(isUnknownFrameType(noType.error.issues, {})).toBe(false);
+  const s = reducer(initialState, { type: "invalid_frame", detail: "bad", at: 1 });
+  expect(s.outdated).toBe(false);
+  expect(s.ticker[0]).toMatchObject({ kind: "error" });
 });

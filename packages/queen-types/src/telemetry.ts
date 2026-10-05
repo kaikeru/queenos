@@ -18,6 +18,8 @@ export const QueenServerMessageSchema = z.discriminatedUnion("type", [
     deployments: z.array(DeploymentSchema).optional(),
     /** Recent releases, newest first (P3). Optional for the same reason. */
     releases: z.array(ReleaseSchema).optional(),
+    /** Latest Sentinel verdict per (release, environment) for the snapshot's releases. Optional for back-compat. */
+    verdicts: z.array(SentinelVerdictSchema).optional(),
   }),
   z.object({ type: z.literal("prompt.updated"), promptRun: PromptRunSchema }),
   z.object({ type: z.literal("train.updated"), train: MergeTrainSchema }),

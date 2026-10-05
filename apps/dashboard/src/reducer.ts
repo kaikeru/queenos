@@ -61,11 +61,13 @@ export interface State {
   /** Commits on main, in landing order. */
   landed: LandedCommit[];
   tickerSeq: number;
+  /** The Queen sent a frame type this build does not know: the dashboard is older than the Queen. */
+  outdated: boolean;
 }
 
 export type Action =
   | { type: "server"; message: QueenServerMessage; at: number }
-  | { type: "invalid_frame"; detail: string; at: number }
+  | { type: "invalid_frame"; detail: string; at: number; /** Unknown `type`: this dashboard is outdated. */ outdated?: boolean }
   | { type: "system"; text: string; at: number };
 
 export const AUDIT_LIMIT = 600;
@@ -86,7 +88,30 @@ export const initialState: State = {
   ticker: [],
   landed: [],
   tickerSeq: 0,
+  outdated: false,
 };
+
+/** The minimal slice of a zod issue needed to classify a rejected frame. */
+export interface FrameIssue {
+  code?: string;
+  path?: readonly PropertyKey[];
+  message?: string;
+  note?: string;
+}
+
+/**
+ * True when a frame failed only because its `type` discriminator is unknown
+ * (a newer Queen), as opposed to a known type with a malformed body.
+ */
+export function isUnknownFrameType(issues: readonly FrameIssue[], frame: unknown): boolean {
+  // A frame with no string `type` is malformed, not newer.
+  if (typeof (frame as { type?: unknown } | null)?.type !== "string") return false;
+  const first = issues[0];
+  if (!first || issues.length !== 1) return false;
+  const path = first.path ?? [];
+  if (path.length !== 1 || path[0] !== "type") return false;
+  return first.code === "invalid_union_discriminator" || /discriminator/i.test(`${first.message ?? ""} ${first.note ?? ""}`);
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -145,6 +170,12 @@ function reasonLabel(reason: string | null | undefined): string {
   return reason.startsWith("superseded") ? "superseded by an upstream ejection" : reason.replace(/^failed:\s*/, "failed: ");
 }
 
+function hydrateVerdicts(list: SentinelVerdict[]): State["verdicts"] {
+  const out: State["verdicts"] = {};
+  for (const v of list) out[v.releaseId] = { ...out[v.releaseId], [v.environment]: v };
+  return out;
+}
+
 // ── reducer ───────────────────────────────────────────────────────────────
 
 export function reducer(state: State, action: Action): State {
@@ -152,6 +183,7 @@ export function reducer(state: State, action: Action): State {
     case "system":
       return pushTicker(state, "system", action.text, action.at);
     case "invalid_frame":
+      if (action.outdated) return state.outdated ? state : { ...state, outdated: true };
       return pushTicker(state, "error", `Dropped an invalid frame from the Queen: ${action.detail}`, action.at);
     case "server":
       return serverMessage(state, action.message, action.at);
@@ -183,6 +215,8 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
         canaryPeak: Object.fromEntries((msg.releases ?? []).map((r) => [r.releaseId, Math.max(state.canaryPeak[r.releaseId] ?? 0, r.canaryPercent ?? 0)])),
         audit: msg.recentAudit.slice(-AUDIT_LIMIT),
         landed: [],
+        // Older Queens omit verdicts: keep whatever live frames gave us.
+        verdicts: msg.verdicts ? hydrateVerdicts(msg.verdicts) : state.verdicts,
       };
       for (const t of byCreated(msg.trains)) next = withLanded(next, t);
       return pushTicker(

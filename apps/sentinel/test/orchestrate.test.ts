@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SentinelVerdictSchema } from "@queenos/queen-types";
-import { BASELINE_PER_BATCH, CANARY_SETTLE_MS, CANDIDATE_PER_BATCH, MAX_BATCHES, OVERRIDES_HEADER, planBatches, runSentinel } from "../src/orchestrate";
+import { BASELINE_PER_BATCH, CANARY_SETTLE_MS, READY_POLL_MS, READY_TIMEOUT_DEFAULT_SECONDS, CANDIDATE_PER_BATCH, MAX_BATCHES, OVERRIDES_HEADER, planBatches, runSentinel } from "../src/orchestrate";
 import { percentile } from "../src/verdict";
 import { FakeWorld, InlineSteps, canary, staging } from "./fakes";
 
@@ -17,7 +17,7 @@ describe("staging", () => {
     const v = SentinelVerdictSchema.parse(w.verdicts[0]);
     expect(v).toMatchObject({ commandId: "cmd-1", releaseId: "rel-1", environment: "staging", verdict: "PROMOTE" });
     expect(v.metrics).toMatchObject({ requests: 60, errorRate: 0, p99Ms: 20, baselineErrorRate: null });
-    expect(v.summary).toBe("Staging: 0/60 errors; p99 20ms → promote");
+    expect(v.summary).toBe("Staging: 0/60 errors; p99 20ms; ready after 4s → promote");
     // staging never sends an override header and probes the default paths
     expect(w.calls.every((c) => Object.keys(c.headers).length === 0)).toBe(true);
     expect(new Set(w.calls.map((c) => c.url))).toEqual(new Set(["https://my-hive-staging.sub.workers.dev/", "https://my-hive-staging.sub.workers.dev/health"]));
@@ -65,7 +65,11 @@ describe("canary", () => {
     const steps = new InlineSteps();
     const out = await runSentinel(canary(), steps, w.ports());
     expect(out.verdict).toBe("PROMOTE");
-    expect(steps.sleeps[0]).toEqual({ name: "settle: version override propagation", ms: CANARY_SETTLE_MS });
+    expect(steps.sleeps.filter((x) => x.name.startsWith("ready wait"))).toHaveLength(2);
+    expect(steps.sleeps.find((x) => x.name.startsWith("settle"))).toEqual({ name: "settle: version override propagation", ms: CANARY_SETTLE_MS });
+    // all three gate probes were pinned to the candidate
+    expect(w.gateCalls).toHaveLength(3);
+    for (const c of w.gateCalls) expect(c.headers[HEADER]).toBe(`my-hive-app="cand-111"`);
     for (const c of w.calls) {
       expect([`my-hive-app="cand-111"`, `my-hive-app="stab-222"`]).toContain(c.headers[HEADER]);
     }
@@ -75,7 +79,7 @@ describe("canary", () => {
     expect(stable).toBeGreaterThan(0);
     const v = w.verdicts[0]!;
     expect(v.metrics).toMatchObject({ requests: 60, errorRate: 0, p99Ms: 84, baselineErrorRate: 0 });
-    expect(v.summary).toBe(`Canary 10%: 0/60 errors vs baseline 0/${stable}; p99 84ms vs 80ms → promote`);
+    expect(v.summary).toBe(`Canary 10%: 0/60 errors vs baseline 0/${stable}; p99 84ms vs 80ms; ready after 4s → promote`);
   });
 
   it("rolls back on an error regression against a clean baseline", async () => {
@@ -125,6 +129,96 @@ describe("canary", () => {
 
   it("rejects a canary command without a candidate version", async () => {
     await expect(runSentinel(canary({ candidateVersionId: undefined }), new InlineSteps(), new FakeWorld().ports())).rejects.toThrow(/candidateVersionId/);
+  });
+});
+
+describe("readiness gate", () => {
+  const notReady = (n: number) => (_c: unknown, i: number) => (i < n ? { status: 503, ms: 460 } : { status: 200, ms: 10 });
+
+  it("ignores warm-up errors, counts none of them, and promotes", async () => {
+    // 5 failing polls (propagation), then healthy: exactly the live incident
+    const w = new FakeWorld(notReady(5));
+    w.autoReady = false;
+    const steps = new InlineSteps();
+    const out = await runSentinel(staging(), steps, w.ports());
+    expect(out.verdict).toBe("PROMOTE");
+    const v = w.verdicts[0]!;
+    expect(v.metrics).toMatchObject({ requests: 60, errorRate: 0 });
+    expect(v.summary).toMatch(/0\/60 errors/);
+    expect(v.summary).toMatch(/ready after \d+s/);
+    // 5 failed + 3 good gate polls, then 60 measured
+    expect(w.calls).toHaveLength(8 + 60);
+    expect(steps.log.filter((s) => s.name.startsWith("ready poll"))).toHaveLength(8);
+  });
+
+  it("an intermittent warm-up resets the consecutive streak", async () => {
+    const seq = [200, 200, 500, 200, 200, 200];
+    const w = new FakeWorld((_c, i) => ({ status: i < seq.length ? seq[i]! : 200 }));
+    w.autoReady = false;
+    const steps = new InlineSteps();
+    await runSentinel(staging(), steps, w.ports());
+    expect(steps.log.filter((s) => s.name.startsWith("ready poll"))).toHaveLength(6);
+    expect(w.verdicts[0]!.verdict).toBe("PROMOTE");
+  });
+
+  it("the smoke check applies to the first measured request, after the gate", async () => {
+    // gate passes on 3 x 200 for "/", then the first measured "/" fails
+    const w = new FakeWorld((c, i) => ({ status: i >= 3 && i === 3 && c.url.endsWith("/") ? 404 : 200 }));
+    w.autoReady = false;
+    await runSentinel(staging(), new InlineSteps(), w.ports());
+    expect(w.verdicts[0]!.summary).toContain("smoke check failed");
+  });
+
+  it("never ready: ROLLBACK 'never became reachable within Ns (last status X)', nothing measured", async () => {
+    const w = new FakeWorld(() => ({ status: 503, ms: 100 }));
+    w.autoReady = false;
+    const out = await runSentinel(staging({ readyTimeoutSeconds: 20 }), new InlineSteps(), w.ports());
+    expect(out.verdict).toBe("ROLLBACK");
+    const v = SentinelVerdictSchema.parse(w.verdicts[0]);
+    expect(v.summary).toBe("Staging: never became reachable within 20s (last status 503) → rollback");
+    expect(v.metrics.requests).toBe(0);
+    // only the gate probed "/": no measured traffic
+    expect(w.calls.every((c) => c.url.endsWith("/"))).toBe(true);
+  });
+
+  it("reports a network error as the last status", async () => {
+    const w = new FakeWorld(() => "throw");
+    w.autoReady = false;
+    await runSentinel(staging({ readyTimeoutSeconds: 10 }), new InlineSteps(), w.ports());
+    expect(w.verdicts[0]!.summary).toContain("(last status network error)");
+  });
+
+  it("respects the cap: bounded polls, default 90s, sleeps are short steps", async () => {
+    const w = new FakeWorld(() => ({ status: 503, ms: 0 }));
+    w.autoReady = false;
+    const steps = new InlineSteps();
+    await runSentinel(staging(), steps, w.ports());
+    expect(w.verdicts[0]!.summary).toContain(`within ${READY_TIMEOUT_DEFAULT_SECONDS}s`);
+    const polls = steps.log.filter((s) => s.name.startsWith("ready poll")).length;
+    expect(polls).toBeLessThanOrEqual(Math.ceil((READY_TIMEOUT_DEFAULT_SECONDS * 1000) / READY_POLL_MS) + 1);
+    expect(polls).toBeGreaterThan(40);
+    expect(steps.sleeps.every((s) => s.ms === READY_POLL_MS)).toBe(true);
+    // slow responses eat into the cap too
+    const slow = new FakeWorld(() => ({ status: 503, ms: 5000 }));
+    slow.autoReady = false;
+    const s2 = new InlineSteps();
+    await runSentinel(staging({ readyTimeoutSeconds: 30 }), s2, slow.ports());
+    expect(s2.log.filter((s) => s.name.startsWith("ready poll")).length).toBeLessThanOrEqual(5);
+  });
+
+  it("canary: the gate itself is pinned to the candidate by the override header", async () => {
+    const w = new FakeWorld(() => ({ status: 503 }));
+    w.autoReady = false;
+    await runSentinel(canary({ readyTimeoutSeconds: 10 }), new InlineSteps(), w.ports());
+    expect(w.calls.length).toBeGreaterThan(0);
+    for (const c of w.calls) expect(c.headers[HEADER]).toBe(`my-hive-app="cand-111"`);
+    expect(w.verdicts[0]).toMatchObject({ verdict: "ROLLBACK", environment: "canary" });
+  });
+
+  it("staging gate uses the plain URL with no override header", async () => {
+    const w = new FakeWorld();
+    await runSentinel(staging(), new InlineSteps(), w.ports());
+    expect(w.gateCalls.every((c) => Object.keys(c.headers).length === 0 && c.url === "https://my-hive-staging.sub.workers.dev/")).toBe(true);
   });
 });
 

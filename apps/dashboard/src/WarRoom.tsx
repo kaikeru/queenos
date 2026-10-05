@@ -50,6 +50,14 @@ export function WarRoom({ hive, backTo }: { hive: string; backTo?: string }) {
 
   return (
     <div className="app">
+      {state.outdated && (
+        <div className="update-banner" role="alert">
+          <span>QueenOS was updated. Reload to get the latest War Room</span>
+          <button type="button" onClick={() => window.location.reload()}>
+            Reload
+          </button>
+        </div>
+      )}
       <TopBar hive={hive} status={status} latencyMs={latencyMs} retryAt={retryAt} state={state} backTo={backTo} />
       <MainTrack landed={state.landed} state={state} />
       <ReleaseTimeline hive={hive} state={state} release={release} />

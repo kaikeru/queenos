@@ -77,6 +77,8 @@ export const SentinelCommandSchema = z.object({
   minRequests: z.number().int().min(1).default(300),
   /** Window length; short for demos, minutes for real use. */
   windowSeconds: z.number().int().min(5).default(300),
+  /** Readiness gate cap: seconds to wait for 3 consecutive 2xx on GET / before measuring. Default 90. */
+  readyTimeoutSeconds: z.number().int().min(1).max(600).optional(),
 });
 export type SentinelCommand = z.infer<typeof SentinelCommandSchema>;
 export type SentinelCommandInput = z.input<typeof SentinelCommandSchema>;

@@ -148,3 +148,17 @@ test("sites view: staging, canary and prod rows come from releases and verdicts"
 test("sites view is empty before any release", () => {
   expect(siteReleaseView(run(base))).toEqual({ staging: null, canary: null, prod: null });
 });
+
+test("snapshot.verdicts hydrates the per-release verdicts; a snapshot without them keeps live ones", () => {
+  const snap = (extra: Record<string, unknown>) => server({ type: "snapshot", promptRuns: [], trains: [], recentAudit: [], releases: [release()], ...extra });
+  let s = run(base, snap({ verdicts: [verdict(), verdict({ commandId: "c2", environment: "canary", verdict: "ROLLBACK" })] }));
+  expect(s.verdicts.r1!.staging!.verdict).toBe("PROMOTE");
+  expect(s.verdicts.r1!.canary!.verdict).toBe("ROLLBACK");
+  expect(s.ticker.every((t) => t.kind !== "sentinel")).toBe(true);
+  // older Queen: no verdicts field leaves the held ones alone
+  s = reducer(s, snap({}));
+  expect(s.verdicts.r1!.staging!.verdict).toBe("PROMOTE");
+  // a snapshot that carries verdicts replaces them
+  s = reducer(s, snap({ verdicts: [] }));
+  expect(s.verdicts).toEqual({});
+});

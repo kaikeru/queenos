@@ -41,7 +41,24 @@ const ms = (v: number | null) => (v === null ? "n/a" : `${Math.round(v)}ms`);
 
 export type VerdictInput = Pick<SentinelCommand, "commandId" | "releaseId" | "environment" | "canaryPercent">;
 
-export function decide(cmd: VerdictInput, candidate: Tally, baseline: Tally | null): SentinelVerdict {
+/** Whole seconds, for summaries. */
+const secs = (v: number) => `${Math.round(v / 1000)}s`;
+
+/** The target never passed the readiness gate: nothing was measured. */
+export function gateTimeoutVerdict(cmd: VerdictInput, timeoutSeconds: number, lastStatus: number | null): SentinelVerdict {
+  const label = cmd.environment === "canary" ? `Canary ${cmd.canaryPercent ?? "?"}%` : "Staging";
+  const last = lastStatus === null ? "network error" : String(lastStatus);
+  return {
+    commandId: cmd.commandId,
+    releaseId: cmd.releaseId,
+    environment: cmd.environment,
+    verdict: "ROLLBACK",
+    metrics: { requests: 0, errorRate: 1, p99Ms: null, baselineErrorRate: null },
+    summary: `${label}: never became reachable within ${timeoutSeconds}s (last status ${last}) → rollback`,
+  };
+}
+
+export function decide(cmd: VerdictInput, candidate: Tally, baseline: Tally | null, readyMs: number | null = null): SentinelVerdict {
   const errorRate = candidate.total === 0 ? 0 : candidate.errors / candidate.total;
   const p99 = percentile(candidate.latencies, 99);
   const hasBaseline = baseline !== null && baseline.total > 0;
@@ -59,8 +76,9 @@ export function decide(cmd: VerdictInput, candidate: Tally, baseline: Tally | nu
   const label = cmd.environment === "canary" ? `Canary ${cmd.canaryPercent ?? "?"}%` : "Staging";
   const base = hasBaseline ? ` vs baseline ${baseline.errors}/${baseline.total}` : "";
   const lat = hasBaseline ? `p99 ${ms(p99)} vs ${ms(baseP99)}` : `p99 ${ms(p99)}`;
+  const ready = readyMs === null ? "" : `; ready after ${secs(readyMs)}`;
   const why = reasons.length > 0 ? ` (${reasons.join("; ")})` : "";
-  let summary = `${label}: ${candidate.errors}/${candidate.total} errors${base}; ${lat}${why} → ${verdict === "PROMOTE" ? "promote" : "rollback"}`;
+  let summary = `${label}: ${candidate.errors}/${candidate.total} errors${base}; ${lat}${ready}${why} → ${verdict === "PROMOTE" ? "promote" : "rollback"}`;
   if (summary.length > 500) summary = `${summary.slice(0, 499)}…`;
 
   return {
