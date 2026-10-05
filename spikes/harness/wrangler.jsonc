@@ -1,0 +1,16 @@
+{
+  // THROWAWAY spike Worker. Delete after use: `pnpm exec wrangler delete --name queenos-day1-harness`.
+  "name": "queenos-day1-harness",
+  "main": "src/index.ts",
+  // Same date as apps/*: implies nodejs_compat (+v2). No compatibility_flags added on purpose.
+  "compatibility_date": "2026-10-02",
+  "account_id": "4773fbabdff038e3b907b14cd212c062",
+  "workers_dev": true,
+  "preview_urls": false,
+  "limits": { "cpu_ms": 300000 },
+  "ai": { "binding": "AI" },
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "durable_objects": { "bindings": [{ "name": "SPIKE_THINK", "class_name": "SpikeThink" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SpikeThink"] }]
+}

@@ -1,0 +1,1 @@
+{ "name": "size-bundler", "main": "bundler.ts", "compatibility_date": "2026-10-02",  "ai": {"binding":"AI"}, "worker_loaders": [{"binding":"LOADER"}], "artifacts": [{"binding":"ARTIFACTS","namespace":"queenos"}] }

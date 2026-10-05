@@ -1,0 +1,2 @@
+{"ok":true,"bundleMs":76,"runMs":187,"mainModule":"bundle.js","sizes":{"bundle.js":56029},"root":[200,"<h1>hi from hono</h1>"],"health":[200,"{\"ok\":true}"]}
+HTTP 200 2.057602s
