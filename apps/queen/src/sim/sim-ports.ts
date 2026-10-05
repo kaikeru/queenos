@@ -4,7 +4,10 @@
  * SimExecutors stands in for every executor Workflow the Queen dispatches to,
  * and calls back into the Queen over its public RPC surface exactly like the
  * real executors would:
- * - provisioner: FORK reports ok after ~300 ms (DELETE shortly after).
+ * - provisioner: FORK reports ok after ~300 ms (DELETE shortly after), with
+ *   "recalled" hive memories: this hive's earlier gate verdicts (other trains
+ *   that passed, or failed their gate), ranked by word overlap with the
+ *   FORK's `recallQuery`. The very first train recalls none.
  * - herald: DEPLOY reports a LIVE preview at `https://<trainId>-preview.sim.queenos.dev`
  *   after ~1.5 s; TEARDOWN reports ok and is recorded (see teardowns()).
  *   Release deploys: staging at `https://<hive>-staging.sim.queenos.dev`, canary
@@ -54,8 +57,10 @@ import type {
   MergeTrain,
   ProvisionCommand,
   ProvisionResult,
+  RecalledMemory,
   TrainResult,
 } from "@queenos/queen-types";
+import { MAX_MEMORY_TEXT, MAX_RECALLED_MEMORIES, MIN_RECALL_SCORE } from "@queenos/queen-types";
 import type { DroneDispatcher } from "../drones";
 import { droneInstanceId } from "../drones";
 import type { DeployDispatcher, ProvisionerDispatcher, SentinelDispatcher } from "../executors";
@@ -271,6 +276,7 @@ export class SimExecutors {
 
   private async runProvision(c: ProvisionCommand): Promise<void> {
     if (c.op === "FORK") {
+      const memories = c.recallQuery ? simRecall(await this.queen().getSnapshot(), c.trainId, c.recallQuery) : [];
       await this.queen().reportProvisionResult({
         commandId: c.commandId,
         op: "FORK",
@@ -278,6 +284,7 @@ export class SimExecutors {
         ok: true,
         artifactRepo: c.forkName,
         baseSha: fakeSha(`base:${c.sourceRepo}`),
+        ...(memories.length ? { memories } : {}),
       });
     } else if (c.op === "DELETE") {
       await this.queen().reportProvisionResult({ commandId: c.commandId, op: "DELETE", trainId: c.trainId, ok: true });
@@ -481,6 +488,48 @@ export class SimExecutors {
   private audit(task: DroneTask, role: DroneRole, status: AppendAuditInput["status"], note: GitNotesPayload | null) {
     return this.queen().appendAudit({ promptId: task.promptId, droneRole: role, status, gitNotesPayload: note });
   }
+}
+
+// ── simulated hive memory recall ─────────────────────────────────────────
+
+const words = (text: string) => new Set(text.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []);
+
+/**
+ * Stand-in for the Provisioner's Vectorize recall: one memory per earlier
+ * gate verdict in the snapshot (a train that passed its gate, or was ejected
+ * for failing it; superseded trains have no verdict). Scored by word overlap
+ * with `query`, mapped into [MIN_RECALL_SCORE, 0.95], best first.
+ */
+export function simRecall(snap: SimSnapshot, trainId: string, query: string): RecalledMemory[] {
+  const q = words(query);
+  const prompts = new Map((snap.promptRuns ?? []).map((p) => [p.promptId, p]));
+  const memories = snap.trains.flatMap((t): RecalledMemory[] => {
+    if (t.trainId === trainId) return [];
+    const promptId = t.includedPrompts.at(-1);
+    const prompt = promptId ? prompts.get(promptId) : undefined;
+    if (!promptId || !prompt) return [];
+    const passed = t.summary && (t.phase === "PASSED" || t.phase === "LANDING" || t.phase === "MERGED");
+    const failed = t.phase === "EJECTED" && t.reason?.startsWith("failed: ");
+    if (!passed && !failed) return [];
+    const verdict = passed ? t.summary! : t.reason!.slice("failed: ".length);
+    const w = words(prompt.promptText);
+    const shared = [...q].filter((x) => w.has(x)).length;
+    const overlap = shared / Math.max(1, Math.min(q.size, w.size));
+    const promptText = prompt.promptText.slice(0, 300);
+    return [
+      {
+        memoryId: `${t.trainId}:${(t.headSha ?? fakeSha(`head:${t.trainId}`)).slice(0, 12)}`,
+        trainId: t.trainId,
+        promptId,
+        outcome: passed ? "PASSED" : "FAILED",
+        promptText,
+        text: `Prompt: ${promptText}\nGate: ${passed ? "passed" : "failed"}. ${verdict}`.slice(0, MAX_MEMORY_TEXT),
+        createdAt: t.createdAt,
+        score: Math.round((MIN_RECALL_SCORE + (0.95 - MIN_RECALL_SCORE) * overlap) * 1000) / 1000,
+      },
+    ];
+  });
+  return memories.sort((a, b) => b.score - a.score || b.createdAt - a.createdAt).slice(0, MAX_RECALLED_MEMORIES);
 }
 
 // ── plausible Cognitive Ledger payloads ──────────────────────────────────

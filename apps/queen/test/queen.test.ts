@@ -1,7 +1,7 @@
 import { env, exports } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { DeployCommand, DroneTask, ProvisionCommand, QueenServerMessage, SentinelCommand } from "@queenos/queen-types";
+import type { DeployCommand, DroneTask, ProvisionCommand, QueenServerMessage, RecalledMemory, SentinelCommand } from "@queenos/queen-types";
 import { modelPin, routerPolicy, type QueenNode, type SocketAttachment } from "../src/queen-node";
 import { migrate } from "../src/db";
 import type { RecordingDispatcher, RecordingHerald, RecordingProvisioner, RecordingSentinel } from "./fakes";
@@ -707,6 +707,73 @@ describe("War Room WebSocket", () => {
   });
 });
 
+describe("hive memory", () => {
+  const mem = (over: Partial<RecalledMemory> = {}): RecalledMemory => ({
+    memoryId: "old:aaaaaaaaaaaa",
+    trainId: "old",
+    promptId: "p-old",
+    outcome: "FAILED",
+    promptText: "add retries",
+    text: "Prompt: add retries. Gate: security rejected an unbounded retry loop.",
+    createdAt: 1,
+    score: 0.81,
+    ...over,
+  });
+
+  it("forks with recallQuery, persists the recalled memories, exposes them and feeds the builder's ragContext", async () => {
+    const ns = newHive();
+    await submit(ns, "add retries to the fetch client");
+    const s0 = await inspect(ns);
+    const fork = s0.provisions[0] as Fork;
+    expect(fork.recallQuery).toBe("add retries to the fetch client");
+    const memories = [mem(), mem({ memoryId: "older:bbbbbbbbbbbb", outcome: "PASSED", text: "Prompt: add a cap. Gate: passed.", score: 0.7 })];
+    const res = await post(ns, "/internal/webhook/provision-result", {
+      commandId: fork.commandId,
+      op: "FORK",
+      trainId: fork.trainId,
+      ok: true,
+      artifactRepo: fork.forkName,
+      baseSha: "b",
+      memories,
+    });
+    expect(await res.json()).toMatchObject({ outcome: "applied", train: { trainId: fork.trainId, memories } });
+    const s1 = await inspect(ns);
+    expect(JSON.parse(String((s1.trains[0] as unknown as { memories: string }).memories))).toEqual(memories);
+    expect(s1.tasks.at(-1)!.ragContext).toEqual([
+      "[FAILED] Prompt: add retries. Gate: security rejected an unbounded retry loop.",
+      "[PASSED] Prompt: add a cap. Gate: passed.",
+    ]);
+    expect((await snapshotOf(ns)).trains[0]!.memories).toEqual(memories);
+  });
+
+  it("a FORK result without memories stores [] and a train broadcast carries it", async () => {
+    const ns = newHive();
+    const { ws, next } = await connect(`/hives/${ns}/room`);
+    await next();
+    await submit(ns, "A");
+    await settle(ns, new Set());
+    const upd = await next((m) => m.type === "train.updated" && m.train.phase === "BUILDING" && m.train.baseSha !== "");
+    expect(upd).toMatchObject({ type: "train.updated", train: { memories: [] } });
+    expect((await inspect(ns)).tasks[0]!.ragContext).toEqual([]);
+    ws.close(1000, "done");
+  });
+
+  it("degrades malformed stored memories to [] (bad JSON, non-array, invalid entries dropped)", async () => {
+    const ns = newHive();
+    await submit(ns, "A");
+    const good = mem();
+    const read = (raw: string | null) =>
+      runInDurableObject(stubFor(ns), (q: QueenNode) => {
+        q.sql.exec("UPDATE merge_trains SET memories = ?", raw);
+        return q.getSnapshot().trains[0]!.memories;
+      });
+    expect(await read("{not json")).toEqual([]);
+    expect(await read('{"a":1}')).toEqual([]);
+    expect(await read(null)).toEqual([]);
+    expect(await read(JSON.stringify([{ nope: true }, good]))).toEqual([good]);
+  });
+});
+
 describe("hibernation-ish", () => {
   it("keeps per-socket state in tags + attachments and re-runs migrations idempotently", async () => {
     const ns = newHive();
@@ -731,7 +798,7 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([6, 6, 6]);
+    expect([state.before, state.after, state.version]).toEqual([7, 7, 7]);
     expect(state.tables).toEqual(["audit_trail", "deployments", "merge_trains", "model_router", "model_stats", "prompt_runs", "releases", "sentinel_verdicts"]);
     ws.close(1000, "done");
   });

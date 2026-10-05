@@ -46,10 +46,12 @@ import type {
   ProvisionCommand,
   ProvisionResult,
   QueenServerMessage,
+  RecalledMemory,
   TrainPhase as QueenTrainPhase,
   TrainResult,
   TrainState,
 } from "@queenos/queen-types";
+import { memoryToRagSnippet } from "@queenos/queen-types";
 import { DEFAULT_POLICY, INITIAL_FLOOR, floorAfter, isCatalogModel, route, type FloorOutcome, type FloorState, type RouterPolicy, type RouterRole, type RouterStats } from "../models/router";
 
 /**
@@ -71,6 +73,8 @@ export const MAX_FORK_ATTEMPTS = 3;
  * failure path as an `ok:false` result. Same value as the fork cap.
  */
 export const MAX_COMMAND_ATTEMPTS = MAX_FORK_ATTEMPTS;
+/** Max chars of a FORK's `recallQuery` (the train's prompt; ProvisionCommandSchema caps it). */
+export const MAX_RECALL_QUERY = 4_000;
 /** Default for COMMAND_TIMEOUT_MS: how long a dispatched command may stay unreported. */
 export const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
 
@@ -124,6 +128,8 @@ export interface TrainRecord extends MergeTrain {
   modelOutcome: ModelOutcome | null;
   /** The current choice was a probe one tier under the hive's floor. */
   modelProbe: boolean;
+  /** Hive memories the Provisioner recalled when it forked this train (best first). Feeds `ragContext`. */
+  memories: RecalledMemory[];
 }
 
 export type ModelOutcome = "BUILT" | "PASSED" | "FAILED";
@@ -307,6 +313,7 @@ export function toMergeTrain(t: TrainRecord): MergeTrain {
     previewUrl: t.previewUrl,
     model: t.model,
     modelReason: t.modelReason,
+    memories: t.memories.map((m) => ({ ...m })),
   };
 }
 
@@ -344,7 +351,7 @@ export class TrainPlanner {
     private readonly ctx: PlannerContext,
   ) {
     for (const p of state.prompts) this.prompts.set(p.promptId, { ...p });
-    this.trains = state.trains.map((t) => ({ ...t, includedPrompts: [...t.includedPrompts] }));
+    this.trains = state.trains.map((t) => ({ ...t, includedPrompts: [...t.includedPrompts], memories: [...(t.memories ?? [])] }));
     for (const d of state.deployments ?? []) this.deployments.set(d.deploymentId, { ...d });
     this.maxTrainSeq = state.maxTrainSeq;
     this.maxPromptSeq = state.maxPromptSeq;
@@ -398,6 +405,7 @@ export class TrainPlanner {
       forkState: "READY",
       baseSha: r.baseSha ?? t.baseSha,
       artifactRepo: r.artifactRepo ?? t.artifactRepo,
+      memories: r.memories ?? [],
       dispatched: false,
       droneAttempt: 1,
     });
@@ -719,6 +727,7 @@ export class TrainPlanner {
       modelChoiceAttempt: null,
       modelOutcome: null,
       modelProbe: false,
+      memories: [],
     };
     this.trains.push(train);
     this.markTrain(train);
@@ -751,8 +760,15 @@ export class TrainPlanner {
         trainId: t.trainId,
         sourceRepo: t.forkSource!,
         forkName: t.artifactRepo,
+        ...this.recallQuery(t),
       },
     });
+  }
+
+  /** What the Provisioner recalls hive memories for: the train's prompt (a pure function of it, so re-dispatches match). */
+  private recallQuery(t: TrainRecord): { recallQuery?: string } {
+    const text = this.prompts.get(t.promptId)?.promptText;
+    return text ? { recallQuery: text.slice(0, MAX_RECALL_QUERY) } : {};
   }
 
   private emitDelete(t: TrainRecord): void {
@@ -898,7 +914,7 @@ export class TrainPlanner {
         promptText: p.promptText,
         role: "BUILDER",
         action: t.action,
-        ragContext: [],
+        ragContext: t.memories.map(memoryToRagSnippet),
         ...(t.action === "REWORK" && p.summary ? { scribeSummary: p.summary } : {}),
         modelChoice,
       },

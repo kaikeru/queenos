@@ -5,6 +5,7 @@ import {
   TEST_RETRY_MS,
   fakeSha,
   simPreviewUrl,
+  simRecall,
   simProdUrl,
   simStagingUrl,
   simVersionId,
@@ -89,6 +90,46 @@ describe("sim provisioner", () => {
     await h.advance(50);
     expect(h.provisions.at(-1)).toEqual({ commandId: "t1-delete-1", op: "DELETE", trainId: "t1", ok: true });
     expect(fakeSha("a")).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it("FORK recalls no memories for the very first train of a hive", async () => {
+    const h = harness();
+    await h.sim.provisioner.dispatch({ ...fork, recallQuery: "add a login button" });
+    await h.advance(300);
+    expect(h.provisions[0]).not.toHaveProperty("memories");
+  });
+
+  it("FORK recalls earlier gate verdicts of this hive, best word overlap first", async () => {
+    const h = harness();
+    const train = (trainId: string, promptId: string, over: Partial<MergeTrain>): MergeTrain => ({
+      trainId, baseSha: "", includedPrompts: [promptId], artifactRepo: `n-train-${trainId}`, status: "TESTING", createdAt: 10, ...over,
+    });
+    h.world.promptRuns.push(
+      { promptId: "pa", namespace: "n", promptText: "add a login button to the header", status: "MERGED", createdAt: 1 },
+      { promptId: "pb", namespace: "n", promptText: "add retries to the fetch client [fail]", status: "EJECTED", createdAt: 2 },
+      { promptId: "pc", namespace: "n", promptText: "tune the cache", status: "BUILDING", createdAt: 3 },
+      { promptId: "pd", namespace: "n", promptText: "add retries again", status: "QUEUED", createdAt: 4 },
+    );
+    h.world.trains.push(
+      train("ta", "pa", { status: "MERGED", phase: "MERGED", summary: "Policy and security passed.", headSha: "a".repeat(40), createdAt: 11 }),
+      train("tb", "pb", { status: "EJECTED", phase: "EJECTED", reason: "failed: Security scan rejected an unbounded retry loop.", createdAt: 12 }),
+      train("tc", "pc", { status: "BUILDING", phase: "BUILDING", createdAt: 13 }), // no verdict yet
+      train("td", "pd", { status: "EJECTED", phase: "EJECTED", reason: "superseded: prompt pb ejected from train tb", createdAt: 14 }),
+    );
+    await h.sim.provisioner.dispatch({ ...fork, recallQuery: "add retries with a cap to the fetch client" });
+    await h.advance(300);
+    const memories = h.provisions[0]!.memories!;
+    expect(memories.map((m) => [m.trainId, m.outcome])).toEqual([
+      ["tb", "FAILED"],
+      ["ta", "PASSED"],
+    ]);
+    expect(memories[0]).toMatchObject({ memoryId: `tb:${fakeSha("head:tb").slice(0, 12)}`, promptId: "pb", promptText: "add retries to the fetch client [fail]" });
+    expect(memories[0]!.text).toContain("Security scan rejected an unbounded retry loop.");
+    expect(memories[1]!.memoryId).toBe(`ta:${"a".repeat(12)}`);
+    expect(memories[0]!.score).toBeGreaterThan(memories[1]!.score);
+    for (const m of memories) expect(m.score).toBeGreaterThanOrEqual(0.6);
+    // Deterministic, and never the forking train itself.
+    expect(simRecall({ trains: [...h.world.trains], promptRuns: h.world.promptRuns }, "tb", "add retries").map((m) => m.trainId)).toEqual(["ta"]);
   });
 
   it("runs a command id at most once, like a Workflow instance id (queued or already done)", async () => {

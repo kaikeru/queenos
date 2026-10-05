@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DeployCommand, Deployment, ProvisionCommand } from "@queenos/queen-types";
+import type { DeployCommand, Deployment, ProvisionCommand, RecalledMemory } from "@queenos/queen-types";
 import { INITIAL_FLOOR, type FloorState, type RouterPolicy, type RouterStats } from "../src/models/router";
 import {
   DEFAULT_COMMAND_TIMEOUT_MS,
@@ -8,6 +8,7 @@ import {
   watchdogDeadline,
   TrainPlanner,
   nextCommandId,
+  toMergeTrain,
   type Effect,
   type ModelStatDelta,
   type PlanResult,
@@ -197,7 +198,7 @@ describe("planner: provisioning", () => {
       {
         type: "provision",
         trainId: "t1",
-        command: { op: "FORK", commandId: "t1-fork-1", hive: "hive", trainId: "t1", sourceRepo: "hive", forkName: "hive-train-t1" },
+        command: { op: "FORK", commandId: "t1-fork-1", hive: "hive", trainId: "t1", sourceRepo: "hive", forkName: "hive-train-t1", recallQuery: "do A" },
       },
     ]);
     expect(s.trains.get("t1")!.forkCommandId).toBe("t1-fork-1");
@@ -217,7 +218,7 @@ describe("planner: provisioning", () => {
     expect(s.status("A")).toBe("IN_TRAIN");
     // The successor forks on the push; it does not wait for the preview deploy.
     expect(s.takeOp("FORK")).toEqual([
-      { op: "FORK", commandId: "t2-fork-1", hive: "hive", trainId: "t2", sourceRepo: "hive-train-t1", forkName: "hive-train-t2" },
+      { op: "FORK", commandId: "t2-fork-1", hive: "hive", trainId: "t2", sourceRepo: "hive-train-t1", forkName: "hive-train-t2", recallQuery: "do B" },
     ]);
     expect(s.takeOp("DEPLOY")).toEqual([
       { op: "DEPLOY", commandId: "t1-deploy-1", hive: "hive", environment: "preview", trainId: "t1", artifactRepo: "hive-train-t1", commitSha: "h1" },
@@ -448,7 +449,7 @@ describe("planner: reconcile", () => {
     expect(r.effects).toContainEqual({
       type: "provision",
       trainId: "t1",
-      command: { op: "FORK", commandId: "t1-fork-1", hive: "hive", trainId: "t1", sourceRepo: "hive", forkName: "hive-train-t1" },
+      command: { op: "FORK", commandId: "t1-fork-1", hive: "hive", trainId: "t1", sourceRepo: "hive", forkName: "hive-train-t1", recallQuery: "do A" },
     });
     s.completeForks();
     expect(s.take("dispatchDrone")).toHaveLength(1);
@@ -473,7 +474,7 @@ describe("planner: reconcile", () => {
     expect(r.effects).toContainEqual({
       type: "provision",
       trainId: "t2",
-      command: { op: "FORK", commandId: "t2-fork-2", hive: "hive", trainId: "t2", sourceRepo: "hive", forkName: "hive-train-t2" },
+      command: { op: "FORK", commandId: "t2-fork-2", hive: "hive", trainId: "t2", sourceRepo: "hive", forkName: "hive-train-t2", recallQuery: "do B" },
     });
     expect(r.effects).toContainEqual({
       type: "provision",
@@ -1021,5 +1022,87 @@ describe("planner: model router", () => {
     k.build("A");
     k.result("A", true);
     expect(k.floor.tier).toBe("fast");
+  });
+});
+
+const memory = (over: Partial<RecalledMemory> = {}): RecalledMemory => ({
+  memoryId: "t0:aaaaaaaaaaaa",
+  trainId: "t0",
+  promptId: "Z",
+  outcome: "FAILED",
+  promptText: "do Z",
+  text: "Prompt: do Z. Gate: security rejected an unbounded retry loop.",
+  createdAt: 1,
+  score: 0.82,
+  ...over,
+});
+
+describe("planner: hive memory", () => {
+  it("FORK carries the train's prompt as recallQuery (truncated to 4000 chars), identical on re-dispatch", () => {
+    const s = new Sim();
+    const long = "x".repeat(4_500);
+    s.run((p) => p.submit({ promptId: "A", promptText: long }));
+    const [first] = s.takeOp("FORK");
+    expect(first!.recallQuery).toBe(long.slice(0, 4_000));
+    const again = s.run((p) => p.reconcile()).effects.find((e) => e.type === "provision");
+    expect(again).toEqual({ type: "provision", trainId: "t1", command: first });
+  });
+
+  it("a fork retry under a new command id recalls for the same prompt", () => {
+    const s = new Sim();
+    s.submit("A");
+    const [c] = s.takeOp("FORK");
+    s.run((p) => p.provisionResult({ commandId: c!.commandId, op: "FORK", trainId: "t1", ok: false, summary: "503" }));
+    expect(s.takeOp("FORK")).toEqual([expect.objectContaining({ commandId: "t1-fork-2", recallQuery: "do A" })]);
+  });
+
+  it("persists recalled memories on the train, exposes them, and feeds them to the BUILD drone as ragContext", () => {
+    const s = new Sim();
+    s.submit("A");
+    expect(s.trains.get("t1")!.memories).toEqual([]);
+    const [c] = s.takeOp("FORK");
+    s.effects = [];
+    const mems = [memory(), memory({ memoryId: "t9:bbbbbbbbbbbb", outcome: "PASSED", text: "Prompt: do Y. Gate: passed." })];
+    const r = s.run((p) => p.provisionResult({ commandId: c!.commandId, op: "FORK", trainId: "t1", ok: true, artifactRepo: c!.forkName, baseSha: "m", memories: mems }));
+    expect(s.trains.get("t1")!.memories).toEqual(mems);
+    expect(toMergeTrain(s.trains.get("t1")!).memories).toEqual(mems);
+    const updated = r.effects.find((e) => e.type === "broadcast" && e.message.type === "train.updated");
+    expect(updated).toMatchObject({ message: { train: { trainId: "t1", memories: mems } } });
+    const [d] = s.take("dispatchDrone");
+    expect(d!.task.ragContext).toEqual([
+      "[FAILED] Prompt: do Z. Gate: security rejected an unbounded retry loop.",
+      "[PASSED] Prompt: do Y. Gate: passed.",
+    ]);
+  });
+
+  it("a fork without memories (recall trouble) still builds, with an empty ragContext", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    expect(s.trains.get("t1")!.memories).toEqual([]);
+    expect(s.take("dispatchDrone")[0]!.task.ragContext).toEqual([]);
+  });
+
+  it("a REWORK train builds with the memories recalled for its own fork; the lander gets none", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.build("A");
+    s.take("dispatchDrone");
+    s.run((p) => p.trainResult({ trainId: "t1", passed: false, summary: "security rejected it" }));
+    const [c] = s.takeOp("FORK");
+    expect(c).toMatchObject({ trainId: "t2", recallQuery: "do A" });
+    const mems = [memory({ trainId: "t1", promptId: "A", text: "Prompt: do A. Gate: failed. security rejected it" })];
+    s.run((p) => p.provisionResult({ commandId: c!.commandId, op: "FORK", trainId: "t2", ok: true, artifactRepo: c!.forkName, memories: mems }));
+    const [d] = s.take("dispatchDrone");
+    expect(d!.task).toMatchObject({ action: "REWORK", scribeSummary: "security rejected it", ragContext: ["[FAILED] Prompt: do A. Gate: failed. security rejected it"] });
+    // A reconcile re-dispatch of the same builder carries the same context.
+    expect(s.run((p) => p.reconcile()).effects.find((e) => e.type === "dispatchDrone")).toMatchObject({ task: { ragContext: d!.task.ragContext } });
+    s.take("dispatchDrone");
+    s.build("A");
+    s.result("A", true);
+    const lander = s.take("dispatchDrone").find((e) => e.task.role === "LANDER");
+    expect(lander!.task.ragContext).toEqual([]);
+    expect(s.trains.get("t2")!.memories).toEqual(mems);
   });
 });

@@ -10,12 +10,14 @@ import {
   ModelRoleSchema,
   ModelTierSchema,
   PromptRunSchema,
+  RecalledMemorySchema,
   ReleaseSchema,
   SentinelVerdictSchema,
   type AuditEvent,
   type Deployment,
   type ModelChoice,
   type ModelStats,
+  type RecalledMemory,
   type SentinelVerdict,
 } from "@queenos/queen-types";
 import { INITIAL_FLOOR, type FloorState, type RouterStats } from "./models/router";
@@ -222,6 +224,12 @@ const MIGRATIONS: readonly string[] = [
     floor_note TEXT
   );
   `,
+  `
+  -- v7: hive memory. The memories the Provisioner recalled for the train's
+  -- prompt when it forked (JSON array of RecalledMemory, best first); they
+  -- become the builder's ragContext. NULL on trains forked before v7.
+  ALTER TABLE merge_trains ADD COLUMN memories TEXT;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -307,7 +315,24 @@ export function rowToTrain(r: Row): TrainRecord {
     modelChoiceAttempt: num(r.model_choice_attempt),
     modelOutcome: str(r.model_outcome ?? null) as ModelOutcome | null,
     modelProbe: Number(r.model_probe ?? 0) === 1,
+    memories: parseMemories(r.memories ?? null),
   };
+}
+
+/** Stored memories, defensively: bad JSON or a non-array is [], and entries that no longer validate are dropped. */
+export function parseMemories(v: SqlStorageValue): RecalledMemory[] {
+  if (v === null) return [];
+  let raw: unknown;
+  try {
+    raw = JSON.parse(String(v));
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((m) => {
+    const parsed = RecalledMemorySchema.safeParse(m);
+    return parsed.success ? [parsed.data] : [];
+  });
 }
 
 function parseChoice(v: SqlStorageValue): ModelChoice | null {
@@ -389,8 +414,8 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        phase, fork_state, fork_source, head_sha, landed_sha, summary, reason, action, dispatched,
        fork_command_id, delete_command_id, deploy_state, deploy_command_id, teardown_command_id, preview_url,
        fork_issued_at, delete_issued_at, deploy_issued_at, teardown_issued_at, drone_issued_at, drone_attempt,
-       model, model_reason, model_choice, model_choice_attempt, model_outcome, model_probe)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       model, model_reason, model_choice, model_choice_attempt, model_outcome, model_probe, memories)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
        status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
@@ -403,7 +428,7 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        teardown_issued_at = excluded.teardown_issued_at, drone_issued_at = excluded.drone_issued_at,
        drone_attempt = excluded.drone_attempt, model = excluded.model, model_reason = excluded.model_reason,
        model_choice = excluded.model_choice, model_choice_attempt = excluded.model_choice_attempt,
-       model_outcome = excluded.model_outcome, model_probe = excluded.model_probe`,
+       model_outcome = excluded.model_outcome, model_probe = excluded.model_probe, memories = excluded.memories`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -439,6 +464,7 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     t.modelChoiceAttempt,
     t.modelOutcome,
     t.modelProbe ? 1 : 0,
+    JSON.stringify(t.memories ?? []),
   );
 }
 
