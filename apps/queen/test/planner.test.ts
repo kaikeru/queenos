@@ -846,7 +846,7 @@ describe("planner: command watchdog", () => {
 });
 
 describe("planner: model router", () => {
-  const QWEN = "@cf/qwen/qwen3.8-27b";
+  const DS_FLASH = "@cf/deepseek-ai/deepseek-v4-flash-0731";
   const GLM_FLASH = "@cf/zai-org/glm-5.3-flash";
   const KIMI = "@cf/moonshotai/kimi-k2.7-code";
   const dispatchOf = (s: Sim) => s.take("dispatchDrone").filter((e) => e.task.role === "BUILDER");
@@ -857,10 +857,10 @@ describe("planner: model router", () => {
     s.take("broadcast");
     s.completeForks();
     const [d] = dispatchOf(s);
-    expect(d!.task.modelChoice).toMatchObject({ model: QWEN, tier: "fast", role: "builder", fallbacks: ["@cf/deepseek-ai/deepseek-v4-flash-0731", GLM_FLASH] });
-    expect(s.trains.get("t1")).toMatchObject({ model: QWEN, modelReason: d!.task.modelChoice!.reason, modelChoiceAttempt: 1, modelProbe: false });
+    expect(d!.task.modelChoice).toMatchObject({ model: DS_FLASH, tier: "fast", role: "builder", fallbacks: [GLM_FLASH, KIMI] });
+    expect(s.trains.get("t1")).toMatchObject({ model: DS_FLASH, modelReason: d!.task.modelChoice!.reason, modelChoiceAttempt: 1, modelProbe: false });
     const upd = s.take("broadcast").find((e) => e.message.type === "train.updated");
-    expect(upd?.message).toMatchObject({ train: { trainId: "t1", model: QWEN, modelReason: expect.stringContaining("fast tier") } });
+    expect(upd?.message).toMatchObject({ train: { trainId: "t1", model: DS_FLASH, modelReason: expect.stringContaining("fast tier") } });
     expect(s.routerDispatches).toBe(1);
   });
 
@@ -878,8 +878,8 @@ describe("planner: model router", () => {
     const s = new Sim();
     s.submit("A");
     s.completeForks();
-    s.run((p) => p.buildResult({ trainId: "t1", headSha: "h", model: GLM_FLASH, failedModels: [QWEN], buildMs: 4200 }));
-    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, passes: 0, failures: 1, failStreak: 1 });
+    s.run((p) => p.buildResult({ trainId: "t1", headSha: "h", model: GLM_FLASH, failedModels: [DS_FLASH], buildMs: 4200 }));
+    expect(s.stat(DS_FLASH)).toMatchObject({ attempts: 1, passes: 0, failures: 1, failStreak: 1 });
     expect(s.stat(GLM_FLASH)).toMatchObject({ attempts: 1, passes: 0, failures: 0, avgBuildMs: 4200 });
     expect(s.trains.get("t1")).toMatchObject({ model: GLM_FLASH, modelOutcome: "BUILT" });
     expect(s.trains.get("t1")!.modelReason).toMatch(/^fell back to @cf\/zai-org\/glm-5.3-flash after 1 unusable · fast tier/);
@@ -893,7 +893,7 @@ describe("planner: model router", () => {
     s.completeForks();
     s.build("A"); // no model in the result: attributed to the router's choice
     s.result("A", true);
-    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, passes: 1, failures: 0, failStreak: 0 });
+    expect(s.stat(DS_FLASH)).toMatchObject({ attempts: 1, passes: 1, failures: 0, failStreak: 0 });
     expect(s.floor).toMatchObject({ tier: "fast", passStreak: 1 });
     const n = s.deltas.length;
     expect(s.run((p) => p.trainResult({ trainId: "t1", passed: true, summary: "again" })).outcome).toBe("ignored:duplicate");
@@ -901,7 +901,7 @@ describe("planner: model router", () => {
     s.land("A");
     expect(s.run((p) => p.trainResult({ trainId: "t1", passed: false, summary: "late" })).outcome).toBe("ignored:stale");
     expect(s.deltas).toHaveLength(n);
-    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, passes: 1, failures: 0 });
+    expect(s.stat(DS_FLASH)).toMatchObject({ attempts: 1, passes: 1, failures: 0 });
   });
 
   it("a gate failure counts against the builder and raises the floor; the REWORK escalates to frontier under role rework and leaves the floor alone", () => {
@@ -910,7 +910,7 @@ describe("planner: model router", () => {
     s.completeForks();
     s.build("A");
     s.result("A", false, "security scan rejected");
-    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, passes: 0, failures: 1, failStreak: 1 });
+    expect(s.stat(DS_FLASH)).toMatchObject({ attempts: 1, passes: 0, failures: 1, failStreak: 1 });
     expect(s.floor).toEqual({ tier: "frontier", passStreak: 0, aboveStreak: 0, note: "raised to frontier after a gate failure" });
     const rework = dispatchOf(s).at(-1);
     expect(rework!.task).toMatchObject({ action: "REWORK", scribeSummary: "security scan rejected" });
@@ -941,7 +941,7 @@ describe("planner: model router", () => {
     s.submit("A");
     s.completeForks();
     s.result("A", false, "no valid change set from any model");
-    expect(s.stat(QWEN)).toMatchObject({ attempts: 1, failures: 1 });
+    expect(s.stat(DS_FLASH)).toMatchObject({ attempts: 1, failures: 1 });
     expect(s.floor.tier).toBe("frontier");
   });
 
@@ -992,7 +992,7 @@ describe("planner: model router", () => {
     s.submit("A");
     s.completeForks();
     const [d] = dispatchOf(s);
-    expect(d!.task.modelChoice).toMatchObject({ model: QWEN, tier: "fast" });
+    expect(d!.task.modelChoice).toMatchObject({ model: DS_FLASH, tier: "fast" });
     expect(d!.task.modelChoice!.reason).toMatch(/^probe: trying fast tier again/);
     expect(s.trains.get("t1")!.modelProbe).toBe(true);
     s.build("A");
@@ -1009,10 +1009,10 @@ describe("planner: model router", () => {
 
     const e = new Sim();
     e.routerDispatches = 4;
-    e.stats.set(`${QWEN}|builder`, { model: QWEN, role: "builder", attempts: 3, passes: 3, failures: 0, avgBuildMs: null, updatedAt: 0 });
+    e.stats.set(`${DS_FLASH}|builder`, { model: DS_FLASH, role: "builder", attempts: 3, passes: 3, failures: 0, avgBuildMs: null, updatedAt: 0 });
     e.submit("A");
     e.completeForks();
-    expect(dispatchOf(e)[0]!.task.modelChoice).toMatchObject({ model: "@cf/deepseek-ai/deepseek-v4-flash-0731", reason: expect.stringContaining("exploring least-tried") });
+    expect(dispatchOf(e)[0]!.task.modelChoice).toMatchObject({ model: GLM_FLASH, reason: expect.stringContaining("exploring least-tried") });
 
     const k = new Sim();
     k.policy = { backoffStreak: 1, probeAfter: 4 };

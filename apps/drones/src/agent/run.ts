@@ -3,7 +3,7 @@
  * fallbacks), take the first run that finished with a passing verify and a clean overlay, and return
  * it as a change set (overlay + ledger reasoning). Commit/push stay in their own step.
  */
-import type { DroneTask } from "@queenos/queen-types";
+import { supportsToolLoop, type DroneTask } from "@queenos/queen-types";
 import { templateFitProblems, validateChangeSet } from "../change-set";
 import type { DroneConfig } from "../config";
 import { AllModelsFailedError, modelsFor, type Generated } from "../generate";
@@ -14,8 +14,6 @@ import { MAX_SEED_FILE_CHARS } from "./limits";
 import { diffTrees, overlayProblems } from "./overlay";
 import { ledgerDiscarded, ledgerReasoning } from "./trace";
 
-/** Workers AI models that time out in tool loops (spike: 3046 after 138–166 s, 0/2). The drone skips them. */
-export const TOOL_LOOP_EXCLUDED: ReadonlySet<string> = new Set(["@cf/qwen/qwen3.8-27b"]);
 /** Whole agent phase, from the drone's replay-stable start clock (Queen watchdog: 10 min). */
 export const AGENT_PHASE_MS = 7 * 60_000;
 /** Wall time per model run. */
@@ -39,9 +37,9 @@ export interface AgentRunOptions {
 
 /** Tool-loop model order: the Queen's choice + fallbacks minus models that cannot drive a tool loop. */
 export function agentModelsFor(task: Pick<DroneTask, "modelChoice">, config: Pick<DroneConfig, "aiGateway">): string[] {
-  const usable = modelsFor(task, config).filter((m) => !TOOL_LOOP_EXCLUDED.has(m));
+  const usable = modelsFor(task, config).filter((m) => supportsToolLoop(m));
   if (usable.length) return usable;
-  const fallback = TOOL_LOOP_EXCLUDED.has(config.aiGateway.model) ? "@cf/zai-org/glm-5.3-flash" : config.aiGateway.model;
+  const fallback = !supportsToolLoop(config.aiGateway.model) ? "@cf/zai-org/glm-5.3-flash" : config.aiGateway.model;
   return [fallback];
 }
 

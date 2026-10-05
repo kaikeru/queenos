@@ -74,3 +74,15 @@ test("formatDuration", () => {
   expect(formatDuration(450)).toBe("450ms");
   expect(formatDuration(21400)).toBe("21.4s");
 });
+
+test("floorLine: above the lowest tier shows the back-off streak and probe countdown", async () => {
+  const { floorLine } = await import("../src/components");
+  expect(floorLine({ tier: "frontier", streak: 1, backoffAfter: 3, probeIn: 2 })).toBe("1/3 clean builds to back off · probe in 2");
+});
+
+test("floorLine: at the lowest (fast) tier there is nothing to back off to, so the phrase is dropped", async () => {
+  const { floorLine } = await import("../src/components");
+  const line = floorLine({ tier: "fast", streak: 0, backoffAfter: 3, probeIn: null });
+  expect(line).toBe("at the lowest tier");
+  expect(line).not.toContain("back off");
+});

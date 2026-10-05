@@ -322,11 +322,11 @@ describe("sim release executors", () => {
 
 describe("sim drones: models", () => {
   const fast: ModelChoice = {
-    model: "@cf/qwen/qwen3.8-27b",
+    model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
     tier: "fast",
     role: "builder",
     reason: "fast tier · no track record yet; lowest cost · floor: fast",
-    fallbacks: ["@cf/zai-org/glm-5.3-flash", "@cf/deepseek-ai/deepseek-v4-flash-0731"],
+    fallbacks: ["@cf/zai-org/glm-5.3-flash", "@cf/moonshotai/kimi-k2.7-code"],
   };
   const frontier: ModelChoice = { model: "@cf/moonshotai/kimi-k2.7-code", tier: "frontier", role: "rework", reason: "rework → escalated to frontier", fallbacks: ["@cf/zai-org/glm-5.3"] };
 

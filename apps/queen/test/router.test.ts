@@ -5,6 +5,7 @@ import {
   DEFAULT_POLICY,
   EXPLORE_EVERY,
   INITIAL_FLOOR,
+  cheapestBuilderTier,
   chooseModel,
   floorAfter,
   route,
@@ -16,10 +17,10 @@ import {
 // Catalog order: frontier DS Pro, Kimi, GLM-5.3; fast DS Flash, GLM Flash, Qwen.
 const DS_PRO = "@cf/deepseek-ai/deepseek-v4-pro-0813"; // frontier, cost 9, 1M
 const KIMI = "@cf/moonshotai/kimi-k2.7-code"; // frontier, cost 8, 262k
-const GLM = "@cf/zai-org/glm-5.3"; // frontier, cost 8, 1M, slow (SLOW_MODEL_HINTS)
+const GLM = "@cf/zai-org/glm-5.3"; // frontier, cost 8, 1M, slow (catalog flag)
 const DS_FLASH = "@cf/deepseek-ai/deepseek-v4-flash-0731"; // fast, cost 3, 1M
 const GLM_FLASH = "@cf/zai-org/glm-5.3-flash"; // fast, cost 3, 1M
-const QWEN = "@cf/qwen/qwen3.8-27b"; // fast, cost 2, 262k
+const QWEN = "@cf/qwen/qwen3.8-27b"; // fast, cost 2, 262k, toolLoop: false (never builder/rework)
 
 const stat = (model: string, attempts: number, passes: number, over: Partial<RouterStats> = {}): RouterStats => ({
   model,
@@ -37,7 +38,7 @@ const frontierFloor: FloorState = { tier: "frontier", passStreak: 0, aboveStreak
 describe("router: tier policy and escalation", () => {
   it("a first BUILD routes at the floor (fast by default); all untried, the cheapest wins", () => {
     const c = build();
-    expect(c).toMatchObject({ model: QWEN, tier: "fast", role: "builder" });
+    expect(c).toMatchObject({ model: DS_FLASH, tier: "fast", role: "builder" });
     expect(c.reason).toBe("fast tier · no track record yet; lowest cost · floor: fast");
   });
 
@@ -63,12 +64,12 @@ describe("router: tier policy and escalation", () => {
 
 describe("router: context filtering", () => {
   it("drops models whose window cannot hold the prompt plus headroom", () => {
-    // 700k chars ≈ 233k tokens + 64k headroom > 262k: Qwen and Kimi are out.
+    // 700k chars ≈ 233k tokens + 64k headroom > 262k: Kimi is out.
     expect(build({ promptChars: 700_000 }).model).toBe(DS_FLASH);
     // DS Pro (cost 9) beats GLM-5.3 (cost 8, but slow: x0.8).
     expect(chooseModel({ role: "rework", attempt: 2, promptChars: 700_000, stats: [] }).model).toBe(DS_PRO);
     // Exactly at the limit still fits.
-    expect(build({ promptChars: (262_144 - CONTEXT_HEADROOM_TOKENS) * 3 }).model).toBe(QWEN);
+    expect(chooseModel({ role: "rework", attempt: 2, promptChars: (262_144 - CONTEXT_HEADROOM_TOKENS) * 3, stats: [] }).model).toBe(KIMI);
   });
 
   it("steps up a tier when nothing fits in the wanted tier; largest window when nothing fits at all", () => {
@@ -102,48 +103,124 @@ describe("router: cost per success", () => {
     const c = build({ stats: bad });
     expect(c.tier).toBe("frontier");
     expect(c.reason).toContain("frontier beats fast on cost per success");
-    expect(build({ stats: [stat(QWEN, 10, 6)] }).tier).toBe("fast");
+    expect(build({ stats: [stat(DS_FLASH, 10, 6)] }).tier).toBe("fast");
   });
 
   it("smoothed rates with ties broken by lower cost, then catalog order; streak penalty", () => {
-    // GLM Flash 1/1 and Qwen 3/4 are both 2/3 smoothed; Qwen is cheaper anyway.
-    expect(build({ stats: [stat(GLM_FLASH, 1, 1), stat(QWEN, 4, 3)] }).model).toBe(QWEN);
-    // Qwen poor: DS Flash and GLM Flash tie on value and cost -> catalog order.
-    expect(build({ stats: [stat(QWEN, 6, 0)] }).model).toBe(DS_FLASH);
+    // GLM Flash 1/1 and DS Flash 3/4 are both 2/3 smoothed, same cost -> catalog order.
+    expect(build({ stats: [stat(GLM_FLASH, 1, 1), stat(DS_FLASH, 4, 3)] }).model).toBe(DS_FLASH);
+    // DS Flash poor: GLM Flash wins.
+    expect(build({ stats: [stat(DS_FLASH, 6, 0)] }).model).toBe(GLM_FLASH);
     // DS Flash 3/5 (0.571) beats GLM Flash 2/4 (0.5)... unless it is on a 2-failure streak (0.471).
-    const base = [stat(QWEN, 6, 0), stat(GLM_FLASH, 4, 2), stat(DS_FLASH, 5, 3)];
+    const base = [stat(GLM_FLASH, 4, 2), stat(DS_FLASH, 5, 3)];
     expect(build({ stats: base }).model).toBe(DS_FLASH);
-    expect(build({ stats: [base[0]!, base[1]!, stat(DS_FLASH, 5, 3, { failStreak: 2 })] }).model).toBe(GLM_FLASH);
+    expect(build({ stats: [base[0]!, stat(DS_FLASH, 5, 3, { failStreak: 2 })] }).model).toBe(GLM_FLASH);
   });
 
   it("only learns from the same role: rework stats never steer first-attempt builds", () => {
-    const reworkOnly = [stat(DS_FLASH, 10, 10, { role: "rework" }), stat(QWEN, 10, 0, { role: "rework" })];
-    expect(build({ stats: reworkOnly }).model).toBe(QWEN);
+    const reworkOnly = [stat(GLM_FLASH, 10, 10, { role: "rework" }), stat(DS_FLASH, 10, 0, { role: "rework" })];
+    expect(build({ stats: reworkOnly }).model).toBe(DS_FLASH);
   });
 });
 
 describe("router: slow models", () => {
   it("a hinted or measured-slow model loses its tie (x0.8 value)", () => {
     expect(chooseModel({ role: "rework", attempt: 2, promptChars: 10, stats: [stat(KIMI, 4, 0, { role: "rework" })] }).model).toBe(DS_PRO);
-    const slowFlash = [stat(DS_FLASH, 2, 2, { avgBuildMs: 130_000 }), stat(GLM_FLASH, 2, 2, { avgBuildMs: 20_000 }), stat(QWEN, 6, 0)];
+    const slowFlash = [stat(DS_FLASH, 2, 2, { avgBuildMs: 130_000 }), stat(GLM_FLASH, 2, 2, { avgBuildMs: 20_000 })];
     expect(build({ stats: slowFlash }).model).toBe(GLM_FLASH);
+  });
+});
+
+describe("router: catalog slow flag", () => {
+  const mk = (id: string, slow?: boolean): CatalogModel => ({ id, label: id, tier: "fast", contextWindow: 1e6, cost: 2, roles: ["builder"], ...(slow !== undefined ? { slow } : {}) });
+
+  it("the real catalog flags GLM-5.3 (and only it) as slow", () => {
+    expect(MODEL_CATALOG.filter((m) => m.slow).map((m) => m.id)).toEqual([GLM]);
+  });
+
+  it("slow comes from the catalog entry, not a hard-coded id list", () => {
+    // Equal cost and record: the unflagged model wins even though it is listed later.
+    expect(build({ catalog: [mk("a", true), mk("b")] }).model).toBe("b");
+    expect(build({ catalog: [mk("a"), mk("b", true)] }).model).toBe("a");
+    // Flagging GLM-5.3 off in a custom catalog removes the discount (GLM, cost 8, then beats DS Pro, cost 9... and Kimi loses on catalog order only).
+    const unflagged = MODEL_CATALOG.map((m) => (m.id === GLM ? { ...m, slow: undefined } : m));
+    expect(chooseModel({ role: "rework", attempt: 2, promptChars: 10, stats: [], catalog: unflagged }).fallbacks).toEqual([GLM, DS_PRO]);
+  });
+
+  it("a measured-slow model is still discounted without the flag", () => {
+    expect(build({ catalog: [mk("a"), mk("b")], stats: [stat("a", 2, 2, { avgBuildMs: 130_000 }), stat("b", 2, 2)] }).model).toBe("b");
+  });
+});
+
+describe("router: toolLoop (builder and rework only run tool-loop models)", () => {
+  const mk = (id: string, cost: number, over: Partial<CatalogModel> = {}): CatalogModel => ({ id, label: id, tier: "fast", contextWindow: 1e6, cost, roles: ["builder", "rework"], ...over });
+
+  it("the real catalog marks only Qwen 3.8 as toolLoop: false", () => {
+    expect(MODEL_CATALOG.filter((m) => m.toolLoop === false).map((m) => m.id)).toEqual([QWEN]);
+  });
+
+  it("never picks a toolLoop: false model even when it is the cheapest, nor lists it as a fallback", () => {
+    const catalog = [mk("no-loop", 1, { toolLoop: false }), mk("ok-a", 2), mk("ok-b", 3)];
+    const c = build({ catalog });
+    expect(c.model).toBe("ok-a");
+    expect(c.fallbacks).toEqual(["ok-b"]);
+    // Even a perfect track record does not bring it back.
+    expect(build({ catalog, stats: [stat("no-loop", 50, 50)] }).model).toBe("ok-a");
+    // Exploration of the least-tried model stays inside the usable set.
+    expect(build({ catalog, dispatchIndex: EXPLORE_EVERY, stats: [stat("ok-a", 3, 3), stat("ok-b", 3, 3)] }).model).not.toBe("no-loop");
+    // Rework escalation too.
+    const frontier = [mk("no-loop", 1, { tier: "frontier", toolLoop: false }), mk("ok", 9, { tier: "frontier" })];
+    const rework = chooseModel({ role: "rework", attempt: 2, promptChars: 10, stats: [], catalog: frontier });
+    expect(rework.model).toBe("ok");
+    expect(rework.fallbacks).toEqual([]);
+  });
+
+  it("an explicit toolLoop: true or absent flag is usable", () => {
+    expect(build({ catalog: [mk("a", 1, { toolLoop: true })] }).model).toBe("a");
+    expect(build({ catalog: [mk("a", 1)] }).model).toBe("a");
+  });
+
+  it("the floor default never lands on one: a tier holding only toolLoop: false models is not a builder tier", () => {
+    const catalog = [mk("no-loop", 1, { toolLoop: false }), mk("front", 8, { tier: "frontier" })];
+    expect(cheapestBuilderTier(catalog)).toBe("frontier");
+    const c = build({ catalog });
+    expect(c).toMatchObject({ model: "front", tier: "frontier" });
+    expect(c.reason).toContain("floor: frontier");
+  });
+
+  it("real catalog: no builder or rework choice or fallback is ever Qwen", () => {
+    for (const role of ["builder", "rework"] as const) {
+      for (const attempt of [1, 2]) {
+        for (let dispatchIndex = 0; dispatchIndex <= 10; dispatchIndex++) {
+          for (const stats of [[], [stat(QWEN, 30, 30, { role })], [stat(DS_FLASH, 10, 0, { role }), stat(GLM_FLASH, 10, 0, { role })]]) {
+            const c = chooseModel({ role, attempt, promptChars: 200, stats, dispatchIndex });
+            expect([c.model, ...c.fallbacks]).not.toContain(QWEN);
+          }
+        }
+      }
+    }
+  });
+
+  it("with only toolLoop: false builders, the no-fit fallback is still not one of them when another exists", () => {
+    const catalog = [mk("no-loop", 1, { toolLoop: false, contextWindow: 9e9 }), mk("small", 2, { contextWindow: 70_000 })];
+    expect(build({ catalog, promptChars: 5_000_000 }).model).toBe("small");
   });
 });
 
 describe("router: exploration", () => {
   it(`every ${EXPLORE_EVERY}th dispatch tries the least-tried candidate in the tier`, () => {
-    const stats = [stat(QWEN, 4, 4), stat(DS_FLASH, 3, 1)]; // GLM Flash untried
-    expect(build({ stats, dispatchIndex: 4 }).model).toBe(QWEN);
+    const stats = [stat(DS_FLASH, 4, 4)]; // GLM Flash untried
+    expect(build({ stats, dispatchIndex: 4 }).model).toBe(DS_FLASH);
     const e = build({ stats, dispatchIndex: 5 });
     expect(e.model).toBe(GLM_FLASH);
     expect(e.reason).toContain("exploring least-tried (0 attempts; every 5th dispatch)");
-    expect(build({ stats, dispatchIndex: 6 }).model).toBe(QWEN);
+    expect(build({ stats, dispatchIndex: 6 }).model).toBe(DS_FLASH);
     expect(build({ stats, dispatchIndex: 10 }).model).toBe(GLM_FLASH);
   });
 
   it("explores within the tier (never across) and keeps the normal reason when the best is the least tried", () => {
-    const c = build({ stats: [stat(GLM_FLASH, 2, 2), stat(DS_FLASH, 2, 2)], dispatchIndex: 5 });
-    expect(c.model).toBe(QWEN);
+    const c = build({ stats: [stat(DS_FLASH, 2, 2), stat(GLM_FLASH, 5, 3)], dispatchIndex: 5 });
+    expect(c.model).toBe(DS_FLASH);
     expect(c.reason).not.toContain("exploring");
   });
 });
@@ -158,15 +235,18 @@ describe("router: pin and fallbacks", () => {
       tier: "frontier",
       reason: "pinned by MODEL_ROUTER_PIN_BUILDER (rework → escalated to frontier)",
     });
-    expect(build({ pin: "  " }).model).toBe(QWEN);
+    expect(build({ pin: "  " }).model).toBe(DS_FLASH);
   });
 
   it("fallbacks: next best in the same tier, then one tier up; at most 2", () => {
-    expect(build().fallbacks).toEqual([DS_FLASH, GLM_FLASH]);
+    expect(build().fallbacks).toEqual([GLM_FLASH, KIMI]);
     // GLM-5.3 is slow (up to ~150 s of a 200 s budget): last.
     expect(chooseModel({ role: "rework", attempt: 2, promptChars: 10, stats: [] }).fallbacks).toEqual([DS_PRO, GLM]);
+    // Only Qwen (toolLoop: false) is left in the fast tier: the builder starts in frontier.
     const catalog = MODEL_CATALOG.filter((m) => m.id !== GLM_FLASH && m.id !== DS_FLASH);
-    expect(build({ catalog }).fallbacks).toEqual([KIMI]);
+    const c = build({ catalog });
+    expect(c).toMatchObject({ model: KIMI, tier: "frontier" });
+    expect(c.fallbacks).toEqual([DS_PRO, GLM]);
   });
 });
 
@@ -200,6 +280,14 @@ describe("router: tier floor (AIMD + probes)", () => {
     expect(r.floor).toEqual({ tier: "frontier", passStreak: 0, aboveStreak: 1, note: null });
   });
 
+  it("at the lowest builder tier the floor text has no back-off phrase; above it, it does", () => {
+    const low = route({ role: "builder", attempt: 1, promptChars: 10, stats: [] });
+    expect(low.choice.reason).toBe("fast tier · no track record yet; lowest cost · floor: fast");
+    expect(low.choice.reason).not.toContain("back off");
+    expect(route({ role: "builder", attempt: 1, promptChars: 10, stats: [], floor: frontierFloor }).choice.reason).toContain("to back off");
+    expect(toRouterFloor(INITIAL_FLOOR).probeIn).toBeNull();
+  });
+
   it(`probes one tier down after ${DEFAULT_POLICY.probeAfter} floor dispatches above the cheapest tier`, () => {
     let floor = frontierFloor;
     const tiers: string[] = [];
@@ -210,7 +298,7 @@ describe("router: tier floor (AIMD + probes)", () => {
       if (r.probe && probeAt < 0) {
         probeAt = i;
         expect(r.choice.reason).toMatch(/^probe: trying fast tier again · /);
-        expect(r.choice.fallbacks).toEqual([DS_FLASH, GLM_FLASH]);
+        expect(r.choice.fallbacks).toEqual([GLM_FLASH, KIMI]);
       }
       floor = r.floor;
     }

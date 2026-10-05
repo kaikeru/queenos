@@ -23,8 +23,17 @@ export const CatalogModelSchema = z.object({
   cost: z.number().positive(),
   /** Roles this model is a sensible choice for. */
   roles: z.array(ModelRoleSchema).min(1),
+  /** Known slow in the real-account bake-off (reasons for minutes); the router discounts its value. */
+  slow: z.boolean().optional(),
+  /** Can drive the drone's tool loop. Defaults to true when absent; builder and rework never route to `false`. */
+  toolLoop: z.boolean().optional(),
 });
 export type CatalogModel = z.infer<typeof CatalogModelSchema>;
+
+/** Whether a model can drive the drone's tool loop (catalog `toolLoop`, default true; unknown ids are assumed capable). */
+export function supportsToolLoop(id: string, catalog: readonly CatalogModel[] = MODEL_CATALOG): boolean {
+  return catalog.find((m) => m.id === id)?.toolLoop !== false;
+}
 
 /**
  * Default catalog (verified available on the account via /ai/models/search on 2026-10-05).
@@ -34,10 +43,10 @@ export type CatalogModel = z.infer<typeof CatalogModelSchema>;
 export const MODEL_CATALOG: readonly CatalogModel[] = [
   { id: "@cf/deepseek-ai/deepseek-v4-pro-0813", label: "DeepSeek V4 Pro", tier: "frontier", contextWindow: 1048576, cost: 9, roles: ["builder", "rework"] },
   { id: "@cf/moonshotai/kimi-k2.7-code", label: "Kimi K2.7 Code", tier: "frontier", contextWindow: 262144, cost: 8, roles: ["builder", "rework"] },
-  { id: "@cf/zai-org/glm-5.3", label: "GLM-5.3", tier: "frontier", contextWindow: 1048576, cost: 8, roles: ["builder", "rework", "genesis"] },
+  { id: "@cf/zai-org/glm-5.3", label: "GLM-5.3", tier: "frontier", contextWindow: 1048576, cost: 8, roles: ["builder", "rework", "genesis"], slow: true },
   { id: "@cf/deepseek-ai/deepseek-v4-flash-0731", label: "DeepSeek V4 Flash", tier: "fast", contextWindow: 1048576, cost: 3, roles: ["builder", "rework"] },
   { id: "@cf/zai-org/glm-5.3-flash", label: "GLM-5.3 Flash", tier: "fast", contextWindow: 1048576, cost: 3, roles: ["builder", "genesis", "scribe"] },
-  { id: "@cf/qwen/qwen3.8-27b", label: "Qwen 3.8 27B", tier: "fast", contextWindow: 262144, cost: 2, roles: ["builder", "genesis"] },
+  { id: "@cf/qwen/qwen3.8-27b", label: "Qwen 3.8 27B", tier: "fast", contextWindow: 262144, cost: 2, roles: ["builder", "genesis"], toolLoop: false },
   { id: "@cf/zai-org/glm-4.7-flash", label: "GLM-4.7 Flash", tier: "light", contextWindow: 131072, cost: 1, roles: ["scribe", "genesis"] },
   { id: "@cf/ibm-granite/granite-4.0-h-micro", label: "Granite 4.0 Micro", tier: "light", contextWindow: 131000, cost: 1, roles: ["scribe"] },
   { id: "@cf/meta/llama-3.2-3b-instruct", label: "Llama 3.2 3B", tier: "light", contextWindow: 80000, cost: 1, roles: ["scribe"] },
