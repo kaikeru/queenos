@@ -8,7 +8,8 @@ const train = (o: Partial<MergeTrain>): MergeTrain => ({ trainId: "t", baseSha: 
 describe("demoSwarmPrompt", () => {
   it("makes n bullets with one race, two collide and one batch-fail marker", () => {
     const p = demoSwarmPrompt(24);
-    const lines = p.split("\n");
+    const [title, ...lines] = p.split("\n");
+    expect(title).toBe("Ship a swarm of 24 feature endpoints");
     expect(lines).toHaveLength(24);
     expect(lines.every((l) => l.startsWith("- Add a /features/"))).toBe(true);
     expect(p.match(/\[race\]/g)).toHaveLength(1);
@@ -16,8 +17,8 @@ describe("demoSwarmPrompt", () => {
     expect(p.match(/\[batch-fail\]/g)).toHaveLength(1);
   });
   it("handles tiny and huge sizes", () => {
-    expect(demoSwarmPrompt(0).split("\n")).toHaveLength(1);
-    expect(new Set(demoSwarmPrompt(40).split("\n")).size).toBe(40);
+    expect(demoSwarmPrompt(0).split("\n")).toHaveLength(2);
+    expect(new Set(demoSwarmPrompt(40).split("\n")).size).toBe(41);
   });
 });
 

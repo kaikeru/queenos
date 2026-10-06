@@ -2,7 +2,7 @@
  * Release view logic (P3): timeline steps, the Sites rows and the tap-to-ship
  * button state. Pure; no React.
  */
-import { CANARY_STEPS, type Release, type ReleasePhase, type SentinelVerdict } from "@queenos/queen-types";
+import { AUTO_SHIP_ACTOR, CANARY_STEPS, type Release, type ReleasePhase, type SentinelVerdict } from "@queenos/queen-types";
 import type { State } from "./reducer";
 
 export const TERMINAL_PHASES: readonly ReleasePhase[] = ["SHIPPED", "FAILED", "ROLLED_BACK", "SUPERSEDED"];
@@ -190,5 +190,47 @@ export function siteReleaseView(state: Pick<State, "releases" | "releaseOrder" |
       shipped || prodUrl
         ? { url: prodUrl, stable: shortVersion(shipped?.candidateVersionId ?? rels.find((r) => r.stableVersionId)?.stableVersionId), tappedBy: shipped?.tappedBy ?? null, releaseId: shipped?.releaseId ?? "" }
         : null,
+  };
+}
+
+// ── prod link and the status-home strip ───────────────────────────────────
+
+/** The production URL: the shipped release's, else any release's, else a LIVE prod deployment's (what the Sites panel shows). */
+export function prodUrlOf(state: Pick<State, "releases" | "releaseOrder" | "deployments">, release?: Release | null): string | null {
+  if (release?.prodUrl) return release.prodUrl;
+  const rels = state.releaseOrder.map((id) => state.releases[id]).filter((r): r is Release => !!r);
+  const fromRelease = rels.find((r) => r.phase === "SHIPPED" && r.prodUrl)?.prodUrl ?? rels.find((r) => r.prodUrl)?.prodUrl;
+  if (fromRelease) return fromRelease;
+  const prod = Object.values(state.deployments)
+    .filter((d) => d.environment === "prod" && d.url && d.status !== "TORN_DOWN")
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  return prod[0]?.url ?? null;
+}
+
+/** Who shipped it: the Queen on her own, a person, or null when not (yet) tapped. */
+export function shipper(r: Release): { kind: "auto" | "human"; by: string } | null {
+  if (!r.tappedBy) return null;
+  return r.tappedBy === AUTO_SHIP_ACTOR ? { kind: "auto", by: r.tappedBy } : { kind: "human", by: r.tappedBy };
+}
+
+export interface ReleaseStrip {
+  release: Release;
+  steps: TimelineStep[];
+  headline: string;
+  shipper: ReturnType<typeof shipper>;
+  /** Set once SHIPPED and a URL is known. */
+  prodUrl: string | null;
+}
+
+/** The status-home release strip: the newest release, or null when there is none. */
+export function releaseStrip(state: Pick<State, "releases" | "releaseOrder" | "deployments" | "canaryPeak">): ReleaseStrip | null {
+  const release = currentRelease(state);
+  if (!release) return null;
+  return {
+    release,
+    steps: timelineSteps(release, state.canaryPeak[release.releaseId] ?? 0),
+    headline: phaseHeadline(release),
+    shipper: shipper(release),
+    prodUrl: release.phase === "SHIPPED" ? prodUrlOf(state, release) : null,
   };
 }

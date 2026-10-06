@@ -1,5 +1,6 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { api, errorMessage, isAuthError } from "./api";
+import { SIM_BADGE_TEXT } from "./homeLogic";
 import { useEscape, useResource } from "./hooks";
 import { Link } from "./router";
 import { hrefFor } from "./route";
@@ -87,7 +88,7 @@ export function ItemChip({ status, sub }: { status: string; sub?: string | null 
 }
 
 /** Header for hive pages: brand, breadcrumbs, link state, page actions. */
-export function HiveHeader(props: { hive: string; crumbs?: { label: string; to?: string }[]; status: ConnStatus; latencyMs: number | null; actions?: ReactNode }) {
+export function HiveHeader(props: { hive: string; crumbs?: { label: string; to?: string }[]; status: ConnStatus; latencyMs: number | null; actions?: ReactNode; sim?: boolean }) {
   const label = props.status === "open" ? `linked${props.latencyMs !== null ? ` ${props.latencyMs}ms` : ""}` : props.status;
   return (
     <header className="hh">
@@ -105,6 +106,7 @@ export function HiveHeader(props: { hive: string; crumbs?: { label: string; to?:
         ))}
       </nav>
       <div className="hh__right">
+        {props.sim && <span className="sim-badge" role="status" title="This hive runs scripted executors, not real builds">{SIM_BADGE_TEXT}</span>}
         {props.actions}
         <div className={`conn conn--${props.status}`} role="status">
           <i />

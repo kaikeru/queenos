@@ -1,5 +1,6 @@
 /** Pure helpers for the status home and item page (no React; unit-tested). */
 import type { Escalation, EscalationAction, EscalationReason, HiveStatus, MergeTrain, Race, WorkItem } from "@queenos/queen-types";
+import { GUARDRAIL_MAX } from "@queenos/queen-types";
 import { itemIdOf, isBuildTrain } from "./swarm";
 
 export const ACTION_LABEL: Record<EscalationAction, string> = {
@@ -108,4 +109,43 @@ export function gateText(t: MergeTrain): string | null {
   if (!s) return null;
   const kb = s.changedBytes >= 1024 ? `${(s.changedBytes / 1024).toFixed(1)} KB` : `${s.changedBytes} B`;
   return `gate ${s.satisfied}/${s.missing} · ${s.checks} checks · ${s.changedFiles} files · ${kb}`;
+}
+
+// ── SIM badge ─────────────────────────────────────────────────────────────
+
+export const SIM_BADGE_TEXT = "SIMULATION · scripted executors";
+
+/** True when the hive runs scripted executors (`mode === "sim"`) or the dashboard uses the mock API. Read defensively: `mode` may predate the types. */
+export function isSimulation(hive: unknown, mock: boolean = import.meta.env.VITE_MOCK_API === "1"): boolean {
+  if (mock) return true;
+  return (hive as { mode?: string } | null | undefined)?.mode === "sim";
+}
+
+// ── guardrails form ───────────────────────────────────────────────────────
+
+export const GUARDRAIL_FIELDS = [
+  { key: "maxChildrenPerItem", label: "Max children per item", hint: "How many sub-items a goal may split into" },
+  { key: "maxActiveTrains", label: "Max active trains", hint: "Concurrent builds (the WIP limit)" },
+] as const;
+export type GuardrailKey = (typeof GUARDRAIL_FIELDS)[number]["key"];
+
+/** Parse a guardrail input; returns the integer or an error message. Range is 1..GUARDRAIL_MAX[key]. */
+export function parseGuardrail(key: GuardrailKey, raw: string): { value: number } | { error: string } {
+  const max = GUARDRAIL_MAX[key];
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return { error: `Enter a whole number from 1 to ${max}` };
+  const value = Number(t);
+  if (value < 1 || value > max) return { error: `Must be between 1 and ${max}` };
+  return { value };
+}
+
+/** The PATCH body for the fields that changed (null when nothing changed or an input is invalid). */
+export function guardrailPatch(current: Record<GuardrailKey, number>, draft: Record<GuardrailKey, string>): { guardrails: Partial<Record<GuardrailKey, number>> } | null {
+  const guardrails: Partial<Record<GuardrailKey, number>> = {};
+  for (const f of GUARDRAIL_FIELDS) {
+    const p = parseGuardrail(f.key, draft[f.key]);
+    if ("error" in p) return null;
+    if (p.value !== current[f.key]) guardrails[f.key] = p.value;
+  }
+  return Object.keys(guardrails).length ? { guardrails } : null;
 }

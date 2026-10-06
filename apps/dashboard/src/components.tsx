@@ -3,7 +3,7 @@ import { Link } from "./router";
 import { ApiError, api, errorMessage } from "./api";
 import { useEscape, usePersistedBool } from "./hooks";
 import { earlierSummary, groupLanes, relativeTime } from "./lanes";
-import { phaseHeadline, phaseHint, releaseSummary, shortVersion, tapButtonState, tapErrorMessage, timelineSteps, type SiteReleaseView } from "./releases";
+import { prodUrlOf, phaseHeadline, phaseHint, releaseSummary, shortVersion, tapButtonState, tapErrorMessage, timelineSteps, type SiteReleaseView } from "./releases";
 import { CANARY_STEPS, type ModelStats, type RecalledMemory, type ModelTier, type Release, type RouterFloor, type SentinelVerdict } from "@queenos/queen-types";
 import {
   PHASE_FLOW,
@@ -700,6 +700,20 @@ export function CanaryBar({ percent, rolledBack, shipped }: { percent: number; r
 
 // ── release timeline ──────────────────────────────────────────────────────
 
+/** The green SHIPPED banner; links to prod once the URL is known. */
+export function ShippedBanner({ release, url }: { release: Release; url: string | null }) {
+  return (
+    <div className="rtl__banner rtl__banner--ok">
+      SHIPPED{release.tappedBy ? ` by ${release.tappedBy}` : ""}
+      {url && (
+        <a className="rtl__prod" href={url} target="_blank" rel="noreferrer" title={url}>
+          prod ▸
+        </a>
+      )}
+    </div>
+  );
+}
+
 export function ReleaseTimeline(props: { hive: string; state: State; release: Release | null; onTapped?: () => void }) {
   const { release, state } = props;
   const [modal, setModal] = useState(false);
@@ -790,7 +804,7 @@ export function ReleaseTimeline(props: { hive: string; state: State; release: Re
       <p className="rtl__hint">{phaseHint(release)}</p>
       {releaseSummary(release) && <p className="rtl__summary">{releaseSummary(release)}</p>}
       {release.phase === "ROLLED_BACK" && <div className="rtl__banner rtl__banner--bad">ROLLED BACK{release.stableVersionId ? ` to ${shortVersion(release.stableVersionId)}` : ""}</div>}
-      {release.phase === "SHIPPED" && <div className="rtl__banner rtl__banner--ok">SHIPPED{release.tappedBy ? ` by ${release.tappedBy}` : ""}</div>}
+      {release.phase === "SHIPPED" && <ShippedBanner release={release} url={prodUrlOf(state, release)} />}
       {sentFor === release.releaseId && error === null && release.phase === "AWAITING_TAP" && <p className="muted">Tap sent. Waiting for the Queen to start the canary…</p>}
 
       {modal && (

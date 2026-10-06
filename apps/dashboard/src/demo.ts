@@ -18,7 +18,7 @@ const SWARM_WORDS = [
   "juniper", "kelp", "lichen", "mosaic", "nectar", "orchid", "prairie", "quill",
 ];
 
-/** An n-bullet goal prompt. One bullet races, two collide on shared paths, one fails the batch gate. */
+/** A titled n-bullet goal prompt (the title line becomes the goal title). One bullet races, two collide on shared paths, one fails the batch gate. */
 export function demoSwarmPrompt(n: number): string {
   const count = Math.max(1, Math.floor(n));
   const marks = new Map<number, string>();
@@ -32,11 +32,12 @@ export function demoSwarmPrompt(n: number): string {
   place(0.3, COLLIDE_MARKER);
   place(0.4, COLLIDE_MARKER);
   place(0.7, BATCH_FAIL_MARKER);
-  return Array.from({ length: count }, (_, i) => {
+  const bullets = Array.from({ length: count }, (_, i) => {
     const w = i < SWARM_WORDS.length ? SWARM_WORDS[i]! : `${SWARM_WORDS[i % SWARM_WORDS.length]!}${Math.floor(i / SWARM_WORDS.length)}`;
     const marker = marks.get(i);
     return `- Add a /features/${w} endpoint returning ${w} facts${marker ? ` ${marker}` : ""}`;
-  }).join("\n");
+  });
+  return [`Ship a swarm of ${count} feature endpoints`, ...bullets].join("\n");
 }
 
 /** Sample size of the one-click swarm demo. */

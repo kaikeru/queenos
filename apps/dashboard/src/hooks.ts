@@ -1,3 +1,4 @@
+import { withRetry } from "./retry";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export interface Resource<T> {
@@ -7,7 +8,7 @@ export interface Resource<T> {
   reload: () => void;
 }
 
-/** Load once per `key` (and on reload()). Stale responses are dropped. */
+/** Load once per `key` (and on reload()). Stale responses are dropped. 5xx and network errors are retried with backoff (3 tries). */
 export function useResource<T>(load: () => Promise<T>, key: string): Resource<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<unknown>(null);
@@ -19,7 +20,7 @@ export function useResource<T>(load: () => Promise<T>, key: string): Resource<T>
   useEffect(() => {
     let live = true;
     setLoading(true);
-    loadRef.current().then(
+    withRetry(() => loadRef.current(), { cancelled: () => !live }).then(
       (d) => {
         if (!live) return;
         setData(d);

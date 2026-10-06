@@ -10,6 +10,7 @@ import { EventLog } from "./EventLog";
 import { Metrics } from "./Metrics";
 import { Link, useRoute } from "./router";
 import { hrefFor, type Route } from "./route";
+import { isSimulation } from "./homeLogic";
 import { HiveFooter, HiveHeader, Shell } from "./shell";
 
 type HiveRoute = Extract<Route, { name: "warroom" }>;
@@ -37,7 +38,7 @@ function HiveRoot({ route }: { route: HiveRoute }) {
           <button type="button" onClick={() => window.location.reload()}>Reload</button>
         </div>
       )}
-      <HiveHeader hive={hive} crumbs={crumbs[page]} status={status} latencyMs={latencyMs} />
+      <HiveHeader hive={hive} crumbs={crumbs[page]} status={status} latencyMs={latencyMs} sim={isSimulation(state.hive)} />
       {page === "queue" && <QueuePage hive={hive} state={state} />}
       {page === "item" && <ItemView hive={hive} itemId={id} state={state} />}
       {page === "trace" && <TraceView hive={hive} traceId={id} state={state} />}

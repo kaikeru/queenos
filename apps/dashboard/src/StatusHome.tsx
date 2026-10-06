@@ -2,10 +2,11 @@ import { useMemo, useState, type FormEvent } from "react";
 import { RUNBOOK, type Escalation, type EscalationAction } from "@queenos/queen-types";
 import { api, errorMessage } from "./api";
 import { SWARM_DEMO_SIZE, demoSwarmPrompt } from "./demo";
-import { ACTION_LABEL, autonomyLabel, compactNumber, durationText, escalationButtons, meterFill, reasonText } from "./homeLogic";
+import { ACTION_LABEL, autonomyLabel, isSimulation, compactNumber, durationText, escalationButtons, meterFill, reasonText } from "./homeLogic";
 import { MergeQueue } from "./MergeQueue";
 import { Link } from "./router";
 import { hrefFor } from "./route";
+import { ReleaseStripRow, GuardrailsPanel } from "./HomePanels";
 import { HiveFooter, HiveHeader, ItemChip } from "./shell";
 import { blockedOrFailed, goalTrees, headline, openEscalations, pipelineCounts, statusTiles, type GoalNode, type ItemRow } from "./status";
 import { SwarmFloor } from "./SwarmFloor";
@@ -30,14 +31,18 @@ export function StatusHome({ hive, room }: { hive: string; room: Room }) {
           <button type="button" onClick={() => window.location.reload()}>Reload</button>
         </div>
       )}
-      <HiveHeader hive={hive} status={status} latencyMs={latencyMs} actions={<AutonomySelect hive={hive} state={room.state} />} />
+      <HiveHeader hive={hive} status={status} latencyMs={latencyMs} sim={isSimulation(state.hive)} actions={<AutonomySelect hive={hive} state={room.state} />} />
 
       <section className={`sh-head sh-head--${head.kind.toLowerCase()}`} aria-live="polite">
         <span className="sh-head__dot" aria-hidden="true" />
         <h2>{head.text}</h2>
       </section>
 
+      <ReleaseStripRow hive={hive} state={state} />
+
       <Tiles tiles={tiles} />
+
+      <GuardrailsPanel hive={hive} state={state} />
 
       {open.length > 0 && (
         <section className="panel sh-needs" aria-label="Needs you">
