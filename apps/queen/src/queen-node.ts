@@ -486,7 +486,8 @@ export class QueenNode extends DurableObject<Env> {
     if (hive !== null && hive !== prompt.namespace) {
       throw new QueenError("CONFLICT", `this hive is "${hive}", not "${prompt.namespace}"`);
     }
-    const hints = this.filingHints(prompt.promptText);
+    // A decomposed goal's text names its children's markers; hints apply to the children (via difficulty), never the goal.
+    const hints = prompt.decompose ? {} : this.filingHints(prompt.promptText);
     const actor = input.user ? `user:${input.user}` : "user";
     await this.maybeLease(prompt.namespace, true);
     const { value: res, acc } = this.decide(prompt.namespace, (d) =>

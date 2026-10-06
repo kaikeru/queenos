@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type { DroneTask, Escalation, HiveStatus, ProvisionCommand, QueenEvent, QueenServerMessage, QueueView } from "@queenos/queen-types";
 
 type Snapshot = Extract<QueenServerMessage, { type: "snapshot" }>;
+import { demoSwarmPrompt } from "../src/sim/sim-v2";
 import type { QueenNode } from "../src/queen-node";
 import type { RecordingDispatcher, RecordingHerald, RecordingProvisioner } from "./fakes";
 import type { SimQueenNode } from "./worker";
@@ -195,6 +196,25 @@ describe("(c) parallel builds", () => {
       peak = Math.max(peak, building.size);
     }
     expect(peak).toBeGreaterThanOrEqual(5);
+  });
+});
+
+describe("(c2) a decomposed swarm does not inherit a child's [race] marker", () => {
+  it("only the [race] child races best-of-3; the rest dispatch at width 1 and build in parallel", async () => {
+    const hive = newHive();
+    const stub = sim(hive);
+    await settings(stub, { guardrails: { maxActiveTrains: 64, maxChildrenPerItem: 24 } }); // the dev:sim defaults
+    const text = demoSwarmPrompt(24);
+    const { item: goal } = await stub.submitWork({ namespace: hive, promptText: text, decompose: true });
+    expect(goal.bestOf ?? null).toBeNull();
+    await pump(stub, async () => (await items(stub)).filter((i) => i.parent_id === goal.itemId).length >= 24, 8_000, "24 children");
+    await pump(stub, async () => (await buildTrains(stub)).length >= 22, 8_000, "22+ build trains at once");
+    const kids = await rows(stub, "SELECT title, best_of, difficulty FROM work_items WHERE parent_id = ?", goal.itemId);
+    expect(kids.filter((k) => k.best_of !== null)).toHaveLength(0);
+    const races = await rows(stub, "SELECT r.width, w.title FROM races r JOIN work_items w ON w.item_id = r.item_id");
+    for (const r of races) expect(String(r.title)).toContain("[race]");
+    expect(races.every((r) => r.width === 3)).toBe(true);
+    expect(races).toHaveLength(1);
   });
 });
 
