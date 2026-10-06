@@ -282,7 +282,7 @@ describe("mergeResult", () => {
     const conflicts = ["E", "F", "G"].map((t) => ({ trainId: t, kind: "unsupported" as const, paths: [], summary: "add/add" }));
     const d = mergeResult(s.k3, merge("K3", { merged: [], conflicts, headSha: undefined }), s.trains, ctx());
     expect(patchOf(d, "K3")).toMatchObject({ phase: "EJECTED", reason: "no members merged", members: [], forkState: "DELETING", deleteCommandId: "K3-delete-1" });
-    expect(d.effects).toEqual([{ type: "provision", trainId: "K3", command: { op: "DELETE", commandId: "K3-delete-1", hive: "hive", trainId: "K3", repo: "hive-train-K3" } }]);
+    expect(d.effects).toEqual([{ type: "provision", trainId: "K3", command: { op: "DELETE", commandId: "K3-delete-1", hive: "hive", trainId: "K3", repo: "hive-train-K3", trace: { traceparent: expect.stringMatching(/^00-/) } } }]);
     expect(patchOf(d, "K4")).toEqual({ members: ["H", "I"], includedPrompts: ["p-H", "p-I"] });
     expect(d.failures.map((f) => [f.trainId, f.cause, f.waitForCarSeq])).toEqual([
       ["E", "conflict", 10],

@@ -176,15 +176,16 @@ describe("migrations", () => {
       );
       expect(rowToRelease(sql.exec("SELECT * FROM releases").one()).traceId).toBe(traceIdFromUuid(releaseId));
 
-      // The snapshot is unchanged for v1 consumers: same rows, no v2 keys anywhere.
+      // WP2.1 (deliberate): the snapshot moved to the v2 shape (toMergeTrainV2 plus the
+      // optional v2 keys). Every v1 key and value is unchanged, so v1 consumers still parse it;
+      // trains only gain the v2 fields that are set (here: the migrated trace id).
       const snap = q.getSnapshot();
       expect(QueenServerMessageSchema.safeParse(snap).success).toBe(true);
-      expect(Object.keys(snap).sort()).toEqual(["deployments", "modelStats", "promptRuns", "recentAudit", "releases", "routerFloor", "trains", "type", "verdicts"]);
+      expect(Object.keys(snap)).toEqual(expect.arrayContaining(["deployments", "modelStats", "promptRuns", "recentAudit", "releases", "routerFloor", "trains", "type", "verdicts"]));
       expect(snap.promptRuns).toEqual(before.promptRuns);
-      expect(snap.trains).toEqual(before.trains);
+      expect(snap.trains).toEqual(before.trains.map((t, i) => ({ ...t, traceId: traceIdFromUuid(trains[i]![1]) })));
       expect(snap.recentAudit).toEqual(before.recentAudit);
       expect(snap.releases).toEqual(before.releases);
-      for (const t of snap.trains) expect(Object.keys(t).sort()).toEqual(Object.keys(before.trains[0]!).sort());
     });
   });
 

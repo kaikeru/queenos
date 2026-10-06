@@ -426,7 +426,7 @@ export class WorkPlanner {
       this.settings = defaultSettingsRecord(ctx.hive, ctx.now);
       this.settingsDirty = true;
     }
-    this.hs = effectiveSettings(this.settings);
+    this.hs = effectiveSettings(this.settings, ctx.now);
     const rolled = rollBudgetDay(this.settings, ctx.now);
     if (rolled !== this.settings) {
       this.settings = rolled;
@@ -1200,7 +1200,7 @@ export class WorkPlanner {
     if (status !== "BLOCKED") item.blockedReason = null;
     if (status !== "ACTIVE") this.releaseClaims(item.itemId, item);
     this.markItem(item);
-    this.event("item.status", item, why ?? `${from} → ${status}`, { from, to: status }, actor, status === "FAILED" ? "warn" : "info");
+    this.event("item.status", item, why ?? `${from} → ${status}`, { from, to: status, kind: item.kind }, actor, status === "FAILED" ? "warn" : "info");
   }
 
   private failItem(item: WorkItemRecord, summary: string | null): void {

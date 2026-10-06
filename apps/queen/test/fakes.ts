@@ -1,4 +1,4 @@
-import type { DeployCommand, DroneTask, ProvisionCommand, SentinelCommand } from "@queenos/queen-types";
+import type { DeployCommand, DroneTask, OracleCommand, ProvisionCommand, SentinelCommand } from "@queenos/queen-types";
 import { droneInstanceId, type DroneDispatcher } from "../src/drones";
 import type { CommandDispatcher } from "../src/executors";
 
@@ -7,6 +7,8 @@ export class RecordingCommands<C extends { commandId: string }> implements Comma
   readonly commands: C[] = [];
   /** Throw on the next N dispatches (exercises the reconcile alarm). */
   failNext = 0;
+  /** Number of dispatchMany calls (createBatch analogue). */
+  batches = 0;
 
   async dispatch(command: C): Promise<{ instanceId: string }> {
     if (this.failNext > 0) {
@@ -16,11 +18,25 @@ export class RecordingCommands<C extends { commandId: string }> implements Comma
     this.commands.push(command);
     return { instanceId: command.commandId };
   }
+
+  async dispatchMany(commands: readonly C[]): Promise<{ failed: string[] }> {
+    this.batches++;
+    const failed: string[] = [];
+    for (const c of commands) {
+      try {
+        await this.dispatch(c);
+      } catch {
+        failed.push(c.commandId);
+      }
+    }
+    return { failed };
+  }
 }
 
 export class RecordingProvisioner extends RecordingCommands<ProvisionCommand> {}
 export class RecordingHerald extends RecordingCommands<DeployCommand> {}
 export class RecordingSentinel extends RecordingCommands<SentinelCommand> {}
+export class RecordingOracle extends RecordingCommands<OracleCommand> {}
 
 export class RecordingDispatcher implements DroneDispatcher {
   readonly tasks: DroneTask[] = [];

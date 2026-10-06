@@ -124,13 +124,38 @@ async function settle(ns: string, reported: Set<string>, opts: { deploys?: boole
   }
 }
 
+/**
+ * v2 merge queue: a passed build boards a car (a QUEUE-lane train) that forks
+ * from main, runs the MERGE drone (fast path: one member, fast-forward) and is
+ * landed by the LANDER. Plays those executors; returns the car id.
+ */
+async function landViaQueue(ns: string, trainId: string, reported: Set<string>, mainSha = "main-1"): Promise<string> {
+  await settle(ns, reported);
+  let s = await inspect(ns);
+  const car = s.trains.find((t) => (t as unknown as { lane: string }).lane === "QUEUE" && JSON.parse(String((t as unknown as { members: string }).members)).includes(trainId));
+  expect(car).toBeDefined();
+  const carId = car!.train_id;
+  expect(s.tasks.at(-1)).toMatchObject({ trainId: carId, action: "MERGE", role: "LANDER", members: [expect.objectContaining({ trainId })] });
+  const merged = await post(ns, "/internal/webhook/merge-result", { trainId: carId, ok: true, headSha: "c".repeat(40), baseSha: "b".repeat(40), merged: [trainId], fastForward: true });
+  expect(await merged.json()).toMatchObject({ outcome: "applied", train: { phase: "LANDING" } });
+  s = await inspect(ns);
+  expect(s.tasks.at(-1)).toMatchObject({ trainId: carId, action: "LAND", members: [expect.objectContaining({ trainId })] });
+  const landed = await post(ns, "/internal/webhook/land-result", { trainId: carId, landed: true, mainSha });
+  expect(await landed.json()).toMatchObject({ outcome: "applied", train: { phase: "MERGED" } });
+  return carId;
+}
+
 async function connect(path: string): Promise<{ ws: WebSocket; next: (pred?: (m: QueenServerMessage) => boolean) => Promise<QueenServerMessage> }> {
   const res = await worker.fetch(`http://queen.test${path}`, { headers: { Upgrade: "websocket" } });
   expect(res.status).toBe(101);
   const ws = res.webSocket!;
   const inbox: QueenServerMessage[] = [];
   ws.addEventListener("message", (e) => {
-    if (e.data !== "pong") inbox.push(JSON.parse(e.data as string));
+    if (e.data === "pong") return;
+    const m = JSON.parse(e.data as string) as QueenServerMessage;
+    // v2: broadcasts arrive coalesced in `batch` frames; tests read the messages inside.
+    if (m.type === "batch") inbox.push(...m.messages);
+    else inbox.push(m);
   });
   ws.accept();
   const next = async (pred: (m: QueenServerMessage) => boolean = () => true) => {
@@ -212,19 +237,16 @@ describe("merge train via HTTP", () => {
     expect(byId[t3!.train_id]!.status).toBe("TESTING");
     expect(s.deleted).toEqual([t2!.artifact_repo]);
     const active = s.trains.filter((t) => t.status !== "EJECTED");
-    expect(active.map((t) => JSON.parse(t.included_prompts))).toEqual([[a], [c], [b]]);
+    expect(active.map((t) => JSON.parse(t.included_prompts))).toEqual([[a], [c], [b], [b]]);
     expect(active.at(-1)!.fork_source).toBe(ns);
     expect(s.prompts).toContainEqual({ prompt_id: b, status: "QUEUED", summary: "B: 3 tests failed", attempts: 1 });
 
-    // A passes (via the /trains/:id/result alias) -> head lands through a LANDER drone.
+    // A passes (via the /trains/:id/result alias) -> boards a merge-queue car, which lands it.
     const pass = await post(ns, `/trains/${t1!.train_id}/result`, { passed: true, summary: "A green", commitSha: "h-a" });
-    expect(await pass.json()).toMatchObject({ outcome: "applied", train: { status: "TESTING" } });
+    expect(await pass.json()).toMatchObject({ outcome: "applied", train: { status: "TESTING", phase: "PASSED" } });
+    await landViaQueue(ns, t1!.train_id, reported);
     s = await inspect(ns);
-    expect(s.tasks.at(-1)).toMatchObject({ trainId: t1!.train_id, role: "LANDER", action: "LAND", baseRef: "h-a" });
-
-    const landed = await post(ns, "/internal/webhook/land-result", { trainId: t1!.train_id, landed: true, mainSha: "main-1" });
-    expect(await landed.json()).toMatchObject({ outcome: "applied", train: { status: "MERGED" } });
-    s = await inspect(ns);
+    expect(s.trains.find((t) => t.train_id === t1!.train_id)).toMatchObject({ phase: "MERGED" });
     expect(s.prompts.find((p) => p.prompt_id === a)!.status).toBe("MERGED");
     expect(s.deleted).toContain(t1!.artifact_repo);
 
@@ -232,10 +254,12 @@ describe("merge train via HTTP", () => {
     const late = await post(ns, "/internal/webhook/train-result", { trainId: t2!.train_id, passed: true, summary: "late" });
     expect(await late.json()).toMatchObject({ outcome: "ignored:stale", train: { status: "EJECTED" } });
 
-    // A REWORK drone carries the Scribe summary as soon as B's new train forks (from main, no waiting).
+    // A REWORK drone (a race of reworkWidth 2) carries the Scribe summary as soon as B's new trains fork (from main, no waiting).
     await settle(ns, reported);
     s = await inspect(ns);
-    expect(s.tasks.at(-1)).toMatchObject({ promptId: b, action: "REWORK", scribeSummary: "B: 3 tests failed" });
+    const reworks = s.tasks.filter((t) => t.action === "REWORK");
+    expect(reworks.length).toBe(2);
+    for (const r of reworks) expect(r).toMatchObject({ promptId: b, scribeSummary: "B: 3 tests failed" });
   });
 
   it("appends audit events and records scribe summaries", async () => {
@@ -312,7 +336,7 @@ describe("executor results", () => {
     expect(snap.deployments).toEqual([expect.objectContaining({ status: "LIVE", url: previewUrl(trainId), versionId: "v-1", hive: ns })]);
     // Gatekeepers can now pass the train.
     const pass = await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "smoke ok" });
-    expect(await pass.json()).toMatchObject({ outcome: "applied", train: { phase: "LANDING" } });
+    expect(await pass.json()).toMatchObject({ outcome: "applied", train: { phase: "PASSED", passedSeq: 1, carId: expect.any(String) } });
   });
 
   it("a gatekeeper pass while DEPLOYING is premature", async () => {
@@ -346,9 +370,9 @@ describe("executor results", () => {
 
   it("MERGED tears the preview down; a teardown result without trainId is matched by command id", async () => {
     const ns = newHive();
-    const { trainId } = await oneTrain(ns, { live: true });
+    const { trainId, reported } = await oneTrain(ns, { live: true });
     await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "ok" });
-    await post(ns, "/internal/webhook/land-result", { trainId, landed: true, mainSha: "m1" });
+    await landViaQueue(ns, trainId, reported, "m1");
     const s = await inspect(ns);
     expect(s.deploys.filter((d) => d.op === "TEARDOWN")).toEqual([
       { op: "TEARDOWN", commandId: `${trainId}-teardown-1`, hive: ns, environment: "preview", trainId, trace: { traceparent: expect.stringMatching(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/) } },
@@ -453,10 +477,17 @@ describe("command watchdog (alarm)", () => {
 });
 
 /** One prompt merged to main as `mainSha`: a release is cut. Returns the staging DEPLOY. */
+/** A supervised hive (releases park at AWAITING_TAP) with one landed train and its release. */
 async function mergedRelease(ns: string, mainSha = "main-1") {
-  const { trainId } = await oneTrain(ns, { live: true });
+  const sup = await worker.fetch(`http://queen.test/hives/${ns}/settings`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", "x-queen-user": "kyle@kaikeru.com" },
+    body: JSON.stringify({ autonomy: "supervised" }),
+  });
+  expect(sup.status).toBe(200);
+  const { trainId, reported } = await oneTrain(ns, { live: true });
   await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "ok" });
-  await post(ns, "/internal/webhook/land-result", { trainId, landed: true, mainSha });
+  await landViaQueue(ns, trainId, reported, mainSha);
   const s = await inspect(ns);
   const staging = s.deploys.find((d): d is Extract<DeployCommand, { op: "DEPLOY" }> => d.op === "DEPLOY" && d.environment === "staging");
   expect(staging).toBeDefined();
@@ -856,7 +887,7 @@ describe("model router (DO)", () => {
     expect(snap.modelStats).toHaveLength(2);
     expect(snap.routerFloor).toEqual({ tier: "frontier", streak: 0, backoffAfter: 3, probeIn: 4 });
     expect(snap.trains[0]).toMatchObject({ model: GLM_FLASH, modelReason: expect.stringContaining("fell back to") });
-    row = (await runInDurableObject(stubFor(ns), (q: QueenNode) => q.sql.exec("SELECT model, model_reason FROM merge_trains").one())) as typeof row;
+    row = (await runInDurableObject(stubFor(ns), (q: QueenNode) => q.sql.exec("SELECT model, model_reason FROM merge_trains WHERE lane = 'BUILD'").one())) as typeof row;
     expect(row.model).toBe(GLM_FLASH);
     ws.close(1000, "done");
 
@@ -876,5 +907,103 @@ describe("model router (DO)", () => {
     expect(routerPolicy({})).toEqual({ backoffStreak: 3, probeAfter: 4 });
     expect(routerPolicy({ ROUTER_BACKOFF_STREAK: "5", ROUTER_PROBE_AFTER: "2" })).toEqual({ backoffStreak: 5, probeAfter: 2 });
     expect(routerPolicy({ ROUTER_BACKOFF_STREAK: "0", ROUTER_PROBE_AFTER: "x" })).toEqual({ backoffStreak: 3, probeAfter: 4 });
+  });
+});
+
+describe("v2 surface (routes and RPCs, §3.6)", () => {
+  const user = { "x-queen-user": "kyle@kaikeru.com" };
+  const req = (ns: string, method: string, path: string, body?: unknown, headers: Record<string, string> = {}) =>
+    worker.fetch(`http://queen.test/hives/${ns}${path}`, {
+      method,
+      headers: { "content-type": "application/json", ...headers },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+
+  it("files a goal, takes the Oracle's answer, and serves items, events, traces, metrics and the queue", async () => {
+    const ns = newHive();
+    expect((await req(ns, "PATCH", "/settings", { autonomy: "supervised" })).status).toBe(401);
+    const patched = await req(ns, "PATCH", "/settings", { guardrails: { maxQueueBatch: 2 } }, user);
+    expect(patched.status).toBe(200);
+    expect(await patched.json()).toMatchObject({ hive: ns, settings: { guardrails: { maxQueueBatch: 2 } }, effectiveAutonomy: "autonomous" });
+
+    const res = await req(ns, "POST", "/prompts", { namespace: ns, promptText: "- Add a /health endpoint\n- Add a /version endpoint", decompose: true });
+    expect(res.status).toBe(201);
+    const { item: goal, promptRun } = await res.json<{ item: { itemId: string; kind: string; status: string; traceId: string }; promptRun: { promptId: string; status: string } }>();
+    expect(goal).toMatchObject({ kind: "goal", status: "DECOMPOSING" });
+    expect(promptRun).toMatchObject({ promptId: goal.itemId, status: "QUEUED" });
+    const oracle = await runInDurableObject(stubFor(ns), (q: QueenNode) => (q.ports.oracle as unknown as { commands: { op: string; commandId: string }[] }).commands.map((c) => ({ ...c })));
+    expect(oracle).toEqual([expect.objectContaining({ op: "DECOMPOSE", commandId: `${goal.itemId}-decompose-1` })]);
+
+    const answer = {
+      commandId: `${goal.itemId}-decompose-1`,
+      op: "DECOMPOSE",
+      itemId: goal.itemId,
+      ok: true,
+      children: [
+        { key: "c1", kind: "feature", title: "Add a /health endpoint", body: "", paths: ["src/features/health.js"] },
+        { key: "c2", kind: "feature", title: "Add a /version endpoint", body: "", dependsOn: ["c1"] },
+      ],
+    };
+    const ok = await post(ns, "/internal/webhook/oracle-result", answer);
+    expect(await ok.json()).toEqual({ outcome: "applied" });
+    expect(await (await post(ns, "/internal/webhook/oracle-result", answer)).json()).toEqual({ outcome: "ignored:duplicate" });
+    expect((await post(ns, "/internal/webhook/oracle-result", { ...answer, itemId: "nope" })).status).toBe(404);
+    expect((await req(ns, "POST", "/internal/webhook/oracle-result", answer)).status).toBe(401);
+
+    const detail = await (await req(ns, "GET", `/items/${goal.itemId}`)).json<{ item: { status: string }; children: { itemId: string; status: string }[] }>();
+    expect(detail.item.status).toBe("ACTIVE");
+    expect(detail.children.map((c) => [c.itemId, c.status])).toEqual([
+      [`${goal.itemId}-c1`, "ACTIVE"],
+      [`${goal.itemId}-c2`, "BLOCKED"],
+    ]);
+    expect((await req(ns, "GET", "/items/nope")).status).toBe(404);
+    const c1 = await (await req(ns, "GET", `/items/${goal.itemId}-c1`)).json<{ trains: { trainId: string; traceId: string }[] }>();
+    expect(c1.trains).toHaveLength(1);
+    expect(c1.trains[0]!.traceId).toBe(goal.traceId);
+
+    const evs = await (await req(ns, "GET", `/events?item=${goal.itemId}-c1&limit=50`)).json<{ events: { type: string; traceId: string }[] }>();
+    expect(evs.events.map((e) => e.type)).toEqual(expect.arrayContaining(["item.filed", "item.status", "train.enqueued", "command.issued"]));
+    expect(evs.events.every((e) => e.traceId === goal.traceId)).toBe(true);
+    const trace = await (await req(ns, "GET", `/traces/${goal.traceId}`)).json<{ traceId: string; spans: { kind: string }[]; events: unknown[] }>();
+    expect(trace.traceId).toBe(goal.traceId);
+    expect(trace.spans.map((s) => s.kind)).toEqual(expect.arrayContaining(["item", "train", "command"]));
+    expect((await req(ns, "GET", "/traces/not-a-trace")).status).toBe(400);
+
+    const metrics = await (await req(ns, "GET", "/metrics?window=24h")).json<{ rollups: { name: string }[]; hive: { headline: string }; source: string }>();
+    expect(metrics.rollups.map((r) => r.name)).toEqual(expect.arrayContaining(["items_filed", "active_builds"]));
+    expect(metrics.hive.headline).toBe("SHIPPING");
+    expect((await req(ns, "GET", "/metrics?window=1y")).status).toBe(400);
+    expect(await (await req(ns, "GET", "/queue")).json()).toEqual({ cars: [], waiting: [], conflicts: [], bisects: [] });
+
+    // The snapshot carries the v2 fields.
+    const snap = await snapshotOf(ns);
+    expect(snap.items?.map((i) => i.kind)).toEqual(["goal", "feature", "feature"]);
+    expect(snap.hive).toMatchObject({ hive: ns, counts: { ACTIVE: 2, BLOCKED: 1 } });
+    expect(snap.trains[0]).toMatchObject({ traceId: goal.traceId });
+    expect(snap.recentEvents?.length).toBeGreaterThan(0);
+
+    // Gatekeepers resolve a pushed repo to its train.
+    const [t] = (await inspect(ns)).trains;
+    expect(await stubFor(ns).getGateTarget(t!.artifact_repo)).toMatchObject({ trainId: t!.train_id, lane: "BUILD", promptId: `${goal.itemId}-c1`, traceId: goal.traceId });
+    expect(await stubFor(ns).getGateTarget("no-such-repo")).toBeNull();
+    expect((await post(ns, "/internal/webhook/merge-result", { trainId: "nope", ok: true })).status).toBe(404);
+  });
+
+  it("files items, takes item actions and resolves escalations as user routes", async () => {
+    const ns = newHive();
+    const anon = await req(ns, "POST", "/items", { kind: "bug", title: "x" });
+    expect(anon.status).toBe(401);
+    const a = await req(ns, "POST", "/items", { kind: "feature", title: "Add /a" }, user);
+    expect(a.status).toBe(201);
+    const { item } = await a.json<{ item: { itemId: string; status: string; source: { actor: string } } }>();
+    expect(item).toMatchObject({ status: "ACTIVE", source: { actor: "user:kyle@kaikeru.com" } });
+    expect((await req(ns, "POST", "/items", { kind: "feature", title: "Add /b", dependsOn: ["nope"] }, user)).status).toBe(400);
+    const b = await (await req(ns, "POST", "/items", { kind: "feature", title: "Add /b", dependsOn: [item.itemId] }, user)).json<{ item: { itemId: string; status: string } }>();
+    expect(b.item.status).toBe("BLOCKED");
+    expect((await req(ns, "POST", `/items/${item.itemId}/actions`, { action: "cancel" }, user)).status).toBe(409);
+    const cancel = await req(ns, "POST", `/items/${b.item.itemId}/actions`, { action: "cancel", note: "not needed" }, user);
+    expect(await cancel.json()).toMatchObject({ outcome: "applied", item: { status: "CANCELLED" } });
+    expect((await req(ns, "POST", "/escalations/nope/resolve", { action: "ack" }, user)).status).toBe(404);
+    expect((await req(ns, "POST", "/escalations/nope/resolve", { action: "ack" })).status).toBe(401);
   });
 });

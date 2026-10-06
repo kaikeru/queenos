@@ -32,7 +32,7 @@
  * and clears the pin.
  */
 import type { EventDraft, MergeConflict, MergeResult } from "@queenos/queen-types";
-import { nextCommandId, type Effect, type TrainPhase, type TrainRecord } from "./planner";
+import { nextCommandId, traceFor, type Effect, type TrainPhase, type TrainRecord } from "./planner";
 
 export interface QueueSettings {
   /** Members per car (GUARDRAIL_DEFAULTS.maxQueueBatch = 4; cut line 6 sets 1). */
@@ -195,7 +195,7 @@ class Builder {
       this.effects.push({
         type: "provision",
         trainId: t.trainId,
-        command: { op: "DELETE", commandId: deleteCommandId, hive: this.namespace, trainId: t.trainId, repo: t.artifactRepo },
+        command: { op: "DELETE", commandId: deleteCommandId, hive: this.namespace, trainId: t.trainId, repo: t.artifactRepo, trace: traceFor(t, deleteCommandId) },
       });
     }
     if (t.deployCommandId !== null && (t.deployState === "PENDING" || t.deployState === "LIVE" || t.deployState === "FAILED")) {
@@ -204,7 +204,7 @@ class Builder {
       this.effects.push({
         type: "deploy",
         trainId: t.trainId,
-        command: { op: "TEARDOWN", commandId: teardownCommandId, hive: this.namespace, environment: "preview", trainId: t.trainId },
+        command: { op: "TEARDOWN", commandId: teardownCommandId, hive: this.namespace, environment: "preview", trainId: t.trainId, trace: traceFor(t, teardownCommandId) },
       });
     }
   }

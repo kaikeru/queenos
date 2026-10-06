@@ -594,16 +594,25 @@ export class TrainPlanner {
    * (the caller applied race.raceWidth(); the planner narrows it to the
    * number of distinct models the router can offer).
    */
-  submit(input: { promptId: string; promptText: string; raceWidth?: number; difficulty?: "normal" | "hard" }): PlanResult {
+  submit(input: { promptId: string; promptText: string; raceWidth?: number; difficulty?: "normal" | "hard"; item?: PlannerItem }): PlanResult {
+    // An item filed in the same decision (not in HiveState.items): its trace, priority and paths.
+    if (input.item) {
+      this.items.set(input.item.itemId, { ...input.item });
+      if (input.item.conflicts !== undefined) this.conflicts.set(input.item.itemId, input.item.conflicts);
+    }
+    // A retried item re-submits its existing prompt id (attempts reset; filing order kept).
+    const prev = this.prompts.get(input.promptId);
     const prompt: PromptRecord = {
       promptId: input.promptId,
       namespace: this.ctx.namespace,
       promptText: input.promptText,
       status: "QUEUED",
-      createdAt: this.ctx.now,
-      seq: ++this.maxPromptSeq,
+      createdAt: prev?.createdAt ?? this.ctx.now,
+      seq: prev?.seq ?? ++this.maxPromptSeq,
       summary: null,
       attempts: 0,
+      ...(input.raceWidth !== undefined ? { raceWidth: input.raceWidth } : {}),
+      ...(input.difficulty !== undefined ? { difficulty: input.difficulty } : {}),
     };
     this.prompts.set(prompt.promptId, prompt);
     this.markPrompt(prompt);
@@ -1078,7 +1087,7 @@ export class TrainPlanner {
         parentSpanId: spanIdFor(prompt.promptId),
         itemId: prompt.promptId,
         summary: `race ${raceId}: ${width} candidates on ${choices.map((c) => c.model).join(", ")}`,
-        data: { raceId, trainIds: race.trainIds, models: choices.map((c) => c.model), action },
+        data: { raceId, width, trainIds: race.trainIds, models: choices.map((c) => c.model), action },
       });
     }
     this.setPromptStatus(prompt.promptId, "QUEUED");
@@ -1495,7 +1504,7 @@ export class TrainPlanner {
         this.eject(l, `lost race to ${winner.trainId}: ${why}`, { raceOutcome: "LOST" });
       }
       this.setRace(race, { state: "DECIDED", winnerTrainId: winner.trainId, reason: ranking.reason, decidedAt: this.ctx.now });
-      this.raceEvent(race, winner, `race ${race.raceId} decided: ${winner.trainId} ${ranking.reason}`, { winner: winner.trainId, outcome: "DECIDED" });
+      this.raceEvent(race, winner, `race ${race.raceId} decided: ${winner.trainId} ${ranking.reason}`, { winner: winner.trainId, winnerModel: winner.model, outcome: "DECIDED" });
       this.maybeLand();
       return;
     }

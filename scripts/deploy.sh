@@ -5,6 +5,20 @@
 #   scripts/deploy.sh --bootstrap     force the bootstrap pass
 #   scripts/deploy.sh --dry-run       build every bundle to .deploy-dryrun/, deploy nothing
 #   scripts/deploy.sh --only edge     run only the named Worker (apps/ dir name) in the full pass
+#   scripts/deploy.sh --force         skip the in-flight v1 train check before deploying the Queen
+#
+# v2 safety check (design §7, R16): the Queen's v11 migration must not run while
+# v1 trains are in flight (v1 successors chain on their predecessors; v2 builds
+# fork from main). Before deploying the Queen, the script reads every hive's
+# snapshot through the edge and refuses if a v1 Queen (no `items` in its
+# snapshot) has any train that is not MERGED or EJECTED. Once the deployed
+# Queen is v2 the check passes. It needs read access through Cloudflare Access:
+#   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET (an Access service token allowed
+#   on the QueenOS app), or CF_ACCESS_TOKEN (a `cf-access-token`, e.g. from
+#   `cloudflared access token -app=https://queenos.kaikeru.com`).
+#   QUEENOS_URL overrides https://queenos.kaikeru.com; QUEENOS_HIVES="demo pulse"
+#   skips the project listing. Without credentials it refuses; pass --force after
+#   checking the War Room yourself.
 #
 # Why two passes: the Workers bind to each other in cycles (queen <-> executors,
 # genesis <-> provisioner, edge -> everything). Wrangler rejects a cross-script
@@ -34,13 +48,15 @@ fi
 
 DRY_RUN=0
 BOOTSTRAP=0
+FORCE=0
 ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --bootstrap) BOOTSTRAP=1 ;;
     --only) shift; ONLY="${1:?--only needs a value}" ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    --force) FORCE=1 ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -49,12 +65,15 @@ done
 OUTROOT="${DEPLOY_DRYRUN_DIR:-$ROOT/.deploy-dryrun}"
 TMP_CFG_NAME=".wrangler.bootstrap.jsonc"
 
-# dir:script-name. The edge is last: it needs the dashboard bundle.
+# dir:script-name. The edge is last: it needs the dashboard bundle. The Oracle
+# (v2) binds the Queen and the Queen binds its workflow: a new Worker, so the
+# first deploy takes the bootstrap pass (or deploy it alone first: see HANDOFF).
 WORKERS=(
   "queen:queen"
   "provisioner:queenos-provisioner"
   "herald:queenos-herald"
   "sentinel:queenos-sentinel"
+  "oracle:queenos-oracle"
   "drones:queenos-drones"
   "gatekeepers:queenos-gatekeepers"
   "vault:queenos-vault"
@@ -126,6 +145,52 @@ script_exists() {
   (cd "$ROOT/apps/$1" && pnpm exec wrangler deployments list --name "$2" >/dev/null 2>&1)
 }
 
+# R16: refuse to deploy the Queen while a v1 Queen has trains in flight.
+check_no_v1_trains() {
+  local base="${QUEENOS_URL:-https://queenos.kaikeru.com}"
+  local -a auth=()
+  if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+    auth=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
+  elif [ -n "${CF_ACCESS_TOKEN:-}" ]; then
+    auth=(-H "cf-access-token: $CF_ACCESS_TOKEN")
+  else
+    echo "==> R16 check: no Access credentials (CF_ACCESS_CLIENT_ID/SECRET or CF_ACCESS_TOKEN) to read hive snapshots." >&2
+    echo "    Check the War Room for trains that are not MERGED/EJECTED, then re-run with --force." >&2
+    return 1
+  fi
+  local hives="${QUEENOS_HIVES:-}"
+  if [ -z "$hives" ]; then
+    hives="$(curl -fsS --max-time 20 "${auth[@]}" "$base/api/projects" | node -e '
+      let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+        try { const list = JSON.parse(s); console.log((Array.isArray(list) ? list : []).map((p) => p.hive).join(" ")); }
+        catch { process.exit(1); } // not JSON: an Access login page, most likely
+      });')" || { echo "==> R16 check: could not list projects at $base/api/projects" >&2; return 1; }
+  fi
+  local busy=0 h
+  for h in $hives; do
+    local verdict
+    verdict="$(curl -fsS --max-time 20 "${auth[@]}" "$base/hives/$h/snapshot" | node -e '
+      let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+        let snap; try { snap = JSON.parse(s); } catch { process.exit(1); }
+        if (Array.isArray(snap.items)) { console.log("v2"); return; }
+        const active = (snap.trains ?? []).filter((t) => t.phase !== "MERGED" && t.phase !== "EJECTED");
+        console.log(active.length ? `active ${active.map((t) => `${t.trainId.slice(0, 8)}:${t.phase}`).join(",")}` : "idle");
+      });')" || { echo "==> R16 check: could not read $base/hives/$h/snapshot" >&2; return 1; }
+    case "$verdict" in
+      active*) echo "==> R16: hive $h has v1 trains in flight (${verdict#active }); wait for them to land or eject." >&2; busy=1 ;;
+      *) echo "==> R16: hive $h is $verdict" ;;
+    esac
+  done
+  [ "$busy" = 0 ]
+}
+
+if [ "$DRY_RUN" = 0 ] && [ "$FORCE" = 0 ] && want queen; then
+  if ! check_no_v1_trains; then
+    echo "Refusing to deploy the Queen (risk R16). Use --force to override." >&2
+    exit 1
+  fi
+fi
+
 if [ "$DRY_RUN" = 1 ]; then rm -rf "$OUTROOT"; mkdir -p "$OUTROOT"; fi
 
 # ---- Pass 1: bootstrap (cross-script bindings stripped) ----
@@ -180,5 +245,9 @@ Deploy finished. One-time manual steps (first deploy only):
        openssl rand -base64 32 | pnpm --filter @queenos/vault exec wrangler secret put VAULT_KEK --env=""
   4. Queen machine token (once):
        openssl rand -hex 32 | pnpm --filter @queenos/queen exec wrangler secret put QUEEN_INTERNAL_TOKEN --env=""
-  5. Open https://queenos.kaikeru.com and sign in.
+  5. v2 (once): the Vectorize metadata index the Oracle's dedupe filters on:
+       pnpm --filter @queenos/oracle exec wrangler vectorize create-metadata-index queenos-memory --property-name=kind --type=string
+     and the edge's Analytics Engine read token (Account Analytics Read):
+       pnpm --filter @queenos/edge exec wrangler secret put ANALYTICS_API_TOKEN --env=""
+  6. Open https://queenos.kaikeru.com and sign in.
 MSG

@@ -1,6 +1,20 @@
 # @queenos/queen
 
-Hono Worker plus the `QueenNode` Durable Object, which is the scheduler and state machine for the speculative merge train. State lives in SQLite. The War Room dashboard gets updates as WebSocket broadcasts.
+Hono Worker plus the `QueenNode` Durable Object: the hive's single source of truth. It runs the work ledger, parallel builds, the merge queue, races, releases, autonomy and escalations. State lives in SQLite; the War Room gets coalesced WebSocket broadcasts. The same Worker hosts the `SwarmGovernor` DO (one instance, `global`).
+
+## v2 decision pipeline (`src/queen-node.ts`, design §3.1)
+
+Every RPC (`report*`, `submitWork`, `fileWorkItem`, `workAction`, `resolveEscalation`, `updateSettings`, `alarm`) runs one `decide()`:
+
+1. **Before (async, only when due):** the `SwarmGovernor` lease (D9). `want` is the hive's `maxActiveTrains` while it has work, 0 when idle; the lease lasts 120 s and is renewed when it expires within 30 s. An expired or failed lease means "no global cap" (fail open). `SWARM_LEASE=off` turns it off (cut line 3).
+2. **Plan (synchronous, no await):** settings + effective autonomy (`autonomy/policy.ts`) + budget + guardrails + lease → the warm `StateCache` (loaded from SQLite only on a cold start) → `TrainPlanner`, `ReleasePlanner`, `WorkPlanner`, `EscalationPlanner` → the triggering transition → a landed car hands all its members to `rp.landed` → `wp.absorb` (prompt → item status, path claims, releases → SHIPPED or a P0 bug, follow-ups, credits) → `ep.resolveStale` → `wp.dispatchReady` → `tp.submit` per READY item (BUILD trains, every fork from main) → `autonomyTransition` (`degraded_by`, ERROR_BUDGET_EXHAUSTED).
+3. **Commit:** rows, `event_log` rows (planner drafts plus the Queen's `command.issued` / `command.result` / `gate.verdict` / `sentinel.verdict` / `hive.settings`) and `metrics_hourly` rollups in **one** `transactionSync`. Then the cache update, the coalesced broadcast (one `batch` frame per ≥ 100 ms, last update per entity wins), Analytics Engine points (`ANALYTICS` → `queenos_events`, never awaited, ≤ 200 per invocation), and executor dispatch grouped per Workflow with `createBatch` (≤ 100 per call; drone dispatches confirmed in one bookkeeping decision).
+
+The merge queue is always on (`ctx.queue` from the hive's `maxQueueBatch` / `maxQueueDepth`): a passed build boards a car, the MERGE drone 3-way merges it, and the LANDER fast-forwards main. The **alarm** runs the three reconciles (watchdogs, race deadlines, the queue, the Oracle watchdog, stale claims), prunes the event log (30 days / 100k rows) and renews the lease.
+
+**Snapshot and broadcasts** use `toMergeTrainV2` (trace, race, lane, members, carId, passedSeq, ...) and carry `items`, `escalations`, `races`, `hive` (HiveStatus) and `recentEvents`; new messages are `item.updated`, `race.updated`, `escalation.updated`, `hive.updated`, `event.appended` and `batch`.
+
+**New hives** start `autonomous` (existing hives migrated `supervised`, D2). `HIVE_DEFAULT_GUARDRAILS` (JSON) seeds a new hive's guardrails; the sim sets `maxActiveTrains` 64 and `maxChildrenPerItem` 24.
 
 ## Hives and routing
 
@@ -13,7 +27,20 @@ There is **one `QueenNode` per hive**, addressed by `idFromName(namespace)`. A h
 
 | Method | Route | RPC on the stub | Body / result |
 |---|---|---|---|
-| POST | `/prompts` | `submitPrompt(SubmitPrompt)` | 201 `{promptRun}` |
+| POST | `/prompts` | `submitWork(SubmitPrompt)` (`submitPrompt` returns just the `promptRun`) | 201 `{item, promptRun}`. Open. `decompose: true` files a goal for the Oracle; otherwise one `feature` item (v1 semantics). `promptRun` is synthesized from the item (QUEUED until dispatched) |
+| POST | `/items` | `fileWorkItem({hive, user, item})` | **User route.** 201 `{item}` (`FileWorkItem`); 400/404/409 on a bad dependency, parent or guardrail |
+| POST | `/items/:id/actions` | `workAction({hive, itemId, user, action})` | **User route.** `{outcome, item}` for `retry` / `cancel` / `not_duplicate`; 409 when the item cannot take it |
+| GET | `/items/:id` | `getItemDetail(itemId)` | `ItemDetail`: item, children, trains (and their cars), races, release, escalations |
+| GET | `/events?trace=&item=&release=&type=&before=&limit=` | `queryEvents(EventQuery)` | `{events}` newest first (`type` is a prefix, e.g. `queue`) |
+| GET | `/traces/:traceId` | `getTrace(traceId)` | `TraceView`: the trace's events plus the span tree |
+| GET | `/metrics?window=24h\|7d` | `getMetrics(window)` | `MetricsView`: hourly rollups + `HiveStatus`, `source: "queen-rollups"` |
+| GET | `/queue` | `getQueue()` | `QueueView`: active cars, passed builds waiting to board, last 20 conflicts and bisects |
+| PATCH | `/settings` | `updateSettings({hive, user, patch})` | **User route.** `UpdateHiveSettings`; returns `HiveStatus`; event `hive.settings` |
+| POST | `/escalations/:id/resolve` | `resolveEscalation({hive, escalationId, user, action})` | **User route.** `ResolveEscalation`; ship → tap, retry/cancel → the item, resume_autonomy → streak reset, raise_budget → today's limits ×1.5, retry on EXECUTOR_LOST → queue resumes. 409 when not allowed, 404 unknown |
+| POST | `/internal/webhook/oracle-result` | `reportOracleResult(OracleResult)` | `{outcome}`; idempotent by `commandId`; 404 for an unknown item |
+| POST | `/internal/webhook/merge-result` | `reportMergeResult(MergeResult)` | `{outcome, train}`; the MERGE drone's report for a car |
+| — | — | `getGateTarget(repo)` | RPC only: `GateTarget` for a pushed repo (BUILD: full gate; QUEUE car: integration gate with the members' smoke paths) or null |
+| — | — | `listOpenItems()` | RPC only: open items (the sim Oracle's TRIAGE dedupe) |
 | POST | `/internal/webhook/train-result` | `reportTrainResult(TrainResult)` | `{outcome, train}`; apps/gatekeepers posts its verdict and Scribe summary (≤ 500 chars) here |
 | POST | `/trains/:id/result` | `reportTrainResult` | Alias of the above; the train id comes from the path |
 | POST | `/internal/webhook/build-result` | `reportBuildResult(BuildResult)` | The builder pushed the train head, so successors can fork from it |
@@ -53,7 +80,8 @@ Machine-only HTTP routes (`/internal/*`, `/trains/:id/result`, `/audit`, `/scrib
 
 ## WebSocket (`/room`)
 
-- On connect the server sends a `snapshot`.
+- On connect the server sends a `snapshot` (directly, never coalesced; so are errors and pongs).
+- v2: every other broadcast is coalesced into `batch` frames (≤ 200 messages, ≤ 1 frame per 100 ms; a single message may be sent bare).
 - The snapshot includes `deployments` (per-train preview rows now; staging/canary/prod rows from P3).
 - After that it broadcasts `prompt.updated`, `train.updated`, `deployment.updated` and `audit.appended`, each after the change has been persisted.
 - `?role=drone` tags a socket as a drone. The default tag is `role:dashboard`. Each socket is also tagged `hive:<ns>`, and its per-socket state lives in `serializeAttachment`.
@@ -82,7 +110,10 @@ The Queen decides, records and dispatches. It performs **no external I/O** (it h
 | `PROVISIONER` | `provisioner-workflow` / `ProvisionerWorkflow` (`queenos-provisioner`) | `ProvisionCommand` FORK / DELETE | `reportProvisionResult` |
 | `HERALD` | `herald-workflow` / `HeraldWorkflow` (`queenos-herald`) | `DeployCommand` DEPLOY / TEARDOWN (preview) | `reportDeployResult` |
 | `SENTINEL` | `sentinel-workflow` / `SentinelWorkflow` (`queenos-sentinel`) | `SentinelCommand` (staging / canary health window) | `reportSentinelVerdict` |
-| `DRONES` | `drone-workflow` / `DroneWorkflow` (`queenos-drones`) | `DroneTask` BUILD / REWORK / LAND | build / train / land results |
+| `DRONES` | `drone-workflow` / `DroneWorkflow` (`queenos-drones`) | `DroneTask` BUILD / REWORK / MERGE / LAND | build / merge / train / land results |
+| `ORACLE` | `oracle-workflow` / `OracleWorkflow` (`queenos-oracle`) | `OracleCommand` DECOMPOSE / TRIAGE | `reportOracleResult` |
+
+Other v2 bindings: `SWARM_GOVERNOR` (the `SwarmGovernor` DO in this Worker; vars `SWARM_MAX_ACTIVE_BUILDS`, `SWARM_AI_RPM`, `SWARM_LEASE`), `ANALYTICS` (Analytics Engine dataset `queenos_events`), and `observability` (Workers Logs; warn/error events are logged as JSON lines with `trace_id`).
 
 - **Command ids** are `<trainId>-<op>-<n>` (`fork`, `delete`, `deploy`, `teardown`; `n` counts attempts). The id is stored on the train row in the same transaction as the decision, **before** dispatch, and is also the Workflow instance id, so re-dispatching it is a no-op.
 - **Results** are matched by command id. A result for an older attempt returns `ignored:stale`, a repeat returns `ignored:duplicate`, and an unknown train returns `NOT_FOUND`. Executors treat `INVALID_INPUT:` / `NOT_FOUND:` / `CONFLICT:` errors as permanent.
@@ -96,6 +127,8 @@ The Queen decides, records and dispatches. It performs **no external I/O** (it h
 ## Merge train
 
 The planner lives in `src/train/planner.ts`. It is pure and returns effects for the DO to execute.
+
+> **v2:** builds no longer chain. Every BUILD train forks from `main`; passed builds board merge-queue **cars** (QUEUE-lane trains, `src/train/queue.ts`) that are chained exactly as described below, merged by the MERGE drone and landed by the LANDER. The text below describes that speculative chain (it now carries cars); see `docs/v2-design.md` §2.3 for the lanes, races and bisect.
 
 - Train k holds `main + prompts 1..k`. **Forks are chained:**
   - Train 1 is forked from the hive repo.
@@ -144,7 +177,8 @@ The planner lives in `src/release/planner.ts` (pure, like the train planner) and
 - Watchdog: same caps as the train; Sentinel gets `max(COMMAND_TIMEOUT_MS, SENTINEL_WINDOW_SECONDS*1000 + 5 min)`. A lost canary verdict rolls back.
 - Vars: `SENTINEL_WINDOW_SECONDS` (default 60) and `SENTINEL_MIN_REQUESTS` (default 100).
 - Broadcasts `release.updated` (updatedAt strictly increases), `deployment.updated`, `sentinel.verdict`; the snapshot has `releases` (newest first, 20).
-- Sim: staging → AWAITING_TAP automatically; then `curl -XPOST localhost:8787/hives/<hive>/releases/<id>/tap -H 'x-queen-user: you@example.com'`. A prompt containing `[canary-fail]` makes the sim Sentinel roll back at 10%.
+- Sim: a new hive is `autonomous`, so a staging PROMOTE auto-ships (`tappedBy: queen:autonomous`). To tap by hand, make it supervised first: `curl -XPATCH localhost:8787/hives/<hive>/settings -H 'content-type: application/json' -d '{"autonomy":"supervised"}'` (the localhost sim defaults the user), then `curl -XPOST localhost:8787/hives/<hive>/releases/<id>/tap -H 'x-queen-user: you@example.com'`. A prompt containing `[canary-fail]` makes the sim Sentinel roll back at 10%; two rollbacks in a row degrade the hive to supervised (ROLLBACK_STREAK).
+- Sim markers (v2): `[race]` (best-of-3), `[hard]`, `[touch:<path>]`, `[collide]`, `[batch-fail]`, `[spot-bug]`, `[gate-spot]`, `[inconclusive]`, `[decompose-fail]`; `POST /prompts` with `"decompose": true` splits bullets into items (see `src/sim/sim-v2.ts`).
 
 ## Model router
 

@@ -33,7 +33,8 @@ export function metricPoint(p: AnalyticsPoint): DataPoint {
     blobs: [p.type, p.hive, p.kindOrRole ?? "", p.model ?? "", p.outcome ?? "", p.environment ?? "", p.traceId ?? "", p.itemId ?? ""].map((b) =>
       b.slice(0, MAX_BLOB_CHARS),
     ),
-    doubles: [num(p.valueMs), num(p.tokensIn), num(p.tokensOut), num(p.credits), num(p.count, 1)],
+    // The optional trailing errorRate double (the Sentinel window point) is only sent when set.
+    doubles: [num(p.valueMs), num(p.tokensIn), num(p.tokensOut), num(p.credits), num(p.count, 1), ...(typeof p.errorRate === "number" && Number.isFinite(p.errorRate) ? [p.errorRate] : [])],
   };
 }
 
@@ -99,5 +100,6 @@ export function eventToPoint(e: QueenEvent, environment?: string): AnalyticsPoin
     tokensIn: nm(d.tokensIn),
     tokensOut: nm(d.tokensOut),
     credits: nm(d.credits),
+    ...(nm(d.errorRate) !== undefined ? { errorRate: nm(d.errorRate) } : {}),
   };
 }

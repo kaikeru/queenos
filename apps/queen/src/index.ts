@@ -3,19 +3,27 @@ import {
   AppendAuditSchema,
   BuildResultSchema,
   DeployResultSchema,
+  EventQuerySchema,
   LandResultSchema,
+  MergeResultSchema,
+  OracleResultSchema,
   ProvisionResultSchema,
   ScribeSummarySchema,
   SentinelVerdictSchema,
   SubmitPromptSchema,
   TapToShipSchema,
   TrainResultSchema,
+  type EventQueryInput,
+  type FileWorkItemInput,
+  type UpdateHiveSettings,
+  type WorkAction,
 } from "@queenos/queen-types";
 import { requireInternalAuth, resolveUser } from "./auth";
 import { QueenError, asQueenError, parseOrThrow } from "./errors";
 import { DEFAULT_HIVE, HIVE_HEADER, USER_HEADER, assertNamespace } from "./queen-node";
 
 export { QueenNode } from "./queen-node";
+export { SwarmGovernor } from "./scale/governor";
 
 /**
  * Routing: one QueenNode per hive, `idFromName(namespace)`.
@@ -23,13 +31,26 @@ export { QueenNode } from "./queen-node";
  * - The same routes at the root resolve the hive from the `x-queen-hive`
  *   header or `?namespace=`; `POST /prompts` falls back to the body's
  *   namespace; everything else falls back to the "queen" hive.
+ *
+ * Route classes (v2 design §3.6):
+ * - open: `POST /prompts`, the WebSocket room and every GET (the edge's Access
+ *   check covers them in production);
+ * - user (`x-queen-user`, set by the edge after Access): tap, items, item
+ *   actions, settings, escalation resolve;
+ * - internal (bearer token): `/internal/*`, `/trains/*`, `/audit`, `/scribe`.
  */
 type HiveEnv = { Bindings: Env; Variables: { hive: string | null } };
 type HiveContext = Context<HiveEnv>;
 
+/** A user route without an Access-verified user (401). */
+class UnauthorizedError extends Error {}
+
 const app = new Hono<HiveEnv>();
 
 app.onError((err, c) => {
+  if (err instanceof UnauthorizedError) {
+    return c.json({ error: { code: "UNAUTHORIZED", message: `missing ${USER_HEADER} (sign in through Cloudflare Access)` } }, 401);
+  }
   const q = asQueenError(err);
   if (q) return c.json({ error: { code: q.code, message: q.detail } }, q.status);
   console.error("queen: unhandled error", err);
@@ -63,6 +84,13 @@ async function body(c: HiveContext): Promise<unknown> {
   }
 }
 
+/** The Access-verified user of a user route, or a 401 (only the localhost sim defaults one). */
+function userOf(c: HiveContext): string {
+  const user = resolveUser(c.env, c.req.url, c.req.header(USER_HEADER));
+  if (!user) throw new UnauthorizedError();
+  return user;
+}
+
 function upgrade(c: HiveContext): Promise<Response> | Response {
   if (c.req.header("Upgrade")?.toLowerCase() !== "websocket") {
     return c.text("Expected WebSocket upgrade", 426);
@@ -77,6 +105,7 @@ function upgrade(c: HiveContext): Promise<Response> | Response {
 hive.get("/room", upgrade);
 hive.get("/ws", upgrade);
 
+// Open (as in v1): returns {item, promptRun}; promptRun is synthesized from the item, so v1 clients still work.
 hive.post("/prompts", async (c) => {
   const prompt = parseOrThrow(SubmitPromptSchema, await body(c), "prompt");
   const namespace = c.get("hive") ?? prompt.namespace;
@@ -84,8 +113,9 @@ hive.post("/prompts", async (c) => {
     throw new QueenError("INVALID_INPUT", `prompt namespace "${prompt.namespace}" does not match hive "${namespace}"`);
   }
   assertNamespace(namespace);
-  const promptRun = await stub(c, namespace).submitPrompt(prompt);
-  return c.json({ promptRun }, 201);
+  const user = c.req.header(USER_HEADER)?.trim();
+  const res = await stub(c, namespace).submitWork({ ...prompt, ...(user ? { user } : {}) });
+  return c.json(res, 201);
 });
 
 // Tap to ship: a USER route. The edge verifies Cloudflare Access and sets
@@ -93,10 +123,7 @@ hive.post("/prompts", async (c) => {
 // internal bearer token. 401 without a user, 409 outside AWAITING_TAP. Only the
 // localhost sim env defaults a missing user (resolveUser).
 hive.post("/releases/:releaseId/tap", async (c) => {
-  const user = resolveUser(c.env, c.req.url, c.req.header(USER_HEADER));
-  if (!user) {
-    return c.json({ error: { code: "UNAUTHORIZED", message: `missing ${USER_HEADER} (sign in through Cloudflare Access)` } }, 401);
-  }
+  const user = userOf(c);
   const releaseId = c.req.param("releaseId");
   // The dashboard sends `{releaseId}`; the body is optional, but must agree with the path.
   const raw = await c.req.text();
@@ -116,8 +143,66 @@ hive.post("/releases/:releaseId/tap", async (c) => {
   return c.json(await stub(c, hiveOf(c)).tapRelease({ releaseId, user }));
 });
 
-// Machine-only routes: shared bearer secret (src/auth.ts). POST /prompts and the
-// WebSocket room stay open for the dashboard (see README: needs auth post-hackathon).
+// ── v2 user routes (x-queen-user) ───────────────────────────────────────
+
+hive.post("/items", async (c) => {
+  const user = userOf(c);
+  const item = (await body(c)) as FileWorkItemInput;
+  return c.json(await stub(c, hiveOf(c)).fileWorkItem({ hive: hiveOf(c), user, item }), 201);
+});
+
+hive.post("/items/:id/actions", async (c) => {
+  const user = userOf(c);
+  const action = (await body(c)) as WorkAction;
+  return c.json(await stub(c, hiveOf(c)).workAction({ hive: hiveOf(c), itemId: c.req.param("id"), user, action }));
+});
+
+hive.patch("/settings", async (c) => {
+  const user = userOf(c);
+  const patch = (await body(c)) as UpdateHiveSettings;
+  return c.json(await stub(c, hiveOf(c)).updateSettings({ hive: hiveOf(c), user, patch }));
+});
+
+hive.post("/escalations/:id/resolve", async (c) => {
+  const user = userOf(c);
+  const action = await body(c);
+  return c.json(await stub(c, hiveOf(c)).resolveEscalation({ hive: hiveOf(c), escalationId: c.req.param("id"), user, action }));
+});
+
+// ── v2 open reads ───────────────────────────────────────────────────────
+
+hive.get("/items/:id", async (c) => c.json(await stub(c, hiveOf(c)).getItemDetail(c.req.param("id"))));
+
+hive.get("/events", async (c) => {
+  const q = c.req.query();
+  const num = (v: string | undefined) => (v === undefined || v === "" ? undefined : Number(v));
+  const query: EventQueryInput = {
+    ...(q.trace ? { traceId: q.trace } : {}),
+    ...(q.item ? { itemId: q.item } : {}),
+    ...(q.release ? { releaseId: q.release } : {}),
+    ...(q.type ? { typePrefix: q.type } : {}),
+    ...(num(q.before) !== undefined ? { before: num(q.before) } : {}),
+    ...(num(q.limit) !== undefined ? { limit: num(q.limit) } : {}),
+  };
+  const parsed = parseOrThrow(EventQuerySchema, query, "event query");
+  return c.json({ events: await stub(c, hiveOf(c)).queryEvents(parsed) });
+});
+
+hive.get("/traces/:traceId", async (c) => c.json(await stub(c, hiveOf(c)).getTrace(c.req.param("traceId"))));
+
+hive.get("/metrics", async (c) => {
+  const w = c.req.query("window") ?? "24h";
+  if (w !== "24h" && w !== "7d") throw new QueenError("INVALID_INPUT", "window must be 24h or 7d");
+  return c.json(await stub(c, hiveOf(c)).getMetrics(w));
+});
+
+hive.get("/queue", async (c) => c.json(await stub(c, hiveOf(c)).getQueue()));
+
+hive.get("/snapshot", async (c) => c.json(await stub(c, hiveOf(c)).getSnapshot()));
+
+// ── internal (bearer) ───────────────────────────────────────────────────
+
+// Machine-only routes: shared bearer secret (src/auth.ts).
 for (const path of ["/internal/*", "/trains/*", "/audit", "/scribe"]) hive.use(path, requireInternalAuth);
 
 // Gatekeeper verdict (pass/fail + Scribe summary <= 500 chars).
@@ -136,13 +221,25 @@ hive.post("/trains/:id/result", async (c) => {
   return c.json(await stub(c, hiveOf(c)).reportTrainResult(result));
 });
 
-// Builder pushed the train head to its fork; successors can fork from it.
+// Builder pushed the train head to its fork.
 hive.post("/internal/webhook/build-result", async (c) => {
   const result = parseOrThrow(BuildResultSchema, await body(c), "build result");
   return c.json(await stub(c, hiveOf(c)).reportBuildResult(result));
 });
 
-// Lander pushed the train head to hive main (or failed to).
+// The MERGE drone's report for a merge-queue car.
+hive.post("/internal/webhook/merge-result", async (c) => {
+  const result = parseOrThrow(MergeResultSchema, await body(c), "merge result");
+  return c.json(await stub(c, hiveOf(c)).reportMergeResult(result));
+});
+
+// The Oracle's DECOMPOSE / TRIAGE answer (idempotent by commandId).
+hive.post("/internal/webhook/oracle-result", async (c) => {
+  const result = parseOrThrow(OracleResultSchema, await body(c), "oracle result");
+  return c.json(await stub(c, hiveOf(c)).reportOracleResult(result));
+});
+
+// Lander pushed the head to hive main (or failed to).
 hive.post("/internal/webhook/land-result", async (c) => {
   const result = parseOrThrow(LandResultSchema, await body(c), "land result");
   return c.json(await stub(c, hiveOf(c)).reportLandResult(result));
@@ -176,8 +273,6 @@ hive.post("/scribe", async (c) => {
   const summary = parseOrThrow(ScribeSummarySchema, await body(c), "scribe summary");
   return c.json(await stub(c, hiveOf(c)).recordScribeSummary(summary));
 });
-
-hive.get("/snapshot", async (c) => c.json(await stub(c, hiveOf(c)).getSnapshot()));
 
 app.route("/hives/:namespace", hive);
 app.route("/", hive);

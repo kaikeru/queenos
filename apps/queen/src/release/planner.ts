@@ -43,6 +43,7 @@
 import {
   AUTO_SHIP_ACTOR,
   CANARY_STEPS,
+  traceIdFromUuid,
   type DeployCommand,
   type DeployResult,
   type Deployment,
@@ -262,26 +263,29 @@ export class ReleasePlanner {
 
   // ── public transitions ────────────────────────────────────────────────
 
-  /** A train MERGED: main is now `headSha`. Cut, supersede, or queue a release. */
-  landed(input: { trainId: string; headSha: string }): ReleasePlanResult {
+  /**
+   * Trains MERGED: main is now `headSha`. Cut, supersede, or queue a release.
+   * v2: a merge-queue car lands several member trains with one push (`trainIds`).
+   */
+  landed(input: { trainId?: string; trainIds?: string[]; headSha: string }): ReleasePlanResult {
     const cur = this.inFlight();
-    if (this.releases.some((r) => r.trainIds.includes(input.trainId) || r.nextTrainIds.includes(input.trainId))) {
-      return this.finish("ignored:duplicate");
-    }
+    const all = input.trainIds ?? (input.trainId ? [input.trainId] : []);
+    const ids = all.filter((id) => !this.releases.some((r) => r.trainIds.includes(id) || r.nextTrainIds.includes(id)));
+    if (ids.length === 0) return this.finish("ignored:duplicate");
     if (cur?.phase === "CANARY") {
       // Never interrupt a canary: queue the head, cut it when the canary ends.
-      this.set(cur, { nextHeadSha: input.headSha, nextTrainIds: [...cur.nextTrainIds, input.trainId] }, false);
+      this.set(cur, { nextHeadSha: input.headSha, nextTrainIds: [...cur.nextTrainIds, ...ids] }, false);
       return this.finish("applied");
     }
     const base = this.sinceLastShipped();
     if (cur && SUPERSEDABLE.has(cur.phase)) {
-      const next = this.create(input.headSha, [...base, input.trainId]);
+      const next = this.create(input.headSha, [...base, ...ids]);
       this.set(cur, { phase: "SUPERSEDED", pending: null, summary: clip(`Superseded by release ${next.releaseId} (main ${short(input.headSha)}).`) });
       this.resolveParked(cur, QUEEN_ACTOR, SUPERSEDED_RESOLUTION);
       this.stage(next);
       return this.finish("applied");
     }
-    this.stage(this.create(input.headSha, [...base, input.trainId]));
+    this.stage(this.create(input.headSha, [...base, ...ids]));
     return this.finish("applied");
   }
 
@@ -722,8 +726,11 @@ export class ReleasePlanner {
   }
 
   private create(headSha: string, trainIds: string[]): ReleaseRecord {
+    const releaseId = this.ctx.newId();
     const rel: ReleaseRecord = {
-      releaseId: this.ctx.newId(),
+      releaseId,
+      // Each release gets its own trace, minted from its id (§2.6).
+      traceId: traceIdFromUuid(releaseId),
       hive: this.ctx.namespace,
       headSha,
       trainIds,

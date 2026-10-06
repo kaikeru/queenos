@@ -6,9 +6,21 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-02",
   "durable_objects": {
-    "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
+    "bindings": [
+      { "name": "QUEEN_NODE", "class_name": "QueenNode" },
+      // v2 (§4.3, D9): one global instance ("global") leasing build slots to hives.
+      { "name": "SWARM_GOVERNOR", "class_name": "SwarmGovernor" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["QueenNode"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["QueenNode"] },
+    { "tag": "v2", "new_sqlite_classes": ["SwarmGovernor"] }
+  ],
+  // Fire-and-forget event points (D1; capped at 200 per invocation). The dataset appears after the first write.
+  "analytics_engine_datasets": [{ "binding": "ANALYTICS", "dataset": "queenos_events" }],
+  // Structured logs carry trace_id / span_id (§2.6). Traces stay off (early beta); to opt in add
+  // "traces": { "enabled": true }.
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
   // The Queen orchestrates only: no Artifacts binding. Every side effect runs
   // in an executor Workflow reached through a cross-script binding; each
   // `script_name` must be the deployed name of that app (its wrangler "name").
@@ -40,6 +52,13 @@
       "name": "sentinel-workflow",
       "class_name": "SentinelWorkflow",
       "script_name": "queenos-sentinel"
+    },
+    {
+      // Oracle (DECOMPOSE / TRIAGE; v2 §3.3): apps/oracle. Deploy it before the Queen.
+      "binding": "ORACLE",
+      "name": "oracle-workflow",
+      "class_name": "OracleWorkflow",
+      "script_name": "queenos-oracle"
     }
   ],
   "vars": {
@@ -56,7 +75,12 @@
     // a tier (K), and floor dispatches above the cheapest tier before a probe
     // one tier lower (N).
     "ROUTER_BACKOFF_STREAK": "3",
-    "ROUTER_PROBE_AFTER": "4"
+    "ROUTER_PROBE_AFTER": "4",
+    // SwarmGovernor ceilings (§2.9, §4.3): global active builds, and the Workers AI
+    // requests/minute budget (80% of the 300 rpm default; ~4 rpm per build → 60 builds).
+    // Set SWARM_LEASE to "off" to fall back to per-hive caps only (D9 cut line 3).
+    "SWARM_MAX_ACTIVE_BUILDS": "64",
+    "SWARM_AI_RPM": "240"
     // Model router: set "MODEL_ROUTER_PIN_BUILDER" to a model id (e.g.
     // "@cf/zai-org/glm-5.3") to force it for every builder / rework drone
     // (demos, debugging). Unset or blank = the Queen routes per task.
@@ -76,16 +100,29 @@
       // Local demo only: no secret needed. Never set this in the default env.
       "vars": {
         "QUEEN_INTERNAL_AUTH": "disabled",
+        "QUEEN_ENVIRONMENT": "sim",
         "COMMAND_TIMEOUT_MS": "600000",
         "SENTINEL_WINDOW_SECONDS": "60",
         "SENTINEL_MIN_REQUESTS": "100",
         "ROUTER_BACKOFF_STREAK": "3",
-        "ROUTER_PROBE_AFTER": "4"
+        "ROUTER_PROBE_AFTER": "4",
+        // Sim ceilings (§6): SIM_SWARM_MAX_ACTIVE_BUILDS = 1000; no real AI quota, so the
+        // rpm budget is not the binding limit (4000 / 4 = 1000).
+        "SWARM_MAX_ACTIVE_BUILDS": "1000",
+        "SWARM_AI_RPM": "4000",
+        // New sim hives: SIM_MAX_ACTIVE_TRAINS = 64 builds at once, and room for the 24-item Swarm prompt.
+        "HIVE_DEFAULT_GUARDRAILS": "{\"maxActiveTrains\":64,\"maxChildrenPerItem\":24}"
       },
       "durable_objects": {
-        "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
+        "bindings": [
+          { "name": "QUEEN_NODE", "class_name": "QueenNode" },
+          { "name": "SWARM_GOVERNOR", "class_name": "SwarmGovernor" }
+        ]
       },
-      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["QueenNode"] }],
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["QueenNode"] },
+        { "tag": "v2", "new_sqlite_classes": ["SwarmGovernor"] }
+      ],
       // Mirrors the top-level workflow bindings only to silence wrangler's
       // "workflows exists at the top level, but not on env.sim" warning. They
       // are never invoked: src/sim/worker.ts injects fake executors instead.
@@ -93,8 +130,12 @@
         { "binding": "DRONES", "name": "drone-workflow", "class_name": "DroneWorkflow", "script_name": "queenos-drones" },
         { "binding": "PROVISIONER", "name": "provisioner-workflow", "class_name": "ProvisionerWorkflow", "script_name": "queenos-provisioner" },
         { "binding": "HERALD", "name": "herald-workflow", "class_name": "HeraldWorkflow", "script_name": "queenos-herald" },
-        { "binding": "SENTINEL", "name": "sentinel-workflow", "class_name": "SentinelWorkflow", "script_name": "queenos-sentinel" }
-      ]
+        { "binding": "SENTINEL", "name": "sentinel-workflow", "class_name": "SentinelWorkflow", "script_name": "queenos-sentinel" },
+        { "binding": "ORACLE", "name": "oracle-workflow", "class_name": "OracleWorkflow", "script_name": "queenos-oracle" }
+      ],
+      // Mirrored only to silence wrangler's "not inherited" warning: local dev keeps AE
+      // writes in memory (no dataset is created); the rollups in SQLite power the Metrics page.
+      "analytics_engine_datasets": [{ "binding": "ANALYTICS", "dataset": "queenos_events" }]
     },
     // Used only by vitest (see vitest.config.ts): the DO without Workflows
     // (wrangler warns about that on every test run; it is intentional).
@@ -106,11 +147,24 @@
         "SENTINEL_WINDOW_SECONDS": "60",
         "SENTINEL_MIN_REQUESTS": "100",
         "ROUTER_BACKOFF_STREAK": "3",
-        "ROUTER_PROBE_AFTER": "4"
+        "ROUTER_PROBE_AFTER": "4",
+        // Every test hive shares the one governor: keep its ceiling out of the way.
+        "SWARM_MAX_ACTIVE_BUILDS": "1000",
+        "SWARM_AI_RPM": "100000"
       },
       "durable_objects": {
-        "bindings": [{ "name": "QUEEN_NODE", "class_name": "QueenNode" }]
-      }
+        "bindings": [
+          { "name": "QUEEN_NODE", "class_name": "QueenNode" },
+          { "name": "SWARM_GOVERNOR", "class_name": "SwarmGovernor" },
+          // test/worker.ts SimQueenNode: the sim ports with fast delays (v2-flow.test.ts e2e).
+          { "name": "SIM_QUEEN", "class_name": "SimQueenNode" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["QueenNode"] },
+        { "tag": "v2", "new_sqlite_classes": ["SwarmGovernor"] },
+        { "tag": "test-sim", "new_sqlite_classes": ["SimQueenNode"] }
+      ]
     }
   }
 }

@@ -1,15 +1,19 @@
 /**
  * Simulation entrypoint (`wrangler dev --env sim`). Same Worker and Durable
- * Object as production, but createPorts() returns a fake Provisioner, Herald,
- * Sentinel and drones that auto-advance the merge train and the release train. See sim-ports.ts.
+ * Objects as production, but createPorts() returns a fake Provisioner, Herald,
+ * Sentinel, Oracle and drones (including the MERGE drone) that auto-advance
+ * the work ledger, the merge queue and the release train. See sim-ports.ts.
+ * The real SwarmGovernor DO runs with the sim ceilings (wrangler env.sim vars).
  *
  * This file is only referenced by wrangler.jsonc env.sim.main; the default
  * bundle (src/index.ts) never imports it.
  */
 import { QueenNode as ProdQueenNode, type QueenPorts } from "../queen-node";
-import { SimExecutors } from "./sim-ports";
+import { RACE_MARKER, SimExecutors } from "./sim-ports";
 
 import app from "../index";
+
+export { SwarmGovernor } from "../scale/governor";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -35,7 +39,12 @@ export class QueenNode extends ProdQueenNode {
     // Called from the base constructor: `this.ctx` is set, subclass fields are not.
     const sim = new SimExecutors(() => this, this.ctx.storage);
     this.sim = sim;
-    return { provisioner: sim.provisioner, herald: sim.herald, sentinel: sim.sentinel, dispatcher: sim.drones };
+    return { provisioner: sim.provisioner, herald: sim.herald, sentinel: sim.sentinel, oracle: sim.oracle, dispatcher: sim.drones };
+  }
+
+  /** `[race]` in a filed prompt or item makes it a best-of-3 race (§6). */
+  protected override filingHints(text: string): { bestOf?: number } {
+    return text.includes(RACE_MARKER) ? { bestOf: 3 } : {};
   }
 
   /** Simulated executors run off the DO alarm (hibernation-safe); then normal reconcile. */

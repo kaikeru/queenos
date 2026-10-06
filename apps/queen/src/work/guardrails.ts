@@ -41,16 +41,20 @@ export function effectiveGuardrails(overrides: Partial<Guardrails> | undefined):
   return out;
 }
 
-/** The hive's effective settings: HIVE_SETTINGS_DEFAULTS + stored overrides (guardrails clamped). */
-export function effectiveSettings(record: Pick<HiveSettingsRecord, "autonomy" | "overrides"> | null): HiveSettings {
+/**
+ * The hive's effective settings: HIVE_SETTINGS_DEFAULTS + stored overrides (guardrails clamped).
+ * With `now`, a `budgetBoost` for that UTC day (the `raise_budget` action) replaces the daily limits.
+ */
+export function effectiveSettings(record: Pick<HiveSettingsRecord, "autonomy" | "overrides" | "budgetBoost"> | null, now?: number): HiveSettings {
   const o: HiveSettingsOverrides = record?.overrides ?? {};
   const d = HIVE_SETTINGS_DEFAULTS;
+  const boost = now !== undefined && record?.budgetBoost && record.budgetBoost.day === utcDay(now) ? record.budgetBoost : null;
   return {
     autonomy: record?.autonomy ?? d.autonomy,
     guardrails: effectiveGuardrails(o.guardrails),
     budget: {
-      dailyCredits: clampInt(o.budget?.dailyCredits, 0, Number.MAX_SAFE_INTEGER, d.budget.dailyCredits),
-      dailyDispatches: clampInt(o.budget?.dailyDispatches, 0, Number.MAX_SAFE_INTEGER, d.budget.dailyDispatches),
+      dailyCredits: boost?.dailyCredits ?? clampInt(o.budget?.dailyCredits, 0, Number.MAX_SAFE_INTEGER, d.budget.dailyCredits),
+      dailyDispatches: boost?.dailyDispatches ?? clampInt(o.budget?.dailyDispatches, 0, Number.MAX_SAFE_INTEGER, d.budget.dailyDispatches),
     },
     slo: { ...d.slo, ...(o.slo ?? {}) },
     race: {

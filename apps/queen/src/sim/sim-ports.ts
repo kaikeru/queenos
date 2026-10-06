@@ -112,13 +112,10 @@ export interface SimQueen {
   reportProvisionResult(r: ProvisionResult): Promise<{ outcome: string }>;
   reportDeployResult(r: DeployResult): Promise<{ outcome: string }>;
   reportSentinelVerdict(v: SentinelVerdict): Promise<{ outcome: string }>;
-  /**
-   * v2: the Oracle's DECOMPOSE / TRIAGE answer (idempotent by commandId).
-   * Optional only until Phase 2 adds it to QueenNode (the sim fails loudly if it is missing).
-   */
-  reportOracleResult?(r: OracleResultInput): Promise<{ outcome: string }>;
-  /** v2: the MERGE drone's report for a car (optional until Phase 2, like reportOracleResult). */
-  reportMergeResult?(r: MergeResultInput): Promise<{ outcome: string }>;
+  /** v2: the Oracle's DECOMPOSE / TRIAGE answer (idempotent by commandId). */
+  reportOracleResult(r: OracleResultInput): Promise<{ outcome: string }>;
+  /** v2: the MERGE drone's report for a car. */
+  reportMergeResult(r: MergeResultInput): Promise<{ outcome: string }>;
   /** v2: open work items, for the TRIAGE duplicate check (absent: TRIAGE finds no duplicates). */
   listOpenItems?(): { itemId: string; title: string; status: string }[] | Promise<{ itemId: string; title: string; status: string }[]>;
   getSnapshot(): SimSnapshot | Promise<SimSnapshot>;
@@ -622,15 +619,11 @@ export class SimExecutors {
   // ── v2: Oracle, MERGE and the car gate ────────────────────────────────
 
   private oracleReport(r: OracleResultInput) {
-    const q = this.queen();
-    if (!q.reportOracleResult) throw new Error("sim: the Queen has no reportOracleResult yet (Phase 2)");
-    return q.reportOracleResult(r);
+    return this.queen().reportOracleResult(r);
   }
 
   private mergeReport(r: MergeResultInput) {
-    const q = this.queen();
-    if (!q.reportMergeResult) throw new Error("sim: the Queen has no reportMergeResult yet (Phase 2)");
-    return q.reportMergeResult(r);
+    return this.queen().reportMergeResult(r);
   }
 
   private async runOracle(c: OracleCommand): Promise<void> {

@@ -123,7 +123,7 @@ const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…`
 
 /**
  * Oracle DECOMPOSE: one child per part (at most `maxChildren`, never more than
- * the contract's 12). Keeps `[collide]`, `[race]` and the other build markers
+ * the contract's 24). Keeps `[collide]`, `[race]` and the other build markers
  * in title/body so the sim builder and filing logic still see them; consumes
  * `[hard]`, `(after N)` / `depends on #N` and `[touch:p]` (into `paths`).
  */
@@ -132,7 +132,7 @@ export function simDecompose(
   openItems: { itemId: string; title: string; status: string }[],
   maxChildren: number,
 ): DecomposedChildInput[] {
-  const parts = splitPrompt(prompt).slice(0, Math.min(maxChildren, 12));
+  const parts = splitPrompt(prompt).slice(0, Math.min(maxChildren, 24));
   return parts.map((part, i) => {
     const key = `c${i + 1}`;
     const after = /\(after (\d+)\)|depends on #(\d+)/i.exec(part);
@@ -155,7 +155,8 @@ export function simDecompose(
       title,
       body: clip(part, 2000),
       acceptance: [clip(`${plain} is visible at /`, 200)],
-      difficulty: /\[hard\]/i.test(part) ? ("hard" as const) : ("normal" as const),
+      // `[race]` races the child (hardWidth 3 through the race policy), like `[hard]`.
+      difficulty: /\[hard\]|\[race\]/i.test(part) ? ("hard" as const) : ("normal" as const),
       dependsOn,
       paths: touchPaths(part).slice(0, 10),
       similar: findSimilar(plain, openItems, 3),
