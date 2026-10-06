@@ -10,6 +10,7 @@
  */
 import { LAND_DEPTH, type DroneTask } from "@queenos/queen-types";
 import { NOTES_REF, type RemoteSpec } from "@queenos/hive-kit";
+import { netRetry, type NetRetry } from "./net-retry";
 import type { DronePorts, GitSession } from "./ports";
 
 /** History fetched from the fork; hive main must be within this many commits of the train head (queen-types). */
@@ -32,10 +33,11 @@ export interface LandOutcome {
 const short = (sha: string) => sha.slice(0, 12);
 const codeOf = (e: unknown) => String((e as { code?: unknown } | null)?.code ?? "");
 
-export async function landTrain(ports: Pick<DronePorts, "artifacts" | "git">, task: DroneTask, timestamp: number): Promise<LandOutcome> {
-  const fork = await ports.artifacts.access(task.artifactRepo, "read");
-  const hive = await ports.artifacts.access(task.namespace, "write");
-  const repo = await ports.git.clone({ remote: fork.remote, token: fork.token, ref: "main", depth: LAND_DEPTH });
+export async function landTrain(ports: Pick<DronePorts, "artifacts" | "git">, task: DroneTask, timestamp: number, net?: NetRetry): Promise<LandOutcome> {
+  const retry = <T>(fn: () => Promise<T>) => netRetry(net, fn);
+  const fork = await retry(() => ports.artifacts.access(task.artifactRepo, "read"));
+  const hive = await retry(() => ports.artifacts.access(task.namespace, "write"));
+  const repo = await retry(() => ports.git.clone({ remote: fork.remote, token: fork.token, ref: "main", depth: LAND_DEPTH }));
 
   const target = SHA_RE.test(task.baseRef) ? task.baseRef : await repo.resolveRef(task.baseRef);
   if (!(await repo.readCommit(target))) {
@@ -45,7 +47,7 @@ export async function landTrain(ports: Pick<DronePorts, "artifacts" | "git">, ta
 
   const hiveRemote: RemoteSpec = { url: hive.remote, token: hive.token };
   try {
-    await repo.push({ ref: LAND_REF, remoteRef: "refs/heads/main", remote: hiveRemote });
+    await retry(() => repo.push({ ref: LAND_REF, remoteRef: "refs/heads/main", remote: hiveRemote }));
   } catch (e) {
     const code = codeOf(e);
     if (code === "NOT_FAST_FORWARD" || code === "PUSH_REJECTED") {
@@ -55,13 +57,13 @@ export async function landTrain(ports: Pick<DronePorts, "artifacts" | "git">, ta
         notesCarried: 0,
       };
     }
-    throw e; // network/auth: let the step retry
+    throw e; // network/auth (transient ones already retried in place): let the step retry
   }
 
   const sources: RemoteSpec[] = [{ url: fork.remote, token: fork.token }];
   for (const m of task.members ?? []) {
     if (m.artifactRepo === task.artifactRepo) continue;
-    const acc = await ports.artifacts.access(m.artifactRepo, "read");
+    const acc = await retry(() => ports.artifacts.access(m.artifactRepo, "read"));
     sources.push({ url: acc.remote, token: acc.token });
   }
   const notes = await carryNotes(repo, sources, hiveRemote, timestamp);

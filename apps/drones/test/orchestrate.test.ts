@@ -252,6 +252,41 @@ describe("LAND", () => {
     expect(q.audits().at(-1)).toMatchObject({ droneRole: "LANDER", status: "REJECTED" });
   });
 
+  it("a 503 that outlasts every retry is reported landed:false with cause infra + this instance's id (not a plain failure)", async () => {
+    const { w, head } = await landWorld();
+    const access = w.artifacts.access.bind(w.artifacts);
+    let hiveCalls = 0;
+    w.artifacts.access = async (repo, scope) => {
+      if (repo === "hive") {
+        hiveCalls++;
+        throw Object.assign(new Error("HTTP Error: 503 Service Unavailable"), { name: "HttpError" });
+      }
+      return access(repo, scope);
+    };
+    const net = { attempts: 2, random: () => 0, sleep: async () => undefined };
+    const steps = new InlineSteps();
+    const out = await runDrone(task({ role: "LANDER", action: "LAND", baseRef: head }), steps, w.ports(), scripted, { net });
+    expect(out).toMatchObject({ status: "not-landed", summary: expect.stringMatching(/Lander failed: .*503/) });
+    expect(hiveCalls).toBe(2 * 4); // in-step tries x (1 + LAND_STEP retries): transient stays retryable
+    expect(w.queen("hive").calls.find((c) => c.method === "reportLandResult")?.input).toMatchObject({
+      trainId: "train-1", landed: false, cause: "infra", commandId: "train-1-land",
+    });
+  });
+
+  it("a 503 then success lands normally", async () => {
+    const { w, head } = await landWorld();
+    const access = w.artifacts.access.bind(w.artifacts);
+    let n = 0;
+    w.artifacts.access = async (repo, scope) => {
+      if (repo === "hive" && ++n === 1) throw Object.assign(new Error("HTTP Error: 503 Service Unavailable"), { name: "HttpError" });
+      return access(repo, scope);
+    };
+    const net = { attempts: 3, random: () => 0, sleep: async () => undefined };
+    const out = await runDrone(task({ role: "LANDER", action: "LAND", baseRef: head }), new InlineSteps(), w.ports(), scripted, { net });
+    expect(out).toMatchObject({ status: "landed", mainSha: head });
+    expect((w.queen("hive").calls.find((c) => c.method === "reportLandResult")!.input as { cause?: string }).cause).toBeUndefined();
+  });
+
   it("reports landed:false when the train head is not in the fork", async () => {
     const { w } = await landWorld();
     const out = await runDrone(task({ role: "LANDER", action: "LAND", baseRef: "f".repeat(40) }), new InlineSteps(), w.ports(), scripted);

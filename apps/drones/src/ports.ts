@@ -2,6 +2,7 @@
  * Drone ports: every side effect the workflow body performs goes through this
  * object, mirroring the Queen's createPorts() seam. Tests swap in fakes.
  */
+import type { NetRetry } from "./net-retry";
 import type {
   AppendAuditInput,
   AuditEvent,
@@ -131,6 +132,7 @@ export type MergeCarFn = (
   ports: Pick<DronePorts, "artifacts" | "git">,
   task: DroneTask,
   timestamp: number,
+  net?: NetRetry,
 ) => Promise<Omit<MergeResultInput, "trainId"> & { trainId?: string }>;
 
 // ── bundle ───────────────────────────────────────────────────────────────

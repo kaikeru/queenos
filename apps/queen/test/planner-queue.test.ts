@@ -68,7 +68,7 @@ function prompt(id: string, seq: number): PromptRecord {
 }
 
 /** Four passed members on car K1, in `carPhase`. */
-function hive(carPhase: TrainRecord["phase"]) {
+function hive(carPhase: TrainRecord["phase"], carOver: Partial<TrainRecord> = {}) {
   const members = ["A", "B", "C", "D"].map((id, i) => base(id, { seq: i + 1, passedSeq: i + 1, carId: "K1" }));
   const car = base("K1", {
     lane: "QUEUE",
@@ -80,6 +80,7 @@ function hive(carPhase: TrainRecord["phase"]) {
     status: carPhase === "BUILDING" ? "BUILDING" : "TESTING",
     dispatched: true,
     headSha: carPhase === "BUILDING" ? null : SHA("c"),
+    ...carOver,
   });
   return {
     planner: () =>
@@ -148,5 +149,50 @@ describe("planner ↔ merge queue: infrastructure", () => {
   it("a car gate VERDICT (no cause) still bisects", () => {
     const r = hive("TESTING").planner().trainResult({ trainId: "K1", passed: false, summary: "smoke failed on /health" });
     expect(r.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "EJECTED" });
+  });
+
+  const infraMerge = (over: Partial<MergeResult> = {}): MergeResult => ({
+    trainId: "K1", ok: false, cause: "infra", merged: [], conflicts: [], fastForward: false,
+    summary: "Merge drone failed: HttpError: HTTP Error: 503 Service Unavailable", ...over,
+  });
+  const dispatches = (effects: Effect[]) => effects.filter((e): e is Extract<Effect, { type: "dispatchDrone" }> => e.type === "dispatchDrone");
+
+  it("a MERGE drone that hit transient infra re-dispatches the SAME car: no eject, no supersede, members stay aboard, nothing charged", () => {
+    const r = hive("BUILDING").planner().mergeResult(infraMerge());
+    expect(r.outcome).toBe("applied");
+    const byId = new Map(r.trains.map((t) => [t.trainId, t]));
+    expect(byId.get("K1")).toMatchObject({ phase: "BUILDING", droneAttempt: 2 });
+    for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)?.carId ?? "K1").toBe("K1"); // untouched (or unchanged)
+    for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)?.phase ?? "PASSED").toBe("PASSED");
+    expect(dispatches(r.effects).map((e) => [e.trainId, e.task.action, e.attempt])).toEqual([["K1", "MERGE", 2]]);
+    expect(r.executorLost).toBeUndefined();
+    expect(r.prompts.every((p) => p.attempts === 0 && p.status === "IN_TRAIN")).toBe(true);
+  });
+
+  it("an infra MERGE report from an older attempt is stale; a plain ok:false still takes the old path (eject + pool)", () => {
+    const stale = hive("BUILDING").planner().mergeResult(infraMerge({ commandId: "K1-merge-1-nope" }));
+    expect(stale.outcome).toBe("ignored:stale");
+    const plain = hive("BUILDING").planner().mergeResult(infraMerge({ cause: undefined }));
+    expect(plain.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "EJECTED" });
+  });
+
+  it("infra MERGE retries are bounded: past MAX_COMMAND_ATTEMPTS the car takes the infra-exhausted path (EJECTED, members back to the pool)", () => {
+    const first = hive("BUILDING").planner().mergeResult(infraMerge());
+    expect(first.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "BUILDING", droneAttempt: 2 });
+    const r = hive("BUILDING", { droneAttempt: 3 }).planner().mergeResult(infraMerge());
+    expect(r.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "EJECTED" });
+    for (const id of ["A", "B", "C", "D"]) expect(r.trains.find((t) => t.trainId === id)).toMatchObject({ carId: null });
+    expect(r.prompts.every((p) => p.attempts === 0)).toBe(true);
+  });
+
+  it("a LANDER that hit transient infra re-dispatches the same car's lander (no eject); NOT_FAST_FORWARD (no cause) still fails the car", () => {
+    const retried = hive("LANDING").planner().landResult({ trainId: "K1", landed: false, cause: "infra", summary: "Lander failed: HttpError: HTTP Error: 503 Service Unavailable" });
+    expect(retried.outcome).toBe("applied");
+    expect(retried.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "LANDING", droneAttempt: 2 });
+    expect(dispatches(retried.effects).map((e) => [e.trainId, e.task.action, e.attempt])).toEqual([["K1", "LAND", 2]]);
+    for (const id of ["A", "B", "C", "D"]) expect(retried.trains.find((t) => t.trainId === id)?.carId ?? "K1").toBe("K1");
+
+    const nff = hive("LANDING").planner().landResult({ trainId: "K1", landed: false, summary: "hive/main moved: not a fast-forward." });
+    expect(nff.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "EJECTED" });
   });
 });

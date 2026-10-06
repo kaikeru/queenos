@@ -10,6 +10,7 @@ import { mergeCar, mergeMessage } from "../src/merge";
 import { defaultMergeCar } from "../src/merge-adapter";
 import type { DronePorts, GitPort } from "../src/ports";
 import { FakeArtifacts, STARTER_FILES, T0_SECONDS, remoteOf } from "./fakes";
+import { Flaky, fastNet } from "./flaky";
 
 const REG = "src/features/index.js";
 const CAR = "hive-car-1";
@@ -228,4 +229,56 @@ describe("mergeCar", () => {
     const car = await g.work(CAR);
     expect((await car.head())?.parents).toEqual([await g.main("hive"), m1.headSha]);
   }, 60_000);
+
+  describe("transient Artifacts errors (503)", () => {
+    it("clone, member fetch and the push each retry a 503 in place, then the merge succeeds with the same result", async () => {
+      const g = new GitWorld();
+      await g.hive();
+      await g.fork(CAR);
+      const m1 = await g.member("t1", feature("a.js"), T0_SECONDS + 1);
+      const f = new Flaky({ access: 1, clone: 1, fetchRef: 1, push: 1 });
+      const { net, sleeps } = fastNet();
+      const r = await mergeCar(f.wrap(g.ports()), carTask([m1]), TS, net);
+      expect(r).toMatchObject({ ok: true, merged: ["t1"], fastForward: true });
+      expect(f.calls).toMatchObject({ clone: 2, fetchRef: 2, push: 2 });
+      expect(sleeps).toHaveLength(4); // access + clone + fetch + push retried once each
+      expect(await g.main(CAR)).toBe(r.headSha);
+    });
+
+    it("a 503 that outlasts the in-step tries is thrown (so the Workflow step retries), never reported as a conflict", async () => {
+      const g = new GitWorld();
+      await g.hive();
+      await g.fork(CAR);
+      const m1 = await g.member("t1", feature("a.js"), T0_SECONDS + 1);
+      const f = new Flaky({ clone: 99 });
+      const { net } = fastNet(3);
+      await expect(mergeCar(f.wrap(g.ports()), carTask([m1]), TS, net)).rejects.toThrow(/503 Service Unavailable/);
+      expect(f.calls.clone).toBe(3);
+    });
+
+    it("a rejected push (NOT_FAST_FORWARD) is not transient: thrown at once, no retry", async () => {
+      const g = new GitWorld();
+      await g.hive();
+      await g.fork(CAR);
+      const m1 = await g.member("t1", feature("a.js"), T0_SECONDS + 1);
+      const f = new Flaky({});
+      const base = f.wrap(g.ports());
+      const ports = {
+        ...base,
+        git: {
+          clone: async (req: Parameters<GitPort["clone"]>[0]) => {
+            const repo = await base.git.clone(req);
+            repo.push = async () => {
+              throw Object.assign(new Error("push to refs/heads/main is not a fast-forward"), { code: "NOT_FAST_FORWARD" });
+            };
+            return repo;
+          },
+        },
+      };
+      const { net, sleeps } = fastNet();
+      await expect(mergeCar(ports, carTask([m1]), TS, net)).rejects.toMatchObject({ code: "NOT_FAST_FORWARD" });
+      expect(f.calls.push).toBe(1);
+      expect(sleeps).toEqual([]);
+    });
+  });
 });

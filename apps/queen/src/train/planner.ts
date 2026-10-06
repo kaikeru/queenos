@@ -814,6 +814,7 @@ export class TrainPlanner {
     if (!isActive(car)) return this.finish("ignored:stale");
     if (car.phase !== "BUILDING") return this.finish("ignored:duplicate");
     if (car.forkState !== "READY") return this.finish("ignored:premature");
+    if (!r.ok && r.cause === "infra") return this.driveInfraFailure(car, r);
     this.applyQueue(this.hooks.mergeResult(car, r, this.trains, this.queueContext()));
     if (isActive(car) && car.phase === "BUILDING") {
       // The queue left the car where it was (e.g. ok:false without a decision): an infra failure.
@@ -877,6 +878,7 @@ export class TrainPlanner {
     if (!t) return this.finish("ignored:unknown");
     if (!isActive(t)) return this.finish("ignored:stale");
     if (t.phase !== "LANDING") return this.finish("ignored:premature");
+    if (!r.landed && r.cause === "infra") return this.driveInfraFailure(t, r);
     if (!r.landed) {
       this.landFailed(t, r.summary || "lander could not push the train head to main");
       return this.finish("applied");
@@ -897,6 +899,22 @@ export class TrainPlanner {
       if (sha) this.landed = { sha, trainIds: [t.trainId] };
     }
     this.maybeLand();
+    return this.finish("applied");
+  }
+
+  /**
+   * A MERGE / LAND drone whose transient Artifacts errors (5xx / 429) outlasted its own retries. Not a verdict:
+   * the SAME car's drone is re-dispatched under the next attempt (no supersede, no member charge; the drone
+   * backs off in-step, and the Workflow retries 10/20/40 s, before it reports). Past MAX_COMMAND_ATTEMPTS the
+   * existing infra-exhausted path applies (merge: infraExhausted → carFailed "infra" → 3 in a row EXECUTOR_LOST;
+   * land: landFailed). A report from an attempt other than the current one is stale.
+   */
+  private driveInfraFailure(t: TrainRecord, r: MergeResult | LandResult): PlanResult {
+    if (!droneOutstanding(t)) return this.finish("ignored:stale");
+    if (r.commandId && r.commandId !== droneInstanceId({ trainId: t.trainId, action: t.phase === "LANDING" ? "LAND" : "MERGE" }, t.droneAttempt)) {
+      return this.finish("ignored:stale");
+    }
+    this.redispatchDrone(t, r.summary || "drone hit an infrastructure error", true);
     return this.finish("applied");
   }
 

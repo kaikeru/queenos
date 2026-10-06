@@ -9,6 +9,7 @@ import { LAND_DEPTH, landTrain } from "../src/land";
 import { mergeCar } from "../src/merge";
 import type { DronePorts, GitPort } from "../src/ports";
 import { FakeArtifacts, STARTER_FILES, T0_SECONDS, remoteOf } from "./fakes";
+import { Flaky, fastNet } from "./flaky";
 
 const CAR = "hive-car-1";
 
@@ -116,5 +117,41 @@ describe("landTrain (merge-queue car)", () => {
     const out = await landTrain(g.ports(), task(members, headSha, "LAND"), T0_SECONDS + 200);
     expect(out).toMatchObject({ landed: true, mainSha: headSha, notesCarried: 0 });
     expect(out.notesError).toContain("deny refs/notes");
+  });
+
+  it("retries a 503 on access, clone and the push in place, then lands", async () => {
+    const g = new GitWorld();
+    const { hive, members, headSha } = await mergedCar(g, 2);
+    const f = new Flaky({ access: 1, clone: 1, push: 1 });
+    const { net, sleeps } = fastNet();
+    const out = await landTrain(f.wrap(g.ports()), task(members, headSha, "LAND"), T0_SECONDS + 200, net);
+    expect(out).toMatchObject({ landed: true, mainSha: headSha });
+    expect(f.calls.clone).toBe(2);
+    expect(f.calls.push).toBeGreaterThanOrEqual(2);
+    expect(sleeps.length).toBeGreaterThanOrEqual(3);
+    expect(await hive.resolveRef("main")).toBe(headSha);
+  });
+
+  it("a 503 that outlasts the in-step tries is thrown (the step retries, then the drone reports infra), not 'not landed'", async () => {
+    const g = new GitWorld();
+    const { members, headSha } = await mergedCar(g, 2);
+    const f = new Flaky({ push: 99 });
+    const { net } = fastNet(3);
+    await expect(landTrain(f.wrap(g.ports()), task(members, headSha, "LAND"), T0_SECONDS + 200, net)).rejects.toThrow(/503 Service Unavailable/);
+    expect(f.calls.push).toBe(3);
+  });
+
+  it("NOT_FAST_FORWARD is unchanged: not landed, and the push is never retried", async () => {
+    const g = new GitWorld();
+    const { hive, members, headSha } = await mergedCar(g, 2);
+    await hive.writeFiles([{ path: "hotfix.txt", content: "human push\n" }]);
+    await hive.commitAll({ message: "hotfix", timestamp: T0_SECONDS + 150 });
+    const f = new Flaky({});
+    const { net, sleeps } = fastNet();
+    const out = await landTrain(f.wrap(g.ports()), task(members, headSha, "LAND"), T0_SECONDS + 200, net);
+    expect(out).toMatchObject({ landed: false });
+    expect(out.summary).toContain("not a fast-forward");
+    expect(f.calls.push).toBe(1);
+    expect(sleeps).toEqual([]);
   });
 });

@@ -21,6 +21,7 @@ import {
   type GitNotesPayload,
   type MergeResult,
   MergeResultSchema,
+  isTransientError,
 } from "@queenos/queen-types";
 import {
   AiGatewayError,
@@ -38,6 +39,7 @@ import { ChangeSetError } from "./change-set";
 import { AllModelsFailedError } from "./generate";
 import { ConfigError, type DroneConfig } from "./config";
 import { landTrain, type LandOutcome } from "./land";
+import type { NetRetry } from "./net-retry";
 import { defaultMergeCar } from "./merge-adapter";
 import type { DronePorts, QueenPort } from "./ports";
 import { SCRIPTED_MODEL } from "./scripted";
@@ -50,6 +52,12 @@ export interface StepRunner {
 
 export const GENERATE_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }, timeout: "5 minutes" };
 export const GIT_STEP: WorkflowStepConfig = { retries: { limit: 4, delay: "5 seconds", backoff: "exponential" }, timeout: "5 minutes" };
+/**
+ * MERGE / LAND: transient Artifacts errors (503 / 429) are retried in place with jitter first (net-retry.ts),
+ * then Workflows retries the step 3 more times (10 s, 20 s, 40 s). Only then is it reported, as infra.
+ */
+export const MERGE_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }, timeout: "5 minutes" };
+export const LAND_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }, timeout: "5 minutes" };
 export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
 /** Step retries of the tool-loop agent (a rate limit that outlasts the in-step retries, a DO reset, an RPC error). */
 export const AGENT_STEP_RETRIES = 5;
@@ -128,6 +136,14 @@ const messageOf = (e: unknown) => String((e as Error)?.message ?? e);
 /** Errors that will not get better on retry become NonRetryableError inside steps. */
 export function toStepError(e: unknown, config: Pick<DroneConfig, "llmMode">): unknown {
   if (e instanceof NonRetryableError) return e;
+  // A 503 / 429 from Artifacts is never permanent: it must stay retryable (Workflows retries it, then the drone reports infra).
+  if (
+    isTransientError(e) &&
+    !(e instanceof AiGatewayError || e instanceof ConfigError || e instanceof LedgerError || e instanceof ChangeSetError) &&
+    !messageOf(e).startsWith(INFRA_PREFIX)
+  ) {
+    return e;
+  }
   const code = String((e as { code?: unknown } | null)?.code ?? "");
   const permanent =
     (e instanceof AiGatewayError && !e.retryable) ||
@@ -151,6 +167,8 @@ export interface DroneRunMeta {
   instanceId?: string;
   /** Rate-limit (429) retry policy for model calls; tests inject `sleep` and `random`. */
   backoff?: BackoffOptions;
+  /** In-step retry policy for MERGE / LAND git calls; tests inject `sleep` and `random`. */
+  net?: NetRetry;
 }
 
 export async function runDrone(payload: unknown, step: StepRunner, ports: DronePorts, config: DroneConfig, meta: DroneRunMeta = {}): Promise<DroneRunResult> {
@@ -163,7 +181,7 @@ export async function runDrone(payload: unknown, step: StepRunner, ports: DroneP
   const role: DroneRole = task.action === "LAND" || task.action === "MERGE" ? "LANDER" : "BUILDER";
   const queen = () => ports.queen(task.namespace);
   const instanceId = meta.instanceId ?? `${task.trainId}-${task.action.toLowerCase()}`;
-  const ctx: RunCtx = { task, role, step, ports, config, queen, instanceId, ...(meta.backoff ? { backoff: meta.backoff } : {}) };
+  const ctx: RunCtx = { task, role, step, ports, config, queen, instanceId, ...(meta.backoff ? { backoff: meta.backoff } : {}), ...(meta.net ? { net: meta.net } : {}) };
 
   const { startedAtMs } = await step.do("clock: start", CLOCK_STEP, async () => ({ startedAtMs: Date.now() }));
   ctx.startedAtMs = startedAtMs;
@@ -183,6 +201,7 @@ interface RunCtx {
   instanceId: string;
   startedAtMs?: number;
   backoff?: BackoffOptions;
+  net?: NetRetry;
 }
 
 /**
@@ -404,12 +423,15 @@ async function failBuild(ctx: RunCtx, stage: string, err: unknown, model?: strin
 async function runLand(ctx: RunCtx): Promise<DroneRunResult> {
   const { task, step, ports, config } = ctx;
   let outcome: LandOutcome;
+  /** A transient error outlasted every retry: the Queen re-dispatches the lander instead of failing the car. */
+  let infra = false;
   try {
-    outcome = await step.do("land: push train head to hive main", GIT_STEP, () =>
-      landTrain(ports, task, commitTimestamp(ctx)).catch((e) => Promise.reject(toStepError(e, config))),
+    outcome = await step.do("land: push train head to hive main", LAND_STEP, () =>
+      landTrain(ports, task, commitTimestamp(ctx), ctx.net).catch((e) => Promise.reject(toStepError(e, config))),
     );
   } catch (e) {
     outcome = { landed: false, summary: clip(`Lander failed: ${messageOf(e)}`), notesCarried: 0 };
+    infra = isTransientError(e);
   }
 
   const executionTimeMs = await elapsed(ctx, "clock: landed");
@@ -430,10 +452,10 @@ async function runLand(ctx: RunCtx): Promise<DroneRunResult> {
     q.reportLandResult(
       outcome.landed && outcome.mainSha
         ? { trainId: task.trainId, landed: true, mainSha: outcome.mainSha, summary: clip(outcome.summary) }
-        : { trainId: task.trainId, landed: false, summary: clip(outcome.summary) },
+        : { trainId: task.trainId, landed: false, summary: clip(outcome.summary), ...(infra ? { cause: "infra" as const, commandId: ctx.instanceId } : {}) },
     ),
   );
-  metric(ctx, { type: "drone.land", model: LANDER_MODEL, outcome: outcome.landed ? "landed" : "not-landed", valueMs: executionTimeMs });
+  metric(ctx, { type: "drone.land", model: LANDER_MODEL, outcome: outcome.landed ? "landed" : infra ? "infra" : "not-landed", valueMs: executionTimeMs });
   await audit(ctx, outcome.landed ? "audit: passed" : "audit: rejected", outcome.landed ? "PASSED" : "REJECTED", ledger);
   return {
     action: "LAND",
@@ -459,13 +481,19 @@ async function runMerge(ctx: RunCtx): Promise<DroneRunResult> {
   const mergeCar = ports.mergeCar ?? defaultMergeCar;
   let result: MergeResult;
   try {
-    result = await step.do("merge: members onto the car fork", GIT_STEP, async () => {
+    result = await step.do("merge: members onto the car fork", MERGE_STEP, async () => {
       const t0 = Date.now();
-      const r = await mergeCar(ports, task, commitTimestamp(ctx)).catch((e) => Promise.reject(toStepError(e, config)));
+      const r = await mergeCar(ports, task, commitTimestamp(ctx), ctx.net).catch((e) => Promise.reject(toStepError(e, config)));
       return MergeResultSchema.parse({ ...r, trainId: task.trainId, mergeMs: r.mergeMs ?? Date.now() - t0 });
     });
   } catch (e) {
-    result = MergeResultSchema.parse({ trainId: task.trainId, ok: false, summary: clip(`Merge drone failed: ${messageOf(e)}`) });
+    // A transient error that outlasted every retry is infra: the Queen re-dispatches the same car.
+    result = MergeResultSchema.parse({
+      trainId: task.trainId,
+      ok: false,
+      summary: clip(`Merge drone failed: ${messageOf(e)}`),
+      ...(isTransientError(e) ? { cause: "infra" as const, commandId: ctx.instanceId } : {}),
+    });
   }
   result = { ...result, summary: clip(result.summary) };
 
@@ -490,7 +518,7 @@ async function runMerge(ctx: RunCtx): Promise<DroneRunResult> {
   });
 
   const queenOutcome = await report(ctx, "report: merge result", (q) => q.reportMergeResult({ ...result, mergeMs: result.mergeMs ?? executionTimeMs }));
-  metric(ctx, { type: "drone.merge", model: MERGE_MODEL, outcome: ok ? (result.merged.length ? "merged" : "empty") : "failed", valueMs: result.mergeMs ?? executionTimeMs });
+  metric(ctx, { type: "drone.merge", model: MERGE_MODEL, outcome: ok ? (result.merged.length ? "merged" : "empty") : result.cause === "infra" ? "infra" : "failed", valueMs: result.mergeMs ?? executionTimeMs });
   await audit(ctx, ok ? "audit: passed" : "audit: rejected", ok ? "PASSED" : "REJECTED", ledger);
   return {
     action: "MERGE",

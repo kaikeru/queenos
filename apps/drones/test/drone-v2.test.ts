@@ -1,4 +1,5 @@
 /** WP1.6: MERGE routing, finish followUps, BuildResult v2 fields, 429 handling, trace logs, AE points. */
+import { NonRetryableError } from "cloudflare:workflows";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AiGatewayError, parseLedger } from "@queenos/hive-kit";
 import { DroneTaskSchema, spanIdFor, traceparent, type MergeResultInput } from "@queenos/queen-types";
@@ -7,7 +8,7 @@ import { generateLive } from "../src/generate";
 import { AGENT_PHASE_MS, MIN_MODEL_MS, runAgentBuild } from "../src/agent/run";
 import { AGENT_SYSTEM_PROMPT } from "../src/agent/prompt";
 import { FinishInputSchema, MAX_FOLLOW_UPS, runFinish, runVerify, EMPTY_TOOL_STATE, type DroneToolDeps, type ToolState } from "../src/agent/tools";
-import { AGENT_RETRY_DELAY_MS, AGENT_STEP_RETRIES, DroneFailedError, MERGE_MODEL, agentStepConfig, isInfraFailure, runDrone } from "../src/orchestrate";
+import { AGENT_RETRY_DELAY_MS, AGENT_STEP_RETRIES, DroneFailedError, MERGE_MODEL, agentStepConfig, isInfraFailure, runDrone, toStepError } from "../src/orchestrate";
 import type { MergeCarFn } from "../src/ports";
 import { FakeAgent, FakeLlm, FakeLoader, FakeWorld, InlineSteps, PASSING_VERIFY, STARTER_FILES, htmlAgent, starterResponses, task, type AgentScript } from "./fakes";
 
@@ -290,6 +291,47 @@ describe("MERGE", () => {
     const q = w.queen("hive");
     expect(q.calls.find((c) => c.method === "reportMergeResult")!.input).toMatchObject({ trainId: "car-1", ok: false, summary: expect.stringContaining("Artifacts is down") });
     expect(q.audits().at(-1)).toMatchObject({ droneRole: "LANDER", status: "REJECTED", gitNotesPayload: { model: MERGE_MODEL, result: "failure" } });
+  });
+
+  it("toStepError keeps a transient 503 retryable (even with a permanent-looking prefix) but not a permanent error", () => {
+    expect(toStepError(new Error("HttpError: HTTP Error: 503 Service Unavailable"), scriptedCfg)).not.toBeInstanceOf(NonRetryableError);
+    expect(toStepError(new Error("UNAVAILABLE: Artifacts 503 Service Unavailable"), scriptedCfg)).not.toBeInstanceOf(NonRetryableError);
+    expect(toStepError(new Error("INVALID_INPUT: bad member"), scriptedCfg)).toBeInstanceOf(NonRetryableError);
+  });
+
+  it("a transient 503 that outlasts every retry is reported ok:false with cause infra + this instance's id (the Queen re-dispatches the same car)", async () => {
+    const w = new FakeWorld();
+    let calls = 0;
+    w.mergeCar = async () => {
+      calls++;
+      throw new Error("HttpError: HTTP Error: 503 Service Unavailable");
+    };
+    const out = await runDrone(mergeTask(), new InlineSteps(), w.ports(), scriptedCfg);
+    expect(out).toMatchObject({ action: "MERGE", status: "failed" });
+    expect(calls).toBe(4); // 1 + MERGE_STEP.retries.limit: the transient error stays retryable
+    expect(w.queen("hive").calls.find((c) => c.method === "reportMergeResult")!.input).toMatchObject({
+      trainId: "car-1", ok: false, cause: "infra", commandId: "car-1-merge", summary: expect.stringContaining("503"),
+    });
+  });
+
+  it("a non-transient failure is ok:false WITHOUT cause (old semantics)", async () => {
+    const w = new FakeWorld();
+    w.mergeCar = async () => {
+      throw new Error("UNAVAILABLE: Artifacts is down");
+    };
+    await runDrone(mergeTask(), new InlineSteps(), w.ports(), scriptedCfg);
+    expect((w.queen("hive").calls.find((c) => c.method === "reportMergeResult")!.input as { cause?: string }).cause).toBeUndefined();
+  });
+
+  it("a 503 then success inside the step retries is a normal merged result", async () => {
+    const w = new FakeWorld();
+    let calls = 0;
+    w.mergeCar = async () => {
+      if (++calls === 1) throw new Error("HttpError: HTTP Error: 503 Service Unavailable");
+      return { ok: true, headSha: "c".repeat(40), merged: ["b-1"], conflicts: [], fastForward: false };
+    };
+    const out = await runDrone(mergeTask(), new InlineSteps(), w.ports(), scriptedCfg);
+    expect(out).toMatchObject({ status: "merged", merged: 1 });
   });
 
   it("the default adapter is WP1.12's mergeCar: an unreachable car fork reports ok:false", async () => {

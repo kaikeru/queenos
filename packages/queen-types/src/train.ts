@@ -135,6 +135,10 @@ export const LandResultSchema = z
     mainSha: z.string().min(1).optional(),
     /** Scribe's <=2-sentence compaction. */
     summary: z.string().max(500).default(""),
+    /** With `landed: false`: a transient infrastructure error outlasted the drone's retries; the Queen re-dispatches the lander (not a non-fast-forward). */
+    cause: z.literal("infra").optional(),
+    /** The reporting drone's Workflow instance id; with `cause`, a report from a superseded attempt is ignored. */
+    commandId: z.string().min(1).optional(),
   })
   .refine((r) => !r.landed || r.mainSha !== undefined, {
     message: "mainSha is required when landed is true",

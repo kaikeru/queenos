@@ -46,6 +46,10 @@ export const MergeResultSchema = z.object({
   trainId: z.string().min(1),
   /** false = infra failure (nothing pushed). */
   ok: z.boolean(),
+  /** With `ok: false`: a transient infrastructure error (Artifacts 5xx / 429) outlasted the drone's retries; the Queen re-dispatches the SAME car (no supersede, no member charge). */
+  cause: z.literal("infra").optional(),
+  /** The reporting drone's Workflow instance id; with `cause`, a report from a superseded attempt is ignored. */
+  commandId: z.string().min(1).optional(),
   headSha: z.string().optional(),
   baseSha: z.string().optional(),
   /** Member trainIds, in merge order. */

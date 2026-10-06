@@ -4,11 +4,13 @@
  *
  * Idempotent: merge commits use the step's fixed timestamp, so a replayed
  * step makes the same SHAs and the push is a no-op. Infra failures (clone,
- * fetch, push errors) throw so the Workflow step retries; the caller
- * (orchestrate.ts `runMerge`) reports `ok: false` once retries run out.
+ * fetch, push errors) are retried in place when transient (5xx / 429, jittered),
+ * then throw so the Workflow step retries; the caller (orchestrate.ts `runMerge`)
+ * reports `ok: false` (`cause: "infra"` if transient) once retries run out.
  */
 import { LAND_DEPTH, type DroneTask, type MergeConflict, type MergeMember, type MergeResultInput } from "@queenos/queen-types";
 import { QUEEN_MERGE_IDENTITY, registryMergeDriver, type GitRepo, type GitMergeConflict, type RemoteSpec } from "@queenos/hive-kit";
+import { netRetry, type NetRetry } from "./net-retry";
 import type { DronePorts, GitSession } from "./ports";
 
 /** Local ref each member's head is fetched into. */
@@ -55,12 +57,13 @@ function fromGit(trainId: string, c: GitMergeConflict): MergeConflict {
  * pushes nothing. `fastForward` = exactly one member whose head IS the car
  * head (its tree was already gated).
  */
-export async function mergeCar(ports: Pick<DronePorts, "artifacts" | "git">, task: DroneTask, timestamp: number): Promise<MergeResultInput> {
+export async function mergeCar(ports: Pick<DronePorts, "artifacts" | "git">, task: DroneTask, timestamp: number, net?: NetRetry): Promise<MergeResultInput> {
   const t0 = Date.now();
   const members = task.members ?? [];
-  const car = await ports.artifacts.access(task.artifactRepo, "write");
+  const retry = <T>(fn: () => Promise<T>) => netRetry(net, fn);
+  const car = await retry(() => ports.artifacts.access(task.artifactRepo, "write"));
   const carRemote: RemoteSpec = { url: car.remote, token: car.token };
-  const repo = asMergeSession(await ports.git.clone({ remote: car.remote, token: car.token, ref: "main", depth: LAND_DEPTH }));
+  const repo = asMergeSession(await retry(() => ports.git.clone({ remote: car.remote, token: car.token, ref: "main", depth: LAND_DEPTH })));
   const baseSha = await repo.resolveRef("main");
 
   const merged: string[] = [];
@@ -68,10 +71,10 @@ export async function mergeCar(ports: Pick<DronePorts, "artifacts" | "git">, tas
   let deepenedCar = false;
 
   for (const m of members) {
-    const fork = await ports.artifacts.access(m.artifactRepo, "read");
+    const fork = await retry(() => ports.artifacts.access(m.artifactRepo, "read"));
     const forkRemote: RemoteSpec = { url: fork.remote, token: fork.token };
     const localRef = `${MEMBER_REF_PREFIX}${m.trainId}`;
-    const fetched = await repo.fetchRef({ remoteRef: "refs/heads/main", localRef, remote: forkRemote, depth: LAND_DEPTH });
+    const fetched = await retry(() => repo.fetchRef({ remoteRef: "refs/heads/main", localRef, remote: forkRemote, depth: LAND_DEPTH }));
     if (!fetched || !(await repo.readCommit(m.headSha))) {
       conflicts.push({
         trainId: m.trainId,
@@ -87,10 +90,10 @@ export async function mergeCar(ports: Pick<DronePorts, "artifacts" | "git">, tas
     if ((await repo.findMergeBase(["main", m.headSha])).length === 0) {
       // Shallow history: fetch everything once (template repos are small), then retry.
       if (!deepenedCar) {
-        await repo.deepen({ remote: carRemote, remoteRef: "refs/heads/main" });
+        await retry(() => repo.deepen({ remote: carRemote, remoteRef: "refs/heads/main" }));
         deepenedCar = true;
       }
-      await repo.deepen({ remote: forkRemote, remoteRef: "refs/heads/main", localRef });
+      await retry(() => repo.deepen({ remote: forkRemote, remoteRef: "refs/heads/main", localRef }));
       await repo.writeRef(localRef, m.headSha);
       // Still no base (unrelated history) → GitRepo.merge reports `unsupported`.
     }
@@ -110,7 +113,7 @@ export async function mergeCar(ports: Pick<DronePorts, "artifacts" | "git">, tas
   }
 
   const headSha = await repo.resolveRef("main");
-  if (headSha !== baseSha) await repo.push({ ref: "main", remoteRef: "refs/heads/main", remote: carRemote });
+  if (headSha !== baseSha) await retry(() => repo.push({ ref: "main", remoteRef: "refs/heads/main", remote: carRemote }));
   const only = members.length === 1 && merged.length === 1 ? members[0] : undefined;
   const fastForward = !!only && headSha === only.headSha;
 
