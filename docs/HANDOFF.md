@@ -8,9 +8,9 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 - **Not** a GitHub clone: an OS for agent swarms.
 - **The judges want** multiple agents working on changes concurrently.
 - **The three questions it answers:**
-  - Awareness: the Queen DO is the single source of truth, plus the work ledger and Cognitive Ledger.
+  - Awareness: the Queen DO (single source of truth), the event log and trace, and hive memory (plus the Cognitive Ledger).
   - Conflicts: path affinity plus a speculative, batched merge queue (3-way merge, integration gate, bisect, conflict -> rework).
-  - Review: gatekeepers, the LLM reviewer, the Scribe, Sentinel, and the error budget.
+  - Review: gates, the LLM reviewer, the Scribe, the integration gate, Sentinel, and error budgets.
 
 **Live (pre-v2 version):** https://queenos.kaikeru.com, behind Cloudflare Access (team `kaikeru`, `@kaikeru.com` emails, one-time-PIN login). The demo hive is `demo`; its prod is https://demo-app.kyle-477.workers.dev and staging is https://demo-staging.kyle-477.workers.dev.
 
