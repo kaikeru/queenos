@@ -2,7 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { DeployCommand, DroneTask, ProvisionCommand, QueenServerMessage, RecalledMemory, SentinelCommand } from "@queenos/queen-types";
-import { modelPin, routerPolicy, type QueenNode, type SocketAttachment } from "../src/queen-node";
+import { modelPin, RECONCILE_DELAY_MS, routerPolicy, type QueenNode, type SocketAttachment } from "../src/queen-node";
 import { migrate } from "../src/db";
 import type { RecordingDispatcher, RecordingHerald, RecordingProvisioner, RecordingSentinel } from "./fakes";
 
@@ -460,6 +460,89 @@ describe("command watchdog (alarm)", () => {
     const ids = await runInDurableObject(stubFor(ns), (q: QueenNode) => [...(q.ports.dispatcher as RecordingDispatcher).instanceIds]);
     const [t] = (await inspect(ns)).trains;
     expect(ids).toEqual([`${t!.train_id}-build`, `${t!.train_id}-build-2`]);
+  });
+
+  /** A car at BUILDING with its MERGE drone out (live: e388fc21, 2026-10-06). */
+  async function carMerging(ns: string) {
+    const { trainId, reported } = await oneTrain(ns, { live: true });
+    await post(ns, "/internal/webhook/train-result", { trainId, passed: true, summary: "ok" });
+    await settle(ns, reported);
+    const s = await inspect(ns);
+    const car = s.trains.find((t) => (t as unknown as { lane: string }).lane === "QUEUE")!;
+    expect(s.tasks.at(-1)).toMatchObject({ trainId: car.train_id, action: "MERGE" });
+    return { carId: car.train_id, memberId: trainId };
+  }
+  const droneIds = (ns: string) => runInDurableObject(stubFor(ns), (q: QueenNode) => [...(q.ports.dispatcher as RecordingDispatcher).instanceIds]);
+  const failDrones = (ns: string, n: number) =>
+    runInDurableObject(stubFor(ns), (q: QueenNode) => {
+      (q.ports.dispatcher as RecordingDispatcher).failNext = n;
+    });
+
+  it("a MERGE infra failure re-dispatches <car>-merge-2 with a full MERGE task (members, baseRef)", async () => {
+    const ns = newHive();
+    const { carId, memberId } = await carMerging(ns);
+    const r = await post(ns, "/internal/webhook/merge-result", {
+      trainId: carId, ok: false, cause: "infra", merged: [], conflicts: [], fastForward: false, summary: "Merge drone failed: HttpError: HTTP Error: 503 Service Unavailable",
+    });
+    expect(await r.json()).toMatchObject({ outcome: "applied", train: { phase: "BUILDING" } });
+    expect((await droneIds(ns)).at(-1)).toBe(`${carId}-merge-2`);
+    expect((await inspect(ns)).tasks.at(-1)).toMatchObject({ trainId: carId, action: "MERGE", role: "LANDER", baseRef: "main", members: [expect.objectContaining({ trainId: memberId })] });
+  });
+
+  it("a re-dispatch whose Workflows create fails is retried within RECONCILE_DELAY_MS, even with a later alarm already armed", async () => {
+    const ns = newHive();
+    const { carId } = await carMerging(ns);
+    // The MERGE drone's watchdog alarm is ~10 min out.
+    expect(await alarmAt(ns)).toBeGreaterThan(Date.now() + T / 2);
+    await failDrones(ns, 1);
+    const t0 = Date.now();
+    const r = await post(ns, "/internal/webhook/merge-result", {
+      trainId: carId, ok: false, cause: "infra", merged: [], conflicts: [], fastForward: false, summary: "Merge drone failed: HttpError: HTTP Error: 503 Service Unavailable",
+    });
+    expect(await r.json()).toMatchObject({ outcome: "applied", train: { phase: "BUILDING" } });
+    expect((await droneIds(ns)).filter((id) => id === `${carId}-merge-2`)).toEqual([]); // create failed: no instance
+    const armed = await alarmAt(ns);
+    expect(armed).not.toBeNull();
+    expect(armed!).toBeLessThanOrEqual(Date.now() + RECONCILE_DELAY_MS + 2_000);
+    expect(armed!).toBeGreaterThanOrEqual(t0);
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    expect((await droneIds(ns)).at(-1)).toBe(`${carId}-merge-2`);
+    expect((await inspect(ns)).trains.find((t) => t.train_id === carId)).toMatchObject({ dispatched: 1 });
+    // Dispatched: back on the ~10 min watchdog clock.
+    expect(await alarmAt(ns)).toBeGreaterThan(Date.now() + T / 2);
+  });
+
+  it("a BUILDER infra re-dispatch whose create fails is retried as <train>-build-2 within RECONCILE_DELAY_MS", async () => {
+    const ns = newHive();
+    await submit(ns, "A");
+    await settle(ns, new Set());
+    const [t] = (await inspect(ns)).trains;
+    const id = t!.train_id;
+    expect(await droneIds(ns)).toEqual([`${id}-build`]);
+    await failDrones(ns, 1);
+    const r = await post(ns, "/internal/webhook/train-result", { trainId: id, passed: false, cause: "infra", summary: "rate limited: 3021", commandId: `${id}-build` });
+    expect(await r.json()).toMatchObject({ outcome: "applied" });
+    expect(await droneIds(ns)).toEqual([`${id}-build`]);
+    expect(await alarmAt(ns)).toBeLessThanOrEqual(Date.now() + RECONCILE_DELAY_MS + 2_000);
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    expect(await droneIds(ns)).toEqual([`${id}-build`, `${id}-build-2`]);
+  });
+
+  it("an undispatched drone (no dispatch failure seen, e.g. a crash before create) is retried well before the 10 min watchdog", async () => {
+    const ns = newHive();
+    await submit(ns, "A");
+    await failDrones(ns, 1);
+    await settle(ns, new Set());
+    const [t] = (await inspect(ns)).trains;
+    expect(await droneIds(ns)).toEqual([]);
+    // Lose the reconcile alarm ioFailed set: only the watchdog can bring the drone back.
+    await runInDurableObject(stubFor(ns), (_q: QueenNode, state) => state.storage.deleteAlarm());
+    await runInDurableObject(stubFor(ns), (q: QueenNode) => (q as unknown as { armWatchdog(): Promise<void> }).armWatchdog());
+    const armed = await alarmAt(ns);
+    expect(armed).not.toBeNull();
+    expect(armed!).toBeLessThanOrEqual(Date.now() + RECONCILE_DELAY_MS + 2_000);
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    expect(await droneIds(ns)).toEqual([`${t!.train_id}-build`]);
   });
 
   it("no alarm when nothing is outstanding; re-armed as soon as a command is issued", async () => {

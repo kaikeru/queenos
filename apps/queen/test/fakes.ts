@@ -42,8 +42,14 @@ export class RecordingDispatcher implements DroneDispatcher {
   readonly tasks: DroneTask[] = [];
   /** Workflow instance ids, in dispatch order (attempts > 1 carry a suffix). */
   readonly instanceIds: string[] = [];
+  /** Throw on the next N dispatches (a Workflows create that fails, e.g. a 503). */
+  failNext = 0;
 
   async dispatch(task: DroneTask, attempt?: number): Promise<{ instanceId: string }> {
+    if (this.failNext > 0) {
+      this.failNext--;
+      throw new Error("UNAVAILABLE: fake Workflows create failed");
+    }
     this.tasks.push(task);
     const instanceId = droneInstanceId(task, attempt);
     this.instanceIds.push(instanceId);

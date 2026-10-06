@@ -1785,11 +1785,19 @@ export class QueenNode extends DurableObject<Env> {
     if (failed) await this.ioFailed();
   }
 
+  /**
+   * A dispatch failed: reconcile (which re-sends it) within RECONCILE_DELAY_MS. Moves an armed alarm EARLIER:
+   * the alarm is usually already set to a watchdog deadline minutes out, and keeping it stalled the retry.
+   */
   private async ioFailed(): Promise<void> {
     console.error(`queen: a dispatch failed; reconciling in ${RECONCILE_DELAY_MS} ms`);
-    if ((await this.ctx.storage.getAlarm()) === null) {
-      await this.ctx.storage.setAlarm(Date.now() + RECONCILE_DELAY_MS);
-    }
+    await this.alarmNoLaterThan(Date.now() + RECONCILE_DELAY_MS);
+  }
+
+  /** Arm the alarm at `at` unless one is due sooner. An alarm in the past is the one now running (it will not fire again). */
+  private async alarmNoLaterThan(at: number): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || at < current || current <= Date.now()) await this.ctx.storage.setAlarm(at);
   }
 
   /**
@@ -1811,9 +1819,7 @@ export class QueenNode extends DurableObject<Env> {
     // an expired lease means "no global cap" (fail open) until then.
     const due = deadlines.filter((d): d is number => d !== null);
     if (!due.length) return;
-    const at = Date.now() + Math.max(0, Math.min(...due) - now) + WATCHDOG_SLACK_MS;
-    const current = await this.ctx.storage.getAlarm();
-    if (current === null || at < current) await this.ctx.storage.setAlarm(at);
+    await this.alarmNoLaterThan(Date.now() + Math.max(0, Math.min(...due) - now) + WATCHDOG_SLACK_MS);
   }
 
   private busy(state: ActiveState): boolean {

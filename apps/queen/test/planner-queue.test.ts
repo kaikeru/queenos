@@ -165,6 +165,11 @@ describe("planner ↔ merge queue: infrastructure", () => {
     for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)?.carId ?? "K1").toBe("K1"); // untouched (or unchanged)
     for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)?.phase ?? "PASSED").toBe("PASSED");
     expect(dispatches(r.effects).map((e) => [e.trainId, e.task.action, e.attempt])).toEqual([["K1", "MERGE", 2]]);
+    const [merge] = dispatches(r.effects);
+    expect(merge!.task).toMatchObject({ trainId: "K1", action: "MERGE", role: "LANDER", baseRef: "main" });
+    expect(merge!.task.members?.map((m) => m.trainId)).toEqual(["A", "B", "C", "D"]);
+    // Not confirmed dispatched until the DO's create succeeds: reconcile re-sends it otherwise.
+    expect(r.trains.find((t) => t.trainId === "K1")).toMatchObject({ dispatched: false });
     expect(r.executorLost).toBeUndefined();
     expect(r.prompts.every((p) => p.attempts === 0 && p.status === "IN_TRAIN")).toBe(true);
   });

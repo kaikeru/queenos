@@ -9,6 +9,7 @@ import {
   MAX_COMMAND_ATTEMPTS,
   MAX_FORK_ATTEMPTS,
   watchdogDeadline,
+  UNDISPATCHED_RETRY_MS,
   TrainPlanner,
   nextCommandId,
   toMergeTrain,
@@ -898,7 +899,10 @@ describe("planner: command watchdog", () => {
     s.submit("B"); // waits for A's push: nothing outstanding for t2 yet
     expect(watchdogDeadline([...s.trains.values()], T, 9999)).toBe(1000 + T);
     s.completeForks();
+    // The drone is due but not confirmed dispatched (a failed create, a crash): retried soon, not after T.
+    expect(watchdogDeadline([...s.trains.values()], T, 9999)).toBe(9999 + UNDISPATCHED_RETRY_MS);
     s.run((p) => p.dispatched("t1", "BUILDING"));
+    s.run((p) => p.dispatched("t2", "BUILDING"));
     expect(watchdogDeadline([...s.trains.values()], T, 9999)).toBe(5000 + T);
     // A row from before the watchdog (no clock) counts from now.
     const legacy = { ...s.trains.get("t1")!, droneIssuedAt: null };

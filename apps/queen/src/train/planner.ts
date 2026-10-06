@@ -452,6 +452,18 @@ const ISSUED_AT = {
   teardownCommandId: "teardownIssuedAt",
 } as const;
 
+/**
+ * How soon the alarm re-sends a drone the DO has not confirmed dispatched (a failed Workflows create, or a
+ * crash between commit and create). Such a drone has no watchdog clock (droneIssuedAt is null until
+ * dispatched), so without this it waited for whatever alarm happened to be armed (live: ~5 min).
+ */
+export const UNDISPATCHED_RETRY_MS = 15_000;
+
+/** Whether the train's current-phase drone should be out but is not confirmed dispatched (reconcile sends it). */
+function droneUndispatched(t: TrainRecord): boolean {
+  return isActive(t) && !t.dispatched && ((t.phase === "BUILDING" && t.forkState === "READY") || t.phase === "LANDING");
+}
+
 /** Whether the train's current-phase drone is out (dispatched, not yet reported). */
 function droneOutstanding(t: TrainRecord): boolean {
   return isActive(t) && t.dispatched && ((t.phase === "BUILDING" && t.forkState === "READY") || t.phase === "LANDING");
@@ -483,6 +495,7 @@ export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: numb
   for (const t of trains) {
     const at = infraRetryAt(t, now);
     if (at !== null) all.push(at);
+    if (droneUndispatched(t)) all.push(now + UNDISPATCHED_RETRY_MS);
   }
   for (const r of races) if (r.state === "RACING" && r.deadlineAt !== null) all.push(r.deadlineAt);
   return all.length ? Math.min(...all) : null;
