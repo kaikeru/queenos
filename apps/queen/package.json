@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
     "lint": "eslint .",
     "cf-typegen": "wrangler types --include-runtime=false",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:load": "VITE_QUEEN_LOAD=1 vitest run test/load.test.ts"
   },
   "dependencies": {
     "@queenos/queen-types": "workspace:*",
