@@ -1,6 +1,6 @@
 # QueenOS: session handoff
 
-Last updated **2026-10-05** by the coordinating Claude session. Read this, then `CLAUDE.md`, `README.md` and `docs/v2-design.md`, before doing anything.
+Last updated **2026-10-06** by the coordinating Claude session. Read this, then `CLAUDE.md`, `README.md` and `docs/v2-design.md`, before doing anything.
 
 ## What this is
 QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog.cloudflare.com/next-git-platform-on-cloudflare/), **due 2026-10-14**. Submissions need a 5–10 minute video, an OSS license (MIT; done), and run instructions.
@@ -23,15 +23,16 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 - **Prefer Cloudflare-native tech** ("a boon"), and keep things simple. The user makes product calls fast; give a recommendation, not a menu.
 - **The Queen is an orchestrator ONLY.** It decides, records and dispatches; executors do all external I/O. Exceptions: fire-and-forget Analytics Engine points (D1) and the `SwarmGovernor` lease before `decide()` (D9).
 
-## v2 status (2026-10-05): Phases 0–2 DONE on main, all green (43/43)
+## v2 status (2026-10-06): Phases 0–2 DONE, Phase 3 progress
 Plan and acceptance: `docs/v2-design.md` §8. Queen internals: `apps/queen/README.md`.
 - **Phase 0:** contracts (`packages/queen-types`) and migrations v8–v11.
 - **Phase 1 (13 packages):** work ledger + path affinity, parallel BUILD lane and races, autonomy/escalation/auto-ship, merge queue, git merge/land (`hive-kit`), observability (event log, rollups, trace), Oracle, drones, gatekeepers/Sentinel (integration gate), Herald/Provisioner config, sim fakes, dashboard data layer, scale plumbing (state cache, coalesced broadcast, `SwarmGovernor`).
-- **Contract patch:** migration v12 (verified, budget boost, REST view schemas, Oracle cap 24).
+- **Contract patch:** migration v13 (verified, budget boost, REST view schemas, Oracle cap 24, queue `passed_at` for waitMs).
 - **Phase 2:** QueenNode `decide()` integration with e2e (a)–(j), status-first dashboard, trace/events/metrics UI, edge metrics proxy (allowlisted Analytics Engine SQL), swarm floor and merge-queue UI.
 - **Fixes:** a decomposed goal no longer inherits one child's `[race]` hint (d27f934); turbo concurrency capped at 4 (workerd test flakes from CPU oversubscription, 7f4ac9b).
 - **Proven in sim** (coordinator, in a browser against `pnpm dev:sim`): the 24-item "Swarm demo" ran fan-out -> parallel builds -> races -> merge-queue cars -> auto-release -> all 25 items SHIPPED with no human. After the race-width fix: 24 distinct items build at once with 1 race.
-- **NOT deployed yet.** Live is the pre-v2 version.
+- **Phase 3 (all main, green 43/43):** README rewritten for v2 (3b41399); demo script rewritten for v2, 13 shots, sim-backed with live inserts (ae1427d); queue wait computed from `passed_at` (migration v13, 7c034b8); sim `[batch-fail]` reliably bisects in swarm demo; dashboard SIM badge (hive status `mode`), release strip with auto-ship and prod link, guardrails panel, swarm title line, retry on first load (5bbe20d); `[spot-bug]` keeps its kind (7c034b8); load test (500/500 landed, 0 SQLite loads/report, ≤10 frames/s, 15.9 RPCs/BUILD, via paced broadcast + batched appendAudits, 72e3fbf); `maxOpenItems` max raised to 1000, default 40 (72e3fbf).
+- **NOT yet deployed to live.** Live still runs pre-v2 version.
 
 ## Phase 3: going live (needs the user)
 1. **Analytics token** (Account Analytics Read): `cd apps/edge && wrangler secret put ANALYTICS_API_TOKEN --env=""`.
@@ -79,13 +80,10 @@ Auto mode blocks production deploys from Claude, so the user runs them: write th
 
 ## Known gaps and gotchas
 - **v2 gaps:**
-  - `[batch-fail]` bisect is timing-dependent live (e2e (f) proves the deterministic case);
-  - `queue.landed` has no `waitMs` (queue-wait p50 stays null);
   - 390 px layout not verified in a real narrow browser (the old release-timeline label overlap at 390px may remain);
   - mock mode (`VITE_MOCK_API=1`) doesn't support POST actions; use `pnpm dev:sim`;
-  - the root README still says releases "reach AWAITING TAP" (now auto-ship); Phase 3 docs;
   - the dashboard shows recalled memories but not whether the builder used them;
-  - no reliable LIVE reviewer reject (the sim has one); the SHIPPED banner has no prod link.
+  - no reliable LIVE reviewer reject (the sim has one).
 - **Live latency:** builds take 40–220s, and the drone generation budget is 200s. The watchdog is 10 min.
 - **Templates:** the no-build template only serves features at `/features/<slug>` unless a feature declares its own `path`.
 - **Sentinel** uses synthetic probes only. With little traffic on demo apps, that's the real signal.

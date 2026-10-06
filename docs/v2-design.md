@@ -497,7 +497,7 @@ Defaults are in `GUARDRAIL_DEFAULTS` (queen-types). Per-hive overrides are clamp
 |---|---|---|---|
 | `maxChildrenPerItem` | 8 | 12 | extras dropped, `GUARDRAIL_TRIPPED` |
 | `maxDepth` | 2 | 3 | auto-filed: dropped (`followup.dropped`); user: 409 |
-| `maxOpenItems` (non-terminal, hive) | 40 | 100 | auto-filed dropped; user 409 |
+| `maxOpenItems` (non-terminal, hive) | 40 | 1000 | auto-filed dropped; user 409 |
 | `maxActiveTrains` (BUILD lane, race candidates count) | 24 | 256 | dispatch waits (`waitReason: capacity`); race width shrinks |
 | `maxQueueBatch` (members per car) | 4 | 16 | car formation stops at the cap |
 | `maxQueueDepth` (active speculative cars) | 3 | 8 | passed builds wait to board |
@@ -598,7 +598,7 @@ export const FileWorkItemSchema = z.object({
 export const WorkActionSchema = z.object({ action: z.enum(["retry", "cancel", "not_duplicate"]), note: z.string().max(500).optional() });
 export const GuardrailsSchema = z.object({
   maxChildrenPerItem: z.number().int().min(1).max(12), maxDepth: z.number().int().min(1).max(3),
-  maxOpenItems: z.number().int().min(1).max(100), maxActiveTrains: z.number().int().min(1).max(256),
+  maxOpenItems: z.number().int().min(1).max(1000), maxActiveTrains: z.number().int().min(1).max(256),
   maxRaceWidth: z.number().int().min(1).max(5), maxAutoFiledPerHour: z.number().int().min(0).max(30),
   maxFollowUpsPerBuild: z.number().int().min(0).max(5),
   maxQueueBatch: z.number().int().min(1).max(16), maxQueueDepth: z.number().int().min(1).max(8),
