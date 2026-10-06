@@ -36,6 +36,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   AppendAuditSchema,
+  AppendAuditsSchema,
   BuildResultSchema,
   DeployResultSchema,
   EventQuerySchema,
@@ -834,8 +835,8 @@ export class QueenNode extends DurableObject<Env> {
 
   // ── RPC surface: ledger, scribe ───────────────────────────────────────
 
-  /** Cognitive Ledger entry from a drone. */
-  async appendAudit(input: AppendAuditInput): Promise<AuditEvent> {
+  /** Validate one audit input and resolve its hive; no writes. */
+  private prepareAudit(input: AppendAuditInput): { event: AuditEvent; hive: string } {
     const a = parseOrThrow(AppendAuditSchema, input, "audit event");
     const notes = a.gitNotesPayload === null ? null : JSON.stringify(a.gitNotesPayload);
     if (notes !== null && new TextEncoder().encode(notes).byteLength > MAX_GIT_NOTES_BYTES) {
@@ -852,11 +853,29 @@ export class QueenNode extends DurableObject<Env> {
       gitNotesPayload: a.gitNotesPayload,
       createdAt: Date.now(),
     };
+    return { event, hive };
+  }
+
+  /** Cognitive Ledger entry from a drone. */
+  async appendAudit(input: AppendAuditInput): Promise<AuditEvent> {
+    return (await this.appendAudits([input]))[0]!;
+  }
+
+  /**
+   * Several Cognitive Ledger entries in one RPC: all validated first (one bad entry rejects the
+   * batch with nothing written), then written in order in one transaction and broadcast together.
+   */
+  async appendAudits(inputs: AppendAuditInput[]): Promise<AuditEvent[]> {
+    const list = parseOrThrow(AppendAuditsSchema, inputs, "audit events");
+    const prepared = list.map((i) => this.prepareAudit(i));
     // event_log (drone.audit) is the source of truth since v10; audit_trail is still written for a v1 rollback.
-    this.ctx.storage.transactionSync(() => appendAuditRow(this.sql, event, hive));
-    this.coalescer.push([{ type: "audit.appended", event }]);
+    this.ctx.storage.transactionSync(() => {
+      for (const { event, hive } of prepared) appendAuditRow(this.sql, event, hive);
+    });
+    const events = prepared.map((p) => p.event);
+    this.coalescer.push(events.map((event) => ({ type: "audit.appended" as const, event })));
     this.coalescer.endApply();
-    return event;
+    return events;
   }
 
   /** Attach a Scribe compaction (<= 500 chars) to a prompt and/or train. */

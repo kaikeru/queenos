@@ -93,7 +93,7 @@ export interface FakeTrain {
 type QueenCall =
   | { method: "getSnapshot" }
   | { method: "getGateTarget"; repo: string }
-  | { method: "appendAudit"; input: AppendAuditInput }
+  | { method: "appendAudits"; inputs: AppendAuditInput[] }
   | { method: "recordScribeSummary"; input: ScribeSummary }
   | { method: "reportTrainResult"; input: TrainResult };
 
@@ -139,9 +139,9 @@ export class FakeQueen implements QueenPort {
       recentAudit: this.recentAudit,
     };
   }
-  async appendAudit(input: AppendAuditInput): Promise<Pick<AuditEvent, "eventId">> {
-    this.calls.push({ method: "appendAudit", input });
-    return { eventId: `evt-${this.calls.length}` };
+  async appendAudits(inputs: AppendAuditInput[]): Promise<Pick<AuditEvent, "eventId">[]> {
+    this.calls.push({ method: "appendAudits", inputs });
+    return inputs.map((_, i) => ({ eventId: `evt-${this.calls.length}-${i}` }));
   }
   async recordScribeSummary(input: ScribeSummary) {
     this.calls.push({ method: "recordScribeSummary", input });
@@ -157,7 +157,7 @@ export class FakeQueen implements QueenPort {
     return this.calls.map((c) => c.method);
   }
   audits(): AppendAuditInput[] {
-    return this.calls.flatMap((c) => (c.method === "appendAudit" ? [c.input] : []));
+    return this.calls.flatMap((c) => (c.method === "appendAudits" ? c.inputs : []));
   }
   /** `ROLE:STATUS` per audit. */
   auditSeq(): string[] {

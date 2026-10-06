@@ -56,6 +56,7 @@ function harness(delays: typeof harnessDelays & { buildJitter?: { min: number; m
       audits.push(a);
       return { eventId: "e", promptId: a.promptId, droneRole: a.droneRole, status: a.status, gitNotesPayload: a.gitNotesPayload ? { discardedPaths: [], ...a.gitNotesPayload } : null, createdAt: clock };
     },
+    appendAudits: async (list) => list.map((a) => (audits.push(a), { eventId: "e", promptId: a.promptId, droneRole: a.droneRole, status: a.status, gitNotesPayload: a.gitNotesPayload ? { discardedPaths: [], ...a.gitNotesPayload } : null, createdAt: clock })),
     reportBuildResult: async (r) => (builds.push(r), calls.push(`build:${r.trainId}`), { outcome: "applied" }),
     reportOracleResult: async (r) => (oracle.push(r), { outcome: "applied" }),
     reportMergeResult: async (r) => (merges.push(r), { outcome: "applied" }),

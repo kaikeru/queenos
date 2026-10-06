@@ -117,11 +117,38 @@ describe("Coalescer", () => {
     expect(frames).toHaveLength(2);
   });
 
-  it("splits a long queue into frames of at most maxBatch", () => {
-    const { c, frames } = rig({ maxBatch: 3 });
+  it("paces a long backlog: one frame of at most maxBatch per interval, never back to back", () => {
+    const { c, frames, clock, advance } = rig({ maxBatch: 3 });
+    const at: number[] = [];
+    const send = c.options.send;
+    (c.options as { send: typeof send }).send = (f) => (at.push(clock.t), send(f));
     c.push(Array.from({ length: 7 }, (_, i) => item(`i${i}`)));
     c.endApply();
+    expect(frames).toHaveLength(1);
+    expect(c.pending).toBe(4);
+    advance(FRAME_INTERVAL_MS - 1);
+    expect(frames).toHaveLength(1);
+    advance(1);
+    expect(frames).toHaveLength(2);
+    advance(FRAME_INTERVAL_MS);
     expect(frames.map((f) => (f.type === "batch" ? f.messages.length : 1))).toEqual([3, 3, 1]);
+    expect(c.pending).toBe(0);
+    for (let i = 1; i < at.length; i++) expect(at[i]! - at[i - 1]!).toBeGreaterThanOrEqual(FRAME_INTERVAL_MS);
+    advance(1000); // drained: no further timer fires a frame
+    expect(frames).toHaveLength(3);
+  });
+
+  it("keeps last-write-wins across a backlog and a new push during the drain", () => {
+    const { c, frames, advance } = rig({ maxBatch: 2 });
+    c.push([item("a", "READY"), item("b"), item("c"), item("d")]);
+    c.endApply(); // sends a, b; c, d backlogged
+    c.push([item("c", "DONE"), item("a", "DONE")]); // c replaces the backlog copy; a is new again
+    c.endApply();
+    advance(FRAME_INTERVAL_MS);
+    advance(FRAME_INTERVAL_MS);
+    const all = frames.flatMap((f) => (f.type === "batch" ? f.messages : [f])) as unknown as { item: { itemId: string; status: string } }[];
+    expect(all.map((m) => `${m.item.itemId}:${m.item.status}`)).toEqual(["a:READY", "b:READY", "d:READY", "c:DONE", "a:DONE"]);
+    expect(all.filter((m) => m.item.itemId === "c")).toHaveLength(1);
   });
 
   it("an empty apply sends and schedules nothing", () => {

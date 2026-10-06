@@ -1,6 +1,6 @@
 /**
  * Coalesced broadcast (v2 design §4.3, item 2). Messages queue per apply and
- * are flushed as one `batch` frame at the end of an apply if ≥ 100 ms have
+ * are flushed as one `batch` frame (at most maxBatch messages; a longer backlog drains one frame per interval) at the end of an apply if ≥ 100 ms have
  * passed since the last frame; otherwise a timer is scheduled for the
  * remainder (the DO stays resident while it is pending), and any later apply
  * flushes first. Per-entity dedupe: the last `train.updated` per train (and
@@ -21,7 +21,7 @@ export interface CoalescerOptions {
   schedule: (ms: number, fn: () => void) => () => void;
   /** Default FRAME_INTERVAL_MS. */
   intervalMs?: number;
-  /** Default MAX_BATCH_MESSAGES (200); a longer queue is sent as several frames. */
+  /** Default MAX_BATCH_MESSAGES (200); a longer backlog drains one frame per interval. */
   maxBatch?: number;
 }
 
@@ -84,18 +84,31 @@ export class Coalescer {
     }
   }
 
-  /** Send everything queued now (one `batch` frame; a single message may be sent bare). */
+  /**
+   * Send one frame now (up to maxBatch messages, oldest first; a single message may be sent bare).
+   * A longer backlog is not sent back to back: the rest stays queued (last write still wins per
+   * entity) and goes out on a timer one interval later, one frame per tick, so the >= interval gap
+   * holds between every pair of frames, not just between flushes.
+   */
   flush(): void {
     this.cancel?.();
     this.cancel = null;
     if (this.queue.size === 0) return;
-    const all = [...this.queue.values()];
-    this.queue.clear();
-    this.lastFrameAt = this.options.now();
     const max = this.options.maxBatch ?? MAX_BATCH_MESSAGES;
-    for (let i = 0; i < all.length; i += max) {
-      const chunk = all.slice(i, i + max);
-      this.options.send(chunk.length === 1 ? chunk[0]! : { type: "batch", messages: chunk });
+    const chunk: QueenServerUnitMessage[] = [];
+    for (const [key, m] of this.queue) {
+      if (chunk.length >= max) break;
+      chunk.push(m);
+      this.queue.delete(key);
+    }
+    this.lastFrameAt = this.options.now();
+    this.options.send(chunk.length === 1 ? chunk[0]! : { type: "batch", messages: chunk });
+    if (this.queue.size > 0) {
+      const interval = this.options.intervalMs ?? FRAME_INTERVAL_MS;
+      this.cancel = this.options.schedule(interval, () => {
+        this.cancel = null;
+        this.flush();
+      });
     }
   }
 

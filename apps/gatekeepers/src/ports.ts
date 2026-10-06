@@ -69,7 +69,8 @@ export interface QueenPort {
    * an older Queen lacks it, and the gate then scans the snapshot (`lookupTrain`).
    */
   getGateTarget?(repo: string): Promise<GateTarget | null>;
-  appendAudit(input: AppendAuditInput): Promise<Pick<AuditEvent, "eventId">>;
+  /** Several consecutive ledger entries in one RPC (one transaction, one broadcast). */
+  appendAudits(inputs: AppendAuditInput[]): Promise<Pick<AuditEvent, "eventId">[]>;
   recordScribeSummary(input: ScribeSummary): Promise<unknown>;
   reportTrainResult(input: TrainResult): Promise<{ outcome: string }>;
 }

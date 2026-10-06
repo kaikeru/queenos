@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import {
   AppendAuditSchema,
+  AppendAuditsSchema,
   BuildResultSchema,
   DeployResultSchema,
   EventQuerySchema,
@@ -267,6 +268,11 @@ hive.post("/internal/webhook/sentinel-verdict", async (c) => {
 hive.post("/audit", async (c) => {
   const audit = parseOrThrow(AppendAuditSchema, await body(c), "audit event");
   return c.json({ event: await stub(c, hiveOf(c)).appendAudit(audit) }, 201);
+});
+
+hive.post("/audits", async (c) => {
+  const audits = parseOrThrow(AppendAuditsSchema, await body(c), "audit events");
+  return c.json({ events: await stub(c, hiveOf(c)).appendAudits(audits) }, 201);
 });
 
 hive.post("/scribe", async (c) => {

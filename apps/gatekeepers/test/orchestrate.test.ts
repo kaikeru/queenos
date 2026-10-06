@@ -35,11 +35,9 @@ describe("runGate: pass path", () => {
     expect(w.failures.stored).toEqual([]);
     expect(steps.names()).toEqual([
       "lookup train #1",
-      "audit: policy running",
-      "audit: security running",
+      "audit: policy+security running",
       "inspect: clone, scan, test",
-      "audit: policy result",
-      "audit: security result",
+      "audit: policy+security result",
       "memory: remember",
       "report: train result",
     ]);
@@ -68,7 +66,7 @@ describe("runGate: fail path ([fail] demo)", () => {
     expect(out).toMatchObject({ status: "gated", passed: false, scribe: "extractive", vectorized: expect.any(Number) });
     if (out.status !== "gated") throw new Error("unreachable");
     expect(w.queen.auditSeq()).toEqual(["POLICY:RUNNING", "SECURITY:RUNNING", "POLICY:PASSED", "SECURITY:PASSED", "SCRIBE:RUNNING", "SCRIBE:PASSED"]);
-    expect(w.queen.methods().filter((m) => m !== "appendAudit" && m !== "getSnapshot")).toEqual(["recordScribeSummary", "reportTrainResult"]);
+    expect(w.queen.methods().filter((m) => m !== "appendAudits" && m !== "getSnapshot")).toEqual(["recordScribeSummary", "reportTrainResult"]);
 
     expect(out.summary.length).toBeLessThanOrEqual(500);
     expect(out.summary).toContain("[fail] marker found in changed file features/fix.md");
@@ -121,7 +119,7 @@ describe("runGate: fail path ([fail] demo)", () => {
 
   it("tolerates the Queen rejecting an audit (permanent error)", async () => {
     const { w, after } = await setup();
-    w.queen.appendAudit = async () => {
+    w.queen.appendAudits = async () => {
       throw new Error("NOT_FOUND: prompt prompt-1 not found");
     };
     const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), config());

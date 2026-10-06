@@ -100,3 +100,9 @@ export const AppendAuditSchema = z.object({
 });
 export type AppendAudit = z.infer<typeof AppendAuditSchema>;
 export type AppendAuditInput = z.input<typeof AppendAuditSchema>;
+
+/** Most audit entries one `appendAudits` call may carry. */
+export const MAX_AUDIT_BATCH = 50;
+/** Input: several Cognitive Ledger entries in one RPC (one transaction, one broadcast). */
+export const AppendAuditsSchema = z.array(AppendAuditSchema).min(1).max(MAX_AUDIT_BATCH);
+export type AppendAuditsInput = z.input<typeof AppendAuditsSchema>;

@@ -161,7 +161,7 @@ export type WorkAction = z.infer<typeof WorkActionSchema>;
 export const GuardrailsSchema = z.object({
   maxChildrenPerItem: z.number().int().min(1).max(24),
   maxDepth: z.number().int().min(1).max(3),
-  maxOpenItems: z.number().int().min(1).max(100),
+  maxOpenItems: z.number().int().min(1).max(1000),
   maxActiveTrains: z.number().int().min(1).max(256),
   maxRaceWidth: z.number().int().min(1).max(5),
   maxAutoFiledPerHour: z.number().int().min(0).max(30),
@@ -189,7 +189,7 @@ export const GUARDRAIL_DEFAULTS = {
 export const GUARDRAIL_MAX = {
   maxChildrenPerItem: 24,
   maxDepth: 3,
-  maxOpenItems: 100,
+  maxOpenItems: 1000,
   maxActiveTrains: 256,
   maxRaceWidth: 5,
   maxAutoFiledPerHour: 30,

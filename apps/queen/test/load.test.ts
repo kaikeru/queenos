@@ -37,6 +37,7 @@ const RPCS = [
   "reportSentinelVerdict",
   "recordScribeSummary",
   "appendAudit",
+  "appendAudits",
 ] as const;
 
 interface Probe {
@@ -59,7 +60,7 @@ describe.skipIf(!enabled)("WP3.4 load: 500 items through one hive", () => {
     await stub.updateSettings({
       hive,
       user: "load@example.com",
-      patch: { guardrails: { maxActiveTrains: 256, maxChildrenPerItem: GOAL_SIZE, maxOpenItems: 100 }, budget: { dailyDispatches: 100_000, dailyCredits: 10_000_000 } },
+      patch: { guardrails: { maxActiveTrains: 256, maxChildrenPerItem: GOAL_SIZE, maxOpenItems: 1000 }, budget: { dailyDispatches: 100_000, dailyCredits: 10_000_000 } },
     });
 
     // Instrument the live DO instance: RPC counters, per-report read deltas, frame timestamps.
@@ -107,7 +108,7 @@ describe.skipIf(!enabled)("WP3.4 load: 500 items through one hive", () => {
     });
 
     // 500 bullets from the demo prompt, filed as 21 goals of <= 24. User filings
-    // are guardrailed (maxOpenItems <= 100, GUARDRAIL_MAX), so intake is rolling:
+    // are guardrailed (maxOpenItems, set to 1000 above; GUARDRAIL_MAX), so intake is rolling:
     // the next goal is filed whenever the hive has room, like a backlogged queue.
     const bullets = demoSwarmPrompt(ITEMS).split("\n").filter((l) => l.startsWith("- "));
     expect(bullets).toHaveLength(ITEMS);

@@ -235,8 +235,10 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   glog(ctx, "lookup", "ready", { phaseRetries: config.phaseRetries });
 
   // 2. POLICY + SECURITY run while the dashboard shows yellow.
-  await audit(ctx, "audit: policy running", "POLICY", "RUNNING", null);
-  await audit(ctx, "audit: security running", "SECURITY", "RUNNING", null);
+  await audits(ctx, "audit: policy+security running", [
+    ["POLICY", "RUNNING", null],
+    ["SECURITY", "RUNNING", null],
+  ]);
 
   let inspection: Inspection;
   const spec: IntegrationSpec | undefined = integration ? { baseSha: train.baseSha, routes: train.routes } : undefined;
@@ -251,14 +253,19 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   if (inspection.status === "stale") return { status: "ignored", reason: "stale-head" };
 
   const ms = Math.max(0, inspection.endedAtMs - inspection.startedAtMs);
-  await audit(ctx, "audit: policy result", "POLICY", inspection.policy.passed ? "PASSED" : "REJECTED", ledgerFor(ctx, POLICY_MODEL, ms, scanSteps("policy", inspection.policy), inspection.policy.passed));
-  await audit(ctx, "audit: security result", "SECURITY", inspection.security.passed ? "PASSED" : "REJECTED", ledgerFor(ctx, SECURITY_MODEL, ms, scanSteps("security", inspection.security), inspection.security.passed));
+  // When the reviewer will run next, its RUNNING rides in this batch (it still precedes the reviewer's result).
+  const reviewing = !!inspection.review && !integration;
+  await audits(ctx, "audit: policy+security result", [
+    ["POLICY", inspection.policy.passed ? "PASSED" : "REJECTED", ledgerFor(ctx, POLICY_MODEL, ms, scanSteps("policy", inspection.policy), inspection.policy.passed)],
+    ["SECURITY", inspection.security.passed ? "PASSED" : "REJECTED", ledgerFor(ctx, SECURITY_MODEL, ms, scanSteps("security", inspection.security), inspection.security.passed)],
+    ...(reviewing ? [["REVIEWER", "RUNNING", null] as AuditRow] : []),
+  ]);
 
   // 2b. REVIEWER: does the change satisfy the prompt? Only for working code (policy, security, smoke passed).
   // The integration gate (a QUEUE car) has no reviewer: every member was reviewed on its own build.
   let reviewState: "approved" | "skipped" | undefined;
   let counts = { satisfied: 0, missing: 0 };
-  if (inspection.review && !integration) {
+  if (reviewing && inspection.review) {
     const r = await reviewGate(ctx, inspection.review);
     if (r.rejected) return failReview(ctx, r.feedback, r.missing, r.report, inspection.changedPaths, inspection);
     reviewState = r.skipped ? "skipped" : "approved";
@@ -329,8 +336,6 @@ type ReviewGate = { rejected: false; skipped: boolean; counts: { satisfied: numb
 
 async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
   const { config, ports, step, train } = ctx;
-  await audit(ctx, "audit: reviewer running", "REVIEWER", "RUNNING", null);
-
   let outcome: ReviewOutcome & { ms: number };
   if (config.reviewMode === "scripted") {
     outcome = { kind: "verdict", verdict: scriptedReview(train.promptFull, packet.rework), model: SCRIPTED_REVIEW_MODEL, ms: 0 };
@@ -420,19 +425,26 @@ function ledgerFor(ctx: Ctx, model: string, executionTimeMs: number, reasoningSt
   }
 }
 
-async function audit(ctx: Ctx, name: string, role: DroneRole, status: AuditStatus, gitNotesPayload: GitNotesPayload | null): Promise<void> {
-  const input: AppendAuditInput = { promptId: ctx.train.promptId, droneRole: role, status, gitNotesPayload };
+type AuditRow = [DroneRole, AuditStatus, GitNotesPayload | null];
+
+/** Consecutive audits in one Queen RPC (one step, order kept). */
+async function audits(ctx: Ctx, name: string, rows: AuditRow[]): Promise<void> {
+  const inputs: AppendAuditInput[] = rows.map(([droneRole, status, gitNotesPayload]) => ({ promptId: ctx.train.promptId, droneRole, status, gitNotesPayload }));
   // Auditing never blocks the gate: permanent Queen errors are logged and skipped.
   await ctx.step.do(name, REPORT_STEP, async () => {
     try {
-      const ev = await ctx.ports.queen(ctx.task.hive).appendAudit(input);
-      return { eventId: ev.eventId as string | null };
+      const evs = await ctx.ports.queen(ctx.task.hive).appendAudits(inputs);
+      return { eventIds: evs.map((e) => e.eventId as string) };
     } catch (e) {
       if (!isPermanentQueenError(e)) throw e;
-      console.warn(`gatekeeper: audit ${role} ${status} rejected by the Queen`, messageOf(e));
-      return { eventId: null };
+      console.warn(`gatekeeper: audit batch ${name} rejected by the Queen`, messageOf(e));
+      return { eventIds: [] as string[] };
     }
   });
+}
+
+async function audit(ctx: Ctx, name: string, role: DroneRole, status: AuditStatus, gitNotesPayload: GitNotesPayload | null): Promise<void> {
+  await audits(ctx, name, [[role, status, gitNotesPayload]]);
 }
 
 /** The v2 fields of `TrainResult`: the gate score, and out-of-diff findings as follow-ups. */
@@ -472,8 +484,10 @@ async function report(ctx: Ctx, passed: boolean, summary: string, extras: { scor
 async function failInfra(ctx: Ctx, err: unknown): Promise<GateRunResult> {
   const summary = clip(`Gatekeeper could not inspect the push: ${messageOf(err)}`, MAX_SUMMARY_CHARS);
   const steps = [summary];
-  await audit(ctx, "audit: policy result", "POLICY", "REJECTED", ledgerFor(ctx, POLICY_MODEL, 0, steps, false));
-  await audit(ctx, "audit: security result", "SECURITY", "REJECTED", ledgerFor(ctx, SECURITY_MODEL, 0, steps, false));
+  await audits(ctx, "audit: policy+security result", [
+    ["POLICY", "REJECTED", ledgerFor(ctx, POLICY_MODEL, 0, steps, false)],
+    ["SECURITY", "REJECTED", ledgerFor(ctx, SECURITY_MODEL, 0, steps, false)],
+  ]);
   await ctx.step.do("scribe: record summary", REPORT_STEP, async () => {
     try {
       await ctx.ports.queen(ctx.task.hive).recordScribeSummary({ promptId: ctx.train.promptId, trainId: ctx.train.trainId, summary });

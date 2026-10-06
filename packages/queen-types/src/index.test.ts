@@ -18,6 +18,8 @@ import {
   GitNotesPayloadSchema,
   GUARDRAIL_DEFAULTS,
   GUARDRAIL_MAX,
+  AppendAuditsSchema,
+  MAX_AUDIT_BATCH,
   GuardrailsSchema,
   HIVE_SETTINGS_DEFAULTS,
   HiveSettingsSchema,
@@ -576,6 +578,21 @@ describe("v2 schemas round-trip", () => {
     expect(GUARDRAIL_MAX.maxChildrenPerItem).toBe(24);
     expect(GuardrailsSchema.safeParse({ ...GUARDRAIL_DEFAULTS, maxChildrenPerItem: 25 }).success).toBe(false);
     expect(OracleResultSchema).toBeDefined();
+  });
+
+  it("lets maxOpenItems reach 1000 and no further", () => {
+    expect(GUARDRAIL_MAX.maxOpenItems).toBe(1000);
+    expect(GuardrailsSchema.parse({ ...GUARDRAIL_DEFAULTS, maxOpenItems: 1000 }).maxOpenItems).toBe(1000);
+    expect(GuardrailsSchema.safeParse({ ...GUARDRAIL_DEFAULTS, maxOpenItems: 1001 }).success).toBe(false);
+    expect(GUARDRAIL_DEFAULTS.maxOpenItems).toBe(40);
+  });
+
+  it("validates a batch of audit entries (1..MAX_AUDIT_BATCH)", () => {
+    const one = { promptId: "p", droneRole: "POLICY", status: "RUNNING" };
+    expect(AppendAuditsSchema.parse([one, one])).toHaveLength(2);
+    expect(AppendAuditsSchema.parse([one])[0]!.gitNotesPayload).toBeNull();
+    expect(AppendAuditsSchema.safeParse([]).success).toBe(false);
+    expect(AppendAuditsSchema.safeParse(Array.from({ length: MAX_AUDIT_BATCH + 1 }, () => one)).success).toBe(false);
   });
 
   it("keeps guardrail defaults inside GUARDRAIL_MAX and the schema", () => {

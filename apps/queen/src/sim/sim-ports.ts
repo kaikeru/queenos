@@ -102,9 +102,12 @@ export * from "./sim-v2";
 /** Judges the Oracle's commands (Phase 2 adds this alias beside the other dispatchers in executors.ts). */
 export type OracleDispatcher = CommandDispatcher<OracleCommand>;
 
+type AuditRow = [DroneRole, AppendAuditInput["status"], GitNotesPayload | null];
+
 /** The slice of QueenNode the simulated executors call (its public RPC surface). */
 export interface SimQueen {
   appendAudit(a: AppendAuditInput): Promise<AuditEvent>;
+  appendAudits(a: AppendAuditInput[]): Promise<AuditEvent[]>;
   reportBuildResult(r: BuildResult): Promise<{ outcome: string }>;
   reportTrainResult(r: TrainResult): Promise<{ outcome: string }>;
   recordScribeSummary(s: ScribeSummary): Promise<unknown>;
@@ -544,10 +547,12 @@ export class SimExecutors {
           });
           return;
         }
-        await this.audit(task, "BUILDER", "PASSED", builderNote(task, headSha, build));
-        await this.audit(task, "POLICY", "RUNNING", null);
-        await this.audit(task, "SECURITY", "RUNNING", null);
-        await this.audit(task, "GATEKEEPER", "RUNNING", null);
+        await this.audits(task, [
+          ["BUILDER", "PASSED", builderNote(task, headSha, build)],
+          ["POLICY", "RUNNING", null],
+          ["SECURITY", "RUNNING", null],
+          ["GATEKEEPER", "RUNNING", null],
+        ]);
         await this.schedule({ id: `${task.trainId}-test`, kind: "test", due: this.now() + this.delays.test, task });
         return;
       }
@@ -572,15 +577,18 @@ export class SimExecutors {
         const shouldFail = task.promptText.includes(FAIL_MARKER) && task.action === "BUILD" && candidate0;
         const reviewFail = !shouldFail && task.promptText.includes(REVIEW_FAIL_MARKER) && task.action === "BUILD" && candidate0;
         const url = train?.previewUrl ?? simPreviewUrl(task.trainId);
-        await this.audit(task, "GATEKEEPER", "PASSED", smokeNote(task, url));
-        await this.audit(task, "POLICY", "PASSED", reviewNote(task, "policy", true));
-        await this.audit(task, "SECURITY", shouldFail ? "REJECTED" : "PASSED", reviewNote(task, "security", !shouldFail));
+        // One RPC for the gate results; the reviewer's RUNNING rides along (it precedes its own result, sent below).
+        await this.audits(task, [
+          ["GATEKEEPER", "PASSED", smokeNote(task, url)],
+          ["POLICY", "PASSED", reviewNote(task, "policy", true)],
+          ["SECURITY", shouldFail ? "REJECTED" : "PASSED", reviewNote(task, "security", !shouldFail)],
+          ...(shouldFail ? [] : [["REVIEWER", "RUNNING", null] as AuditRow]),
+        ]);
         const commitSha = fakeSha(`head:${task.trainId}`);
         if (!shouldFail) {
           // Like the live gate: the reviewer only sees working code (policy, security and smoke passed).
-          await this.audit(task, "REVIEWER", "RUNNING", null);
-          await this.audit(task, "REVIEWER", reviewFail ? "REJECTED" : "PASSED", reviewerNote(task, !reviewFail));
           if (reviewFail) {
+            await this.audit(task, "REVIEWER", "REJECTED", reviewerNote(task, false));
             // The reviewer's feedback is the Scribe summary, so the REWORK carries it to the next builder.
             await this.queen().recordScribeSummary({ promptId: task.promptId, trainId: task.trainId, summary: REVIEW_FEEDBACK });
             await this.queen().reportTrainResult({ trainId: task.trainId, passed: false, summary: REVIEW_FEEDBACK, commitSha });
@@ -590,7 +598,10 @@ export class SimExecutors {
         const summary = shouldFail
           ? "Security scan rejected the change: an unbounded retry loop swallows errors. Rework should add a retry cap and surface the failure."
           : "Policy and security checks passed and the preview answered its smoke test; the change is scoped to the requested module with tests. The reviewer approved the change.";
-        await this.audit(task, "SCRIBE", "PASSED", scribeNote(task, summary));
+        await this.audits(task, [
+          ...(shouldFail ? [] : [["REVIEWER", "PASSED", reviewerNote(task, true)] as AuditRow]),
+          ["SCRIBE", "PASSED", scribeNote(task, summary)],
+        ]);
         const paths = (await this.store.get<string[]>(PATHS_KEY(task.trainId))) ?? simChangedPaths(task.promptText);
         await this.queen().reportTrainResult({
           trainId: task.trainId,
@@ -791,6 +802,11 @@ export class SimExecutors {
   private async arm(due: number): Promise<void> {
     const current = await this.store.getAlarm();
     if (current === null || due < current) await this.store.setAlarm(Math.max(due, this.now() + 1));
+  }
+
+  /** Consecutive audits in one Queen RPC (entries keep their order). */
+  private audits(task: DroneTask, rows: AuditRow[]) {
+    return this.queen().appendAudits(rows.map(([role, status, note]) => ({ promptId: task.promptId, droneRole: role, status, gitNotesPayload: note })));
   }
 
   private audit(task: DroneTask, role: DroneRole, status: AppendAuditInput["status"], note: GitNotesPayload | null) {

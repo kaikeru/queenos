@@ -910,6 +910,32 @@ describe("model router (DO)", () => {
   });
 });
 
+describe("appendAudits (batched ledger entries)", () => {
+  it("writes the entries in order in one call, and rejects the whole batch when one is bad", async () => {
+    const ns = newHive();
+    const stub = stubFor(ns);
+    const { promptId } = await stub.submitPrompt({ namespace: ns, promptText: "Add a /health endpoint" });
+    const events = await stub.appendAudits([
+      { promptId, droneRole: "POLICY", status: "RUNNING" },
+      { promptId, droneRole: "SECURITY", status: "RUNNING" },
+      { promptId, droneRole: "POLICY", status: "PASSED" },
+    ]);
+    expect(events.map((e) => `${e.droneRole}:${e.status}`)).toEqual(["POLICY:RUNNING", "SECURITY:RUNNING", "POLICY:PASSED"]);
+    expect(await rpcError(stub.appendAudits([{ promptId, droneRole: "SCRIBE", status: "PASSED" }, { promptId: "nope", droneRole: "SCRIBE", status: "PASSED" }]))).toMatch(/^NOT_FOUND: /);
+    expect(await rpcError(stub.appendAudits([]))).toMatch(/^INVALID_INPUT: /);
+    await runInDurableObject(stub, (q: QueenNode) => {
+      expect(q.sql.exec("SELECT COUNT(*) AS n FROM audit_trail").one().n).toBe(3);
+      expect(q.getSnapshot().recentAudit.map((e) => e.eventId).sort()).toEqual(events.map((e) => e.eventId).sort());
+    });
+    const http = await worker.fetch(`http://queen.test/hives/${ns}/audits`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify([{ promptId, droneRole: "SCRIBE", status: "PASSED" }]),
+    });
+    expect(http.status).toBe(201);
+  });
+});
+
 describe("v2 surface (routes and RPCs, §3.6)", () => {
   const user = { "x-queen-user": "kyle@kaikeru.com" };
   const req = (ns: string, method: string, path: string, body?: unknown, headers: Record<string, string> = {}) =>
