@@ -5,7 +5,8 @@
  *
  * - `lease({hive, want, ttlMs})` grants `min(want, ceiling − Σ other unexpired
  *   leases)`, where `ceiling = min(SWARM_MAX_ACTIVE_BUILDS,
- *   ⌊SWARM_AI_RPM / EST_RPM_PER_BUILD⌋)`.
+ *   ⌊SWARM_AI_RPM / SWARM_RPM_PER_BUILD⌋)` (SWARM_RPM_PER_BUILD defaults to
+ *   queen-types EST_RPM_PER_BUILD = 20, a Think tool-loop build).
  * - Every hive with demand is guaranteed ⌊ceiling / hivesWithDemand⌋; a hive
  *   asking for more than it holds makes the others shrink at their next renewal.
  * - `want = 0` releases the hive's lease. Leases are a soft ceiling for new
@@ -22,11 +23,15 @@ import { EST_RPM_PER_BUILD, SWARM_DEFAULTS, type SwarmLease, type SwarmLeaseRequ
 export interface GovernorEnv {
   SWARM_MAX_ACTIVE_BUILDS?: string;
   SWARM_AI_RPM?: string;
+  /** Workers AI requests/min one active build makes (default EST_RPM_PER_BUILD). */
+  SWARM_RPM_PER_BUILD?: string;
 }
 
 export interface GovernorCeilings {
   maxActiveBuilds: number;
   aiRpm: number;
+  /** Requests/min per active build; the rpm budget allows ⌊aiRpm / rpmPerBuild⌋ builds. */
+  rpmPerBuild: number;
 }
 
 /** One hive's current lease. */
@@ -42,17 +47,19 @@ function posInt(v: string | undefined, fallback: number): number {
   return Number.isInteger(n) && n >= 0 ? n : fallback;
 }
 
-/** Ceilings from env, defaulting to queen-types SWARM_DEFAULTS (64 builds, 240 rpm). */
+/** Ceilings from env, defaulting to queen-types SWARM_DEFAULTS (64 builds, 240 rpm) and EST_RPM_PER_BUILD (20). */
 export function governorCeilings(env: GovernorEnv): GovernorCeilings {
+  const rpmPerBuild = posInt(env.SWARM_RPM_PER_BUILD, EST_RPM_PER_BUILD);
   return {
     maxActiveBuilds: posInt(env.SWARM_MAX_ACTIVE_BUILDS, SWARM_DEFAULTS.maxActiveBuilds),
     aiRpm: posInt(env.SWARM_AI_RPM, SWARM_DEFAULTS.aiRpm),
+    rpmPerBuild: rpmPerBuild > 0 ? rpmPerBuild : EST_RPM_PER_BUILD,
   };
 }
 
-/** `min(maxActiveBuilds, ⌊aiRpm / EST_RPM_PER_BUILD⌋)` (queen-types EST_RPM_PER_BUILD = 4). */
-export function globalCeiling(c: GovernorCeilings): number {
-  return Math.min(c.maxActiveBuilds, Math.floor(c.aiRpm / EST_RPM_PER_BUILD));
+/** `min(maxActiveBuilds, ⌊aiRpm / rpmPerBuild⌋)`: 240 rpm / 20 = 12 live builds. */
+export function globalCeiling(c: Pick<GovernorCeilings, "maxActiveBuilds" | "aiRpm"> & { rpmPerBuild?: number }): number {
+  return Math.min(c.maxActiveBuilds, Math.floor(c.aiRpm / Math.max(1, c.rpmPerBuild ?? EST_RPM_PER_BUILD)));
 }
 
 /**

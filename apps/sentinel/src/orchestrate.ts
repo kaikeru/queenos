@@ -108,8 +108,14 @@ export async function probeBatch(ports: SentinelPorts, baseUrl: string, paths: s
   const tally = emptyTally();
   results.forEach((r, i) => {
     tally.total++;
-    if (r.status === null || r.status >= 500) tally.errors++;
-    if (smoke && i === 0 && (r.status === null || r.status < 200 || r.status >= 300)) tally.smokeFailures++;
+    if (r.status === null) {
+      // No answer: maybe infrastructure, maybe a hung candidate. decide() attributes it (baseline) or leaves it out.
+      tally.unreachable = (tally.unreachable ?? 0) + 1;
+      if (smoke && i === 0) tally.smokeUnreachable = (tally.smokeUnreachable ?? 0) + 1;
+    } else {
+      if (r.status >= 500) tally.errors++;
+      if (smoke && i === 0 && (r.status < 200 || r.status >= 300)) tally.smokeFailures++;
+    }
     tally.latencies.push(Math.round(r.ms));
   });
   return tally;

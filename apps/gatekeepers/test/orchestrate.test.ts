@@ -259,14 +259,74 @@ describe("runGate: Queen phase race and guards", () => {
 });
 
 describe("runGate: infrastructure failures", () => {
-  it("ejects (instead of hanging in TESTING) when the clone keeps failing", async () => {
+  it("reports infra (instead of hanging in TESTING) when the clone keeps failing; stops once the Queen ejects the train", async () => {
     const { w, after } = await setup();
     w.artifacts.failWith = new Error("artifacts is unreachable");
+    // After the infra report the Queen's infra cap is spent: the train is EJECTED.
+    w.queen.phases = ["TESTING", "EJECTED"];
     const steps = new InlineSteps();
     const out = await runGate(gateTask(after), steps, w.ports(), config());
-    expect(out).toMatchObject({ status: "gated", passed: false, summary: expect.stringContaining("artifacts is unreachable") });
+    expect(out).toMatchObject({ status: "gated", passed: false, infra: true, summary: expect.stringContaining("artifacts is unreachable") });
     expect(steps.log.find((l) => l.name === "inspect: clone, scan, test")).toMatchObject({ attempts: 4, ok: false }); // 1 + 3 retries
-    expect(w.queen.reports()).toHaveLength(1);
+    expect(w.queen.reports()).toEqual([expect.objectContaining({ passed: false, cause: "infra" })]);
+    expect(w.queen.reports()[0]!.commandId).toBeUndefined(); // a gate report, not a drone's
+  });
+
+  it("retries a 503 from Artifacts inside the inspect step (jittered), then gates normally", async () => {
+    const { w, after } = await setup();
+    let n = 0;
+    const real = w.artifacts.access.bind(w.artifacts);
+    w.artifacts.access = async (repo, scope) => {
+      if (++n <= 2) throw new Error("HttpError: HTTP Error: 503 Service Unavailable");
+      return real(repo, scope);
+    };
+    const steps = new InlineSteps();
+    const out = await runGate(gateTask(after), steps, w.ports(), config());
+    expect(out).toMatchObject({ status: "gated", passed: true });
+    expect(out).not.toHaveProperty("infra");
+    expect(n).toBe(3);
+    // All within the first try of the step: the in-step jittered retry absorbed the 503s.
+    expect(steps.log.find((l) => l.name === "inspect: clone, scan, test")).toMatchObject({ attempts: 1, ok: true });
+    expect(w.queen.reports()).toEqual([expect.objectContaining({ passed: true })]);
+  });
+
+  it("a 503 that outlasts every retry is reported as infra, then re-gated after the Queen re-deploys", async () => {
+    const { w, after } = await setup();
+    let n = 0;
+    const real = w.artifacts.access.bind(w.artifacts);
+    // 3 in-step tries x 4 step tries = 12 failures in round 1; round 2 succeeds.
+    w.artifacts.access = async (repo, scope) => {
+      if (++n <= 12) throw new Error("HttpError: HTTP Error: 503 Service Unavailable");
+      return real(repo, scope);
+    };
+    // Round 1 sees TESTING; after the infra report the Queen re-deploys (DEPLOYING), then TESTING again.
+    w.queen.phases = ["TESTING", "DEPLOYING", "DEPLOYING", "TESTING"];
+    const steps = new InlineSteps();
+    const out = await runGate(gateTask(after), steps, w.ports(), config());
+    expect(out).toMatchObject({ status: "gated", passed: true, rounds: 2 });
+    expect(w.queen.reports().map((r) => [r.passed, r.cause ?? null])).toEqual([
+      [false, "infra"],
+      [true, null],
+    ]);
+    expect(steps.log.find((l) => l.name === "inspect: clone, scan, test")).toMatchObject({ attempts: 4, ok: false });
+    expect(steps.log.find((l) => l.name === "inspect: clone, scan, test ~r2")).toMatchObject({ attempts: 1, ok: true });
+    expect(steps.sleeps.map((x) => x.name)).toContain("infra: wait for the re-deploy ~r2");
+  });
+
+  it("gives up after GATE_INFRA_ROUNDS runs when the Queen keeps applying infra reports", async () => {
+    const { w, after } = await setup();
+    w.artifacts.failWith = new Error("HTTP Error: 502 Bad Gateway");
+    const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), config({ GATE_INFRA_ROUNDS: "3" }));
+    expect(out).toMatchObject({ status: "gated", passed: false, infra: true, rounds: 3 });
+    expect(w.queen.reports()).toHaveLength(3);
+    expect(w.queen.reports().every((r) => r.cause === "infra")).toBe(true);
+  });
+
+  it("toStepError never makes an HTTP 503 non-retryable", async () => {
+    const { toStepError } = await import("../src/orchestrate");
+    const { NonRetryableError } = await import("cloudflare:workflows");
+    expect(toStepError(new Error("HttpError: HTTP Error: 503 Service Unavailable"))).not.toBeInstanceOf(NonRetryableError);
+    expect(toStepError(new Error("UNAVAILABLE: ARTIFACTS binding is not configured"))).toBeInstanceOf(NonRetryableError);
   });
 
   it("sandbox mode surfaces 'not implemented' as the failure reason (no retries)", async () => {

@@ -32,7 +32,7 @@ export const REPO = "hive-train-aaaaaaaaaaaa";
 export const remoteOf = (repo: string) => `https://acct.artifacts.cloudflare.net/git/queenos/${repo}.git`;
 
 export function config(vars: GateVars = {}): GateConfig {
-  return readConfig({ GATE_PHASE_RETRIES: "4", GATE_PHASE_WAIT_MS: "5000", ...vars });
+  return readConfig({ GATE_PHASE_RETRIES: "4", GATE_PHASE_WAIT_MS: "5000", GATE_TRANSIENT_BASE_MS: "0", ...vars });
 }
 
 export class FakeArtifacts implements ArtifactsPort {

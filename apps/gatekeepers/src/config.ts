@@ -26,6 +26,14 @@ export interface GateConfig {
    */
   phaseRetries: number;
   phaseWaitMs: number;
+  /**
+   * Gate runs per push when the gate itself fails on infrastructure (GATE_INFRA_ROUNDS, default 3 =
+   * the Queen's MAX_INFRA_ATTEMPTS): after an infra report the Queen re-deploys the preview and
+   * this instance waits for TESTING again and re-gates.
+   */
+  infraRounds: number;
+  /** Base of the in-step jittered retry of transient (5xx / 429) Artifacts errors (GATE_TRANSIENT_BASE_MS). */
+  transientBaseMs: number;
   /** Gateway id and the Scribe model (MODEL_SCRIBE). */
   aiGateway: AiGatewayConfig;
   /** "llm" (production), "scripted" (deterministic, tests/sim) or "off". Unset = "off". */
@@ -44,6 +52,8 @@ export interface GateVars {
   SECURITY_ALLOWED_HOSTS?: string;
   GATE_PHASE_RETRIES?: string;
   GATE_PHASE_WAIT_MS?: string;
+  GATE_INFRA_ROUNDS?: string;
+  GATE_TRANSIENT_BASE_MS?: string;
   AI_GATEWAY_ID?: string;
   MODEL_SCRIBE?: string;
   REVIEW_MODE?: string;
@@ -87,6 +97,8 @@ export function readConfig(env: GateVars): GateConfig {
     allowedHosts: splitList(env.SECURITY_ALLOWED_HOSTS, DEFAULT_ALLOWED_HOSTS),
     phaseRetries: int(env.GATE_PHASE_RETRIES, 24, 1, 60),
     phaseWaitMs: int(env.GATE_PHASE_WAIT_MS, 5000, 0, 60_000),
+    infraRounds: int(env.GATE_INFRA_ROUNDS, 3, 1, 8),
+    transientBaseMs: int(env.GATE_TRANSIENT_BASE_MS, 2000, 0, 30_000),
     aiGateway: { gatewayId: env.AI_GATEWAY_ID?.trim() || "queenos", model: modelForRole("SCRIBE", env) },
     reviewMode,
     reviewModel: env.MODEL_REVIEWER?.trim() || DEFAULT_MODEL_REVIEWER,

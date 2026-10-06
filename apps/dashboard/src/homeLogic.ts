@@ -31,6 +31,26 @@ const REASON_TEXT: Record<EscalationReason, string> = {
 };
 export const reasonText = (r: EscalationReason): string => REASON_TEXT[r];
 
+const UUID_PREFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+/**
+ * A short id that tells items apart. Oracle children are `<goal uuid>-<key>`,
+ * so their first 8 chars are the GOAL's: keep the key ("8e7b9165…-ip").
+ */
+export function shortItemId(id: string): string {
+  const m = UUID_PREFIX.exec(id);
+  if (m && id.length > m[0].length) return `${id.slice(0, 8)}…${id.slice(m[0].length)}`;
+  return id.slice(0, 8);
+}
+
+/** The escalation card's subject: an item's title when known (else a distinguishing short id), or "<type> <id>". */
+export function escalationSubjectLabel(e: Pick<Escalation, "subject">, items: Readonly<Record<string, Pick<WorkItem, "title">>>): string {
+  if (e.subject.type !== "item") return `${e.subject.type} ${e.subject.id.slice(0, 8)}`;
+  const title = items[e.subject.id]?.title;
+  if (title) return `item “${title.length > 48 ? `${title.slice(0, 47)}…` : title}”`;
+  return `item ${shortItemId(e.subject.id)}`;
+}
+
 /** "autonomous" or "autonomous → supervised (error budget, rollback streak)". */
 export function autonomyLabel(h: Pick<HiveStatus, "effectiveAutonomy" | "degradedBy"> & { settings: Pick<HiveStatus["settings"], "autonomy"> }): string {
   const configured = h.settings.autonomy;

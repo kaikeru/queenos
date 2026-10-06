@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MergeTrain, Race } from "@queenos/queen-types";
 import { demoSwarmPrompt } from "../src/demo";
-import { attemptsOf, autonomyLabel, compactNumber, durationText, escalationButtons, gateText, meterFill, validItemActions } from "../src/homeLogic";
+import { attemptsOf, autonomyLabel, compactNumber, durationText, escalationButtons, escalationSubjectLabel, gateText, meterFill, shortItemId, validItemActions } from "../src/homeLogic";
 
 const train = (o: Partial<MergeTrain>): MergeTrain => ({ trainId: "t", baseSha: "a", includedPrompts: ["p"], artifactRepo: "r", status: "BUILDING", createdAt: 1, ...o }) as MergeTrain;
 
@@ -57,5 +57,23 @@ describe("homeLogic", () => {
   it("gate text", () => {
     expect(gateText(train({}))).toBeNull();
     expect(gateText(train({ score: { review: "approved", satisfied: 3, missing: 0, changedFiles: 2, changedBytes: 2457, checks: 4 } }))).toContain("2.4 KB");
+  });
+});
+
+describe("escalation subject (one card per item, not per goal)", () => {
+  const goal = "8e7b9165-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
+  const ids = ["upper", "ip", "hex", "fib"].map((k) => `${goal}-${k}`);
+  const esc = (id: string) => ({ subject: { type: "item" as const, id } });
+
+  it("tells Oracle children of one goal apart by their key when the item is not loaded", () => {
+    const labels = ids.map((id) => escalationSubjectLabel(esc(id), {}));
+    expect(new Set(labels).size).toBe(4);
+    expect(labels[1]).toBe("item 8e7b9165…-ip");
+    expect(shortItemId(goal)).toBe("8e7b9165");
+    expect(shortItemId("abc")).toBe("abc");
+  });
+  it("prefers the item title", () => {
+    expect(escalationSubjectLabel(esc(ids[3]!), { [ids[3]!]: { title: "Add /features/fib" } })).toBe("item “Add /features/fib”");
+    expect(escalationSubjectLabel({ subject: { type: "hive", id: "demo" } }, {})).toBe("hive demo");
   });
 });

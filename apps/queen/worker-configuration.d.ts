@@ -12,6 +12,8 @@ interface __BaseEnv_Env {
 	/** SwarmGovernor ceilings (§4.3): global active builds and the Workers AI rpm budget. */
 	SWARM_MAX_ACTIVE_BUILDS?: string;
 	SWARM_AI_RPM?: string;
+	/** Workers AI requests/min one active build makes (default 20, a Think tool loop): lease ≈ SWARM_AI_RPM / this. */
+	SWARM_RPM_PER_BUILD?: string;
 	/** "off" disables the SwarmGovernor lease (D9 cut line 3): per-hive caps only. */
 	SWARM_LEASE?: string;
 	/** JSON guardrail overrides a new hive starts with (the sim: maxActiveTrains 64, maxChildrenPerItem 24). */

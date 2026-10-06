@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import { initialState, reducer, releaseLetters, type Action, type State } from "../src/reducer";
-import { currentRelease, phaseHint, releaseSummary, siteReleaseView, tapButtonState, tapErrorMessage, timelineSteps } from "../src/releases";
+import { currentRelease, phaseHeadline, phaseHint, releaseSummary, siteReleaseView, tapButtonState, tapErrorMessage, timelineSteps } from "../src/releases";
 
 const release = (over: Record<string, unknown> = {}) => ({
   releaseId: "r1",
@@ -109,6 +109,13 @@ test("timeline: rollback fails at the peak canary step; failure and supersede st
   expect(states(release({ phase: "FAILED" }))[0]).toBe("bad");
   expect(states(release({ phase: "FAILED", stagingUrl: "https://s" }))).toEqual(["done", "bad", "todo", "todo", "todo", "todo", "todo", "todo"]);
   expect(states(release({ phase: "SUPERSEDED" }))).toEqual(Array(8).fill("muted"));
+});
+
+test("timeline: a FAILED release that was tapped failed in CANARY, not at VALIDATING (live b2c25c89 / main c89aa02)", () => {
+  const r = release({ phase: "FAILED", stagingUrl: "https://s", tappedAt: 5, tappedBy: "queen:autonomous", canaryPercent: null });
+  expect(states(r)).toEqual(["done", "done", "done", "bad", "todo", "todo", "todo", "todo"]);
+  expect(phaseHeadline(r as never)).toBe("Canary failed");
+  expect(phaseHeadline(release({ phase: "FAILED", stagingUrl: "https://s" }) as never)).toBe("Failed before shipping");
 });
 
 test("tap button: visible only in AWAITING_TAP, locked while pending or after a tap was sent", () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DeployResultSchema } from "@queenos/queen-types";
-import { HeraldFailedError, NOT_IMPLEMENTED, runHerald } from "../src/orchestrate";
+import { NonRetryableError } from "cloudflare:workflows";
+import { HeraldFailedError, NOT_IMPLEMENTED, TRANSIENT_ATTEMPTS, TRANSIENT_BASE_MS, runHerald, toStepError } from "../src/orchestrate";
 import { FakeWorld, InlineSteps, PREVIEW, SHA, TEMPLATE_FILES, TOKEN, TRAIN, apiError, deploy, teardown } from "./fakes";
 
 const WORKER = "my-hive-app";
@@ -100,7 +101,7 @@ describe("preview DEPLOY", () => {
     expect(w.queen.results[0]!.versionId).toBeUndefined();
   });
 
-  it("a retryable REST failure (5xx) is retried by the step", async () => {
+  it("a retryable REST failure (5xx) is retried in place with jitter, inside the step", async () => {
     const w = new FakeWorld();
     let n = 0;
     const real = w.cloudflare.createPreview.bind(w.cloudflare);
@@ -111,7 +112,9 @@ describe("preview DEPLOY", () => {
     const steps = new InlineSteps();
     const out = await runHerald(deploy(), steps, w.ports());
     expect(out.ok).toBe(true);
-    expect(steps.log.find((l) => l.name === "read source, deploy preview")!.attempts).toBe(3);
+    expect(steps.log.find((l) => l.name === "read source, deploy preview")!.attempts).toBe(1);
+    expect(w.sleeps).toHaveLength(2);
+    expect(w.sleeps.every((ms) => ms >= 0 && ms <= 8 * TRANSIENT_BASE_MS)).toBe(true);
   });
 
   it("exhausted retries report ok:false, with the summary clipped to 500 chars", async () => {
@@ -317,14 +320,15 @@ describe("canary DEPLOY", () => {
     }
   });
 
-  it("a retryable deployment failure is retried by its step without re-uploading", async () => {
+  it("a retryable deployment failure is retried in place without re-uploading", async () => {
     const w = new FakeWorld();
     w.cloudflare.deploymentErrors = [apiError(503, 0, true)];
     const steps = new InlineSteps();
     const out = await runHerald(canary(), steps, w.ports());
     expect(out.ok).toBe(true);
     expect(w.cloudflare.uploads).toHaveLength(1);
-    expect(steps.log.find((l) => l.name === "deploy canary split")!.attempts).toBe(2);
+    expect(steps.log.find((l) => l.name === "deploy canary split")!.attempts).toBe(1);
+    expect(w.sleeps).toHaveLength(1);
   });
 
   it("never lets the token into step results or reports", async () => {
@@ -399,5 +403,58 @@ describe("reporting", () => {
     const steps = new InlineSteps();
     await expect(runHerald({ op: "DEPLOY" }, steps, new FakeWorld().ports())).rejects.toBeInstanceOf(HeraldFailedError);
     expect(steps.log).toEqual([]);
+  });
+});
+
+describe("infrastructure failures (live 2026-10-06: Artifacts HTTP 503 under a 12-item swarm)", () => {
+  const http503 = () => Object.assign(new Error("HTTP Error: 503 Service Unavailable"), { name: "HttpError", data: { statusCode: 503 } });
+
+  it("a preview deploy whose clone keeps getting 503 is retried in-step and by the step, then reported ok:false + retryable", async () => {
+    const w = new FakeWorld();
+    let clones = 0;
+    w.git.clone = async () => {
+      clones++;
+      throw http503();
+    };
+    const steps = new InlineSteps();
+    const out = await runHerald(deploy(), steps, w.ports());
+    expect(out.ok).toBe(false);
+    // 3 jittered tries in each of 1 + 3 step attempts.
+    expect(steps.log.find((l) => l.name === "read source, deploy preview")).toMatchObject({ attempts: 4, ok: false });
+    expect(clones).toBe(TRANSIENT_ATTEMPTS * 4);
+    expect(w.queen.results[0]).toMatchObject({ ok: false, retryable: true, summary: expect.stringContaining("503") });
+    expect(DeployResultSchema.safeParse(w.queen.results[0]).success).toBe(true);
+  });
+
+  it("a canary whose source clone keeps getting 503 is reported retryable (never a bad change)", async () => {
+    const w = new FakeWorld();
+    w.git.clone = async () => {
+      throw http503();
+    };
+    const out = await runHerald(canary(), new InlineSteps(), w.ports());
+    expect(out.ok).toBe(false);
+    expect(w.queen.results[0]).toMatchObject({ ok: false, retryable: true, environment: "canary" });
+  });
+
+  it("a preview whose source is broken (the change) is NOT retryable", async () => {
+    const w = new FakeWorld();
+    w.git.files = { "README.md": "no worker here" };
+    const out = await runHerald(deploy(), new InlineSteps(), w.ports());
+    expect(out.ok).toBe(false);
+    expect(w.queen.results[0]!.retryable).toBeUndefined();
+  });
+
+  it("a non-retryable API error (4xx) is not retried in place and not retryable", async () => {
+    const w = new FakeWorld();
+    w.cloudflare.failWith = { method: "ensureWorker", error: apiError(400, 10021, false, "script validation") };
+    await runHerald(deploy(), new InlineSteps(), w.ports());
+    expect(w.sleeps).toEqual([]);
+    expect(w.queen.results[0]!.retryable).toBeUndefined();
+  });
+
+  it("toStepError never turns an HTTP 503 into NonRetryableError; UNAVAILABLE: config errors still are", () => {
+    expect(toStepError(http503())).not.toBeInstanceOf(NonRetryableError);
+    expect(toStepError(new Error("HttpError: HTTP Error: 503 Service Unavailable"))).not.toBeInstanceOf(NonRetryableError);
+    expect(toStepError(new Error("UNAVAILABLE: ARTIFACTS binding is not configured"))).toBeInstanceOf(NonRetryableError);
   });
 });

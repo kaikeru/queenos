@@ -174,6 +174,8 @@ export class FakeWorld {
 export class InlineSteps implements StepRunner {
   readonly log: { name: string; attempts: number; ok: boolean }[] = [];
   readonly sleeps: { name: string; ms: number }[] = [];
+  /** Retry delays a step's dynamic `retries.delay` function chose (Workflows calls it after each failed attempt). */
+  readonly retryDelays: { name: string; attempt: number; error: string; ms: number }[] = [];
 
   async do<T>(name: string, config: WorkflowStepConfig, fn: () => Promise<T>): Promise<T> {
     const limit = config.retries?.limit ?? 5;
@@ -187,6 +189,12 @@ export class InlineSteps implements StepRunner {
         if (e instanceof NonRetryableError || attempt > limit) {
           this.log.push({ name, attempts: attempt, ok: false });
           throw e;
+        }
+        const delay = config.retries?.delay;
+        if (typeof delay === "function") {
+          const ctx = { step: { name, count: 1 }, attempt, config: {} } as unknown as Parameters<typeof delay>[0]["ctx"];
+          const ms = Number(await delay({ ctx, error: e as Error }));
+          this.retryDelays.push({ name, attempt, error: String((e as Error)?.message ?? e), ms });
         }
       }
     }

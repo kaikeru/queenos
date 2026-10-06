@@ -35,6 +35,16 @@
  * - `reconcile()` auto-taps a parked release once `autoShip` is true, unless it
  *   has an open SENTINEL_INCONCLUSIVE or a human chose `hold`; in a supervised
  *   hive it opens APPROVAL_REQUIRED for a parked release that never had one.
+ * - Infrastructure is never the change's fault. A Herald DEPLOY that fails with
+ *   `retryable` (5xx / 429 past Herald's own retries) is re-issued, up to
+ *   MAX_COMMAND_ATTEMPTS; a lost executor (watchdog cap) or an inconclusive
+ *   canary verdict is infrastructure too. Then the release is PARKED, never
+ *   FAILED / ROLLED_BACK: staging stays in STAGING; a canary has its traffic
+ *   rolled back to stable (if it was split) and returns to AWAITING_TAP. Either
+ *   way EXECUTOR_LOST (or SENTINEL_INCONCLUSIVE) opens on the release, the
+ *   rollback streak and the error budget are untouched, and no P0 bug is filed
+ *   (bugs come only from FAILED / ROLLED_BACK). `retry` re-runs the step; a newer
+ *   main head supersedes the parked release as usual.
  * - Each ROLLED_BACK or canary-FAILED release bumps `rollbackStreak`
  *   (ROLLBACK_STREAK at 2); SHIPPED resets it. A failed Herald rollback opens
  *   ROLLBACK_FAILED. Superseding a parked release resolves its escalations as
@@ -43,6 +53,8 @@
 import {
   AUTO_SHIP_ACTOR,
   CANARY_STEPS,
+  INFRA_SUMMARY_PREFIX,
+  isInfraStopped,
   traceIdFromUuid,
   type DeployCommand,
   type DeployResult,
@@ -226,6 +238,9 @@ export function toRelease(r: ReleaseRecord): Release {
 }
 
 const clip = (s: string) => (s.length > 500 ? `${s.slice(0, 497)}...` : s);
+
+/** INFRA_SUMMARY_PREFIX also marks a canary rollback in flight as infra, so rollbackResult parks instead of ROLLED_BACK. */
+const isInfraStop = isInfraStopped;
 const short = (sha: string) => sha.slice(0, 7);
 
 const ISSUED_AT = {
@@ -320,9 +335,7 @@ export class ReleasePlanner {
     this.effects.push({ type: "broadcast", message: { type: "sentinel.verdict", verdict: v } });
     if (rel.phase === "VALIDATING") {
       if (v.inconclusive) {
-        // Parked even when autonomous: nobody measured staging.
-        this.set(rel, { phase: "AWAITING_TAP", pending: null, summary: clip(`Sentinel inconclusive on staging: ${v.summary}`) });
-        this.openEscalation("SENTINEL_INCONCLUSIVE", rel, `Sentinel could not measure staging for release ${rel.releaseId} (main ${short(rel.headSha)}): ${v.summary}`);
+        this.stagingInconclusive(rel, v.summary);
       } else if (v.verdict === "PROMOTE") {
         this.set(rel, { phase: "AWAITING_TAP", pending: null, summary: clip(v.summary) });
         if (this.ctx.autoShip && !this.ctx.paused) this.autoShip(rel);
@@ -332,12 +345,12 @@ export class ReleasePlanner {
       }
     } else if (v.verdict === "PROMOTE" && !v.inconclusive) {
       this.promoteCanary(rel, v.summary);
-    } else {
+    } else if (v.inconclusive) {
+      // Nothing was measured (unreachable, too few answers): not the change. Roll traffic back, park, ask.
       const percent = rel.canaryPercent ?? 0;
-      this.startRollback(rel, `Canary at ${percent}% ${v.inconclusive ? "inconclusive" : "failed"}: ${v.summary}`);
-      if (v.inconclusive) {
-        this.openEscalation("SENTINEL_INCONCLUSIVE", rel, `Sentinel could not measure the ${percent}% canary of release ${rel.releaseId}, so it was rolled back: ${v.summary}`, ["ack"]);
-      }
+      this.canaryInfraStop(rel, `Canary at ${percent}% inconclusive: ${v.summary}`, "SENTINEL_INCONCLUSIVE");
+    } else {
+      this.startRollback(rel, `Canary at ${rel.canaryPercent ?? 0}% failed: ${v.summary}`);
     }
     return this.finish("applied");
   }
@@ -351,6 +364,27 @@ export class ReleasePlanner {
     this.startCanary(rel, user);
     this.resolveParked(rel, user, "ship");
     return this.finish("applied");
+  }
+
+  /**
+   * `retry` on a release's EXECUTOR_LOST: re-run the step infrastructure stopped.
+   * A parked staging deploy is re-issued; a parked canary (AWAITING_TAP after an
+   * infra stop) restarts at 1% (the human's retry is the tap).
+   */
+  retry(releaseId: string, user: string): ReleasePlanResult {
+    const rel = this.releases.find((r) => r.releaseId === releaseId);
+    if (!rel) return this.finish("ignored:unknown");
+    if (rel.phase === "STAGING" && rel.pending === null) {
+      this.set(rel, { summary: null });
+      this.stage(rel);
+      return this.finish("applied");
+    }
+    if (rel.phase === "AWAITING_TAP" && !this.ctx.paused) {
+      this.startCanary(rel, user);
+      this.resolveParked(rel, user, "ship");
+      return this.finish("applied");
+    }
+    return this.finish("conflict");
   }
 
   /** The tap body: record who/when and start the 1% canary. */
@@ -376,7 +410,9 @@ export class ReleasePlanner {
   /** AWAITING_TAP and parked: an open SENTINEL_INCONCLUSIVE, or a human chose `hold`. */
   private parkedByHuman(rel: ReleaseRecord): boolean {
     return this.escalationsOf(rel).some(
-      (e) => (e.status === "OPEN" && e.reason === "SENTINEL_INCONCLUSIVE") || (PARKED_RELEASE_REASONS.has(e.reason) && resolutionAction(e) === "hold"),
+      (e) =>
+        (e.status === "OPEN" && (e.reason === "SENTINEL_INCONCLUSIVE" || e.reason === "EXECUTOR_LOST")) ||
+        (PARKED_RELEASE_REASONS.has(e.reason) && resolutionAction(e) === "hold"),
     );
   }
 
@@ -432,9 +468,10 @@ export class ReleasePlanner {
       return;
     }
     if (o.kind === "ROLLBACK") return this.rollbackFailed(rel, late);
-    if (rel.phase === "STAGING" || rel.phase === "VALIDATING") return this.stagingFailed(rel, late);
-    // CANARY: a lost deploy or verdict is treated as unhealthy.
-    this.startRollback(rel, late);
+    // A lost executor is infrastructure, never the change: park and escalate (no FAILED, no rollback count, no bug).
+    if (rel.phase === "STAGING") return this.stagingInfraStop(rel, late);
+    if (rel.phase === "VALIDATING") return this.stagingInconclusive(rel, late);
+    this.canaryInfraStop(rel, late, "EXECUTOR_LOST");
   }
 
   // ── staging ───────────────────────────────────────────────────────────
@@ -453,6 +490,12 @@ export class ReleasePlanner {
     if (!r.ok || !r.url) {
       const why = r.summary || (r.ok ? "Herald reported a staging deploy without a URL." : "Staging deploy failed.");
       this.setEnv("staging", { status: "FAILED", summary: clip(why), versionId: r.versionId ?? null });
+      if (!r.ok && r.retryable) {
+        // Infrastructure (5xx / 429 past Herald's retries): re-issue, then park.
+        if (commandAttempt(rel.deployCommandId) < MAX_COMMAND_ATTEMPTS) this.deployStaging(rel);
+        else this.stagingInfraStop(rel, why);
+        return;
+      }
       this.stagingFailed(rel, `Staging deploy failed: ${why}`);
       return;
     }
@@ -468,6 +511,19 @@ export class ReleasePlanner {
    */
   private stagingFailed(rel: ReleaseRecord, summary: string): void {
     this.set(rel, { phase: "FAILED", pending: null, summary: clip(summary) });
+  }
+
+  /** Staging could not be deployed for infrastructure reasons: parked in STAGING (a newer head supersedes it; `retry` re-deploys). */
+  private stagingInfraStop(rel: ReleaseRecord, why: string): void {
+    const summary = clip(`${INFRA_SUMMARY_PREFIX}staging deploy did not complete after ${commandAttempt(rel.deployCommandId)} attempts: ${why}`);
+    this.set(rel, { pending: null, summary });
+    this.openEscalation("EXECUTOR_LOST", rel, `Release ${rel.releaseId} (main ${short(rel.headSha)}) is parked: ${summary.slice(INFRA_SUMMARY_PREFIX.length)}`);
+  }
+
+  /** Nobody measured staging (unreachable, too few answers, Sentinel lost): parked even when autonomous. */
+  private stagingInconclusive(rel: ReleaseRecord, why: string): void {
+    this.set(rel, { phase: "AWAITING_TAP", pending: null, summary: clip(`Sentinel inconclusive on staging: ${why}`) });
+    this.openEscalation("SENTINEL_INCONCLUSIVE", rel, `Sentinel could not measure staging for release ${rel.releaseId} (main ${short(rel.headSha)}): ${why}`);
   }
 
   // ── canary ────────────────────────────────────────────────────────────
@@ -488,6 +544,12 @@ export class ReleasePlanner {
     if (!r.ok || !candidate || !url) {
       const why = r.summary || (!r.ok ? "Canary deploy failed." : !candidate ? "Herald reported a canary deploy without a version id." : "Herald reported a canary deploy without a URL.");
       this.setEnv("canary", { status: "FAILED", summary: clip(why) });
+      if (!r.ok && r.retryable) {
+        // Infrastructure (5xx / 429 past Herald's retries): re-issue the same step, then stop on infra.
+        if (commandAttempt(rel.deployCommandId) < MAX_COMMAND_ATTEMPTS) this.deployCanary(rel);
+        else this.canaryInfraStop(rel, `Canary deploy at ${CANARY_STEPS[rel.step ?? 0]}% did not complete after ${commandAttempt(rel.deployCommandId)} attempts: ${why}`, "EXECUTOR_LOST");
+        return;
+      }
       this.startRollback(rel, `Canary deploy at ${CANARY_STEPS[rel.step ?? 0]}% failed: ${why}`);
       return;
     }
@@ -518,6 +580,45 @@ export class ReleasePlanner {
       if (e.status === "OPEN" && e.reason === "ROLLBACK_STREAK") this.resolveEscalation(e, QUEEN_ACTOR, `cleared: release ${rel.releaseId} shipped`);
     }
     this.cutQueued(rel, false);
+  }
+
+  /**
+   * A canary stopped by infrastructure (deploy 5xx past its retries, a lost executor, an
+   * inconclusive verdict). If traffic may be split (a candidate is up and there is a stable
+   * version), Herald rolls it back first; then the release is parked (canaryParked).
+   */
+  private canaryInfraStop(rel: ReleaseRecord, why: string, reason: "EXECUTOR_LOST" | "SENTINEL_INCONCLUSIVE"): void {
+    this.set(rel, { summary: clip(`${INFRA_SUMMARY_PREFIX}${why}`) });
+    this.openEscalation(
+      reason,
+      rel,
+      reason === "EXECUTOR_LOST"
+        ? `Release ${rel.releaseId} (main ${short(rel.headSha)}) stopped on infrastructure, not a bad change: ${why}. Traffic is back on the stable version; retry restarts the canary.`
+        : `Sentinel could not measure the ${rel.canaryPercent ?? 0}% canary of release ${rel.releaseId}; traffic is back on the stable version and the release is parked (ack to let it ship again): ${why}`,
+      // Canary-time SENTINEL_INCONCLUSIVE stays ack-only (it is opened while the release is still in CANARY).
+      reason === "SENTINEL_INCONCLUSIVE" ? ["ack"] : undefined,
+    );
+    if (rel.stableVersionId && rel.candidateVersionId) this.dispatchRollback(rel);
+    else this.canaryParked(rel);
+  }
+
+  /**
+   * After an infra stop (and its rollback, if any): back to AWAITING_TAP with the canary reset,
+   * untapped, so it never counts against the error budget or the rollback streak and files no
+   * bug. A head that landed during the canary supersedes it instead.
+   */
+  private canaryParked(rel: ReleaseRecord): void {
+    this.setEnv("canary", { status: "TORN_DOWN", percent: null });
+    if (rel.nextHeadSha) {
+      this.set(rel, { phase: "SUPERSEDED", pending: null });
+      this.resolveParked(rel, QUEEN_ACTOR, SUPERSEDED_RESOLUTION);
+      for (const e of this.escalationsOf(rel)) {
+        if (e.status === "OPEN" && e.reason === "EXECUTOR_LOST") this.resolveEscalation(e, QUEEN_ACTOR, SUPERSEDED_RESOLUTION);
+      }
+      this.cutQueued(rel, true);
+      return;
+    }
+    this.set(rel, { phase: "AWAITING_TAP", pending: null, step: null, canaryPercent: null, candidateVersionId: null, tappedBy: null, tappedAt: null });
   }
 
   private startRollback(rel: ReleaseRecord, summary: string): void {
@@ -553,8 +654,13 @@ export class ReleasePlanner {
       else this.rollbackFailed(rel, why);
       return;
     }
-    this.set(rel, { phase: "ROLLED_BACK", pending: null, canaryPercent: 0 });
     this.setEnv("prod", { status: "LIVE", url: rel.prodUrl, versionId: rel.stableVersionId, percent: 100, summary: clip(`Rolled back release ${rel.releaseId}: ${rel.summary ?? ""}`) });
+    if (isInfraStop(rel)) {
+      // The traffic is safe again; the change was never judged: park, do not count.
+      this.canaryParked(rel);
+      return;
+    }
+    this.set(rel, { phase: "ROLLED_BACK", pending: null, canaryPercent: 0 });
     this.setEnv("canary", { status: "TORN_DOWN", percent: null });
     this.countRollback(rel);
     this.cutQueued(rel, true);
@@ -564,7 +670,8 @@ export class ReleasePlanner {
     this.set(rel, { phase: "FAILED", pending: null, summary: clip(`${rel.summary ?? "Canary failed."} ${why}; prod may still split traffic, roll back manually.`) });
     this.setEnv("prod", { status: "FAILED", summary: clip(why) });
     this.openEscalation("ROLLBACK_FAILED", rel, `Release ${rel.releaseId}: ${why}. Prod may still split traffic between ${rel.stableVersionId ?? "?"} and ${rel.candidateVersionId ?? "?"}; roll back by hand, then ack.`);
-    this.countRollback(rel);
+    // An infra stop whose rollback failed too: still not the change (no streak; the budget and bug filing skip it as well).
+    if (!isInfraStop(rel)) this.countRollback(rel);
     this.cutQueued(rel, true);
   }
 

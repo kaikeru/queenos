@@ -328,6 +328,8 @@ class Acc {
   conflictClaims: { itemId: string; paths: string[] }[] = [];
   carInfraFailures?: number;
   executorLost = false;
+  /** Prompts FAILED on infrastructure (→ EXECUTOR_LOST on the item, not REWORK_EXHAUSTED). */
+  infraFailed = new Map<string, string>();
   rollbackStreak?: number;
   followUps: AbsorbFollowUps[] = [];
   credits = 0;
@@ -348,6 +350,7 @@ class Acc {
     this.conflictClaims.push(...r.conflictClaims);
     if (r.carInfraFailures !== undefined) this.carInfraFailures = r.carInfraFailures;
     if (r.executorLost) this.executorLost = true;
+    for (const f of r.infraFailed ?? []) this.infraFailed.set(f.promptId, f.summary);
     if (r.landed && r.landed.trainIds.length) this.onLanded?.(r.landed);
     return r;
   }
@@ -568,21 +571,40 @@ export class QueenNode extends DurableObject<Env> {
   async reportTrainResult(input: TrainResult): Promise<TrainUpdate> {
     const r = parseOrThrow(TrainResultSchema, input, "train result");
     return this.trainTransition(r.trainId, (d, t) => {
+      const attempt = t.droneAttempt;
+      // A gatekeeper that could not run the gate (Artifacts / Cloudflare 5xx): reported in TESTING, no drone commandId.
+      const gateInfra = r.cause === "infra" && !r.passed && t.phase === "TESTING" && !r.commandId;
       const res = d.acc.train(d.tp.trainResult(r));
+      if (r.cause === "infra" && !r.passed && !gateInfra) {
+        // A builder that hit an infrastructure limit (AI rate limits): a drone result, not a gate verdict.
+        const commandId = r.commandId ?? droneInstanceId({ trainId: t.trainId, action: t.action }, attempt);
+        d.acc.events.push(
+          this.commandResult(t, commandId, `build infra failure (${res.outcome === "applied" ? "re-dispatched" : res.outcome}): ${r.summary}`, {
+            action: t.action,
+            role: t.action === "REWORK" ? "rework" : "builder",
+            outcome: "error",
+            cause: "infra",
+            applied: res.outcome,
+          }),
+        );
+        return res;
+      }
       const sha = r.commitSha ?? t.headSha ?? "";
       const prompt = d.state.prompts.find((p) => p.promptId === t.promptId);
       d.acc.events.push({
         type: "gate.verdict",
         severity: r.passed ? "info" : "warn",
         actor: "gatekeeper",
+        // (gateInfra: not a verdict; the planner re-deploys and re-gates, no attempt charged.)
         traceId: traceOfTrain(t),
         spanId: spanIdFor(`gate:${t.trainId}:${sha}`),
         parentSpanId: spanIdFor(t.trainId),
         itemId: isCar(t) ? null : t.promptId,
         trainId: t.trainId,
-        summary: clip(`gate ${r.passed ? "passed" : "failed"}: ${r.summary}`, 500),
+        summary: clip(`gate ${r.passed ? "passed" : gateInfra ? "could not run (infrastructure; re-gating)" : "failed"}: ${r.summary}`, 500),
         data: {
-          outcome: r.passed ? "PASSED" : "FAILED",
+          outcome: r.passed ? "PASSED" : gateInfra ? "INFRA" : "FAILED",
+          ...(gateInfra ? { cause: "infra" } : {}),
           attempt: (prompt?.attempts ?? 0) + 1,
           lane: t.lane ?? "BUILD",
           applied: res.outcome,
@@ -775,6 +797,9 @@ export class QueenNode extends DurableObject<Env> {
     switch (intent.type) {
       case "release.tap":
         d.acc.release(d.rp.tap(intent.releaseId, intent.user));
+        return;
+      case "release.retry":
+        d.acc.release(d.rp.retry(intent.releaseId, intent.user));
         return;
       case "work.retry":
         d.acc.work(d.wp.retry(intent.itemId, `user:${intent.user}`, note));
@@ -1368,6 +1393,7 @@ export class QueenNode extends DurableObject<Env> {
         summary: p.summary,
         attempts: p.attempts,
         ...(acc.itemConflicts.has(p.promptId) ? { conflicts: acc.itemConflicts.get(p.promptId)! } : {}),
+        ...(acc.infraFailed.has(p.promptId) ? { infra: true } : {}),
       }));
       acc.work(
         wp.absorb({

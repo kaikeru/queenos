@@ -122,6 +122,8 @@ export interface HeraldPorts {
   credentials: CredentialsPort;
   cloudflare(creds: CloudflareCredentials): CloudflareApi;
   queen(hive: string): QueenPort;
+  /** Backoff sleep of the in-step transient retry (default setTimeout; tests pass a no-op). */
+  sleep?: (ms: number) => Promise<unknown>;
 }
 
 export interface HeraldEnvBindings {

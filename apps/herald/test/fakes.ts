@@ -154,6 +154,8 @@ export class FakeWorld {
   readonly cloudflare = new FakeCloudflare();
   readonly queen = new FakeQueen();
   readonly queenHives: string[] = [];
+  /** In-step transient-retry backoffs (ms). */
+  readonly sleeps: number[] = [];
   ports(): HeraldPorts {
     return {
       artifacts: this.artifacts,
@@ -164,6 +166,7 @@ export class FakeWorld {
         this.queenHives.push(hive);
         return this.queen;
       },
+      sleep: async (ms: number) => void this.sleeps.push(ms),
     };
   }
 }

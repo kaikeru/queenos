@@ -1,11 +1,11 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { SWARM_DEFAULTS, type SwarmLeaseRequest } from "@queenos/queen-types";
+import { EST_RPM_PER_BUILD, SWARM_DEFAULTS, type SwarmLeaseRequest } from "@queenos/queen-types";
 import type { QueenNode } from "../src/queen-node";
 import { SwarmGovernor, decideLease, globalCeiling, governorCeilings, type GovernorEnv, type LeaseRecord } from "../src/scale/governor";
 
-const C = { maxActiveBuilds: 64, aiRpm: 240 }; // ceiling 60
+const C = { maxActiveBuilds: 64, aiRpm: 240, rpmPerBuild: 4 }; // ceiling 60 (the lease arithmetic below)
 const stubFor = (ns: string) => env.QUEEN_NODE.get(env.QUEEN_NODE.idFromName(ns));
 const req = (hive: string, want: number, ttlMs = 120_000): SwarmLeaseRequest => ({ hive, want, ttlMs });
 
@@ -26,12 +26,24 @@ function table() {
 
 describe("ceilings", () => {
   it("defaults, env overrides and the rpm clamp", () => {
-    expect(governorCeilings({})).toEqual({ maxActiveBuilds: SWARM_DEFAULTS.maxActiveBuilds, aiRpm: SWARM_DEFAULTS.aiRpm });
-    expect(governorCeilings({ SWARM_MAX_ACTIVE_BUILDS: "10", SWARM_AI_RPM: "400" })).toEqual({ maxActiveBuilds: 10, aiRpm: 400 });
-    expect(governorCeilings({ SWARM_MAX_ACTIVE_BUILDS: "junk", SWARM_AI_RPM: "-1" })).toEqual(governorCeilings({}));
+    expect(EST_RPM_PER_BUILD).toBe(20);
+    expect(governorCeilings({})).toEqual({ maxActiveBuilds: SWARM_DEFAULTS.maxActiveBuilds, aiRpm: SWARM_DEFAULTS.aiRpm, rpmPerBuild: 20 });
+    expect(governorCeilings({ SWARM_MAX_ACTIVE_BUILDS: "10", SWARM_AI_RPM: "400", SWARM_RPM_PER_BUILD: "8" })).toEqual({ maxActiveBuilds: 10, aiRpm: 400, rpmPerBuild: 8 });
+    expect(governorCeilings({ SWARM_MAX_ACTIVE_BUILDS: "junk", SWARM_AI_RPM: "-1", SWARM_RPM_PER_BUILD: "0" })).toEqual(governorCeilings({}));
     expect(globalCeiling(C)).toBe(60); // min(64, 240/4)
     expect(globalCeiling({ maxActiveBuilds: 10, aiRpm: 400 })).toBe(10);
-    expect(globalCeiling({ maxActiveBuilds: 1000, aiRpm: 400 })).toBe(100);
+    expect(globalCeiling({ maxActiveBuilds: 1000, aiRpm: 400 })).toBe(20); // 400 / 20 (default rpm per build)
+    expect(globalCeiling({ maxActiveBuilds: 1000, aiRpm: 400, rpmPerBuild: 4 })).toBe(100);
+  });
+
+  it("SWARM_RPM_PER_BUILD sets the live lease: 240 rpm / 20 per Think build = 12 builds, so a 12-item swarm fits", () => {
+    const live = governorCeilings({ SWARM_MAX_ACTIVE_BUILDS: "64", SWARM_AI_RPM: "240", SWARM_RPM_PER_BUILD: "20" });
+    expect(globalCeiling(live)).toBe(12);
+    expect(decideLease([], req("demo", 24), 0, live).lease).toMatchObject({ granted: 12, globalCeiling: 12, aiRpmCeiling: 240 });
+    // The old 4-rpm estimate granted the whole 24-train hive cap (the 2026-10-06 burst).
+    expect(decideLease([], req("demo", 24), 0, { ...live, rpmPerBuild: 4 }).lease.granted).toBe(24);
+    // Sim keeps its high ceiling (wrangler env.sim: 4000 rpm / 4 per build).
+    expect(globalCeiling(governorCeilings({ SWARM_MAX_ACTIVE_BUILDS: "1000", SWARM_AI_RPM: "4000", SWARM_RPM_PER_BUILD: "4" }))).toBe(1000);
   });
 });
 
@@ -98,7 +110,7 @@ describe("decideLease", () => {
   });
 
   it("a zero ceiling grants nothing", () => {
-    expect(table().ask("a", 5, 0, { maxActiveBuilds: 0, aiRpm: 240 }).granted).toBe(0);
+    expect(table().ask("a", 5, 0, { maxActiveBuilds: 0, aiRpm: 240, rpmPerBuild: 4 }).granted).toBe(0);
   });
 });
 

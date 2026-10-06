@@ -79,6 +79,17 @@ export const TrainResultSchema = z.object({
   score: GateScoreSchema.optional(),
   /** v2: findings in paths outside the diff, filed as bugs (they do not fail the gate). */
   followUps: z.array(FollowUpSchema).max(3).optional(),
+  /**
+   * v2: a builder drone that could not run for infrastructure reasons (Workers AI rate limits that outlasted
+   * every retry). Not a verdict: the Queen re-dispatches the drone (no rework, no model failure, the router
+   * floor untouched). Only with `passed: false`.
+   * Gatekeepers send it too (no `commandId`) when the GATE itself could not run (Artifacts / Cloudflare
+   * 5xx, 429): the train is in TESTING, so the Queen re-deploys the preview after a backoff and the
+   * gatekeeper re-gates; past the infra-retry cap the item gets EXECUTOR_LOST, never REWORK_EXHAUSTED.
+   */
+  cause: z.literal("infra").optional(),
+  /** The reporting drone's Workflow instance id. With `cause`, a report from a superseded attempt is ignored. */
+  commandId: z.string().min(1).max(200).optional(),
 });
 export type TrainResult = z.infer<typeof TrainResultSchema>;
 

@@ -24,6 +24,16 @@ export const PER_MODEL_MS = 240_000;
 /** Do not start a model with less than this left. */
 export const MIN_MODEL_MS = 45_000;
 export const MAX_SEED_FILES = 400;
+/** Submission keys per (instance, model): in-step 429 retries × step retries, with room to spare. */
+export const MAX_SUBMISSIONS_PER_MODEL = 48;
+
+/** Prefix of an infrastructure failure (not the model's fault): the drone reports it as `cause: "infra"`. */
+export const INFRA_PREFIX = "INFRA: ";
+
+/** The `n`th submission key for a model: `<instance>:<model>`, then `<instance>:<model>:rl<n>`. */
+export function submissionKey(instanceId: string, model: string, n: number): string {
+  return n === 0 ? `${instanceId}:${model}` : `${instanceId}:${model}:rl${n}`;
+}
 
 export interface AgentGenerated extends Generated {
   trace: string[];
@@ -82,6 +92,8 @@ export function rejectReason(r: AgentBuildResult, base: Record<string, string>):
   return problems.length ? problems.slice(0, 3).join("; ") : null;
 }
 
+const SKIPPED_BUDGET = "skipped: agent wall-time budget exhausted";
+
 const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
 
 export async function runAgentBuild(task: DroneTask, ports: Pick<DronePorts, "agent" | "artifacts" | "git">, config: DroneConfig, opts: AgentRunOptions): Promise<AgentGenerated> {
@@ -95,33 +107,41 @@ export async function runAgentBuild(task: DroneTask, ports: Pick<DronePorts, "ag
   for (const model of agentModelsFor(task, config)) {
     const remaining = opts.deadlineMs - now();
     if (remaining < MIN_MODEL_MS) {
-      failures.push({ model, reason: "skipped: agent wall-time budget exhausted" });
+      failures.push({ model, reason: SKIPPED_BUDGET });
       continue;
     }
     // A thrown error here (DO reset by a deploy, RPC failure) propagates: the step retries and
     // re-attaches to the same submission through the same name + idempotency key.
     // A 429 inside the agent run is the platform's problem, not the model's: back off and run the same
-    // model again (a fresh submission key, so it does not re-attach to the rate-limited one). If it
-    // outlasts the retries it propagates as a retryable error: the step retries, and the model is
-    // never added to `failedModels`.
-    const r = await withRateLimitRetry(async (attempt) => {
-      const res = await agent.build(`${opts.instanceId}|${model}`, {
-        base,
-        task: {
-          promptId: task.promptId,
-          trainId: task.trainId,
-          action: task.action,
-          promptText: task.promptText,
-          ragContext: task.ragContext,
-          ...(task.scribeSummary ? { scribeSummary: task.scribeSummary } : {}),
-        },
-        model,
-        idempotencyKey: attempt === 0 ? `${opts.instanceId}:${model}` : `${opts.instanceId}:${model}:rl${attempt}`,
-        timeoutMs: Math.min(PER_MODEL_MS, Math.max(0, opts.deadlineMs - now())),
-        skipCache: task.action === "REWORK",
-      });
-      if (res.status === "error" && !res.finish && isRateLimited(res.error ?? "")) throw new AiGatewayError(clip(`rate limited: ${res.error}`, 300), 429, true);
-      return res;
+    // model again under the next submission key (so it does not re-attach to the rate-limited one).
+    // If it outlasts the in-step retries it propagates as a retryable 429: the Workflow step retries
+    // with a long jittered delay (orchestrate.ts agentStepConfig), and the model is never added to
+    // `failedModels`. On that step retry the earlier keys re-attach to their spent (rate-limited)
+    // submissions: those are skipped at once, with no new model call and no backoff, until a key
+    // that is fresh (or still running) is reached.
+    let key = 0;
+    const r = await withRateLimitRetry(async () => {
+      for (;;) {
+        const res = await agent.build(`${opts.instanceId}|${model}`, {
+          base,
+          task: {
+            promptId: task.promptId,
+            trainId: task.trainId,
+            action: task.action,
+            promptText: task.promptText,
+            ragContext: task.ragContext,
+            ...(task.scribeSummary ? { scribeSummary: task.scribeSummary } : {}),
+          },
+          model,
+          idempotencyKey: submissionKey(opts.instanceId, model, key),
+          timeoutMs: Math.min(PER_MODEL_MS, Math.max(0, opts.deadlineMs - now())),
+          skipCache: task.action === "REWORK",
+        });
+        if (!(res.status === "error" && !res.finish && isRateLimited(res.error ?? ""))) return res;
+        key += 1;
+        if (res.reattached && key < MAX_SUBMISSIONS_PER_MODEL) continue; // spent by an earlier step attempt
+        throw new AiGatewayError(clip(`rate limited: ${res.error}`, 300), 429, true);
+      }
     }, opts.backoff);
     total.inputTokens += r.usage.inputTokens;
     total.outputTokens += r.usage.outputTokens;
@@ -152,6 +172,11 @@ export async function runAgentBuild(task: DroneTask, ports: Pick<DronePorts, "ag
       verified: r.lastVerify?.ok === true,
       followUps: (r.finish?.followUps ?? []).slice(0, MAX_FOLLOW_UPS),
     };
+  }
+  if (failures.length > 0 && failures.every((f) => f.reason === SKIPPED_BUDGET)) {
+    // No model ran at all: earlier step attempts (rate limits, transient errors) used up the agent phase.
+    // That says nothing about the models, so it is not AllModelsFailed (no failedModels, no rework).
+    throw new Error(`${INFRA_PREFIX}agent wall-time budget used up by retries before any model could run (AI rate limits?)`);
   }
   const why = failures.map((f) => `${f.model}: ${f.reason}`).join(" | ");
   throw new AllModelsFailedError(clip(`no verified change from any model: ${why || "no model available"}`, 900), failures.map((f) => f.model));

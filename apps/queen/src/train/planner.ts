@@ -113,6 +113,41 @@ export const MAX_COMMAND_ATTEMPTS = MAX_FORK_ATTEMPTS;
 export const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
 /** Default Guardrails.maxConflictReworks (D7). */
 export const DEFAULT_MAX_CONFLICT_REWORKS = 2;
+/**
+ * ONE infra path (5xx / 429 / lost executors are never the change's fault): a builder drone
+ * (`TrainResult.cause = "infra"` in BUILDING), a fork (ok:false or lost), a preview deploy
+ * (`DeployResult.retryable`, or lost) and a gate (`cause = "infra"` in TESTING) are all re-dispatched
+ * with no attempt, rework or model-failure charge, up to the same cap: MAX_COMMAND_ATTEMPTS tries of
+ * that command (persisted in its command id / droneAttempt). Past it, infraExhausted(): the train is
+ * EJECTED ("failed on infrastructure: …") and the item FAILED with EXECUTOR_LOST, never
+ * REWORK_EXHAUSTED. Preview / gate retries wait INFRA_RETRY_BASE_MS·2^(n-1) (jittered) via the alarm.
+ */
+export const MAX_INFRA_ATTEMPTS = MAX_COMMAND_ATTEMPTS;
+export const INFRA_RETRY_BASE_MS = 30_000;
+export const INFRA_RETRY_MAX_MS = 5 * 60_000;
+
+/** Deterministic jitter in [0.5, 1.5) from a key (the planner is pure: no randomness). */
+function jitter(key: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 16777619);
+  return 0.5 + (h >>> 0) / 2 ** 32;
+}
+
+/** Backoff before infra retry n (n = the failed DEPLOY attempt): 30 s, 60 s, 120 s … (cap 5 min), ±50% jitter per train. */
+export function infraRetryDelayMs(t: Pick<TrainRecord, "trainId" | "deployCommandId">): number {
+  const n = Math.max(1, commandAttempt(t.deployCommandId));
+  return Math.round(Math.min(INFRA_RETRY_MAX_MS, INFRA_RETRY_BASE_MS * 2 ** (n - 1)) * jitter(`${t.trainId}:${n}`));
+}
+
+/** A train parked for an infra retry: DEPLOYING with its last deploy FAILED (the clock is the failure time). */
+function awaitingInfraRetry(t: TrainRecord): boolean {
+  return isActive(t) && t.phase === "DEPLOYING" && t.deployState === "FAILED";
+}
+
+/** When a parked train's preview is re-deployed (null when it is not parked). */
+export function infraRetryAt(t: TrainRecord, now: number): number | null {
+  return awaitingInfraRetry(t) ? (t.deployIssuedAt ?? now) + infraRetryDelayMs(t) : null;
+}
 
 export interface TrainRecord extends MergeTrain {
   seq: number;
@@ -348,6 +383,8 @@ export interface PlanResult {
   carInfraFailures?: number;
   /** v2: open EXECUTOR_LOST (subject hive) and pause car formation. */
   executorLost?: boolean;
+  /** Prompts FAILED on infrastructure (infra retries / executor attempts spent): EXECUTOR_LOST on the item, not REWORK_EXHAUSTED. */
+  infraFailed?: { promptId: string; summary: string }[];
 }
 
 const TERMINAL: ReadonlySet<TrainPhase> = new Set(["MERGED", "EJECTED"]);
@@ -443,6 +480,10 @@ export function outstandingSince(t: TrainRecord, now: number): number[] {
  */
 export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: number, now: number, races: readonly RaceRecord[] = []): number | null {
   const all = trains.flatMap((t) => outstandingSince(t, now)).map((x) => x + timeoutMs);
+  for (const t of trains) {
+    const at = infraRetryAt(t, now);
+    if (at !== null) all.push(at);
+  }
   for (const r of races) if (r.state === "RACING" && r.deadlineAt !== null) all.push(r.deadlineAt);
   return all.length ? Math.min(...all) : null;
 }
@@ -557,6 +598,7 @@ export class TrainPlanner {
   private carInfraFailures: number;
   private carInfraDirty = false;
   private executorLost = false;
+  private infraFailed: { promptId: string; summary: string }[] = [];
   private readonly hooks: QueueHooks;
   private readonly activeBuildsAtStart: number;
   private landing = false;
@@ -662,7 +704,7 @@ export class TrainPlanner {
       this.scheduleFork(t);
     } else {
       this.promptSummary(t, summary);
-      this.fail(t, `fork failed: ${summary}`);
+      this.infraExhausted(t, `fork failed: ${summary}`);
     }
   }
 
@@ -701,7 +743,10 @@ export class TrainPlanner {
     if (t.phase !== "DEPLOYING") return this.finish("ignored:premature");
     const commitSha = r.commitSha ?? t.headSha;
     if (!r.ok || !r.url) {
-      this.previewFailed(t, r.summary || (r.ok ? "Herald reported a deploy without a preview URL." : "Preview deploy failed."), commitSha, r.versionId ?? null);
+      const summary = r.summary || (r.ok ? "Herald reported a deploy without a preview URL." : "Preview deploy failed.");
+      // Infrastructure (5xx / 429 past Herald's retries): not the change's fault. Re-deploy after a backoff.
+      if (!r.ok && r.retryable) this.infraRetry(t, `preview deploy failed: ${summary}`);
+      else this.previewFailed(t, summary, commitSha, r.versionId ?? null);
       return this.finish("applied");
     }
     this.setTrain(t, { deployState: "LIVE", previewUrl: r.url, phase: "TESTING" });
@@ -710,11 +755,12 @@ export class TrainPlanner {
   }
 
   /** A preview deploy failed (ok:false, no URL, or timed out for the last time). */
-  private previewFailed(t: TrainRecord, summary: string, commitSha: string | null, versionId: string | null): void {
+  private previewFailed(t: TrainRecord, summary: string, commitSha: string | null, versionId: string | null, infra = false): void {
     this.setTrain(t, { deployState: "FAILED" }, false);
     this.setDeployment(t, { status: "FAILED", summary, commitSha, versionId });
     this.promptSummary(t, summary);
-    this.fail(t, `preview deploy failed: ${summary}`, { carCause: "infra" });
+    if (infra) this.infraExhausted(t, `preview deploy failed: ${summary}`);
+    else this.fail(t, `preview deploy failed: ${summary}`, { carCause: "infra" });
   }
 
   private previewTornDown(t: TrainRecord, r: DeployResult): PlanResult {
@@ -790,6 +836,12 @@ export class TrainPlanner {
     // A pass must come from testing the live preview; a failure (e.g. the
     // builder giving up) is honoured in any phase.
     if (r.passed && t.phase !== "TESTING") return this.finish("ignored:premature");
+    // The gate itself could not run (gatekeepers report in TESTING, without a drone commandId): re-deploy, re-gate.
+    if (!r.passed && r.cause === "infra" && t.phase === "TESTING" && !r.commandId) {
+      this.infraRetry(t, `gate could not run: ${r.summary}`);
+      return this.finish("applied");
+    }
+    if (!r.passed && r.cause === "infra" && !isCar(t)) return this.builderInfraFailure(t, r);
     if (isCar(t)) {
       if (!r.passed) {
         this.fail(t, r.summary, { carCause: "gate" });
@@ -892,6 +944,8 @@ export class TrainPlanner {
         this.emitDeploy(t);
       } else if (t.phase === "DEPLOYING" && t.deployState === "NONE") {
         this.deployPreview(t);
+      } else if (awaitingInfraRetry(t) && (infraRetryAt(t, this.ctx.now) ?? 0) <= this.ctx.now) {
+        this.deployPreview(t);
       } else if (t.phase === "LANDING" && !t.dispatched) {
         this.dispatchLander(t);
       }
@@ -901,6 +955,43 @@ export class TrainPlanner {
     }
     this.maybeLand();
     return this.finish("applied");
+  }
+
+  /**
+   * A builder drone that could not run for infrastructure reasons (Workers AI
+   * rate limits past every retry). Not a verdict: no rework, no model failure,
+   * the router floor untouched. The drone is re-dispatched under the next
+   * attempt, exactly as the watchdog does for a lost drone (and with the same
+   * attempt cap, past which it fails like a lost drone). A report from an
+   * attempt other than the current one is stale (the watchdog already moved on).
+   */
+  private builderInfraFailure(t: TrainRecord, r: TrainResult): PlanResult {
+    if (!droneOutstanding(t) || t.phase !== "BUILDING") return this.finish("ignored:stale");
+    if (r.commandId && r.commandId !== droneInstanceId({ trainId: t.trainId, action: t.action }, t.droneAttempt)) return this.finish("ignored:stale");
+    this.redispatchDrone(t, r.summary, true);
+    return this.finish("applied");
+  }
+
+  /**
+   * Re-issue an outstanding builder / lander drone under the next attempt, or give up past the cap.
+   * `infra` (the drone reported an infrastructure failure): past the cap, infraExhausted (EXECUTOR_LOST).
+   */
+  private redispatchDrone(t: TrainRecord, summary: string, infra = false): void {
+    const lander = t.phase === "LANDING";
+    if (t.droneAttempt < MAX_COMMAND_ATTEMPTS) {
+      this.setTrain(t, { dispatched: false, droneAttempt: t.droneAttempt + 1 }, false);
+      if (lander) this.dispatchLander(t);
+      else this.dispatchBuilder(t);
+    } else if (lander) {
+      this.landFailed(t, summary);
+    } else if (infra) {
+      this.promptSummary(t, summary);
+      this.infraExhausted(t, summary);
+    } else {
+      // Same path as a builder giving up (a failed trainResult); a car: infra.
+      this.promptSummary(t, summary);
+      this.fail(t, summary, { carCause: "infra" });
+    }
   }
 
   /**
@@ -930,21 +1021,9 @@ export class TrainPlanner {
         this.forkFailed(t, late("Provisioner FORK", t.forkCommandId));
       } else if (t.phase === "DEPLOYING" && t.deployState === "PENDING" && expired(t.deployIssuedAt)) {
         if (commandAttempt(t.deployCommandId) < MAX_COMMAND_ATTEMPTS) this.deployPreview(t);
-        else this.previewFailed(t, late("Herald DEPLOY", t.deployCommandId), t.headSha, null);
+        else this.previewFailed(t, late("Herald DEPLOY", t.deployCommandId), t.headSha, null, true);
       } else if (droneOutstanding(t) && expired(t.droneIssuedAt)) {
-        const lander = t.phase === "LANDING";
-        const summary = late(lander ? "LANDER drone" : isCar(t) ? "MERGE drone" : "BUILDER drone", null);
-        if (t.droneAttempt < MAX_COMMAND_ATTEMPTS) {
-          this.setTrain(t, { dispatched: false, droneAttempt: t.droneAttempt + 1 }, false);
-          if (lander) this.dispatchLander(t);
-          else this.dispatchBuilder(t);
-        } else if (lander) {
-          this.landFailed(t, summary);
-        } else {
-          // Same path as a builder giving up (a failed trainResult); a car: infra.
-          this.promptSummary(t, summary);
-          this.fail(t, summary, { carCause: "infra" });
-        }
+        this.redispatchDrone(t, late(t.phase === "LANDING" ? "LANDER drone" : isCar(t) ? "MERGE drone" : "BUILDER drone", null));
       }
     }
   }
@@ -1264,6 +1343,54 @@ export class TrainPlanner {
   }
 
   // ── internals: failure ────────────────────────────────────────────────
+
+  /**
+   * The train's preview deploy or gate failed on infrastructure: no attempt charged, no rework.
+   * Park it (DEPLOYING, deploy FAILED, clock = now) and let the alarm re-deploy the preview after
+   * infraRetryDelayMs (the gatekeeper waiting on the train re-gates once it is back in TESTING).
+   * Past MAX_INFRA_ATTEMPTS deploys: infraExhausted.
+   */
+  private infraRetry(t: TrainRecord, summary: string): void {
+    const n = commandAttempt(t.deployCommandId);
+    if (n >= MAX_INFRA_ATTEMPTS) {
+      this.setTrain(t, { deployState: "FAILED" }, false);
+      this.setDeployment(t, { status: "FAILED", summary: clip500(summary) });
+      this.promptSummary(t, summary);
+      this.infraExhausted(t, `${summary} (after ${n} attempts)`);
+      return;
+    }
+    this.setTrain(t, { phase: "DEPLOYING", deployState: "FAILED", deployIssuedAt: this.ctx.now });
+    const delay = infraRetryDelayMs(t);
+    this.setDeployment(t, { status: "FAILED", summary: clip500(`${summary} (infrastructure: retry ${n}/${MAX_INFRA_ATTEMPTS - 1} in ${Math.round(delay / 1000)} s)`) });
+    this.event(t, {
+      type: "train.phase",
+      severity: "warn",
+      summary: clip500(`${isCar(t) ? "car" : "train"} ${t.trainId} infra retry ${n}/${MAX_INFRA_ATTEMPTS - 1} in ${Math.round(delay / 1000)} s: ${summary}`),
+      data: { from: "TESTING", to: "DEPLOYING", lane: t.lane ?? "BUILD", infraRetry: n, delayMs: delay },
+    });
+  }
+
+  /**
+   * An executor kept failing on infrastructure (infra retries or command attempts spent). A car:
+   * the queue's infra path (members return to the pool; 3 in a row → EXECUTOR_LOST on the hive).
+   * A race candidate: ejected alone, as any failed candidate. A build: EJECTED and its prompt
+   * FAILED with attempts unchanged, reported in `infraFailed` (EXECUTOR_LOST on the item).
+   */
+  private infraExhausted(t: TrainRecord, summary: string): void {
+    if (!isActive(t)) return;
+    if (isCar(t) || this.racingRaceOf(t)) {
+      this.fail(t, summary, { carCause: "infra" });
+      return;
+    }
+    this.eject(t, `failed on infrastructure: ${summary}`);
+    const p = this.prompts.get(t.promptId);
+    if (p) {
+      this.setPromptSummary(p.promptId, summary);
+      this.setPromptStatus(p.promptId, "FAILED");
+      this.infraFailed.push({ promptId: p.promptId, summary: clip500(summary) });
+    }
+    this.maybeLand();
+  }
 
   private fail(t: TrainRecord, summary: string, opts: FailOptions = {}): void {
     if (!isActive(t)) return;
@@ -1655,6 +1782,7 @@ export class TrainPlanner {
       dispatchIndex: this.routerDispatches,
       floor: this.floor,
       policy: this.policy(),
+      inFlight: this.buildersInFlight(t),
     });
     if (routed.floorRouted && !t.raceId) this.setFloor(routed.floor);
     const choice = routed.choice;
@@ -1666,6 +1794,22 @@ export class TrainPlanner {
       modelProbe: routed.probe,
     });
     return choice;
+  }
+
+  /**
+   * Builder/rework drones in flight per model (the router's load spread): every
+   * other active BUILD train in BUILDING whose model was chosen for its current
+   * drone attempt, including ones routed earlier in this same decision.
+   */
+  private buildersInFlight(except: TrainRecord): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const o of this.trains) {
+      if (o === except || !isActive(o) || isCar(o) || o.phase !== "BUILDING") continue;
+      const m = o.modelChoice;
+      if (!m || o.modelChoiceAttempt !== o.droneAttempt) continue;
+      out[m.model] = (out[m.model] ?? 0) + 1;
+    }
+    return out;
   }
 
   private policy(): RouterPolicy {
@@ -1862,7 +2006,9 @@ export class TrainPlanner {
       itemConflicts: [...this.dirtyConflicts].map((itemId) => ({ itemId, conflicts: this.conflicts.get(itemId)! })),
       ...(this.carInfraDirty ? { carInfraFailures: this.carInfraFailures } : {}),
       ...(this.executorLost ? { executorLost: true } : {}),
+      ...(this.infraFailed.length ? { infraFailed: this.infraFailed } : {}),
     };
+    this.infraFailed = [];
     this.modelDeltas = [];
     this.events = [];
     this.landed = null;

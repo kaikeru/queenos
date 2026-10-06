@@ -40,13 +40,28 @@ describe("staging", () => {
     expect(w.verdicts[0]!.verdict).toBe("PROMOTE");
   });
 
-  it("treats network errors and timeouts as errors and rolls back", async () => {
+  it("network errors / timeouts with no baseline are infrastructure (could not reach the deployment): inconclusive, not a health failure", async () => {
     const w = new FakeWorld((_c, i) => (i % 2 === 0 ? "throw" : { status: 200 }));
     await runSentinel(staging(), new InlineSteps(), w.ports());
     const v = w.verdicts[0]!;
-    expect(v.verdict).toBe("ROLLBACK");
-    expect(v.metrics.errorRate).toBe(0.5);
-    expect(v.summary).toContain("smoke check failed");
+    expect(v).toMatchObject({ verdict: "ROLLBACK", inconclusive: true });
+    expect(v.metrics.errorRate).toBe(0);
+    expect(v.summary).toContain("probes could not reach the deployment");
+    expect(v.summary).not.toContain("smoke check failed");
+  });
+
+  it("a few unreachable probes (<= 1%) are left out of the sample and still promote", async () => {
+    const w = new FakeWorld((_c, i) => (i === 7 ? "throw" : { status: 200 }));
+    await runSentinel(staging({ minRequests: 100 }), new InlineSteps(), w.ports());
+    expect(w.verdicts[0]).toMatchObject({ verdict: "PROMOTE" });
+    expect(w.verdicts[0]!.inconclusive).toBeUndefined();
+  });
+
+  it("answered 5xx are still real failures even when some probes were unreachable", async () => {
+    const w = new FakeWorld((_c, i) => (i % 2 === 0 ? "throw" : { status: 503 }));
+    await runSentinel(staging(), new InlineSteps(), w.ports());
+    expect(w.verdicts[0]).toMatchObject({ verdict: "ROLLBACK" });
+    expect(w.verdicts[0]!.inconclusive).toBeUndefined();
   });
 
   it("rolls back on 5xx above 1% but tolerates 0.x%", async () => {
@@ -114,10 +129,17 @@ describe("canary", () => {
     expect(w.verdicts[0]!.verdict).toBe("PROMOTE"); // limit = max(2000, 3600)
   });
 
-  it("rolls back when the pinned candidate errors on the network", async () => {
+  it("rolls back when the pinned candidate errors on the network while the stable baseline answers (the candidate hangs)", async () => {
     const w = new FakeWorld((c) => (isCandidate(c) ? "throw" : { status: 200 }));
     await runSentinel(canary(), new InlineSteps(), w.ports());
     expect(w.verdicts[0]).toMatchObject({ verdict: "ROLLBACK", metrics: { errorRate: 1 } });
+    expect(w.verdicts[0]!.inconclusive).toBeUndefined();
+  });
+
+  it("is inconclusive when neither the candidate nor the baseline can be reached (infrastructure)", async () => {
+    const w = new FakeWorld(() => "throw");
+    await runSentinel(canary(), new InlineSteps(), w.ports());
+    expect(w.verdicts[0]).toMatchObject({ verdict: "ROLLBACK", inconclusive: true });
   });
 
   it("without a stable version there is no baseline and no stable probes", async () => {

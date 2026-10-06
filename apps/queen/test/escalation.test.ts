@@ -78,6 +78,7 @@ const paths: { reason: EscalationReason; subject: EscalationSubject; action: Esc
   { reason: "EXECUTOR_LOST", subject: hive, action: "retry", intents: [{ type: "queue.resume" }] },
   { reason: "EXECUTOR_LOST", subject: item, action: "retry", intents: [{ type: "work.retry", itemId: "i1", user: USER, resetAttempts: true, resetConflicts: true }] },
   { reason: "EXECUTOR_LOST", subject: hive, action: "ack", intents: [] },
+  { reason: "EXECUTOR_LOST", subject: release, action: "retry", intents: [{ type: "release.retry", releaseId: "r1", user: USER }] },
 ];
 
 describe("escalation planner: resolve, every reason and action", () => {
@@ -161,6 +162,15 @@ describe("escalation planner: auto-resolve", () => {
   it("an informational (ack-only) canary SENTINEL_INCONCLUSIVE outlives its release", () => {
     const e = newEscalation("hive", 1, { reason: "SENTINEL_INCONCLUSIVE", subject: release, summary: "canary", actions: ["ack"] });
     expect(new EscalationPlanner([e], ctx).resolveStale({ releases: [{ releaseId: "r1", phase: "ROLLED_BACK" }] }).escalations).toEqual([]);
+  });
+
+  it("a release's EXECUTOR_LOST stays while the release is parked, and resolves once it is superseded or ended", () => {
+    const e = opened("EXECUTOR_LOST", release);
+    for (const phase of ["STAGING", "AWAITING_TAP", "CANARY"] as const) {
+      expect(new EscalationPlanner([e], ctx).resolveStale({ releases: [{ releaseId: "r1", phase }] }).escalations).toEqual([]);
+    }
+    const r = new EscalationPlanner([e], ctx).resolveStale({ releases: [{ releaseId: "r1", phase: "SUPERSEDED" }] });
+    expect(r.escalations[0]).toMatchObject({ status: "RESOLVED", resolution: "superseded" });
   });
 
   it("REWORK_EXHAUSTED resolves when its item left FAILED", () => {

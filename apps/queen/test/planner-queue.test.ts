@@ -133,3 +133,20 @@ describe("planner ↔ merge queue", () => {
     expect(stale.mergeResult({ ...result, trainId: "nope" }).outcome).toBe("ignored:unknown");
   });
 });
+
+describe("planner ↔ merge queue: infrastructure", () => {
+  it("a car whose integration gate could not run (cause infra) is re-deployed and re-gated, not bisected; members stay aboard", () => {
+    const r = hive("TESTING").planner().trainResult({ trainId: "K1", passed: false, summary: "Gatekeeper could not inspect the push: HTTP Error: 503 Service Unavailable", cause: "infra" });
+    expect(r.outcome).toBe("applied");
+    const byId = new Map(r.trains.map((t) => [t.trainId, t]));
+    expect(byId.get("K1")).toMatchObject({ phase: "DEPLOYING", deployState: "FAILED", deployIssuedAt: 1000 });
+    for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)?.phase ?? "PASSED").toBe("PASSED");
+    expect(r.executorLost).toBeUndefined();
+    expect(r.prompts.every((p) => p.attempts === 0)).toBe(true);
+  });
+
+  it("a car gate VERDICT (no cause) still bisects", () => {
+    const r = hive("TESTING").planner().trainResult({ trainId: "K1", passed: false, summary: "smoke failed on /health" });
+    expect(r.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "EJECTED" });
+  });
+});

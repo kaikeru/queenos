@@ -34,6 +34,12 @@ const BASE_STEPS = [
   { key: "SHIPPED", label: "SHIPPED" },
 ] as const;
 
+function canaryPosition(r: Release, peak: number): number {
+  const pct = r.phase === "CANARY" ? (r.canaryPercent ?? 0) : Math.max(peak, r.canaryPercent ?? 0);
+  const i = CANARY_STEPS.findIndex((s) => s >= pct && pct > 0);
+  return 3 + (i < 0 ? 0 : i);
+}
+
 /** Index into BASE_STEPS of where the release is (SHIPPED = past the end). */
 function positionOf(r: Release, peak: number): number {
   switch (r.phase) {
@@ -44,14 +50,13 @@ function positionOf(r: Release, peak: number): number {
     case "AWAITING_TAP":
       return 2;
     case "CANARY":
-    case "ROLLED_BACK": {
-      const pct = r.phase === "CANARY" ? (r.canaryPercent ?? 0) : Math.max(peak, r.canaryPercent ?? 0);
-      const i = CANARY_STEPS.findIndex((s) => s >= pct && pct > 0);
-      return 3 + (i < 0 ? 0 : i);
-    }
+    case "ROLLED_BACK":
+      return canaryPosition(r, peak);
     case "SHIPPED":
       return BASE_STEPS.length;
     case "FAILED":
+      // Tapped = it failed in canary (not at VALIDATING, even though it has a staging URL).
+      if (r.tappedAt !== null) return canaryPosition(r, peak);
       return r.stagingUrl ? 1 : 0;
     case "SUPERSEDED":
       return -1;
@@ -84,7 +89,7 @@ export function phaseHeadline(r: Release): string {
     case "SHIPPED":
       return "Shipped to production";
     case "FAILED":
-      return "Failed before shipping";
+      return r.tappedAt !== null ? "Canary failed" : "Failed before shipping";
     case "ROLLED_BACK":
       return "Canary failed. Rolled back to the stable version";
     case "SUPERSEDED":

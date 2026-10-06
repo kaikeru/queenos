@@ -14,7 +14,7 @@
  */
 import type { WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import { spanIdFor, type AppendAuditInput, type AuditEvent, type AuditStatus, type DroneRole, type FollowUp, type GateScore, type GateTarget, type GitNotesPayload, type MemoryOutcome, type TrainLane } from "@queenos/queen-types";
+import { isTransientError, retryTransient, spanIdFor, type AppendAuditInput, type AuditEvent, type AuditStatus, type DroneRole, type FollowUp, type GateScore, type GateTarget, type GitNotesPayload, type MemoryOutcome, type TrainLane } from "@queenos/queen-types";
 import { AiGatewayError, LedgerError, buildGitNotesPayload, composeMemoryText, memoryIdFor } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import { classifyPush, gateInstanceId, parsePushEvent, type GateTask } from "./event";
@@ -31,7 +31,14 @@ export interface StepRunner {
 }
 
 export const LOOKUP_STEP: WorkflowStepConfig = { retries: { limit: 4, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
-export const INSPECT_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" }, timeout: "5 minutes" };
+/**
+ * Clone + scan + test. Inside each try, transient Artifacts errors (5xx / 429) are retried with
+ * jitter first (retryTransient), so a swarm of gates does not retry in lockstep; then Workflows
+ * retries the step 3 more times (10 s, 20 s, 40 s). Only then is it reported, as infra.
+ */
+export const INSPECT_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }, timeout: "5 minutes" };
+/** In-step jittered tries of the inspect body on transient errors. */
+export const INSPECT_TRANSIENT_ATTEMPTS = 3;
 export const SCRIBE_STEP: WorkflowStepConfig = { retries: { limit: 2, delay: "3 seconds", backoff: "exponential" }, timeout: "2 minutes" };
 export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
 /** The reviewer retries internally (and fails open), so Workflows must not retry it again. */
@@ -52,6 +59,8 @@ export function isPermanentQueenError(e: unknown): boolean {
 /** Errors that will not get better on retry become NonRetryableError inside steps. */
 export function toStepError(e: unknown): unknown {
   if (e instanceof NonRetryableError) return e;
+  // An HTTP 503 / 429 / 5xx (e.g. isomorphic-git "HTTP Error: 503 Service Unavailable") is always worth a retry.
+  if (isTransientError(e)) return e;
   const permanent = e instanceof NotImplementedError || (e instanceof AiGatewayError && !e.retryable) || e instanceof LedgerError || /^(INVALID_INPUT|NOT_FOUND|CONFLICT|UNAVAILABLE): /.test(messageOf(e));
   return permanent ? new NonRetryableError(clip(messageOf(e), 1_000)) : e;
 }
@@ -206,6 +215,10 @@ export type GateRunResult =
       followUps?: FollowUp[];
       scribe?: ScribeResult["method"];
       vectorized?: number;
+      /** The gate itself could not run (reported with `cause: "infra"`). */
+      infra?: boolean;
+      /** Gate runs this instance made (> 1 after infra re-gates). */
+      rounds?: number;
     };
 
 interface Ctx {
@@ -216,17 +229,44 @@ interface Ctx {
   train: ReadyLookup;
 }
 
+/** Step names of round r > 1 get a suffix (Workflows caches steps by name; round 1 keeps its names for replay). */
+function roundSteps(step: StepRunner, round: number): StepRunner {
+  if (round === 1) return step;
+  return { do: (name, c, fn) => step.do(`${name} ~r${round}`, c, fn), sleep: (name, ms) => step.sleep(`${name} ~r${round}`, ms) };
+}
+
+/**
+ * Gate a push. When the gate itself fails on infrastructure it reports `cause: "infra"`; the Queen
+ * then re-deploys the preview (no attempt charged) and this instance waits for TESTING again and
+ * re-gates, up to `config.infraRounds` runs. It stops as soon as the Queen did not apply the report
+ * or the train left (ejected after the Queen's infra cap: EXECUTOR_LOST).
+ */
 export async function runGate(task: GateTask, step: StepRunner, ports: GatekeeperPorts, config: GateConfig): Promise<GateRunResult> {
+  let last: GateRunResult | null = null;
+  for (let round = 1; round <= config.infraRounds; round++) {
+    const s = roundSteps(step, round);
+    // Later rounds wait out the Queen's backoff (30 s .. 3 min) plus the re-deploy.
+    if (round > 1) await s.sleep("infra: wait for the re-deploy", config.phaseWaitMs);
+    const out = await gateRound(task, s, ports, config, round === 1 ? config.phaseRetries : config.phaseRetries * 3);
+    if (out.status !== "gated") return last ?? out;
+    const result = round > 1 ? { ...out, rounds: round } : out;
+    if (!out.infra || out.queenOutcome !== "applied") return result;
+    last = result;
+  }
+  return last!;
+}
+
+async function gateRound(task: GateTask, step: StepRunner, ports: GatekeeperPorts, config: GateConfig, lookups: number): Promise<GateRunResult> {
   // 1. Wait for the Queen to process the builder's build-result (push event vs RPC race).
   let train: ReadyLookup | null = null;
-  for (let i = 1; i <= config.phaseRetries; i++) {
+  for (let i = 1; i <= lookups; i++) {
     const look = await step.do(`lookup train #${i}`, LOOKUP_STEP, () => lookupTrain(ports.queen(task.hive), task));
     if (look.status === "ignored") return { status: "ignored", reason: look.reason };
     if (look.status === "ready") {
       train = look;
       break;
     }
-    if (i < config.phaseRetries) await step.sleep(`wait for TESTING #${i}`, config.phaseWaitMs);
+    if (i < lookups) await step.sleep(`wait for TESTING #${i}`, config.phaseWaitMs);
   }
   if (!train) return { status: "ignored", reason: "phase-timeout" };
 
@@ -244,7 +284,13 @@ export async function runGate(task: GateTask, step: StepRunner, ports: Gatekeepe
   const spec: IntegrationSpec | undefined = integration ? { baseSha: train.baseSha, routes: train.routes } : undefined;
   try {
     inspection = await step.do("inspect: clone, scan, test", INSPECT_STEP, () =>
-      inspectPush(ports, task, config, train.trainId, train.previewUrl, train.promptFull, spec).catch((e) => Promise.reject(toStepError(e))),
+      retryTransient(() => inspectPush(ports, task, config, train.trainId, train.previewUrl, train.promptFull, spec), {
+        attempts: INSPECT_TRANSIENT_ATTEMPTS,
+        baseMs: config.transientBaseMs,
+        maxMs: config.transientBaseMs * 8,
+        sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+        onRetry: (attempt, delayMs, err) => glog(ctx, "inspect", "transient-retry", { attempt, delayMs, error: clip(messageOf(err), 200) }),
+      }).catch((e) => Promise.reject(toStepError(e))),
     );
   } catch (e) {
     glog(ctx, "inspect", "infra-failure", { error: clip(messageOf(e), 200) });
@@ -468,7 +514,7 @@ function glog(ctx: Ctx, step: string, outcome: string, extra: Record<string, unk
   }
 }
 
-async function report(ctx: Ctx, passed: boolean, summary: string, extras: { score?: GateScore; followUps?: FollowUp[] } = {}): Promise<string> {
+async function report(ctx: Ctx, passed: boolean, summary: string, extras: { score?: GateScore; followUps?: FollowUp[]; cause?: "infra" } = {}): Promise<string> {
   return ctx.step.do("report: train result", REPORT_STEP, async () => {
     try {
       const r = await ctx.ports.queen(ctx.task.hive).reportTrainResult({ trainId: ctx.train.trainId, passed, summary, commitSha: ctx.task.after, ...extras });
@@ -480,7 +526,11 @@ async function report(ctx: Ctx, passed: boolean, summary: string, extras: { scor
   });
 }
 
-/** The gate itself broke (clone failed, sandbox not implemented, ...): eject rather than hang in TESTING. */
+/**
+ * The gate itself broke (clone failed after its retries, sandbox not implemented, ...): report it as
+ * infrastructure (`cause: "infra"`), never as a verdict on the change. The Queen re-deploys and
+ * re-gates (no attempt charged), then opens EXECUTOR_LOST past its cap.
+ */
 async function failInfra(ctx: Ctx, err: unknown): Promise<GateRunResult> {
   const summary = clip(`Gatekeeper could not inspect the push: ${messageOf(err)}`, MAX_SUMMARY_CHARS);
   const steps = [summary];
@@ -496,8 +546,8 @@ async function failInfra(ctx: Ctx, err: unknown): Promise<GateRunResult> {
     }
     return { recorded: true };
   });
-  const queenOutcome = await report(ctx, false, summary);
-  return { status: "gated", trainId: ctx.train.trainId, passed: false, summary, queenOutcome, lane: ctx.train.lane };
+  const queenOutcome = await report(ctx, false, summary, { cause: "infra" });
+  return { status: "gated", trainId: ctx.train.trainId, passed: false, summary, queenOutcome, lane: ctx.train.lane, infra: true };
 }
 
 export const CHUNK_CHARS = 1_500;

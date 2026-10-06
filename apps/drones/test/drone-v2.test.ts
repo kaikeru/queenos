@@ -4,10 +4,10 @@ import { AiGatewayError, parseLedger } from "@queenos/hive-kit";
 import { DroneTaskSchema, spanIdFor, traceparent, type MergeResultInput } from "@queenos/queen-types";
 import { readConfig } from "../src/config";
 import { generateLive } from "../src/generate";
-import { AGENT_PHASE_MS, runAgentBuild } from "../src/agent/run";
+import { AGENT_PHASE_MS, MIN_MODEL_MS, runAgentBuild } from "../src/agent/run";
 import { AGENT_SYSTEM_PROMPT } from "../src/agent/prompt";
 import { FinishInputSchema, MAX_FOLLOW_UPS, runFinish, runVerify, EMPTY_TOOL_STATE, type DroneToolDeps, type ToolState } from "../src/agent/tools";
-import { MERGE_MODEL, runDrone } from "../src/orchestrate";
+import { AGENT_RETRY_DELAY_MS, AGENT_STEP_RETRIES, DroneFailedError, MERGE_MODEL, agentStepConfig, isInfraFailure, runDrone } from "../src/orchestrate";
 import type { MergeCarFn } from "../src/ports";
 import { FakeAgent, FakeLlm, FakeLoader, FakeWorld, InlineSteps, PASSING_VERIFY, STARTER_FILES, htmlAgent, starterResponses, task, type AgentScript } from "./fakes";
 
@@ -89,6 +89,87 @@ describe("429 / rate limit: retried with jittered backoff, never a failed model"
     expect(err).toBeInstanceOf(AiGatewayError);
     expect(err).toMatchObject({ status: 429, retryable: true });
     expect(err).not.toHaveProperty("failedModels");
+  });
+
+  // The live failure (2026-10-06, hive demo): 12 Think builders started together, 8 hit Workers AI's
+  // per-minute limit, the step's single 5 s retry re-attached to the spent submissions, and the drone
+  // reported a BUILD FAILURE: the Queen reworked the items (escalating the model) and added load.
+  const LIVE_429 = "3021: rate limiting: inference request per min rate reached";
+
+  it("agent step: a rate limit past the in-step retries makes the STEP retry with a long jittered delay, then builds; no failure report, no failedModels", async () => {
+    let fresh = 0;
+    const { w, agent } = await agentWorld(() => (input, files) => (++fresh <= 6 ? { status: "error", error: LIVE_429 } : htmlAgent(input, files)));
+    const steps = new InlineSteps();
+    const out = await runDrone(task({ modelChoice: choice("m-a", "m-b") }), steps, w.ports(), agentCfg, { instanceId: "t-build", backoff: backoff().opts });
+    expect(out.status).toBe("built");
+
+    // Step attempt 1: 4 in-step tries (keys 0..3), all 429. Step attempt 2 re-attaches to those 4 spent
+    // submissions without a model call, then starts key 4 (429), key 5 (429), key 6 (built).
+    expect(steps.log.find((l) => l.name === "agent: build")).toMatchObject({ attempts: 2, ok: true });
+    expect(agent.started).toEqual(["t-build:m-a", ...[1, 2, 3, 4, 5, 6].map((n) => `t-build:m-a:rl${n}`)]);
+    expect(agent.calls.filter((c) => c.input.model === "m-b")).toEqual([]); // the fallback was never charged with it
+    const [d] = steps.retryDelays;
+    expect(steps.retryDelays).toHaveLength(1);
+    expect(d!.error).toMatch(/rate limited: 3021/);
+    expect(d!.ms).toBeGreaterThanOrEqual(15_000);
+    expect(d!.ms).toBeLessThanOrEqual(30_000);
+
+    const q = w.queen("hive");
+    expect(q.calls.map((c) => c.method)).toEqual(["appendAudit", "reportBuildResult", "appendAudit"]);
+    const built = q.calls.find((c) => c.method === "reportBuildResult")!.input as { model: string; failedModels?: string[] };
+    expect(built.model).toBe("m-a");
+    expect(built.failedModels).toBeUndefined();
+    expect(steps.names()).not.toContain("report: build failure");
+  });
+
+  it("agent step: rate-limited through every step retry reports an INFRA outcome (cause: infra), never a build failure or failedModels", async () => {
+    const { w } = await agentWorld(() => () => ({ status: "error", error: LIVE_429 }));
+    const steps = new InlineSteps();
+    const err = await runDrone(task({ modelChoice: choice("m-a", "m-b") }), steps, w.ports(), agentCfg, { instanceId: "t-build", backoff: backoff().opts }).catch((e) => e);
+    expect(err).toBeInstanceOf(DroneFailedError);
+    expect(steps.log.find((l) => l.name === "agent: build")).toMatchObject({ attempts: AGENT_STEP_RETRIES + 1, ok: false });
+    // Every step retry waited a long, jittered, growing backoff (≤ 90 s each, ≤ 6 min in all).
+    expect(steps.retryDelays).toHaveLength(AGENT_STEP_RETRIES);
+    for (const d of steps.retryDelays) {
+      expect(d.ms).toBeGreaterThanOrEqual(15_000);
+      expect(d.ms).toBeLessThanOrEqual(90_000);
+    }
+    expect(steps.retryDelays.reduce((n, d) => n + d.ms, 0)).toBeLessThanOrEqual(6 * 60_000);
+
+    expect(steps.names()).toContain("report: infra failure");
+    expect(steps.names()).not.toContain("report: build failure");
+    const q = w.queen("hive");
+    const reports = q.calls.filter((c) => c.method === "reportTrainResult");
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.input).toMatchObject({ trainId: "train-1", passed: false, cause: "infra", commandId: "t-build" });
+    expect((reports[0]!.input as { summary: string }).summary).toMatch(/infrastructure limit \(not a build failure\).*rate limited: 3021/);
+    expect(q.calls.some((c) => c.method === "reportBuildResult")).toBe(false);
+    expect(JSON.stringify(q.calls)).not.toContain("failedModels");
+  });
+
+  it("agentStepConfig: rate limits wait 15-30 s, 30-60 s, then 45-90 s; other errors 5 s; never past the agent phase", () => {
+    const at = (attempt: number, error: Error, cfg = agentStepConfig(AGENT_PHASE_MS, () => 0, () => 0.5)) => {
+      const delay = cfg.retries!.delay as (i: { ctx: { attempt: number }; error: Error }) => number;
+      return delay({ ctx: { attempt }, error });
+    };
+    const rl = new Error("AiGatewayError: rate limited: 3021: rate limiting: inference request per min rate reached");
+    expect(agentStepConfig(0).retries).toMatchObject({ limit: AGENT_STEP_RETRIES, backoff: "constant" });
+    expect([1, 2, 3, 4, 5].map((a) => at(a, rl))).toEqual([22_500, 45_000, 67_500, 67_500, 67_500]);
+    expect(at(1, new AiGatewayError("AI run failed: 429", 429, true))).toBe(22_500);
+    expect(at(1, new Error("Durable Object reset because its code was updated."))).toBe(AGENT_RETRY_DELAY_MS);
+    // Near the deadline a long wait could no longer start a model: retry at once and fail fast as INFRA.
+    const late = agentStepConfig(AGENT_PHASE_MS, () => AGENT_PHASE_MS - MIN_MODEL_MS - 30_000, () => 0.5);
+    expect(at(1, rl, late)).toBe(22_500);
+    expect(at(2, rl, late)).toBe(1_000);
+  });
+
+  it("isInfraFailure: rate limits and INFRA (budget used up by retries) are infra; model and gate failures are not", () => {
+    expect(isInfraFailure(new Error(`AiGatewayError: rate limited: ${LIVE_429}`))).toBe(true);
+    expect(isInfraFailure(new AiGatewayError("AI run failed: 429 Too Many Requests", 429, true))).toBe(true);
+    expect(isInfraFailure(new Error("INFRA: agent wall-time budget used up by retries before any model could run (AI rate limits?)"))).toBe(true);
+    expect(isInfraFailure(new Error("NonRetryableError: INFRA: agent wall-time budget used up"))).toBe(true);
+    expect(isInfraFailure(new Error("no verified change from any model: m-a: no accepted finish after 16 step(s)"))).toBe(false);
+    expect(isInfraFailure(new Error("3046: Request timeout"))).toBe(false);
   });
 
   it("agent: other provider errors are still plain failures (failedModels) with no backoff", async () => {

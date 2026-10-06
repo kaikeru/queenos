@@ -227,6 +227,43 @@ describe("router: exploration", () => {
   });
 });
 
+describe("router: load spread (Workers AI limits are per model)", () => {
+  it("moves a dispatch to the least-in-flight model of the same tier, round-robin across a burst", () => {
+    const inFlight: Record<string, number> = {};
+    const picks: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const c = build({ inFlight: { ...inFlight } });
+      picks.push(c.model);
+      inFlight[c.model] = (inFlight[c.model] ?? 0) + 1;
+      expect(c.tier).toBe("fast");
+    }
+    expect(picks).toEqual([DS_FLASH, GLM_FLASH, DS_FLASH, GLM_FLASH, DS_FLASH, GLM_FLASH]);
+    const spread = build({ inFlight: { [DS_FLASH]: 3, [GLM_FLASH]: 1 } });
+    expect(spread).toMatchObject({ model: GLM_FLASH, fallbacks: [DS_FLASH, KIMI] });
+    expect(spread.reason).toContain("spread: 3 in flight on DeepSeek V4 Flash, 1 here");
+  });
+
+  it("never crosses tiers, never overrides a pin, and skips a much worse model", () => {
+    // Escalated (frontier) dispatches spread among the frontier models only.
+    const r = chooseModel({ role: "rework", attempt: 2, promptChars: 200, stats: [], inFlight: { [KIMI]: 2 } });
+    expect(r.tier).toBe("frontier");
+    expect(r.model).not.toBe(KIMI);
+    expect(build({ pin: GLM, inFlight: { [GLM]: 9 } }).model).toBe(GLM);
+    // GLM Flash at 1/10 is worth < half of DS Flash at 9/10: load stays on DS Flash.
+    expect(build({ stats: [stat(DS_FLASH, 10, 9), stat(GLM_FLASH, 10, 1)], inFlight: { [DS_FLASH]: 4 } }).model).toBe(DS_FLASH);
+    // No load: unchanged choice.
+    expect(build({ inFlight: {} }).model).toBe(DS_FLASH);
+  });
+
+  it("the floor moves exactly as without the spread", () => {
+    const a = route({ role: "builder", attempt: 1, promptChars: 200, stats: [], floor: frontierFloor });
+    const b = route({ role: "builder", attempt: 1, promptChars: 200, stats: [], floor: frontierFloor, inFlight: { [a.choice.model]: 5 } });
+    expect(b.floor).toEqual(a.floor);
+    expect(b.choice.tier).toBe(a.choice.tier);
+    expect(b.choice.model).not.toBe(a.choice.model);
+  });
+});
+
 describe("router: pin and fallbacks", () => {
   it("MODEL_ROUTER_PIN_BUILDER forces the model; blank is ignored; no exploration and no floor counters", () => {
     const r = route({ role: "builder", attempt: 1, promptChars: 10, stats: [], pin: GLM, dispatchIndex: 5, floor: { ...frontierFloor, aboveStreak: 1 } });

@@ -21,6 +21,10 @@ import {
   type QueueOptions,
   type RaceSettings,
   type TrainRecord,
+  INFRA_RETRY_BASE_MS,
+  MAX_INFRA_ATTEMPTS,
+  infraRetryAt,
+  infraRetryDelayMs,
 } from "../src/train/planner";
 
 type Fork = Extract<ProvisionCommand, { op: "FORK" }>;
@@ -590,9 +594,10 @@ describe("planner: async forks", () => {
     }
     const [last] = s.takeOp("FORK");
     s.run((p) => p.provisionResult({ commandId: last!.commandId, op: "FORK", trainId: "t1", ok: false, summary: "Artifacts 503" }));
-    expect(s.trains.get("t1")).toMatchObject({ phase: "EJECTED", reason: "failed: fork failed: Artifacts 503" });
-    expect(s.trainOf("A")).toMatchObject({ trainId: "t2", action: "REWORK" });
-    expect(s.prompts.get("A")).toMatchObject({ attempts: 1, summary: "Artifacts 503" });
+    // Infrastructure, not the change: no rework charged; the item gets EXECUTOR_LOST (infraFailed).
+    expect(s.trains.get("t1")).toMatchObject({ phase: "EJECTED", reason: "failed on infrastructure: fork failed: Artifacts 503" });
+    expect(s.trains.has("t2")).toBe(false);
+    expect(s.prompts.get("A")).toMatchObject({ attempts: 0, status: "FAILED" });
   });
 
   it("records DELETE results: ok, duplicate, stale and failed", () => {
@@ -789,11 +794,11 @@ describe("planner: command watchdog", () => {
     s.run((p) => p.reconcile());
     expect(s.trains.get("t1")).toMatchObject({
       phase: "EJECTED",
-      reason: `failed: fork failed: Provisioner FORK t1-fork-${MAX_FORK_ATTEMPTS} did not report within 10 min (executor lost?)`,
+      reason: `failed on infrastructure: fork failed: Provisioner FORK t1-fork-${MAX_FORK_ATTEMPTS} did not report within 10 min (executor lost?)`,
     });
-    // Same path as ok:false: the prompt is re-queued as a rework with a fresh fork.
-    expect(s.trainOf("A")).toMatchObject({ trainId: "t2", action: "REWORK", forkCommandId: "t2-fork-1" });
-    expect(s.prompts.get("A")).toMatchObject({ attempts: 1, status: "QUEUED" });
+    // Same path as ok:false: the executor is lost, so no rework is charged (EXECUTOR_LOST on the item).
+    expect(s.trains.has("t2")).toBe(false);
+    expect(s.prompts.get("A")).toMatchObject({ attempts: 0, status: "FAILED" });
     expect(s.takeOp("DELETE").map((c) => c.commandId)).toEqual(["t1-delete-1"]);
   });
 
@@ -813,7 +818,8 @@ describe("planner: command watchdog", () => {
     s.now += T;
     s.run((p) => p.reconcile());
     expect(s.trains.get("t1")).toMatchObject({ phase: "EJECTED", deployState: "TEARING_DOWN" });
-    expect(s.trains.get("t1")!.reason).toMatch(/^failed: preview deploy failed: Herald DEPLOY t1-deploy-3 did not report/);
+    expect(s.trains.get("t1")!.reason).toMatch(/^failed on infrastructure: preview deploy failed: Herald DEPLOY t1-deploy-3 did not report/);
+    expect(s.prompts.get("A")).toMatchObject({ attempts: 0, status: "FAILED" });
     expect(s.deployments.get("preview-t1")).toMatchObject({ status: "FAILED" });
     expect(s.takeOp("TEARDOWN").map((c) => c.commandId)).toEqual(["t1-teardown-1"]);
   });
@@ -1055,6 +1061,61 @@ describe("planner: model router", () => {
     s.build("A");
     s.result("A", true);
     expect(s.floor).toEqual({ tier: "fast", passStreak: 0, aboveStreak: 0, note: "dropped to fast after a probe passed" });
+  });
+
+  it("an INFRA builder failure (AI rate limits) re-dispatches the drone: no rework, no model failure, floor and prompt attempts untouched", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.take("dispatchDrone");
+    s.run((p) => p.dispatched("t1", "BUILDING"));
+    const before = { floor: { ...s.floor }, deltas: s.deltas.length };
+    const r = s.run((p) => p.trainResult({ trainId: "t1", passed: false, summary: "rate limited: 3021", cause: "infra", commandId: "t1-build" }));
+    expect(r.outcome).toBe("applied");
+    expect(s.trains.get("t1")).toMatchObject({ phase: "BUILDING", action: "BUILD", droneAttempt: 2, dispatched: false, modelOutcome: null });
+    expect(s.prompts.get("A")).toMatchObject({ attempts: 0 });
+    expect(s.deltas).toHaveLength(before.deltas);
+    expect(s.floor).toEqual(before.floor);
+    const [again] = s.take("dispatchDrone");
+    expect(again).toMatchObject({ trainId: "t1", attempt: 2, task: { action: "BUILD" } });
+    // A late or duplicate infra report from the superseded attempt is stale.
+    expect(s.run((p) => p.trainResult({ trainId: "t1", passed: false, summary: "late", cause: "infra", commandId: "t1-build" })).outcome).toBe("ignored:stale");
+    expect(s.trains.get("t1")!.droneAttempt).toBe(2);
+    // The re-dispatched drone then builds and passes normally.
+    s.run((p) => p.dispatched("t1", "BUILDING"));
+    s.build("A");
+    s.result("A", true);
+    expect(s.status("A")).not.toBe("EJECTED");
+    expect(s.floor.tier).toBe("fast");
+  });
+
+  it("past the drone attempt cap an INFRA failure fails the item on infrastructure (EXECUTOR_LOST), not as a rework", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    for (let n = 1; n < MAX_COMMAND_ATTEMPTS; n++) {
+      s.run((p) => p.dispatched("t1", "BUILDING"));
+      const id = n === 1 ? "t1-build" : `t1-build-${n}`;
+      expect(s.run((p) => p.trainResult({ trainId: "t1", passed: false, summary: "rate limited", cause: "infra", commandId: id })).outcome).toBe("applied");
+    }
+    s.run((p) => p.dispatched("t1", "BUILDING"));
+    s.run((p) => p.trainResult({ trainId: "t1", passed: false, summary: "rate limited", cause: "infra", commandId: `t1-build-${MAX_COMMAND_ATTEMPTS}` }));
+    expect(s.trains.get("t1")).toMatchObject({ phase: "EJECTED", reason: "failed on infrastructure: rate limited" });
+    expect(s.prompts.get("A")).toMatchObject({ attempts: 0, status: "FAILED" });
+    expect(() => s.trainOf("A")).toThrow(); // no rework train
+    expect(s.results.at(-1)!.infraFailed).toEqual([{ promptId: "A", summary: "rate limited" }]);
+  });
+
+  it("concurrent BUILD dispatches spread across the tier's builder models (Workers AI limits are per model); the floor is unchanged", () => {
+    const s = new Sim();
+    s.submit("A", "B", "C", "D");
+    s.completeForks();
+    const models = dispatchOf(s).map((d) => d.task.modelChoice!);
+    expect(models.map((m) => m.model)).toEqual([DS_FLASH, GLM_FLASH, DS_FLASH, GLM_FLASH]);
+    expect(models.every((m) => m.tier === "fast")).toBe(true);
+    expect(models[1]!.reason).toContain("spread: 1 in flight on DeepSeek V4 Flash, 0 here");
+    expect(models[1]!.fallbacks[0]).toBe(DS_FLASH);
+    expect(s.floor).toMatchObject({ tier: "fast" });
   });
 
   it("honours the pin and the policy from the context; every 5th decision explores", () => {
@@ -1508,4 +1569,101 @@ describe("planner: War Room views", () => {
     expect(toMergeTrainV2(t)).not.toHaveProperty("lane");
     expect(toMergeTrainV2({ ...t, lane: "QUEUE", members: ["x"] })).toMatchObject({ lane: "QUEUE", members: ["x"] });
   });
+});
+
+describe("planner: infrastructure failures (one path: no attempt charged, bounded, then EXECUTOR_LOST)", () => {
+  const deployFail = (s: Sim, commandId: string, retryable: boolean, summary = "Preview deploy failed: HttpError: HTTP Error: 503 Service Unavailable") =>
+    s.run((p) => p.deployResult({ commandId, op: "DEPLOY", environment: "preview", trainId: "t1", ok: false, retryable, summary }));
+  const waitOut = (s: Sim) => {
+    const t = s.trains.get("t1")!;
+    const at = infraRetryAt(t, s.now);
+    expect(at).not.toBeNull();
+    s.now = at!;
+    return s.run((p) => p.reconcile());
+  };
+
+  it("a retryable (503) preview deploy is re-deployed after a jittered backoff via the alarm: no rework, attempts untouched", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.build("A", false);
+    expect(s.takeOp("DEPLOY").map((c) => c.commandId)).toEqual(["t1-deploy-1"]);
+    expect(deployFail(s, "t1-deploy-1", true).outcome).toBe("applied");
+    const t = s.trains.get("t1")!;
+    expect(t).toMatchObject({ phase: "DEPLOYING", deployState: "FAILED", deployIssuedAt: s.now });
+    expect(s.prompts.get("A")).toMatchObject({ attempts: 0, status: "IN_TRAIN" });
+    expect(s.takeOp("DEPLOY")).toEqual([]); // not at once: backoff
+    const delay = infraRetryDelayMs(t);
+    expect(delay).toBeGreaterThanOrEqual(INFRA_RETRY_BASE_MS / 2);
+    expect(delay).toBeLessThan(INFRA_RETRY_BASE_MS * 1.5);
+    // The alarm is armed for the retry (well before the 10 min watchdog).
+    expect(watchdogDeadline([...s.trains.values()], DEFAULT_COMMAND_TIMEOUT_MS, s.now)).toBe(s.now + delay);
+    // Early reconcile: still waiting.
+    s.now += 1;
+    s.run((p) => p.reconcile());
+    expect(s.takeOp("DEPLOY")).toEqual([]);
+    waitOut(s);
+    expect(s.takeOp("DEPLOY").map((c) => c.commandId)).toEqual(["t1-deploy-2"]);
+    s.run((p) => p.deployResult({ commandId: "t1-deploy-2", op: "DEPLOY", environment: "preview", trainId: "t1", ok: true, url: url("t1") }));
+    expect(s.trains.get("t1")).toMatchObject({ phase: "TESTING", deployState: "LIVE" });
+    s.result("A", true);
+    expect(s.trains.get("t1")!.phase).toMatch(/^(PASSED|LANDING)$/); // passed its gate (direct landing without a queue)
+    expect(s.prompts.get("A")!.attempts).toBe(0);
+  });
+
+  it("a non-retryable preview failure (the change: bad module) still reworks", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.build("A", false);
+    s.takeOp("DEPLOY");
+    deployFail(s, "t1-deploy-1", false, "Uncaught SyntaxError");
+    expect(s.trains.get("t1")!.phase).toBe("EJECTED");
+    expect(s.trainOf("A")).toMatchObject({ action: "REWORK" });
+    expect(s.prompts.get("A")!.attempts).toBe(1);
+  });
+
+  it("a gate that could not run (cause infra in TESTING, no commandId) re-deploys and re-gates; it never reworks", () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.build("A");
+    expect(s.trains.get("t1")!.phase).toBe("TESTING");
+    const r = s.run((p) => p.trainResult({ trainId: "t1", passed: false, summary: "Gatekeeper could not inspect the push: HttpError: HTTP Error: 503 Service Unavailable", cause: "infra" }));
+    expect(r.outcome).toBe("applied");
+    expect(s.trains.get("t1")).toMatchObject({ phase: "DEPLOYING", deployState: "FAILED" });
+    expect(s.prompts.get("A")).toMatchObject({ attempts: 0 });
+    expect(s.deltas.filter((d) => d.failures > 0)).toEqual([]); // not a model failure
+    expect(s.events.some((e) => /infra retry 1\/2/.test(e.summary))).toBe(true);
+    waitOut(s);
+    s.completeDeploys();
+    expect(s.trains.get("t1")!.phase).toBe("TESTING");
+    s.result("A", true);
+    expect(s.trains.get("t1")!.phase).toMatch(/^(PASSED|LANDING)$/); // passed its gate (direct landing without a queue)
+  });
+
+  it(`repeated infra failures stop after ${MAX_INFRA_ATTEMPTS} attempts with EXECUTOR_LOST (infraFailed), never REWORK_EXHAUSTED`, () => {
+    const s = new Sim();
+    s.submit("A");
+    s.completeForks();
+    s.build("A", false);
+    for (let n = 1; n < MAX_INFRA_ATTEMPTS; n++) {
+      const [c] = s.takeOp("DEPLOY");
+      expect(c!.commandId).toBe(`t1-deploy-${n}`);
+      deployFail(s, c!.commandId, true);
+      expect(s.trains.get("t1")!.phase).toBe("DEPLOYING");
+      waitOut(s);
+    }
+    // The last deploy goes live, but then the gate cannot run: same cap (counted by deploy attempts).
+    const [last] = s.takeOp("DEPLOY");
+    expect(last!.commandId).toBe(`t1-deploy-${MAX_INFRA_ATTEMPTS}`);
+    s.run((p) => p.deployResult({ commandId: last!.commandId, op: "DEPLOY", environment: "preview", trainId: "t1", ok: true, url: url("t1") }));
+    const r = s.run((p) => p.trainResult({ trainId: "t1", passed: false, summary: "Gatekeeper could not inspect the push: HTTP Error: 503", cause: "infra" }));
+    expect(s.trains.get("t1")).toMatchObject({ phase: "EJECTED" });
+    expect(s.trains.get("t1")!.reason).toMatch(/^failed on infrastructure: gate could not run: .*503.*\(after 3 attempts\)$/);
+    expect(s.prompts.get("A")).toMatchObject({ status: "FAILED", attempts: 0 });
+    expect(r.infraFailed).toEqual([{ promptId: "A", summary: expect.stringContaining("gate could not run") }]);
+    expect([...s.trains.values()].filter((t) => t.action === "REWORK")).toEqual([]);
+  });
+
 });

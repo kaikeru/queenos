@@ -10,7 +10,8 @@
  *   ship            → ReleasePlanner.tap(releaseId, user)
  *   hold            → nothing (the release stays parked; auto-ship is blocked for it)
  *   retry           → WorkPlanner.retry(itemId) (attempts and conflicts reset),
- *                     or resume merge-car formation (EXECUTOR_LOST on the hive)
+ *                     or resume merge-car formation (EXECUTOR_LOST on the hive),
+ *                     or ReleasePlanner.retry(releaseId) (EXECUTOR_LOST on a release)
  *   cancel          → WorkPlanner.cancel(itemId)
  *   resume_autonomy → rollback streak = 0, error budget waived until the next failure,
  *                     sibling degradation escalations resolved
@@ -128,6 +129,8 @@ export function escalationResolvedEvent(e: Escalation): EventDraft {
 export type EscalationIntent =
   /** ReleasePlanner.tap(releaseId, user). */
   | { type: "release.tap"; releaseId: string; user: string }
+  /** ReleasePlanner.retry(releaseId, user): re-run the step infrastructure stopped (EXECUTOR_LOST on a release). */
+  | { type: "release.retry"; releaseId: string; user: string }
   /** WorkPlanner.retry(itemId): FAILED → READY, attempts and conflicts reset. */
   | { type: "work.retry"; itemId: string; user: string; resetAttempts: true; resetConflicts: true }
   /** WorkPlanner.cancel(itemId). */
@@ -241,6 +244,7 @@ export class EscalationPlanner {
    * Resolve escalations whose subject moved on without a human:
    * - APPROVAL_REQUIRED / SENTINEL_INCONCLUSIVE whose release left AWAITING_TAP
    *   (SUPERSEDED → `superseded`; tapped or otherwise → `cleared: release <phase>`);
+   * - EXECUTOR_LOST on a release that is no longer parked (superseded or ended);
    * - REWORK_EXHAUSTED whose item is no longer FAILED (retried or cancelled elsewhere).
    * Subjects not listed are left alone.
    */
@@ -257,6 +261,11 @@ export class EscalationPlanner {
         if (phase === undefined || phase === "AWAITING_TAP") continue;
         // A canary-time SENTINEL_INCONCLUSIVE is informational (ack only): it outlives its release.
         if (!e.actions.includes("ship")) continue;
+        this.settle(e, QUEEN_ACTOR, phase === "SUPERSEDED" ? SUPERSEDED_RESOLUTION : `cleared: release ${phase.toLowerCase()}`);
+      } else if (e.reason === "EXECUTOR_LOST" && e.subject.type === "release") {
+        // A release parked on infrastructure that moved on without a retry (superseded, or ended).
+        const phase = releases.get(e.subject.id);
+        if (phase === undefined || phase === "STAGING" || phase === "AWAITING_TAP" || phase === "CANARY") continue;
         this.settle(e, QUEEN_ACTOR, phase === "SUPERSEDED" ? SUPERSEDED_RESOLUTION : `cleared: release ${phase.toLowerCase()}`);
       } else if (e.reason === "REWORK_EXHAUSTED" && e.subject.type === "item") {
         const status = items.get(e.subject.id);
@@ -291,6 +300,7 @@ export class EscalationPlanner {
           return [{ type: "work.retry", itemId: id, user, resetAttempts: true, resetConflicts: true }];
         }
         if (type === "hive" && e.reason === "EXECUTOR_LOST") return [{ type: "queue.resume" }];
+        if (type === "release" && e.reason === "EXECUTOR_LOST") return [{ type: "release.retry", releaseId: id, user }];
         return null;
       case "cancel":
         if (type !== "item") return null;

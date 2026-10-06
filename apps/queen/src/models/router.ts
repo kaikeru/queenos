@@ -30,6 +30,14 @@
  * 4. Exploration: every EXPLORE_EVERY-th router decision in a hive
  *    (`dispatchIndex % EXPLORE_EVERY === 0`, 1-based) picks the least-tried
  *    candidate in the chosen model's tier (fewest attempts, then value order).
+ * 4b. Load spread: Workers AI rate limits are per model, so when the pick
+ *    already has builder drones in flight (`inFlight`, counted by the planner,
+ *    including dispatches earlier in the same decision), the candidate in the
+ *    same tier with the fewest in flight wins (ties: value order), provided its
+ *    value is at least SPREAD_MIN_VALUE_RATIO of the pick's. Twelve builds
+ *    dispatched together alternate between the tier's builder models instead
+ *    of all landing on the cheapest one. Never with a pin; never changes the
+ *    tier, so the floor (AIMD) moves exactly as before.
  * 5. Fallbacks: the next best candidates in the chosen tier, then the best one
  *    tier up, at most MAX_FALLBACKS.
  * 6. Pin (MODEL_ROUTER_PIN_BUILDER) forces the model for builder and rework
@@ -88,6 +96,8 @@ export interface ChooseModelInput {
   dispatchIndex?: number;
   floor?: FloorState;
   policy?: RouterPolicy;
+  /** Builder/rework drones in flight per model id in this hive (load spread, step 4b). */
+  inFlight?: Readonly<Record<string, number>>;
 }
 
 export interface RouteResult {
@@ -110,6 +120,8 @@ export const EXPLORE_EVERY = 5;
 export const SLOW_FACTOR = 0.8;
 export const SLOW_BUILD_MS = 120_000;
 export const MAX_FALLBACKS = 2;
+/** Load spread only moves to a same-tier model worth at least this share of the pick's value. */
+export const SPREAD_MIN_VALUE_RATIO = 0.5;
 
 /** Builder and rework run the drone tool loop; the catalog says which models can. */
 const canToolLoop = (m: CatalogModel) => m.toolLoop !== false;
@@ -249,12 +261,23 @@ export function route(input: ChooseModelInput): RouteResult {
   const tierOf = (r: Ranked) => r.model.tier;
   let detail = pick.attempts > 0 ? `best value ${pick.passes}/${pick.attempts} @ cost ${pick.model.cost}` : "no track record yet; lowest cost";
   const explore = !pin && (input.dispatchIndex ?? 0) > 0 && input.dispatchIndex! % EXPLORE_EVERY === 0;
+  let explored = false;
   if (explore) {
     const sameTier = ranked.filter((r) => tierOf(r) === tierOf(pick));
     const least = [...sameTier].sort((a, b) => a.attempts - b.attempts || ranked.indexOf(a) - ranked.indexOf(b))[0]!;
     if (least !== pick) {
       pick = least;
+      explored = true;
       detail = `exploring least-tried (${least.attempts} attempt${least.attempts === 1 ? "" : "s"}; every ${EXPLORE_EVERY}th dispatch)`;
+    }
+  }
+  const load = (r: Ranked) => input.inFlight?.[r.model.id] ?? 0;
+  if (!pin && !explored && load(pick) > 0) {
+    const peers = ranked.filter((r) => tierOf(r) === tierOf(pick) && r.value >= pick.value * SPREAD_MIN_VALUE_RATIO);
+    const least = [...peers].sort((a, b) => load(a) - load(b) || ranked.indexOf(a) - ranked.indexOf(b))[0]!;
+    if (least !== pick && load(least) < load(pick)) {
+      detail = `spread: ${load(pick)} in flight on ${pick.model.label}, ${load(least)} here`;
+      pick = least;
     }
   }
   const tier = tierOf(pick);

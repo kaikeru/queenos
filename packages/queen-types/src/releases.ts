@@ -31,6 +31,15 @@ export const ReleasePhaseSchema = z.enum([
 ]);
 export type ReleasePhase = z.infer<typeof ReleasePhaseSchema>;
 
+/**
+ * Summary prefix of a release stopped by infrastructure (a deploy that kept hitting 5xx / 429, a lost
+ * executor, an inconclusive canary), not by its change. Such a release is parked rather than failed;
+ * if it still ends FAILED (its traffic rollback failed too), it never counts against the error budget
+ * or the rollback streak and files no bug.
+ */
+export const INFRA_SUMMARY_PREFIX = "Infrastructure: ";
+export const isInfraStopped = (r: { summary?: string | null }): boolean => r.summary?.startsWith(INFRA_SUMMARY_PREFIX) ?? false;
+
 export const ReleaseSchema = z.object({
   releaseId: z.string().min(1),
   hive: z.string().min(1),

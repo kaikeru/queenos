@@ -27,6 +27,7 @@
  * A dependency that is not loaded is "unknown" and keeps its dependent BLOCKED.
  */
 import {
+  isInfraStopped,
   CHILD_DEDUPE_THRESHOLD,
   DEDUPE_THRESHOLD,
   MODEL_CATALOG,
@@ -177,6 +178,8 @@ export interface AbsorbPrompt {
   attempts?: number;
   /** Merge-conflict reworks so far, when the train planner tracks them (mirrored; D7). */
   conflicts?: number;
+  /** FAILED on infrastructure (executor / infra retries spent), not by the change: EXECUTOR_LOST, not REWORK_EXHAUSTED. */
+  infra?: boolean;
 }
 
 /** Train-planner train rows (structurally: TrainRecord). */
@@ -750,7 +753,7 @@ export class WorkPlanner {
         }
       }
       if (p.status === "MERGED") this.setStatus(item, "LANDED", "queen");
-      else if (p.status === "FAILED") this.failItem(item, p.summary ?? null);
+      else if (p.status === "FAILED") this.failItem(item, p.summary ?? null, p.infra === true);
     }
 
     for (const t of input.trains ?? []) {
@@ -791,6 +794,8 @@ export class WorkPlanner {
       return;
     }
     if (r.phase !== "ROLLED_BACK" && r.phase !== "FAILED") return;
+    // Bugs only for failures attributable to the change; a release stopped by infrastructure files none.
+    if (isInfraStopped({ summary: r.summary ?? null })) return;
     // One Queen bug per release (exact ref check): a repeated release row changes nothing.
     const prior = [...this.items.values()].some((i) => i.source.kind === "queen" && i.source.releaseId === r.releaseId);
     if (prior) return;
@@ -1203,8 +1208,18 @@ export class WorkPlanner {
     this.event("item.status", item, why ?? `${from} → ${status}`, { from, to: status, kind: item.kind }, actor, status === "FAILED" ? "warn" : "info");
   }
 
-  private failItem(item: WorkItemRecord, summary: string | null): void {
-    this.setStatus(item, "FAILED", "queen", summary ? `failed: ${clip(summary, 200)}` : "failed");
+  private failItem(item: WorkItemRecord, summary: string | null, infra = false): void {
+    this.setStatus(item, "FAILED", "queen", summary ? `failed${infra ? " on infrastructure" : ""}: ${clip(summary, 200)}` : "failed");
+    if (infra) {
+      // Not the change: the executors kept failing (5xx / 429 / lost). Retry re-runs it with attempts reset.
+      this.openEscalation(
+        "EXECUTOR_LOST",
+        { type: "item", id: item.itemId },
+        clip(`"${clip(item.title, 80)}" stopped: infrastructure kept failing after its retries (no rework charged; ${item.attempts} reworks so far). ${summary ?? ""}`.trim(), 500),
+        item.traceId,
+      );
+      return;
+    }
     this.openEscalation(
       "REWORK_EXHAUSTED",
       { type: "item", id: item.itemId },

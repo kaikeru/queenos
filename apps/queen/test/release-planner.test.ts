@@ -12,6 +12,7 @@ import {
   type SentinelSettings,
 } from "../src/release/planner";
 import { DEFAULT_COMMAND_TIMEOUT_MS, MAX_COMMAND_ATTEMPTS } from "../src/train/planner";
+import { isReleaseFailure } from "../src/autonomy/policy";
 
 type Deploy = Extract<DeployCommand, { op: "DEPLOY" }>;
 type Rollback = Extract<DeployCommand, { op: "ROLLBACK" }>;
@@ -482,7 +483,7 @@ describe("release planner: watchdog and reconcile", () => {
     expect(s.rel("r1").deployIssuedAt).toBe(1000);
   });
 
-  it("a stuck staging deploy is re-issued under new ids (old ids stale), then FAILED", () => {
+  it("a stuck staging deploy is re-issued under new ids (old ids stale), then parked on infrastructure (EXECUTOR_LOST, not FAILED)", () => {
     const s = new RSim();
     s.land("t1");
     s.herald();
@@ -494,8 +495,9 @@ describe("release planner: watchdog and reconcile", () => {
     expect(s.deployResult({ commandId: "r1-staging-1" }, { url: STAGING_URL }).outcome).toBe("ignored:stale");
     s.now += T;
     s.run((p) => p.reconcile());
-    expect(s.rel("r1")).toMatchObject({ phase: "FAILED", pending: null });
-    expect(s.rel("r1").summary).toMatch(/^Herald DEPLOY r1-staging-3 did not report within 10 min/);
+    expect(s.rel("r1")).toMatchObject({ phase: "STAGING", pending: null });
+    expect(s.rel("r1").summary).toMatch(/^Infrastructure: staging deploy did not complete after 3 attempts: Herald DEPLOY r1-staging-3 did not report within 10 min/);
+    expect(s.open()).toEqual(["EXECUTOR_LOST:r1"]);
   });
 
   it("Sentinel gets max(COMMAND_TIMEOUT_MS, window + 5 min) before it is re-issued", () => {
@@ -515,7 +517,7 @@ describe("release planner: watchdog and reconcile", () => {
     expect(sentinelTimeoutMs(T, 60)).toBe(T);
   });
 
-  it("a canary verdict that never arrives (after the cap) is treated as unhealthy: rollback", () => {
+  it("a canary verdict that never arrives (after the cap) is infrastructure: traffic rolled back, then parked (not ROLLED_BACK, not counted)", () => {
     const s = RSim.canary1();
     s.sentinels();
     for (let n = 2; n <= MAX_COMMAND_ATTEMPTS + 1; n++) {
@@ -523,8 +525,12 @@ describe("release planner: watchdog and reconcile", () => {
       s.run((p) => p.reconcile());
     }
     expect(s.rel("r1")).toMatchObject({ phase: "CANARY", pending: "ROLLBACK" });
-    expect(s.rel("r1").summary).toMatch(/^Sentinel r1-verify1-3 did not report/);
+    expect(s.rel("r1").summary).toMatch(/^Infrastructure: Sentinel r1-verify1-3 did not report/);
     expect(s.herald()).toEqual([expect.objectContaining({ op: "ROLLBACK", commandId: "r1-rollback-1" })]);
+    s.deployResult({ commandId: "r1-rollback-1", op: "ROLLBACK", environment: "canary" });
+    expect(s.rel("r1")).toMatchObject({ phase: "AWAITING_TAP", tappedAt: null, candidateVersionId: null, canaryPercent: null });
+    expect(s.streak).toBe(0);
+    expect(s.open()).toEqual(["EXECUTOR_LOST:r1"]);
   });
 
   it("a stuck ROLLBACK is re-issued, then FAILED", () => {
@@ -749,18 +755,113 @@ describe("release planner: rollback streak and escalations", () => {
     expect(s.events.find((x) => x.type === "escalation.opened" && x.summary.startsWith("ROLLBACK_FAILED"))).toMatchObject({ severity: "error", releaseId: id });
   });
 
-  it("an inconclusive canary verdict rolls back and opens an informational SENTINEL_INCONCLUSIVE", () => {
+  it("an inconclusive canary verdict rolls traffic back, opens an informational SENTINEL_INCONCLUSIVE and parks (never counted)", () => {
     const s = RSim.canary1();
     s.verdict(s.sentinels().at(-1)!, "ROLLBACK", "too few requests", true);
-    expect(s.rel("r1").summary).toBe("Canary at 1% inconclusive: too few requests");
-    expect(s.herald()).toEqual([expect.objectContaining({ op: "ROLLBACK" })]);
+    expect(s.rel("r1").summary).toBe("Infrastructure: Canary at 1% inconclusive: too few requests");
+    const [rb] = s.herald();
+    expect(rb).toEqual(expect.objectContaining({ op: "ROLLBACK" }));
     expect(s.open()).toEqual(["SENTINEL_INCONCLUSIVE:r1"]);
     expect([...s.escalations.values()].find((e) => e.reason === "SENTINEL_INCONCLUSIVE")).toMatchObject({ actions: ["ack"] });
+    s.deployResult({ commandId: rb!.commandId, op: "ROLLBACK", environment: "canary" });
+    expect(s.rel("r1")).toMatchObject({ phase: "AWAITING_TAP", tappedAt: null });
+    expect(s.streak).toBe(0);
   });
 
   it("the streak passes through untouched when nothing ends", () => {
     const s = new RSim();
     s.streak = 5;
     expect(s.land("t1").rollbackStreak).toBe(5);
+  });
+});
+
+describe("release planner: infrastructure failures are never the change's fault", () => {
+  const HTTP503 = "Canary deploy failed: HttpError: HTTP Error: 503 Service Unavailable";
+
+  it("live 2026-10-06 (b2c25c89): a 1% canary deploy that keeps hitting Artifacts 503 is re-issued, then parked with EXECUTOR_LOST: no rollback, no FAILED, no streak", () => {
+    const s = RSim.awaitingTap({ autoShip: true });
+    expect(s.rel("r1").phase).toBe("CANARY");
+    for (let n = 1; n <= MAX_COMMAND_ATTEMPTS; n++) {
+      const id = s.rel("r1").deployCommandId!;
+      expect(id).toBe(`r1-canary1-${n}`);
+      s.deploys();
+      s.deployResult({ commandId: id }, { environment: "canary", ok: false, retryable: true, summary: HTTP503 });
+    }
+    expect(s.deploys()).toEqual([]); // nothing more, no ROLLBACK either (nothing was uploaded)
+    const r = s.rel("r1");
+    expect(r).toMatchObject({ phase: "AWAITING_TAP", pending: null, tappedAt: null, tappedBy: null, candidateVersionId: null });
+    expect(r.summary).toMatch(/^Infrastructure: Canary deploy at 1% did not complete after 3 attempts: .*503/);
+    expect(s.streak).toBe(0);
+    expect(s.open()).toEqual(["EXECUTOR_LOST:r1"]);
+    expect(isReleaseFailure(r)).toBe(false);
+    // Parked: the autonomous reconcile does not re-ship it on its own.
+    s.run((p) => p.reconcile());
+    expect(s.rel("r1").phase).toBe("AWAITING_TAP");
+    expect(s.deploys()).toEqual([]);
+    // retry (the EXECUTOR_LOST action) restarts the canary at 1%.
+    expect(s.run((p) => p.retry("r1", "kyle@kaikeru.com")).outcome).toBe("applied");
+    expect(s.rel("r1")).toMatchObject({ phase: "CANARY", tappedBy: "kyle@kaikeru.com" });
+    expect(s.deploys().map((c) => c.commandId)).toEqual(["r1-canary1-4"]);
+  });
+
+  it("a non-retryable canary deploy failure still takes the rollback path (and counts)", () => {
+    const s = RSim.canary1();
+    s.verdict(s.sentinels()[0]!, "PROMOTE");
+    const [d] = s.deploys();
+    s.deployResult(d!, { environment: "canary", ok: false, summary: "Script validation failed: 10021" });
+    expect(s.herald()).toEqual([expect.objectContaining({ op: "ROLLBACK" })]);
+  });
+
+  it("a later-step infra stop rolls the split back to stable first, then parks", () => {
+    const s = RSim.canary1();
+    s.verdict(s.sentinels()[0]!, "PROMOTE"); // → 10%
+    for (let n = 1; n <= MAX_COMMAND_ATTEMPTS; n++) {
+      const [d] = s.deploys();
+      s.deployResult(d!, { environment: "canary", ok: false, retryable: true, summary: HTTP503 });
+    }
+    const [rb] = s.herald();
+    expect(rb).toMatchObject({ op: "ROLLBACK", toVersionId: "v-stable" });
+    s.deployResult({ commandId: rb!.commandId, op: "ROLLBACK", environment: "canary" });
+    expect(s.rel("r1")).toMatchObject({ phase: "AWAITING_TAP", canaryPercent: null });
+    expect(s.deployments.get("prod")).toMatchObject({ versionId: "v-stable", percent: 100 });
+    expect(s.streak).toBe(0);
+  });
+
+  it("a retryable staging deploy failure is re-issued, then parked in STAGING; a newer head supersedes it and clears EXECUTOR_LOST's subject", () => {
+    const s = new RSim();
+    s.land("t1");
+    for (let n = 1; n <= MAX_COMMAND_ATTEMPTS; n++) {
+      const [d] = s.deploys();
+      expect(d!.commandId).toBe(`r1-staging-${n}`);
+      s.deployResult(d!, { ok: false, retryable: true, summary: "Staging deploy failed: HTTP Error: 503 Service Unavailable" });
+    }
+    expect(s.rel("r1")).toMatchObject({ phase: "STAGING", pending: null });
+    expect(s.open()).toEqual(["EXECUTOR_LOST:r1"]);
+    // retry re-deploys staging.
+    s.run((p) => p.retry("r1", "kyle@kaikeru.com"));
+    expect(s.deploys().map((c) => c.commandId)).toEqual(["r1-staging-4"]);
+    // A newer head supersedes it as any STAGING release.
+    s.land("t2");
+    expect(s.rel("r1").phase).toBe("SUPERSEDED");
+  });
+
+  it("a non-retryable staging deploy failure is still FAILED (the change: bad module)", () => {
+    const s = new RSim();
+    s.land("t1");
+    s.deployResult(s.deploys()[0]!, { ok: false, summary: "Uncaught SyntaxError" });
+    expect(s.rel("r1").phase).toBe("FAILED");
+  });
+
+  it("a staging Sentinel that never reports is inconclusive (parked for a human), not FAILED", () => {
+    const s = new RSim();
+    s.land("t1");
+    s.deployResult(s.deploys()[0]!, { url: STAGING_URL });
+    s.sentinels();
+    for (let n = 2; n <= MAX_COMMAND_ATTEMPTS + 1; n++) {
+      s.now += sentinelTimeoutMs(T, 60);
+      s.run((p) => p.reconcile());
+    }
+    expect(s.rel("r1").phase).toBe("AWAITING_TAP");
+    expect(s.open()).toEqual(["SENTINEL_INCONCLUSIVE:r1"]);
   });
 });

@@ -13,7 +13,7 @@
 import type { WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import { CloudflareApiError, type DeploymentVersion } from "@queenos/hive-kit";
-import { DeployCommandSchema, type DeployCommand, type DeployResult } from "@queenos/queen-types";
+import { DeployCommandSchema, isTransientError, retryTransient, type DeployCommand, type DeployResult } from "@queenos/queen-types";
 import type { HeraldPorts } from "./ports";
 import { SourceError, previewNameFor, readWorkerSource, stagingWorkerNameFor, workerNameFor, type WorkerSource } from "./source";
 
@@ -22,8 +22,16 @@ export interface StepRunner {
   sleep(name: string, ms: number): Promise<void>;
 }
 
-export const REST_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" }, timeout: "2 minutes" };
-export const DEPLOY_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" }, timeout: "5 minutes" };
+/**
+ * Transient errors (Artifacts / Cloudflare API 5xx, 429, network) are retried twice: first inside
+ * each try with jitter (withTransientRetry: up to TRANSIENT_ATTEMPTS, so a swarm of deploys does not
+ * retry in lockstep), then by Workflows (10 s, 20 s, 40 s). Only then is a failure reported, and a
+ * transient one is reported `retryable` (the Queen re-dispatches; never a verdict on the change).
+ */
+export const REST_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }, timeout: "2 minutes" };
+export const DEPLOY_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }, timeout: "5 minutes" };
+export const TRANSIENT_ATTEMPTS = 3;
+export const TRANSIENT_BASE_MS = 2_000;
 export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
 
 const MAX_SUMMARY = 500;
@@ -39,11 +47,30 @@ export class HeraldFailedError extends Error {
 /** Errors that will not get better on retry become NonRetryableError inside steps. */
 export function toStepError(e: unknown): unknown {
   if (e instanceof NonRetryableError) return e;
+  // An HTTP 503 / 429 / 5xx (isomorphic-git "HTTP Error: 503 Service Unavailable", a retryable API error) always retries.
+  if (isTransientError(e)) return e;
   const permanent =
     e instanceof SourceError ||
     (e instanceof CloudflareApiError && !e.retryable) ||
     /^(INVALID_INPUT|NOT_FOUND|CONFLICT|UNAVAILABLE): /.test(messageOf(e));
   return permanent ? new NonRetryableError(clip(messageOf(e), 1_000)) : e;
+}
+
+/** "source head … is not the requested commit": Artifacts briefly serving a stale head (not the change). */
+const STALE_HEAD = /is not the requested commit/;
+
+/** Whether a deploy failure is infrastructure (worth re-dispatching), not the change. */
+export function isRetryableFailure(e: unknown): boolean {
+  return isTransientError(e) || STALE_HEAD.test(messageOf(e));
+}
+
+/** Every step body retries transient errors in place with jittered backoff before Workflows' own retries. */
+export function withTransientRetry(step: StepRunner, ports: Pick<HeraldPorts, "sleep">): StepRunner {
+  const sleep = ports.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  return {
+    do: (name, config, fn) => step.do(name, config, () => retryTransient(fn, { attempts: TRANSIENT_ATTEMPTS, baseMs: TRANSIENT_BASE_MS, maxMs: 8 * TRANSIENT_BASE_MS, sleep })),
+    sleep: (name, ms) => step.sleep(name, ms),
+  };
 }
 
 function isPermanentQueenError(e: unknown): boolean {
@@ -54,6 +81,8 @@ export type HeraldRunResult = { commandId: string; op: DeployCommand["op"]; envi
 
 type Outcome = {
   ok: boolean;
+  /** ok:false on infrastructure (DeployResult.retryable). */
+  retryable?: boolean;
   summary: string;
   url?: string;
   versionId?: string;
@@ -72,6 +101,7 @@ export async function runHerald(payload: unknown, step: StepRunner, ports: Heral
     throw new HeraldFailedError(`invalid DeployCommand: ${parsed.error.issues.map((i) => i.path.join(".")).join(", ")}`);
   }
   const cmd = parsed.data;
+  step = withTransientRetry(step, ports);
 
   // Log trace context if present
   if (cmd.trace) {
@@ -110,6 +140,7 @@ export async function runHerald(payload: unknown, step: StepRunner, ports: Heral
     environment: cmd.environment,
     ...(cmd.op !== "ROLLBACK" && cmd.trainId ? { trainId: cmd.trainId } : {}),
     ok: outcome.ok,
+    ...(!outcome.ok && outcome.retryable ? { retryable: true } : {}),
     ...(outcome.url ? { url: outcome.url } : {}),
     ...(outcome.versionId ? { versionId: outcome.versionId } : {}),
     ...(outcome.stableVersionId ? { stableVersionId: outcome.stableVersionId } : {}),
@@ -221,7 +252,7 @@ async function deployPreview(cmd: DeployCmd, step: StepRunner, ports: HeraldPort
       summary: `${deployed.created ? "Created" : "Updated"} Worker Preview ${preview} on ${worker}: ${deployed.modules} modules, ${deployed.bytes} bytes, commit ${cmd.commitSha.slice(0, 12)}.`,
     };
   } catch (e) {
-    return { ok: false, summary: clip(`Preview deploy failed: ${messageOf(e)}`) };
+    return { ok: false, summary: clip(`Preview deploy failed: ${messageOf(e)}`), ...(isRetryableFailure(e) ? { retryable: true } : {}) };
   }
 }
 
@@ -292,7 +323,7 @@ async function deployStaging(cmd: DeployCmd, step: StepRunner, ports: HeraldPort
     // The repo head moved past this commit (and stayed there through the step's retries):
     // a newer release owns staging, so never overwrite it with older code.
     if (/is not the requested commit/.test(messageOf(e))) return { ok: false, summary: "superseded" };
-    return { ok: false, summary: clip(`Staging deploy failed: ${messageOf(e)}`) };
+    return { ok: false, summary: clip(`Staging deploy failed: ${messageOf(e)}`), ...(isTransientError(e) ? { retryable: true } : {}) };
   }
 }
 
@@ -356,7 +387,7 @@ async function deployCanary(cmd: DeployCmd, step: StepRunner, ports: HeraldPorts
       summary: `Deployed ${script}: ${split}${stable ? "" : " (first prod deploy, no stable version)"}.`,
     };
   } catch (e) {
-    return { ok: false, summary: clip(`Canary deploy failed: ${messageOf(e)}`) };
+    return { ok: false, summary: clip(`Canary deploy failed: ${messageOf(e)}`), ...(isRetryableFailure(e) ? { retryable: true } : {}) };
   }
 }
 

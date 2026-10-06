@@ -106,8 +106,8 @@ export const RUNBOOK: Readonly<Record<EscalationReason, RunbookEntry>> = {
     actions: { ack: "Acknowledge." },
   },
   EXECUTOR_LOST: {
-    what: "An executor command exhausted its watchdog attempts, or three merge-queue cars in a row failed on infrastructure.",
-    did: "Failed the item (or fell back), or paused merge-car formation.",
+    what: "An executor command exhausted its watchdog attempts, a build's preview deploy or gate kept failing on infrastructure (5xx, 429) through its infra retries, or three merge-queue cars in a row failed on infrastructure.",
+    did: "Failed the item without charging a rework (or fell back), or paused merge-car formation.",
     actions: { retry: "Retry: resume the merge queue or re-issue the command.", ack: "Acknowledge." },
   },
 };

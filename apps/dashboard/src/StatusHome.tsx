@@ -2,7 +2,7 @@ import { useMemo, useState, type FormEvent } from "react";
 import { RUNBOOK, type Escalation, type EscalationAction } from "@queenos/queen-types";
 import { api, errorMessage } from "./api";
 import { SWARM_DEMO_SIZE, demoSwarmPrompt } from "./demo";
-import { ACTION_LABEL, autonomyLabel, isSimulation, compactNumber, durationText, escalationButtons, meterFill, reasonText } from "./homeLogic";
+import { ACTION_LABEL, autonomyLabel, isSimulation, compactNumber, durationText, escalationButtons, escalationSubjectLabel, meterFill, reasonText } from "./homeLogic";
 import { MergeQueue } from "./MergeQueue";
 import { Link } from "./router";
 import { hrefFor } from "./route";
@@ -48,7 +48,7 @@ export function StatusHome({ hive, room }: { hive: string; room: Room }) {
         <section className="panel sh-needs" aria-label="Needs you">
           <p className="eyebrow">NEEDS YOU ({open.length})</p>
           <div className="sh-needs__list">
-            {open.map((e) => <EscalationCard key={e.escalationId} hive={hive} e={e} />)}
+            {open.map((e) => <EscalationCard key={e.escalationId} hive={hive} e={e} items={state.items} />)}
           </div>
         </section>
       )}
@@ -195,7 +195,7 @@ function Throughput({ tiles, counts }: { tiles: ReturnType<typeof statusTiles>; 
 
 // ── needs you ─────────────────────────────────────────────────────────────
 
-function EscalationCard({ hive, e }: { hive: string; e: Escalation }) {
+function EscalationCard({ hive, e, items }: { hive: string; e: Escalation; items: Room["state"]["items"] }) {
   const [busy, setBusy] = useState<EscalationAction | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [done, setDone] = useState<EscalationAction | null>(null);
@@ -214,7 +214,7 @@ function EscalationCard({ hive, e }: { hive: string; e: Escalation }) {
   };
   const runbook = RUNBOOK[e.reason];
   const subject =
-    e.subject.type === "item" ? <Link to={hrefFor.item(hive, e.subject.id)}>item {e.subject.id.slice(0, 8)}</Link> : <span>{e.subject.type} {e.subject.id.slice(0, 8)}</span>;
+    e.subject.type === "item" ? <Link to={hrefFor.item(hive, e.subject.id)}>{escalationSubjectLabel(e, items)}</Link> : <span>{escalationSubjectLabel(e, items)}</span>;
   return (
     <article className="sh-esc">
       <p className="sh-esc__title">

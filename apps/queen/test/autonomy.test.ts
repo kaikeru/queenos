@@ -139,3 +139,15 @@ describe("hiveHeadline", () => {
     expect(hiveHeadline({ ...base, openEscalations: 1, level: "paused" })).toBe("NEEDS_YOU");
   });
 });
+
+describe("infrastructure never charges the error budget", () => {
+  it("isReleaseFailure / changeSuccessFromReleases skip a release stopped by infrastructure", async () => {
+    const { isReleaseFailure, changeSuccessFromReleases } = await import("../src/autonomy/policy");
+    const infra = { phase: "FAILED" as const, tappedAt: 5, updatedAt: 10, summary: "Infrastructure: Canary deploy at 1% did not complete after 3 attempts: 503" };
+    const real = { phase: "ROLLED_BACK" as const, tappedAt: 5, updatedAt: 11, summary: "Canary at 10% failed: 5xx" };
+    expect(isReleaseFailure(infra)).toBe(false);
+    expect(isReleaseFailure(real)).toBe(true);
+    const c = changeSuccessFromReleases([infra, real], { changeSuccessTarget: 0.9, window: 20 });
+    expect(c.rolledBack + c.canaryFailed).toBe(1);
+  });
+});

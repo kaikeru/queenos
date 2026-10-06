@@ -116,8 +116,9 @@ describe("runAgentBuild", () => {
     const { w: w2, agent: a2 } = await world(() => htmlAgent);
     const err = await runAgentBuild(parsed(), w2.ports(), agentCfg, { instanceId: "i", deadlineMs: AGENT_PHASE_MS, now: () => now }).catch((e) => e);
     expect(a2.calls).toEqual([]);
-    expect(err).toBeInstanceOf(AllModelsFailedError);
-    expect(err.message).toMatch(/budget exhausted/);
+    // No model ran at all (earlier step attempts used the phase up): infra, not the models' fault.
+    expect(err).not.toBeInstanceOf(AllModelsFailedError);
+    expect(err.message).toMatch(/^INFRA: agent wall-time budget used up by retries before any model could run/);
   });
 
   it("REWORK bypasses the gateway cache and carries the reviewer feedback", async () => {

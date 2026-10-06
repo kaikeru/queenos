@@ -475,6 +475,37 @@ describe("absorb", () => {
     });
   }
 
+  it("a prompt FAILED on infrastructure opens EXECUTOR_LOST on the item (retry / ack), not REWORK_EXHAUSTED", () => {
+    const { s, id } = active();
+    s.absorb({ prompts: [{ promptId: id, status: "FAILED", attempts: 0, summary: "gate could not run: HTTP Error: 503", infra: true }] });
+    expect(s.status(id)).toBe("FAILED");
+    expect(s.open("REWORK_EXHAUSTED")).toEqual([]);
+    const e = s.open("EXECUTOR_LOST")[0]!;
+    expect(e.subject).toEqual({ type: "item", id });
+    expect(e.actions).toEqual(["retry", "ack"]);
+    expect(e.summary).toContain("infrastructure");
+    expect(s.item(id).escalationId).toBe(e.escalationId);
+    // Retry resolves it and re-queues the item with attempts reset.
+    s.run((p) => p.action(id, { action: "retry" }, "user:a@x"));
+    expect(s.status(id)).toBe("READY");
+    expect([...s.escalations.values()].find((x) => x.escalationId === e.escalationId)).toMatchObject({ status: "RESOLVED" });
+  });
+
+  it("REWORK_EXHAUSTED subjects are per item, not the goal (Oracle children share the goal's id prefix)", () => {
+    const s = new WSim();
+    const { goalId, cmd } = s.goal("Goals\n- upper\n- ip\n- hex\n- fib");
+    s.decomposed(goalId, cmd.commandId, ["upper", "ip", "hex", "fib"].map((k) => ({ key: k, title: `Add /features/${k}` })));
+    s.dispatch();
+    const kids = [...s.items.values()].filter((i) => i.parentId === goalId);
+    expect(kids).toHaveLength(4);
+    for (const k of kids) s.absorb({ prompts: [{ promptId: k.itemId, status: "FAILED", attempts: 3 }] });
+    const subjects = s.open("REWORK_EXHAUSTED").map((e) => e.subject.id).sort();
+    expect(subjects).toEqual(kids.map((k) => k.itemId).sort());
+    expect(subjects).not.toContain(goalId);
+    // Children are `<goal id>-<key>`: with a uuid goal id their first 8 chars are the goal's (the dashboard label bug).
+    expect(subjects.every((x) => x.startsWith(`${goalId}-`))).toBe(true);
+  });
+
   it("a MERGED BUILD train lands its item too; QUEUE cars are ignored", () => {
     const { s, id } = active();
     s.absorb({ trains: [{ trainId: "car", promptId: id, lane: "QUEUE", phase: "MERGED" }] });
@@ -559,6 +590,13 @@ describe("absorb", () => {
     expect(s.settings!.rollbackStreak).toBe(0);
     expect(s.open("ROLLBACK_STREAK")).toHaveLength(0);
     expect(r.events.map((e) => e.type)).not.toContain("autonomy.degraded");
+  });
+
+  it("a release stopped by infrastructure files no bug (not attributable to the change)", () => {
+    const s = new WSim();
+    s.feature("seed");
+    s.absorb({ releases: [{ releaseId: "R1", phase: "FAILED", trainIds: [], canaryPercent: 1, summary: "Infrastructure: Canary deploy at 1% did not complete after 3 attempts: HTTP Error: 503. Herald ROLLBACK failed" }] });
+    expect([...s.items.values()].filter((i) => i.source.kind === "queen")).toHaveLength(0);
   });
 
   it("a staging FAILED release files a bug too", () => {

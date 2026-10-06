@@ -439,16 +439,16 @@ describe("command watchdog (alarm)", () => {
     expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
     expect((await inspect(ns)).forks.map((f) => f.commandId).at(-1)).toBe(`${id}-fork-3`);
 
-    // Attempt cap reached: the same path as an ok:false fork (EJECTED, re-queued as REWORK).
+    // Attempt cap reached: the executor is lost (infrastructure), not the change: EJECTED, prompt FAILED, no rework charged.
     await skew(ns, 3 * (T + 2_000));
     expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
     const s = await inspect(ns);
     expect(s.trains[0]).toMatchObject({ train_id: id, phase: "EJECTED", fork_state: "DELETING" });
-    expect(String((s.trains[0] as unknown as { reason: string }).reason)).toMatch(/^failed: fork failed: Provisioner FORK .*-fork-3 did not report/);
-    expect(s.trains[1]).toMatchObject({ phase: "BUILDING", fork_state: "PENDING" });
-    expect(s.prompts[0]).toMatchObject({ status: "QUEUED", attempts: 1 });
+    expect(String((s.trains[0] as unknown as { reason: string }).reason)).toMatch(/^failed on infrastructure: fork failed: Provisioner FORK .*-fork-3 did not report/);
+    expect(s.trains).toHaveLength(1);
+    expect(s.prompts[0]).toMatchObject({ status: "FAILED", attempts: 0 });
     expect(s.provisions.filter((c) => c.op === "DELETE").map((c) => c.commandId)).toEqual([`${id}-delete-1`]);
-    expect(await alarmAt(ns)).not.toBeNull(); // the rework's fork and the delete are outstanding
+    expect(await alarmAt(ns)).not.toBeNull(); // the delete is outstanding
   });
 
   it("a drone that never reports is re-dispatched under a new instance id", async () => {

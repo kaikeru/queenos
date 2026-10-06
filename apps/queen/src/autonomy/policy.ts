@@ -11,7 +11,7 @@
  * `supervised` has nothing to degrade from, so only an `autonomous` hive
  * reports reasons.
  */
-import type { AutonomyLevel, Escalation, EscalationReason, EventDraft, HiveHeadline, Release } from "@queenos/queen-types";
+import { isInfraStopped, type AutonomyLevel, type Escalation, type EscalationReason, type EventDraft, type HiveHeadline, type Release } from "@queenos/queen-types";
 import { QUEEN_ACTOR, RESUMABLE_REASONS, escalationOpenedEvent, escalationResolvedEvent, newEscalation, resolutionAction, resolvedEscalation } from "./escalation";
 
 /** Consecutive rollbacks (ROLLED_BACK or canary-FAILED) that degrade the hive. */
@@ -61,8 +61,12 @@ export function errorBudget(input: ChangeSuccessInput): SloStatus {
   };
 }
 
-/** A release that counts against change success: ROLLED_BACK, or FAILED once it had been tapped (canary). */
-export function isReleaseFailure(r: Pick<Release, "phase" | "tappedAt">): boolean {
+/**
+ * A release that counts against change success: ROLLED_BACK, or FAILED once it had been tapped (canary).
+ * Never one stopped by infrastructure (INFRA_SUMMARY_PREFIX): that says nothing about the change.
+ */
+export function isReleaseFailure(r: Pick<Release, "phase" | "tappedAt"> & { summary?: string | null }): boolean {
+  if (isInfraStopped(r)) return false;
   return r.phase === "ROLLED_BACK" || (r.phase === "FAILED" && r.tappedAt !== null);
 }
 
@@ -71,7 +75,7 @@ export function isReleaseFailure(r: Pick<Release, "phase" | "tappedAt">): boolea
  * terminal releases that count (SHIPPED, ROLLED_BACK, canary-FAILED), by updatedAt.
  */
 export function changeSuccessFromReleases(
-  releases: readonly Pick<Release, "phase" | "tappedAt" | "updatedAt">[],
+  releases: readonly (Pick<Release, "phase" | "tappedAt" | "updatedAt"> & { summary?: string | null })[],
   slo: { changeSuccessTarget: number; window: number },
 ): ChangeSuccessInput {
   const counted = releases

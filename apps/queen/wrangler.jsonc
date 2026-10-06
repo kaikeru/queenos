@@ -77,10 +77,13 @@
     "ROUTER_BACKOFF_STREAK": "3",
     "ROUTER_PROBE_AFTER": "4",
     // SwarmGovernor ceilings (§2.9, §4.3): global active builds, and the Workers AI
-    // requests/minute budget (80% of the 300 rpm default; ~4 rpm per build → 60 builds).
+    // requests/minute budget (80% of the 300 rpm default) over the requests/minute one
+    // Think tool-loop build makes (~20; the old estimate of 4 let a 12-item swarm burst past
+    // the limit on 2026-10-06): 240 / 20 = 12 concurrent builds account-wide.
     // Set SWARM_LEASE to "off" to fall back to per-hive caps only (D9 cut line 3).
     "SWARM_MAX_ACTIVE_BUILDS": "64",
-    "SWARM_AI_RPM": "240"
+    "SWARM_AI_RPM": "240",
+    "SWARM_RPM_PER_BUILD": "20"
     // Model router: set "MODEL_ROUTER_PIN_BUILDER" to a model id (e.g.
     // "@cf/zai-org/glm-5.3") to force it for every builder / rework drone
     // (demos, debugging). Unset or blank = the Queen routes per task.
@@ -110,6 +113,7 @@
         // rpm budget is not the binding limit (4000 / 4 = 1000).
         "SWARM_MAX_ACTIVE_BUILDS": "1000",
         "SWARM_AI_RPM": "4000",
+        "SWARM_RPM_PER_BUILD": "4",
         // New sim hives: SIM_MAX_ACTIVE_TRAINS = 64 builds at once, and room for the 24-item Swarm prompt.
         "HIVE_DEFAULT_GUARDRAILS": "{\"maxActiveTrains\":64,\"maxChildrenPerItem\":24}"
       },
@@ -150,7 +154,8 @@
         "ROUTER_PROBE_AFTER": "4",
         // Every test hive shares the one governor: keep its ceiling out of the way.
         "SWARM_MAX_ACTIVE_BUILDS": "1000",
-        "SWARM_AI_RPM": "100000"
+        "SWARM_AI_RPM": "100000",
+        "SWARM_RPM_PER_BUILD": "20"
       },
       "durable_objects": {
         "bindings": [

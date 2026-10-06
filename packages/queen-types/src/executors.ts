@@ -138,6 +138,12 @@ export const DeployResultSchema = z.object({
   percent: z.number().int().min(0).max(100).optional(),
   commitSha: z.string().optional(),
   summary: Summary.optional(),
+  /**
+   * `ok: false` on infrastructure (Artifacts / Cloudflare API 5xx, 429, network) that outlasted Herald's
+   * own retries: not the change's fault. A preview: the Queen re-deploys after a backoff (no attempt
+   * charged), and opens EXECUTOR_LOST once its infra retries are spent (never REWORK_EXHAUSTED).
+   */
+  retryable: z.boolean().optional(),
 });
 export type DeployResult = z.infer<typeof DeployResultSchema>;
 

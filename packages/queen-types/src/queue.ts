@@ -103,8 +103,12 @@ export const SwarmLeaseSchema = z.object({
 });
 export type SwarmLease = z.infer<typeof SwarmLeaseSchema>;
 
-/** ~8 LLM steps per Think build over ~2 min. */
-export const EST_RPM_PER_BUILD = 4;
+/**
+ * Default Workers AI requests/min per active builder (`SWARM_RPM_PER_BUILD` overrides it). A Think tool-loop
+ * build makes up to 16 model calls, mostly within its first few minutes, plus the AI SDK's own retries:
+ * ~20 rpm while it runs (the old estimate of 4 let 12 builders burst past the per-minute limit, 2026-10-06).
+ */
+export const EST_RPM_PER_BUILD = 20;
 
 /** Env defaults for the SwarmGovernor ceilings (§2.9): `SWARM_MAX_ACTIVE_BUILDS`, `SWARM_AI_RPM` (80% of 300 rpm). */
 export const SWARM_DEFAULTS = { maxActiveBuilds: 64, simMaxActiveBuilds: 1000, aiRpm: 240 } as const;

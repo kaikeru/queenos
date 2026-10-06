@@ -9,13 +9,22 @@ export const P99_BASELINE_FACTOR = 3;
 /** Compact result of probing one target (the only thing a step returns). */
 export interface Tally {
   total: number;
+  /** Answered with 5xx. */
   errors: number;
   smokeFailures: number;
+  /**
+   * No answer at all (network error / timeout): Sentinel could not reach the deployment. Not an
+   * error by itself (it may be infrastructure); decide() attributes it to the candidate only when
+   * the pinned stable baseline answered in the same window. Optional: absent in older step results.
+   */
+  unreachable?: number;
+  /** The smoke probe got no answer. */
+  smokeUnreachable?: number;
   /** Latency (ms) of each answered or failed request. */
   latencies: number[];
 }
 
-export const emptyTally = (): Tally => ({ total: 0, errors: 0, smokeFailures: 0, latencies: [] });
+export const emptyTally = (): Tally => ({ total: 0, errors: 0, smokeFailures: 0, unreachable: 0, smokeUnreachable: 0, latencies: [] });
 
 export function mergeTallies(parts: Tally[]): Tally {
   const out = emptyTally();
@@ -23,6 +32,8 @@ export function mergeTallies(parts: Tally[]): Tally {
     out.total += p.total;
     out.errors += p.errors;
     out.smokeFailures += p.smokeFailures;
+    out.unreachable = (out.unreachable ?? 0) + (p.unreachable ?? 0);
+    out.smokeUnreachable = (out.smokeUnreachable ?? 0) + (p.smokeUnreachable ?? 0);
     out.latencies.push(...p.latencies);
   }
   return out;
@@ -63,7 +74,17 @@ export function gateTimeoutVerdict(cmd: VerdictInput, timeoutSeconds: number, la
   };
 }
 
-export function decide(cmd: VerdictInput, candidate: Tally, baseline: Tally | null, readyMs: number | null = null): SentinelVerdict {
+/** The baseline answered (almost) everything: unreachability of the candidate is then the candidate's own (e.g. it hangs). */
+const BASELINE_REACHABLE = 0.9;
+
+export function decide(cmd: VerdictInput, rawCandidate: Tally, baseline: Tally | null, readyMs: number | null = null): SentinelVerdict {
+  const unreachable = rawCandidate.unreachable ?? 0;
+  const baseAnswered = baseline ? baseline.total - (baseline.unreachable ?? 0) : 0;
+  const attributable = baseline !== null && baseline.total > 0 && baseAnswered / baseline.total >= BASELINE_REACHABLE;
+  // Unattributable unreachability is left out of the sample (infrastructure between Sentinel and the edge).
+  const candidate: Tally = attributable
+    ? { ...rawCandidate, errors: rawCandidate.errors + unreachable, smokeFailures: rawCandidate.smokeFailures + (rawCandidate.smokeUnreachable ?? 0) }
+    : { ...rawCandidate, total: rawCandidate.total - unreachable };
   const errorRate = candidate.total === 0 ? 0 : candidate.errors / candidate.total;
   const p99 = percentile(candidate.latencies, 99);
   const hasBaseline = baseline !== null && baseline.total > 0;
@@ -78,8 +99,16 @@ export function decide(cmd: VerdictInput, candidate: Tally, baseline: Tally | nu
   if (p99 !== null && p99 > p99Limit) reasons.push(`p99 ${ms(p99)} > ${ms(p99Limit)}`);
 
   // Healthy but under-sampled: still ROLLBACK (old Queens stay safe), flagged inconclusive. Real failures are not.
-  const inconclusive = reasons.length === 0 && isTooFewRequests(candidate.total, cmd.minRequests);
-  if (inconclusive) reasons.push(`inconclusive: only ${candidate.total} of ${cmd.minRequests} requests answered`);
+  // So is a window where Sentinel could not reach the deployment for more than MAX_ERROR_RATE of its probes.
+  const unreachableRate = attributable || rawCandidate.total === 0 ? 0 : unreachable / rawCandidate.total;
+  const inconclusive = reasons.length === 0 && (isTooFewRequests(candidate.total, cmd.minRequests) || unreachableRate > MAX_ERROR_RATE);
+  if (inconclusive) {
+    reasons.push(
+      unreachableRate > MAX_ERROR_RATE
+        ? `inconclusive: ${unreachable}/${rawCandidate.total} probes could not reach the deployment (network / timeout)`
+        : `inconclusive: only ${candidate.total} of ${cmd.minRequests} requests answered`,
+    );
+  }
   const verdict = reasons.length > 0 ? "ROLLBACK" : "PROMOTE";
   const label = cmd.environment === "canary" ? `Canary ${cmd.canaryPercent ?? "?"}%` : "Staging";
   const base = hasBaseline ? ` vs baseline ${baseline.errors}/${baseline.total}` : "";

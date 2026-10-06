@@ -22,7 +22,17 @@ import {
   type MergeResult,
   MergeResultSchema,
 } from "@queenos/queen-types";
-import { AiGatewayError, LedgerError, buildGitNotesPayload, structuredLog, traceFields, writeMetric, type BackoffOptions } from "@queenos/hive-kit";
+import {
+  AiGatewayError,
+  LedgerError,
+  buildGitNotesPayload,
+  isRateLimited,
+  jitteredBackoffMs,
+  structuredLog,
+  traceFields,
+  writeMetric,
+  type BackoffOptions,
+} from "@queenos/hive-kit";
 import { commitAndPush, generateChangeSet, type CommitPushResult, type Generated, type LedgerStore } from "./build";
 import { ChangeSetError } from "./change-set";
 import { AllModelsFailedError } from "./generate";
@@ -31,7 +41,7 @@ import { landTrain, type LandOutcome } from "./land";
 import { defaultMergeCar } from "./merge-adapter";
 import type { DronePorts, QueenPort } from "./ports";
 import { SCRIPTED_MODEL } from "./scripted";
-import { AGENT_PHASE_MS, runAgentBuild, type AgentGenerated } from "./agent/run";
+import { AGENT_PHASE_MS, INFRA_PREFIX, MIN_MODEL_MS, runAgentBuild, type AgentGenerated } from "./agent/run";
 
 export interface StepRunner {
   do<T>(name: string, config: WorkflowStepConfig, fn: () => Promise<T>): Promise<T>;
@@ -41,8 +51,32 @@ export interface StepRunner {
 export const GENERATE_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }, timeout: "5 minutes" };
 export const GIT_STEP: WorkflowStepConfig = { retries: { limit: 4, delay: "5 seconds", backoff: "exponential" }, timeout: "5 minutes" };
 export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
-/** The tool-loop agent: one retry, which re-attaches to the same BuilderAgent submissions. */
-export const AGENT_STEP: WorkflowStepConfig = { retries: { limit: 1, delay: "5 seconds", backoff: "constant" }, timeout: "8 minutes" };
+/** Step retries of the tool-loop agent (a rate limit that outlasts the in-step retries, a DO reset, an RPC error). */
+export const AGENT_STEP_RETRIES = 5;
+/** Delay before re-running the agent step after a non-rate-limit error (it re-attaches to the same submissions). */
+export const AGENT_RETRY_DELAY_MS = 5_000;
+/** Rate-limit step retries: equal-jitter exponential from 15 s, capped at 90 s (≤ 6 min over all 5 retries). */
+export const AGENT_RATE_LIMIT_BACKOFF = { baseMs: 15_000, maxMs: 90_000 } as const;
+
+/**
+ * The `agent: build` step config. Workflows calls `retries.delay` with the error after each failed attempt
+ * (`backoff: "constant"`, so the returned delay is used as is):
+ * - a rate limit (Workers AI 429 / 3021 "inference request per min rate reached") waits a long, jittered
+ *   backoff so a swarm of builders that hit the per-minute limit together do not retry in lockstep;
+ * - anything else waits AGENT_RETRY_DELAY_MS (the retry re-attaches to the same BuilderAgent submission).
+ * The wait never runs past the agent phase (`deadlineMs`, minus the time a model needs): once a retry could
+ * no longer start a model, it waits 1 s and fails fast as INFRA (the drone reports `cause: "infra"`), so the
+ * whole drone stays well inside the Queen's watchdog (COMMAND_TIMEOUT_MS, 10 min).
+ */
+export function agentStepConfig(deadlineMs: number, now: () => number = Date.now, random: () => number = Math.random): WorkflowStepConfig {
+  const delay = ({ ctx, error }: { ctx: { attempt: number }; error: Error }): number => {
+    if (!isRateLimited(error)) return AGENT_RETRY_DELAY_MS;
+    const wait = jitteredBackoffMs(Math.max(1, ctx.attempt), { ...AGENT_RATE_LIMIT_BACKOFF, random });
+    const room = deadlineMs - MIN_MODEL_MS - now();
+    return wait <= room ? wait : 1_000;
+  };
+  return { retries: { limit: AGENT_STEP_RETRIES, delay, backoff: "constant" }, timeout: "8 minutes" };
+}
 export const CLOCK_STEP: WorkflowStepConfig = { retries: { limit: 2, delay: "1 second" }, timeout: "10 seconds" };
 
 export const LANDER_MODEL = "queenos/lander-git-push";
@@ -102,6 +136,7 @@ export function toStepError(e: unknown, config: Pick<DroneConfig, "llmMode">): u
     (e instanceof ChangeSetError && (config.llmMode === "scripted" || e instanceof AllModelsFailedError)) ||
     code === "NOTHING_TO_COMMIT" ||
     code === "INVALID_PATH" ||
+    messageOf(e).startsWith(INFRA_PREFIX) ||
     /^(INVALID_INPUT|NOT_FOUND|CONFLICT|UNAVAILABLE): /.test(messageOf(e));
   return permanent ? new NonRetryableError(clip(messageOf(e), 1_000)) : e;
 }
@@ -237,7 +272,7 @@ async function runBuild(ctx: RunCtx): Promise<DroneRunResult> {
     if (config.llmMode === "live" && config.harness === "agent") {
       // The Think tool loop replaces the single-shot generator; everything after this step is unchanged.
       const deadlineMs = (ctx.startedAtMs ?? Date.now()) + AGENT_PHASE_MS;
-      gen = await step.do("agent: build", AGENT_STEP, async () => {
+      gen = await step.do("agent: build", agentStepConfig(deadlineMs), async () => {
         const t0 = Date.now();
         const g = await runAgentBuild(task, ports, config, { instanceId: ctx.instanceId, deadlineMs, ...(ctx.backoff ? { backoff: ctx.backoff } : {}) }).catch((e) => Promise.reject(toStepError(e, config)));
         console.log(`drone: agent ${g.model} built ${task.trainId} in ${g.agentUsage.steps} step(s), ${g.agentUsage.inputTokens}/${g.agentUsage.outputTokens} tokens`);
@@ -326,10 +361,25 @@ function buildUsage(gen: Generated): BuildUsage {
   return { inputTokens: gen.usage.inputTokens, outputTokens: gen.usage.outputTokens, ...(steps !== undefined ? { steps } : {}) };
 }
 
-/** Report the failure (train result + REJECTED audit), then fail the instance. */
+/**
+ * An infrastructure failure, not the model's: Workers AI rate limits that outlasted every retry, or an agent
+ * phase used up by those retries before any model could run. Matched on the message, since a step error
+ * comes back from Workflows as a plain Error.
+ */
+export function isInfraFailure(e: unknown): boolean {
+  const msg = messageOf(e);
+  return isRateLimited(e) || msg.startsWith(INFRA_PREFIX) || msg.includes(`: ${INFRA_PREFIX}`);
+}
+
+/**
+ * Report the failure (train result + REJECTED audit), then fail the instance. An infrastructure failure
+ * (isInfraFailure) is reported as `cause: "infra"` with this instance's id: the Queen re-dispatches the drone
+ * (same item, no rework, no verdict against the model, the AIMD floor untouched) instead of reworking it.
+ */
 async function failBuild(ctx: RunCtx, stage: string, err: unknown, model?: string): Promise<never> {
   const { task, config } = ctx;
-  const summary = clip(`Builder drone failed during ${stage}: ${messageOf(err)}`);
+  const infra = isInfraFailure(err);
+  const summary = clip(`Builder drone ${infra ? "hit an infrastructure limit (not a build failure)" : "failed"} during ${stage}: ${messageOf(err)}`);
   const executionTimeMs = await elapsed(ctx, "clock: failed");
   const ledger = buildGitNotesPayload({
     taskPrompt: task.promptText,
@@ -339,8 +389,12 @@ async function failBuild(ctx: RunCtx, stage: string, err: unknown, model?: strin
     result: "failure",
     executionTimeMs,
   });
-  await report(ctx, "report: build failure", (q) => q.reportTrainResult({ trainId: task.trainId, passed: false, summary }));
-  metric(ctx, { type: "drone.build", ...(model ? { model } : {}), outcome: "failed", valueMs: executionTimeMs });
+  if (infra) {
+    await report(ctx, "report: infra failure", (q) => q.reportTrainResult({ trainId: task.trainId, passed: false, summary, cause: "infra", commandId: ctx.instanceId }));
+  } else {
+    await report(ctx, "report: build failure", (q) => q.reportTrainResult({ trainId: task.trainId, passed: false, summary }));
+  }
+  metric(ctx, { type: "drone.build", ...(model ? { model } : {}), outcome: infra ? "infra" : "failed", valueMs: executionTimeMs });
   await audit(ctx, "audit: rejected", "REJECTED", ledger);
   throw new DroneFailedError(summary);
 }
