@@ -42,6 +42,10 @@ export class QueenNode extends ProdQueenNode {
     return { provisioner: sim.provisioner, herald: sim.herald, sentinel: sim.sentinel, oracle: sim.oracle, dispatcher: sim.drones };
   }
 
+  protected override isSim(): boolean {
+    return true;
+  }
+
   /** `[race]` in a filed prompt or item makes it a best-of-3 race (§6). */
   protected override filingHints(text: string): { bestOf?: number } {
     return text.includes(RACE_MARKER) ? { bestOf: 3 } : {};

@@ -12,6 +12,7 @@ import {
   jitteredBuildMs,
   simChangedPaths,
   simDecompose,
+  childKind,
   TEST_RETRY_MS,
   fakeSha,
   simPreviewUrl,
@@ -559,6 +560,17 @@ describe("sim oracle", () => {
     expect(simDecompose(demoSwarmPrompt(24), [], 5)).toHaveLength(5);
   });
 
+  it("the swarm title line is not an item; every child is a feature bullet", () => {
+    const kids = simDecompose(demoSwarmPrompt(24), [], 24);
+    expect(kids).toHaveLength(24);
+    expect(kids.every((k) => k.title.startsWith("Add a /features/") && k.kind === "feature")).toBe(true);
+  });
+
+  it("markers are not classified: [spot-bug] keeps kind feature, a real 'bug' word still wins", () => {
+    expect(childKind("Add a footer [spot-bug]")).toBe("feature");
+    expect(simDecompose("- Add a footer [spot-bug]\n- Fix the bug [race]", [], 5).map((k) => k.kind)).toEqual(["feature", "bug"]);
+  });
+
   it("keeps [collide] / [race] in the child so the build and filing logic see them", () => {
     const [k] = simDecompose("- Add thing [race] [collide]", [], 12);
     expect(k!.title).toContain("[race]");
@@ -612,16 +624,17 @@ const demoGoals = [
 ].join("\n");
 
 describe("demoSwarmPrompt", () => {
-  it("n bullets, distinct words, two [collide], one [batch-fail], one [race]", () => {
+  it("a title line, then n bullets, distinct words, two [collide], one [batch-fail], one [race]", () => {
     const text = demoSwarmPrompt(24);
-    const lines = text.split("\n");
+    const [title, ...lines] = text.split("\n");
+    expect(title).toBe("Ship a swarm of 24 feature endpoints");
     expect(lines).toHaveLength(24);
     expect(lines.every((l) => /^- Add a \/features\/(\w+) endpoint returning \1 facts/.test(l))).toBe(true);
     expect(new Set(lines.map((l) => l.split(" ")[3])).size).toBe(24);
     expect(text.match(/\[collide\]/g)).toHaveLength(2);
     expect(text.match(/\[batch-fail\]/g)).toHaveLength(1);
     expect(text.match(/\[race\]/g)).toHaveLength(1);
-    expect(demoSwarmPrompt(40).split("\n")).toHaveLength(40);
+    expect(demoSwarmPrompt(40).split("\n")).toHaveLength(41);
     expect(demoSwarmPrompt(6).match(/\[(collide|batch-fail|race)\]/g)).toHaveLength(4);
   });
 });

@@ -114,8 +114,9 @@ export function findSimilar(title: string, items: { itemId: string; title: strin
 }
 
 export function childKind(part: string): "feature" | "bug" | "chore" {
-  if (/\b(fix|bug|broken)\b/i.test(part)) return "bug";
-  if (/\b(chore|rename|bump|refactor|cleanup)\b/i.test(part)) return "chore";
+  const text = part.replace(/\[[a-z:-][^\]]*\]/gi, " "); // markers like [spot-bug] are not words
+  if (/\b(fix|bug|broken)\b/i.test(text)) return "bug";
+  if (/\b(chore|rename|bump|refactor|cleanup)\b/i.test(text)) return "chore";
   return "feature";
 }
 
@@ -173,7 +174,9 @@ const SWARM_WORDS = [
 ];
 
 /**
- * The "Swarm" demo prompt: `n` bullets `Add a /features/<word> endpoint
+ * The "Swarm" demo prompt: a title line (`Ship a swarm of n feature endpoints`;
+ * splitPrompt ignores non-bullet lines when bullets exist, so it is the goal's
+ * title and never an item) then `n` bullets `Add a /features/<word> endpoint
  * returning <word> facts`; two carry `[collide]`, one `[batch-fail]`, one
  * `[race]` (spread through the list; for small n they land on distinct bullets).
  */
@@ -190,11 +193,12 @@ export function demoSwarmPrompt(n: number): string {
   place(0.3, COLLIDE_MARKER);
   place(0.4, COLLIDE_MARKER);
   place(0.7, BATCH_FAIL_MARKER);
-  return Array.from({ length: count }, (_, i) => {
+  const bullets = Array.from({ length: count }, (_, i) => {
     const w = i < SWARM_WORDS.length ? SWARM_WORDS[i]! : `${SWARM_WORDS[i % SWARM_WORDS.length]!}${Math.floor(i / SWARM_WORDS.length)}`;
     const marker = marks.get(i);
     return `- Add a /features/${w} endpoint returning ${w} facts${marker ? ` ${marker}` : ""}`;
-  }).join("\n");
+  });
+  return [`Ship a swarm of ${count} feature endpoints`, ...bullets].join("\n");
 }
 
 // ── sim main log ─────────────────────────────────────────────────────────

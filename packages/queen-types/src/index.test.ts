@@ -404,6 +404,7 @@ describe("v2 schemas round-trip", () => {
   };
   const hiveStatus = {
     hive: "demo",
+    mode: "sim",
     settings: HIVE_SETTINGS_DEFAULTS,
     effectiveAutonomy: "supervised",
     degradedBy: ["ERROR_BUDGET_EXHAUSTED"],

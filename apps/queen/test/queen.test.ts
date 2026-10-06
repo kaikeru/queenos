@@ -826,7 +826,7 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([12, 12, 12]);
+    expect([state.before, state.after, state.version]).toEqual([13, 13, 13]);
     expect(state.tables).toEqual([
       "audit_trail", "deployments", "escalations", "event_log", "hive_settings", "merge_trains", "metrics_hourly", "model_router",
       "model_stats", "path_claims", "prompt_runs", "races", "releases", "sentinel_verdicts", "sqlite_sequence", "work_items",
@@ -969,9 +969,10 @@ describe("v2 surface (routes and RPCs, §3.6)", () => {
     expect(trace.spans.map((s) => s.kind)).toEqual(expect.arrayContaining(["item", "train", "command"]));
     expect((await req(ns, "GET", "/traces/not-a-trace")).status).toBe(400);
 
-    const metrics = await (await req(ns, "GET", "/metrics?window=24h")).json<{ rollups: { name: string }[]; hive: { headline: string }; source: string }>();
+    const metrics = await (await req(ns, "GET", "/metrics?window=24h")).json<{ rollups: { name: string }[]; hive: { headline: string; mode?: string }; source: string }>();
     expect(metrics.rollups.map((r) => r.name)).toEqual(expect.arrayContaining(["items_filed", "active_builds"]));
     expect(metrics.hive.headline).toBe("SHIPPING");
+    expect(metrics.hive.mode).toBe("live");
     expect((await req(ns, "GET", "/metrics?window=1y")).status).toBe(400);
     expect(await (await req(ns, "GET", "/queue")).json()).toEqual({ cars: [], waiting: [], conflicts: [], bisects: [] });
 

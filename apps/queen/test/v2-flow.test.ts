@@ -325,6 +325,7 @@ describe("(h) rollbacks", () => {
     expect(status).toMatchObject({ effectiveAutonomy: "supervised" });
     expect(status.degradedBy).toContain("ROLLBACK_STREAK");
     expect(status.headline).toBe("NEEDS_YOU");
+    expect(status.mode).toBe("sim");
   });
 });
 

@@ -447,6 +447,11 @@ export class QueenNode extends DurableObject<Env> {
     return Date.now();
   }
 
+  /** True only in the sim worker (simulated executors); surfaced as `HiveStatus.mode`. */
+  protected isSim(): boolean {
+    return false;
+  }
+
   /** Seam for tests and sim: override to inject fake executor / drone ports. */
   protected createPorts(env: Env): QueenPorts {
     return {
@@ -1859,6 +1864,7 @@ export class QueenNode extends DurableObject<Env> {
     const releaseInFlight = one("SELECT COUNT(*) AS n FROM releases WHERE phase IN ('STAGING', 'VALIDATING', 'AWAITING_TAP', 'CANARY')") > 0;
     return {
       hive,
+      mode: this.isSim() ? "sim" : "live",
       settings: { ...hs, autonomy: s.autonomy },
       effectiveAutonomy: eff.level,
       degradedBy: eff.reasons.slice(0, 5),

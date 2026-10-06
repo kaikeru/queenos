@@ -57,6 +57,10 @@ export class SimQueenNode extends ProdQueenNode {
   declare holdText: string | null | undefined;
   private declare held: { kind: "car" | "text"; run: () => Promise<unknown> }[] | undefined;
 
+  protected override isSim(): boolean {
+    return true;
+  }
+
   protected override createPorts(): QueenPorts {
     const sim = new SimExecutors(() => this, this.ctx.storage, E2E_DELAYS);
     this.sim = sim;

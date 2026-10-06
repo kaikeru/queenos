@@ -56,15 +56,15 @@ const columns = (sql: SqlStorage, table: string) =>
 const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v FROM _migrations").one().v);
 
 describe("migrations", () => {
-  it("a fresh DO migrates to v12", async () => {
-    expect(SCHEMA_VERSION).toBe(12);
+  it("a fresh DO migrates to v13", async () => {
+    expect(SCHEMA_VERSION).toBe(13);
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
-      expect(version(q.sql)).toBe(12);
+      expect(version(q.sql)).toBe(13);
       const t = tables(q.sql);
       for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims"]) {
         expect(t.has(name), name).toBe(true);
       }
-      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified"]) {
+      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at"]) {
         expect(columns(q.sql, "merge_trains").has(c), c).toBe(true);
       }
       for (const c of ["paths", "wait_reason", "conflicts"]) expect(columns(q.sql, "work_items").has(c), c).toBe(true);
@@ -74,8 +74,8 @@ describe("migrations", () => {
       // A new hive has no settings row yet (it gets one, autonomous, at its first v2 filing).
       expect(loadHiveSettings(q.sql)).toBeNull();
       // Idempotent: re-running is a no-op.
-      expect(migrate(state.storage)).toBe(12);
-      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(12);
+      expect(migrate(state.storage)).toBe(13);
+      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(13);
     });
   });
 
@@ -140,8 +140,8 @@ describe("migrations", () => {
       };
 
       // ── migrate ──
-      expect(migrate(state.storage)).toBe(12);
-      expect(version(sql)).toBe(12);
+      expect(migrate(state.storage)).toBe(13);
+      expect(version(sql)).toBe(13);
 
       // 3 work_items: user feature items with the prompt ids, v2 trace ids and first-line titles.
       const items = sql.exec("SELECT * FROM work_items ORDER BY seq").toArray().map(rowToWorkItem);
@@ -358,6 +358,7 @@ describe("v2 row mappers round-trip", () => {
         members: ["t1", "t2"],
         carId: null,
         passedSeq: 3,
+        passedAt: 1234,
         conflict: { trainId: "t2", kind: "content" as const, paths: ["a.js"], summary: "s" },
         changedPaths: ["a.js"],
         waitForCarSeq: 4,

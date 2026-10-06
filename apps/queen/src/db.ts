@@ -413,6 +413,10 @@ const MIGRATIONS: readonly Migration[] = [
   -- budget_boost: JSON BudgetBoost (day, dailyCredits, dailyDispatches); in effect only on that UTC day.
   ALTER TABLE hive_settings ADD COLUMN budget_boost TEXT;
   `,
+  `
+  -- v13: dedicated gate-pass timestamp (was overloading drone_issued_at, the watchdog clock).
+  ALTER TABLE merge_trains ADD COLUMN passed_at INTEGER;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -534,6 +538,7 @@ export function rowToTrain(r: Row): TrainRecord {
     ...(r.members !== null && r.members !== undefined ? { members: parseJson(r.members, stringArray) ?? [] } : {}),
     carId: str(r.car_id ?? null),
     passedSeq: num(r.passed_seq),
+    passedAt: num(r.passed_at),
     conflict: parseJson(r.conflict ?? null, schemaCheck<MergeConflict>(MergeConflictSchema)),
     ...(r.changed_paths !== null && r.changed_paths !== undefined ? { changedPaths: parseJson(r.changed_paths, stringArray) ?? [] } : {}),
     waitForCarSeq: num(r.wait_for_car_seq),
@@ -718,9 +723,9 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        fork_issued_at, delete_issued_at, deploy_issued_at, teardown_issued_at, drone_issued_at, drone_attempt,
        model, model_reason, model_choice, model_choice_attempt, model_outcome, model_probe, memories,
        trace_id, race_id, candidate, race_outcome, gate_score, credits,
-       lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of, verified)
+       lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of, verified, passed_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
        status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
@@ -738,7 +743,8 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        race_outcome = excluded.race_outcome, gate_score = excluded.gate_score, credits = excluded.credits,
        lane = excluded.lane, members = excluded.members, car_id = excluded.car_id, passed_seq = excluded.passed_seq,
        conflict = excluded.conflict, changed_paths = excluded.changed_paths,
-       wait_for_car_seq = excluded.wait_for_car_seq, bisect_of = excluded.bisect_of, verified = excluded.verified`,
+       wait_for_car_seq = excluded.wait_for_car_seq, bisect_of = excluded.bisect_of, verified = excluded.verified,
+       passed_at = excluded.passed_at`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -790,6 +796,7 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     t.waitForCarSeq ?? null,
     t.bisectOf ?? null,
     t.verified === null || t.verified === undefined ? null : t.verified ? 1 : 0,
+    t.passedAt ?? null,
   );
 }
 

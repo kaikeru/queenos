@@ -173,6 +173,8 @@ export type HiveHeadline = z.infer<typeof HiveHeadlineSchema>;
 
 export const HiveStatusSchema = z.object({
   hive: z.string(),
+  /** `sim` when the Queen runs against simulated executors (dev:sim), `live` otherwise. Absent on old Queens. */
+  mode: z.enum(["sim", "live"]).optional(),
   settings: HiveSettingsSchema,
   effectiveAutonomy: AutonomyLevelSchema,
   degradedBy: z.array(EscalationReasonSchema).max(5),

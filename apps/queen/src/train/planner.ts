@@ -151,6 +151,8 @@ export interface TrainRecord extends MergeTrain {
   deployIssuedAt: number | null;
   teardownIssuedAt: number | null;
   droneIssuedAt: number | null;
+  /** When the BUILD train passed its gate (migration v13); the merge queue reads it for queue-wait. */
+  passedAt?: number | null;
   /** Attempt number of the current phase's drone (instance id suffix when > 1). */
   droneAttempt: number;
   /** Router's choice, or (after the build) the model that actually built the head. */
@@ -1216,9 +1218,8 @@ export class TrainPlanner {
 
   /** A BUILD train passed its gate (or won its race): it takes a queue ticket and waits to board. */
   private pass(t: TrainRecord, patch: Partial<TrainRecord>): void {
-    // droneIssuedAt is idle in PASSED (droneOutstanding() needs BUILDING/LANDING), so it doubles as the
-    // "passed at" clock the queue reads to compute queue-wait on landing; a later dispatch restamps it.
-    this.setTrain(t, { ...patch, phase: "PASSED", passedSeq: ++this.maxPassedSeq, droneIssuedAt: this.ctx.now });
+    // passedAt is the "passed at" clock the queue reads to compute queue-wait on landing.
+    this.setTrain(t, { ...patch, phase: "PASSED", passedSeq: ++this.maxPassedSeq, passedAt: this.ctx.now });
     this.promptStatus(t, "IN_TRAIN");
   }
 

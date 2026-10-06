@@ -464,7 +464,7 @@ describe("carLanded", () => {
 
 describe("carLanded queue wait", () => {
   it("queue.landed carries per-member waits and their mean as waitMs (gate pass to landing)", () => {
-    const ms = [passed("A", 1, { droneIssuedAt: 1_000 }), passed("B", 2, { droneIssuedAt: 4_000 }), passed("C", 3)];
+    const ms = [passed("A", 1, { passedAt: 1_000 }), passed("B", 2, { passedAt: 4_000 }), passed("C", 3)];
     const k = car("K1", 10, ms, [], { phase: "LANDING" });
     const d = carLanded(k, SHA("e"), [...ms, k], ctx({ now: 7_000 }));
     expect(d.events[0]!.data).toMatchObject({ members: ["A", "B", "C"], waits: [6_000, 3_000, null], waitMs: 4_500 });
