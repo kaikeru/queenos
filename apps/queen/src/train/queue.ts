@@ -515,11 +515,19 @@ export function carLanded(car: TrainRecord, landedSha: string, trains: readonly 
     b.patch(id, { phase: "MERGED", status: "MERGED", landedSha });
     b.cleanUp(id);
   }
+  // Queue wait per member: gate pass (planner stamps droneIssuedAt then) to landing. `waitMs` is the mean
+  // (what metrics/rollup reads); `waits` is per member, aligned with `members` (null = no stamp).
+  const waits = members.map((id) => {
+    const at = b.get(id)?.droneIssuedAt;
+    return typeof at === "number" ? Math.max(0, ctx.now - at) : null;
+  });
+  const known = waits.filter((w): w is number => w !== null);
+  const waitMs = known.length ? Math.round(known.reduce((a, w) => a + w, 0) / known.length) : undefined;
   b.event({
     type: "queue.landed",
     trainId: car.trainId,
     summary: `car ${car.trainId} landed ${members.length} member${members.length === 1 ? "" : "s"} at main@${short(landedSha)}`,
-    data: { carId: car.trainId, members, landedSha },
+    data: { carId: car.trainId, members, landedSha, waits, ...(waitMs !== undefined ? { waitMs } : {}) },
   });
   return b.build();
 }

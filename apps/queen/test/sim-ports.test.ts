@@ -3,6 +3,7 @@ import { MODEL_CATALOG } from "@queenos/queen-types";
 import type { AppendAuditInput, MergeResultInput, OracleResultInput, TrainResult, BuildResult, DeployResult, ModelChoice, DroneTask, MergeTrain, PromptRun, ProvisionResult, Release, SentinelCommand, SentinelVerdict } from "@queenos/queen-types";
 import {
   BATCH_FAIL_MARKER,
+  BATCH_FAIL_MAX_HOLDS,
   COLLIDE_MARKER,
   SIM_BUILD_JITTER_MS,
   DEFAULT_SIM_DELAYS,
@@ -745,6 +746,34 @@ describe("sim gate: [batch-fail] and races", () => {
     await h.sim.drones.dispatch({ ...carTask("carC", ["mb2"]), members: [member("mb2", "p-mb")] });
     await h.advance(1500);
     expect(h.merges.at(-1)).toMatchObject({ merged: ["mb2"], fastForward: true });
+  });
+
+  it("a first-attempt [batch-fail] build holds its gate verdict until another build is waiting in the pool", async () => {
+    const h = harness(); // the harness's own train t1 is "in flight" (TESTING), so the culprit must wait
+    await forkAndBuild(h, "mb", `b ${BATCH_FAIL_MARKER}`);
+    await h.advance(100);
+    await h.advance(TEST_RETRY_MS * 4);
+    expect(h.trainResults.find((t) => t.trainId === "mb")).toBeUndefined();
+    h.world.trains.push({ trainId: "ma", baseSha: "", includedPrompts: [], artifactRepo: "r", status: "TESTING", createdAt: 0, phase: "PASSED", lane: "BUILD", carId: null });
+    await h.advance(TEST_RETRY_MS);
+    await h.advance(100);
+    expect(h.trainResults.find((t) => t.trainId === "mb")).toMatchObject({ passed: true });
+  });
+
+  it("the hold gives up after BATCH_FAIL_MAX_HOLDS and never applies to a REWORK or a lone build", async () => {
+    const h = harness();
+    await forkAndBuild(h, "mb2", `b ${BATCH_FAIL_MARKER}`, { action: "REWORK", promptId: "p-mb" });
+    await h.advance(200);
+    expect(h.trainResults.find((t) => t.trainId === "mb2")).toMatchObject({ passed: true });
+    const h2 = harness();
+    h2.phase.value = "PASSED"; // the harness's t1 is no longer in flight: nothing to wait for
+    await forkAndBuild(h2, "mc", `c ${BATCH_FAIL_MARKER}`);
+    await h2.advance(200);
+    expect(h2.trainResults.find((t) => t.trainId === "mc")).toMatchObject({ passed: true });
+    const h3 = harness();
+    await forkAndBuild(h3, "md", `d ${BATCH_FAIL_MARKER}`);
+    for (let i = 0; i < BATCH_FAIL_MAX_HOLDS + 2; i++) await h3.advance(TEST_RETRY_MS);
+    expect(h3.trainResults.find((t) => t.trainId === "md")).toMatchObject({ passed: true });
   });
 
   it("[batch-fail] alone passes (fast-forward, no gate run)", async () => {

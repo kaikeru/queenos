@@ -180,8 +180,14 @@ export const CANARY_FAIL_PERCENT = 10;
 /** The sim gatekeeper waits for TESTING (the preview going LIVE) this often, this many times. */
 export const TEST_RETRY_MS = 500;
 export const TEST_MAX_TRIES = 40;
+/**
+ * A first-attempt `[batch-fail]` build holds its gate verdict (polling every TEST_RETRY_MS, at most this
+ * many times) until another build train is waiting in the pool, or none is still in flight, so it boards a
+ * multi-member car and the integration gate has something to bisect.
+ */
+export const BATCH_FAIL_MAX_HOLDS = 120;
 
-type DroneJob = { id: string; kind: "build" | "test" | "land" | "merge"; due: number; task: DroneTask; tries?: number };
+type DroneJob = { id: string; kind: "build" | "test" | "land" | "merge"; due: number; task: DroneTask; tries?: number; holds?: number };
 type ProvisionJob = { id: string; kind: "provision"; due: number; command: ProvisionCommand };
 type DeployJob = { id: string; kind: "deploy"; due: number; command: DeployCommand };
 type SentinelJob = { id: string; kind: "sentinel"; due: number; command: SentinelCommand };
@@ -554,6 +560,13 @@ export class SimExecutors {
           return;
         }
         if (task.action === "MERGE") return this.runCarGate(task, train);
+        if (task.action === "BUILD" && (train?.candidate ?? 0) === 0 && task.promptText.includes(BATCH_FAIL_MARKER)) {
+          const holds = job.holds ?? 0;
+          if (holds < BATCH_FAIL_MAX_HOLDS && (await this.shouldHoldForCompany(task.trainId))) {
+            await this.schedule({ ...job, due: this.now() + TEST_RETRY_MS, holds: holds + 1 });
+            return;
+          }
+        }
         // In a race only candidate 0 fails or is rejected, so the others can win on score.
         const candidate0 = (train?.candidate ?? 0) === 0;
         const shouldFail = task.promptText.includes(FAIL_MARKER) && task.action === "BUILD" && candidate0;
@@ -710,6 +723,16 @@ export class SimExecutors {
       await this.audit(task, "GATEKEEPER", "RUNNING", null);
       await this.schedule({ id: `${task.trainId}-test`, kind: "test", due: this.now() + this.delays.test, task });
     }
+  }
+
+  /**
+   * True while a `[batch-fail]` build should keep waiting: no other passed build is waiting to board, but
+   * some other build is still in flight and may pass soon.
+   */
+  private async shouldHoldForCompany(trainId: string): Promise<boolean> {
+    const others = (await this.queen().getSnapshot()).trains.filter((t) => t.trainId !== trainId && t.lane !== "QUEUE" && !t.carId);
+    if (others.some((t) => t.phase === "PASSED")) return false;
+    return others.some((t) => t.phase === "BUILDING" || t.phase === "DEPLOYING" || t.phase === "TESTING");
   }
 
   /**

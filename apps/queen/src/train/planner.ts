@@ -1216,7 +1216,9 @@ export class TrainPlanner {
 
   /** A BUILD train passed its gate (or won its race): it takes a queue ticket and waits to board. */
   private pass(t: TrainRecord, patch: Partial<TrainRecord>): void {
-    this.setTrain(t, { ...patch, phase: "PASSED", passedSeq: ++this.maxPassedSeq });
+    // droneIssuedAt is idle in PASSED (droneOutstanding() needs BUILDING/LANDING), so it doubles as the
+    // "passed at" clock the queue reads to compute queue-wait on landing; a later dispatch restamps it.
+    this.setTrain(t, { ...patch, phase: "PASSED", passedSeq: ++this.maxPassedSeq, droneIssuedAt: this.ctx.now });
     this.promptStatus(t, "IN_TRAIN");
   }
 

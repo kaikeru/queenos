@@ -462,6 +462,21 @@ describe("carLanded", () => {
   });
 });
 
+describe("carLanded queue wait", () => {
+  it("queue.landed carries per-member waits and their mean as waitMs (gate pass to landing)", () => {
+    const ms = [passed("A", 1, { droneIssuedAt: 1_000 }), passed("B", 2, { droneIssuedAt: 4_000 }), passed("C", 3)];
+    const k = car("K1", 10, ms, [], { phase: "LANDING" });
+    const d = carLanded(k, SHA("e"), [...ms, k], ctx({ now: 7_000 }));
+    expect(d.events[0]!.data).toMatchObject({ members: ["A", "B", "C"], waits: [6_000, 3_000, null], waitMs: 4_500 });
+  });
+
+  it("omits waitMs when no member has a pass stamp", () => {
+    const ms = [passed("A", 1)];
+    const k = car("K1", 10, ms, [], { phase: "LANDING" });
+    expect(carLanded(k, SHA("e"), [...ms, k], ctx()).events[0]!.data).not.toHaveProperty("waitMs");
+  });
+});
+
 describe("§3.2b batch failure → bisect, end to end (pure)", () => {
   it("K5 [P,Q,R,S] ✗ → K7 [P,Q] + K8 [R,S]; K7 ✗ → K9 [P] + K10 [Q], K8 superseded; K10 ✗ → Q reworks; R,S board behind", () => {
     let n = 0;

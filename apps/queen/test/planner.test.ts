@@ -326,6 +326,8 @@ describe("planner: results", () => {
     s.result("B", true);
     expect(s.take("dispatchDrone").map((d) => d.task.promptId)).toEqual(["C"]);
     expect([s.trainOf("C").passedSeq, s.trainOf("B").passedSeq]).toEqual([1, 2]);
+    // Passing stamps the "passed at" clock the queue reads for queue-wait.
+    expect(s.trainOf("B").droneIssuedAt).toBe(s.now);
     expect(s.trainOf("B").phase).toBe("PASSED");
     s.result("A", true);
     expect(s.trainOf("A")).toMatchObject({ phase: "PASSED", passedSeq: 3 });
