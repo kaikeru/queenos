@@ -1,0 +1,83 @@
+/* Swarm floor + merge queue (v2 design §5.1, §5.2). Animations use transform/opacity only. */
+.floor, .mq { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+.floor__head, .mq__head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.floor__head .eyebrow, .mq__head .eyebrow { margin: 0; }
+.floor__summary { font: 600 13px var(--mono); color: var(--text); margin-bottom: 10px; overflow-wrap: anywhere; }
+.floor__empty { font: 13px var(--mono); color: var(--dim); }
+
+.floor__groups { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-start; }
+.fgroup { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.fgroup__label { font: 600 10px var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--dim); }
+.fgroup__label b { color: var(--text); margin-left: 4px; }
+.fgroup__tiles { display: flex; flex-wrap: wrap; gap: 4px; max-width: 360px; }
+.frace { display: flex; flex-wrap: wrap; gap: 3px; padding: 3px; border: 1px dashed var(--violet); border-radius: 8px; background: rgba(167, 139, 250, 0.08); }
+
+.tile { display: block; width: 22px; height: 22px; border-radius: 5px; border: 1px solid transparent; background: var(--tile, var(--faint)); opacity: 0.92; text-decoration: none; color: inherit; transition: background-color 0.3s, opacity 0.3s, transform 0.15s; animation: tile-in 0.45s ease-out both; will-change: transform, opacity; }
+.tile:hover, .tile:focus-visible { transform: scale(1.25); opacity: 1; outline: 1px solid var(--text); z-index: 1; }
+.tile--waiting { --tile: var(--faint); }
+.tile--building { --tile: var(--cyan); }
+.tile--deploying { --tile: #5b8cff; }
+.tile--gating { --tile: var(--yellow); }
+.tile--racing { --tile: var(--violet); }
+.tile--queued { --tile: #7be0c3; }
+.tile--merging { --tile: var(--green); }
+.tile--building, .tile--gating, .tile--deploying { animation: tile-in 0.45s ease-out both, tile-pulse 2.4s ease-in-out 0.5s infinite; }
+.tile--winner { box-shadow: 0 0 0 2px var(--green); }
+.tile--loser { opacity: 0.4; }
+@keyframes tile-in { from { transform: translateY(8px) scale(0.6); opacity: 0; } to { transform: none; opacity: 0.92; } }
+@keyframes tile-pulse { 50% { opacity: 0.6; } }
+
+.bars { display: flex; flex-direction: column; gap: 6px; }
+.bar { display: grid; grid-template-columns: 84px 1fr 48px; align-items: center; gap: 8px; font: 12px var(--mono); }
+.bar__track { height: 12px; border-radius: 6px; background: var(--bg-2); overflow: hidden; }
+.bar__fill { display: block; height: 100%; width: 100%; background: var(--tile, var(--cyan)); transform-origin: left; transform: scaleX(var(--w, 0)); transition: transform 0.4s ease-out; }
+.bar b { text-align: right; }
+
+/* rail */
+.mq__meta { font: 12px var(--mono); color: var(--dim); }
+.rail { display: flex; align-items: stretch; gap: 8px; overflow-x: auto; overscroll-behavior-x: contain; max-width: 100%; padding: 4px 2px 10px; scrollbar-width: thin; }
+.rail__main, .car { flex: 0 0 auto; border: 1px solid var(--line-2); border-radius: 10px; padding: 8px 10px; background: var(--panel-2); font: 12px var(--mono); }
+.rail__main { border-color: rgba(53, 242, 160, 0.5); color: var(--green); display: flex; flex-direction: column; justify-content: center; }
+.rail__arrow { flex: 0 0 auto; align-self: center; color: var(--faint); font: 700 16px var(--mono); }
+.car { display: flex; flex-direction: column; gap: 6px; min-width: 120px; animation: tile-in 0.45s ease-out both; }
+.car__top { display: flex; align-items: center; gap: 8px; }
+.car__top b { font-size: 14px; }
+.car__phase { font-size: 10px; letter-spacing: 0.1em; padding: 1px 6px; border-radius: 999px; border: 1px solid currentColor; }
+.car--merging .car__phase { color: var(--cyan); } .car--gating .car__phase { color: var(--yellow); }
+.car--passed .car__phase { color: #7be0c3; } .car--landing .car__phase { color: var(--green); }
+.car--landing { border-color: rgba(53, 242, 160, 0.5); }
+.car__ff { color: var(--yellow); font-size: 11px; }
+.car__members { display: flex; flex-wrap: wrap; gap: 4px; }
+.mchip { display: inline-block; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 7px; border-radius: 6px; background: var(--bg-2); border: 1px solid var(--line); color: var(--text); text-decoration: none; }
+a.mchip:hover { border-color: var(--cyan); }
+.rail__empty { align-self: center; color: var(--dim); font: 12px var(--mono); padding: 0 6px; }
+.mq__waiting { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font: 12px var(--mono); color: var(--dim); margin-bottom: 8px; }
+.stories { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.story { font: 12px var(--mono); display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; overflow-wrap: anywhere; }
+.story__kind { font-weight: 700; } .story--conflict .story__kind { color: var(--yellow); } .story--bisect .story__kind { color: var(--violet); }
+.story a { color: var(--cyan); }
+.story__paths { color: var(--dim); }
+
+/* queue page */
+.qpage { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.qtable-wrap { overflow-x: auto; max-width: 100%; }
+.qtable { width: 100%; border-collapse: collapse; font: 12px var(--mono); }
+.qtable th { text-align: left; color: var(--dim); font-weight: 600; letter-spacing: 0.08em; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.qtable td { padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.qtable button.linkish { background: none; border: 0; padding: 0; color: var(--cyan); font: 700 12px var(--mono); }
+.qdetail td { white-space: normal; background: var(--bg-2); }
+.qdetail dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; }
+.qdetail dt { color: var(--dim); } .qdetail dd { margin: 0; overflow-wrap: anywhere; }
+.qtree { list-style: none; margin: 0; padding-left: 14px; border-left: 1px solid var(--line-2); }
+.v--ok { color: var(--green); } .v--bad { color: var(--red); } .v--na { color: var(--dim); }
+
+@media (max-width: 480px) {
+  .floor, .mq { padding: 12px; }
+  .fgroup__tiles { max-width: 100%; }
+  .tile { width: 20px; height: 20px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tile, .car { animation: none !important; }
+  .tile, .bar__fill { transition: none; }
+  .tile:hover, .tile:focus-visible { transform: none; }
+}
