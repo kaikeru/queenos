@@ -138,7 +138,7 @@ async function smokeRoutes(ports: GatekeeperPorts, previewUrl: string, routes: S
   let failed: { route: SmokeRoute; result: SmokeResult } | undefined;
   let ok = 0;
   for (const route of routes) {
-    const r = await ports.smoke.check(previewUrl, route.path);
+    const r = await ports.smoke.check(previewUrl, route.path, route.member ? "feature" : "base");
     if (r.passed) {
       ok++;
       continue;
@@ -154,7 +154,7 @@ async function smokeRoutes(ports: GatekeeperPorts, previewUrl: string, routes: S
     passed: false,
     checks: ok + 1,
     log: logs.join("\n"),
-    failingCheck: `integration ${smokeCheckName(route.path)}${who}`,
+    failingCheck: `integration ${smokeCheckName(route.path, route.member ? "feature" : "base")}${who}`,
     ...(result.firstError ? { firstError: result.firstError } : {}),
     failed: route,
   };

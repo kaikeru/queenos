@@ -216,7 +216,9 @@ export class FakeSmoke implements SmokeProbe {
   result: SmokeResult = { passed: true, status: 200, log: "smoke: ok" };
   /** Per-path overrides (the integration gate probes several routes). */
   byPath = new Map<string, SmokeResult>();
-  async check(url: string, path = "/"): Promise<SmokeResult> {
+  readonly kinds: string[] = [];
+  async check(url: string, path = "/", kind: "base" | "feature" = "base"): Promise<SmokeResult> {
+    this.kinds.push(kind);
     this.urls.push(url);
     this.paths.push(path);
     return this.byPath.get(path) ?? this.result;

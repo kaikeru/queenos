@@ -66,6 +66,38 @@ describe("FetchSmokeProbe", () => {
     expect(r.firstError).toMatch(/unreachable after 3 attempts \(fetch failed\)/);
   });
 
+  it("feature kind: 400/401/405/422 pass (the app answered deliberately)", async () => {
+    for (const code of [400, 401, 405, 422, 302]) {
+      const { p, calls } = probe(new Response("bad input", { status: code }));
+      const r = await p.check("https://x.dev", "/features/hex", "feature");
+      expect(r).toMatchObject({ passed: true, status: code });
+      expect(calls).toHaveLength(1);
+    }
+  });
+
+  it("feature kind: 404 and 500 fail with the route in the error", async () => {
+    for (const code of [404, 500, 503]) {
+      const { p } = probe(new Response("x", { status: code }));
+      const r = await p.check("https://x.dev", "/features/hex", "feature");
+      expect(r.passed).toBe(false);
+      expect(r.status).toBe(code);
+      expect(r.firstError).toContain(`GET /features/hex returned HTTP ${code}`);
+      expect(r.log).toContain("FAIL  preview smoke > GET /features/hex is routed");
+    }
+  });
+
+  it("feature kind: a network failure fails", async () => {
+    const { p } = probe(new TypeError("fetch failed"));
+    expect((await p.check("https://x.dev", "/f", "feature")).passed).toBe(false);
+  });
+
+  it("base kind: /health 400 fails (default kind is base)", async () => {
+    const { p } = probe(new Response("bad", { status: 400 }));
+    const r = await p.check("https://x.dev", "/health");
+    expect(r.passed).toBe(false);
+    expect(r.firstError).toContain("expected 2xx");
+  });
+
   it("aborts a hung request at the timeout", async () => {
     const fetch: SmokeFetch = (_url, init) => new Promise((_res, rej) => init.signal!.addEventListener("abort", () => rej(new Error("aborted"))));
     const p = new FetchSmokeProbe({ fetch, attempts: 1, timeoutMs: 20 });

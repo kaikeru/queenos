@@ -3,6 +3,7 @@ import type { GateTarget } from "@queenos/queen-types";
 import { integrationRoutes } from "../src/inspect";
 import { followUpsFrom } from "../src/followups";
 import { lookupTrain, runGate } from "../src/orchestrate";
+import { FetchSmokeProbe } from "../src/smoke";
 import { FakeWorld, HIVE, InlineSteps, REPO, config, gateTask } from "./fakes";
 
 const TRACE_A = "a".repeat(32);
@@ -130,6 +131,48 @@ describe("integration gate (lane QUEUE)", () => {
     expect(w.queen.reports()[0]).toMatchObject({ trainId: "car-1", passed: false, score: { review: "skipped" } });
     // The raw log carries both the route and the member for the Scribe.
     expect(w.failures.stored[0]![0]!.text).toContain('declared by member m2 "Add pricing page"');
+  });
+
+  it("probes member routes as feature routes and base routes as base", async () => {
+    const { w, head } = await carWorld();
+    await runGate(gateTask(head), new InlineSteps(), w.ports(), config());
+    expect(w.smoke.kinds).toEqual(["base", "base", "feature", "feature"]);
+  });
+
+  /** Real FetchSmokeProbe against a canned Worker: path -> status. */
+  function realProbe(statuses: Record<string, number>) {
+    return new FetchSmokeProbe({
+      attempts: 1,
+      fetch: async (url) => new Response(`status for ${new URL(url).pathname}`, { status: statuses[new URL(url).pathname] ?? 200 }),
+    });
+  }
+
+  it("a member route answering 400 (input validation) passes the car: no failure, no bisect trigger", async () => {
+    const { w, head } = await carWorld();
+    const ports = { ...w.ports(), smoke: realProbe({ "/dark": 400, "/pricing": 422 }) };
+    const out = await runGate(gateTask(head), new InlineSteps(), ports, config());
+    expect(out).toMatchObject({ status: "gated", passed: true, lane: "QUEUE" });
+    expect(w.queen.reports()[0]).toMatchObject({ trainId: "car-1", passed: true });
+  });
+
+  it("a member route answering 404 or 500 still fails the car and names the member", async () => {
+    for (const code of [404, 500]) {
+      const { w, head } = await carWorld();
+      const ports = { ...w.ports(), smoke: realProbe({ "/pricing": code }) };
+      const out = await runGate(gateTask(head), new InlineSteps(), ports, config());
+      expect(out).toMatchObject({ status: "gated", passed: false });
+      if (out.status !== "gated") throw new Error("unreachable");
+      expect(out.summary).toContain("GET /pricing");
+      expect(out.summary).toContain("m2");
+      expect(w.failures.stored.at(-1)![0]!.text).toContain('declared by member m2 "Add pricing page"');
+    }
+  });
+
+  it("/health answering 400 still fails the car, attributed to no member", async () => {
+    const { w, head } = await carWorld();
+    const ports = { ...w.ports(), smoke: realProbe({ "/health": 400 }) };
+    const out = await runGate(gateTask(head), new InlineSteps(), ports, config());
+    expect(out).toMatchObject({ status: "gated", passed: false });
   });
 
   it("a failing base route (/health) is attributed to no member", async () => {
