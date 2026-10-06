@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decomposeSchema, parseDecomposition, systemPrompt, userPrompt } from "../src/prompt";
+import { decomposeSchema, enforceBulletFanout, parseBullets, parseDecomposition, systemPrompt, userPrompt } from "../src/prompt";
 
 describe("prompt", () => {
   it("states the same-file dependency rule, the fewer-items rule and new-files rule", () => {
@@ -8,6 +8,15 @@ describe("prompt", () => {
     expect(s).toMatch(/Prefer fewer, independent items/);
     expect(s).toMatch(/New features go in new files/);
     expect(s).toContain("Never return more than 5");
+  });
+
+  it("tells the model generated paths never collide, bullets are separate items, fewer only for vague goals", () => {
+    const s = systemPrompt(12);
+    expect(s).toMatch(/GENERATED files \(src\/features\/index\.js\)/);
+    expect(s).toMatch(/must not appear in any item's paths/);
+    expect(s).toMatch(/each line is its own item/);
+    expect(s).toMatch(/Prefer fewer, independent items ONLY when/);
+    expect(s).toContain("src/features/<slug>.js");
   });
 
   it("schema requires paths and caps children", () => {
@@ -57,5 +66,19 @@ describe("parseDecomposition", () => {
   it("returns [] for garbage and skips untitled children", () => {
     expect(parseDecomposition("I cannot do that", 4)).toEqual([]);
     expect(parseDecomposition(JSON.stringify({ children: [child({ title: "" })] }), 4)).toEqual([]);
+  });
+});
+
+describe("parseBullets / enforceBulletFanout", () => {
+  it("finds top-level bullets and numbered lines, nests sub-bullets, drops exact duplicates", () => {
+    const { preface, bullets } = parseBullets("Title line\n- one\n  - sub detail\n2. two\n* One!\n3) three");
+    expect(preface).toBe("Title line");
+    expect(bullets.map((b) => b.text)).toEqual(["one", "two", "three"]);
+    expect(bullets[0]!.details).toEqual(["- sub detail"]);
+  });
+
+  it("leaves children alone for fewer than two bullets", () => {
+    const kids = parseDecomposition(JSON.stringify([{ title: "T", body: "b" }]), 5);
+    expect(enforceBulletFanout("goal\n- only one", kids, 5)).toBe(kids);
   });
 });

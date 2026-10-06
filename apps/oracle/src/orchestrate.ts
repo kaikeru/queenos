@@ -17,7 +17,7 @@ import {
   type SimilarItem,
 } from "@queenos/queen-types";
 import { AiGatewayError } from "@queenos/hive-kit";
-import { decomposeSchema, parseDecomposition, systemPrompt, userPrompt } from "./prompt";
+import { decomposeSchema, enforceBulletFanout, parseDecomposition, systemPrompt, userPrompt } from "./prompt";
 import type { OraclePorts } from "./ports";
 
 export interface StepRunner {
@@ -112,7 +112,7 @@ async function decompose(cmd: Extract<OracleCommand, { op: "DECOMPOSE" }>, step:
             responseFormat: { type: "json_schema", json_schema: { name: "decomposition", schema: decomposeSchema(maxChildren), strict: true } },
             metadata: { role: "planner", hive, commandId },
           });
-          const children = parseDecomposition(res.text, maxChildren);
+          const children = enforceBulletFanout(cmd.promptText, parseDecomposition(res.text, maxChildren), maxChildren);
           if (children.length === 0) {
             errors.push(`${model}: no usable children`);
             break; // a bad answer at temperature 0 will not improve; next model

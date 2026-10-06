@@ -109,6 +109,84 @@ describe("runOracle DECOMPOSE", () => {
   });
 });
 
+describe("runOracle DECOMPOSE bullet fan-out guard", () => {
+  const slugs = ["quote", "uuid", "time", "dice", "coin", "echo", "ping", "hash", "color", "lorem", "joke", "fact"];
+  const bullets = slugs.map((s) => `- Add a /features/${s} endpoint returning ${s} JSON`);
+  const prompt12 = `Add twelve /features utility endpoints to Pulse\n\n${bullets.join("\n")}`;
+  const cmd12 = (over = {}) => decomposeCmd({ promptText: prompt12, limits: { maxChildren: 16 }, ...over });
+
+  it("12 bullets collapsed into one merged child fan out to 12 children", async () => {
+    const w = new FakeWorld();
+    w.llm.script = [
+      answer([c("c1", { title: "Add twelve /features utility endpoints to Pulse", body: "register each route in src/features/index.js", paths: ["src/features/index.js", "src/features/"] })]),
+    ];
+    await runOracle(cmd12(), new InlineSteps(), w.ports());
+    const kids = w.queen.results[0]!.children!;
+    expect(kids).toHaveLength(12);
+    expect(kids.map((k) => k.key)).toEqual(Array.from({ length: 12 }, (_, n) => `c${n + 1}`));
+    expect(kids[1]!.title).toBe("Add a /features/uuid endpoint returning uuid JSON");
+    expect(kids.every((k) => k.dependsOn.length === 0 && !k.paths.includes("src/features/index.js"))).toBe(true);
+    expect(w.memory.indexed[0]!.items).toHaveLength(12);
+  });
+
+  it("reuses the model's per-bullet details when they match", async () => {
+    const w = new FakeWorld();
+    w.llm.script = [answer([c("c1", { title: "Add a /features/uuid endpoint returning uuid JSON", body: "use crypto.randomUUID() and return it in a long body", acceptance: ["returns 200"], paths: ["src/features/uuid.js", "src/features/index.js"] })])];
+    await runOracle(cmd12(), new InlineSteps(), w.ports());
+    const kids = w.queen.results[0]!.children!;
+    expect(kids).toHaveLength(12);
+    const uuid = kids.find((k) => k.title.includes("uuid"))!;
+    expect(uuid).toMatchObject({ acceptance: ["returns 200"], paths: ["src/features/uuid.js"] });
+    expect(uuid.body).toContain("crypto.randomUUID");
+  });
+
+  it("trusts the model when it returns one child per bullet", async () => {
+    const w = new FakeWorld();
+    w.llm.script = [answer(slugs.map((_, n) => c(`c${n + 1}`)))];
+    await runOracle(cmd12(), new InlineSteps(), w.ports());
+    expect(w.queen.results[0]!.children!.map((k) => k.title)).toEqual(slugs.map((_, n) => `Item c${n + 1}`));
+  });
+
+  it("allows fewer children for exact duplicate bullets, and caps at maxChildren", async () => {
+    const w = new FakeWorld();
+    const text = "- Add /a endpoint\n- Add /b endpoint\n- add /a endpoint!\n";
+    w.llm.script = [answer([c("c1"), c("c2")])];
+    await runOracle(decomposeCmd({ promptText: text }), new InlineSteps(), w.ports());
+    expect(w.queen.results[0]!.children).toHaveLength(2);
+    w.llm.script = [answer([c("c1")])];
+    await runOracle(cmd12({ limits: { maxChildren: 5 } }), new InlineSteps(), w.ports());
+    expect(w.queen.results[1]!.children).toHaveLength(5);
+  });
+
+  it("a vague single-goal prompt keeps the model's grouping", async () => {
+    const w = new FakeWorld();
+    w.llm.script = [answer([c("c1", { title: "Add a footer and an about page" })])];
+    await runOracle(decomposeCmd(), new InlineSteps(), w.ports());
+    expect(w.queen.results[0]!.children).toHaveLength(1);
+    // a single bullet is not a list either
+    await runOracle(decomposeCmd({ promptText: "Polish things\n- make the header nicer" }), new InlineSteps(), w.ports());
+    expect(w.queen.results[1]!.children).toHaveLength(1);
+  });
+
+  it("strips generated paths from every child and drops generated-only dependsOn edges", async () => {
+    const w = new FakeWorld();
+    w.llm.script = [
+      answer([
+        c("c1", { paths: ["src/features/a.js", "src/features/index.js"] }),
+        c("c2", { paths: ["src/features/b.js", "src/features/index.js"], dependsOn: ["c1"] }),
+        c("c3", { paths: ["src/shared.js", "src/features/index.js"] }),
+        c("c4", { paths: ["src/shared.js"], dependsOn: ["c3"] }),
+      ]),
+    ];
+    await runOracle(decomposeCmd(), new InlineSteps(), w.ports());
+    const kids = w.queen.results[0]!.children!;
+    expect(kids.flatMap((k) => k.paths)).not.toContain("src/features/index.js");
+    expect(kids[0]!.paths).toEqual(["src/features/a.js"]);
+    expect(kids[1]!.dependsOn).toEqual([]);
+    expect(kids[3]!.dependsOn).toEqual(["c3"]); // real shared file: edge kept
+  });
+});
+
 describe("runOracle TRIAGE", () => {
   it("finds similar items (excluding itself), indexes the item and reports", async () => {
     const w = new FakeWorld();
