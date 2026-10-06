@@ -1,10 +1,52 @@
 import { Home } from "./Home";
 import { NewProject } from "./NewProject";
 import { Wizard } from "./Wizard";
-import { WarRoom } from "./WarRoom";
+import { WarRoom, useRoom } from "./WarRoom";
+import { StatusHome } from "./StatusHome";
+import { ItemView } from "./ItemView";
+import { QueuePage } from "./QueuePage";
+import { TraceView } from "./TraceView";
+import { EventLog } from "./EventLog";
+import { Metrics } from "./Metrics";
 import { Link, useRoute } from "./router";
-import { hrefFor } from "./route";
-import { Shell } from "./shell";
+import { hrefFor, type Route } from "./route";
+import { HiveFooter, HiveHeader, Shell } from "./shell";
+
+type HiveRoute = Extract<Route, { name: "warroom" }>;
+
+/** One live room per hive: the socket and state persist while the user moves between its pages. */
+function HiveRoot({ route }: { route: HiveRoute }) {
+  const { hive, page } = route;
+  const room = useRoom(hive);
+  const { state, status, latencyMs } = room;
+  const id = route.id ?? "";
+  if (page === "status") return <StatusHome hive={hive} room={room} />;
+  if (page === "lanes") return <WarRoom hive={hive} room={room} backTo={hrefFor.status(hive)} />;
+  const crumbs: Record<string, { label: string }[]> = {
+    queue: [{ label: "queue" }],
+    item: [{ label: "item" }, { label: id }],
+    trace: [{ label: "trace" }, { label: id.slice(0, 8) }],
+    events: [{ label: "events" }],
+    metrics: [{ label: "metrics" }],
+  };
+  return (
+    <div className="app hive-page">
+      {state.outdated && (
+        <div className="update-banner" role="alert">
+          <span>QueenOS was updated. Reload to get the latest dashboard</span>
+          <button type="button" onClick={() => window.location.reload()}>Reload</button>
+        </div>
+      )}
+      <HiveHeader hive={hive} crumbs={crumbs[page]} status={status} latencyMs={latencyMs} />
+      {page === "queue" && <QueuePage hive={hive} state={state} />}
+      {page === "item" && <ItemView hive={hive} itemId={id} state={state} />}
+      {page === "trace" && <TraceView hive={hive} traceId={id} state={state} />}
+      {page === "events" && <EventLog hive={hive} state={state} />}
+      {page === "metrics" && <Metrics hive={hive} state={state} />}
+      <HiveFooter hive={hive} />
+    </div>
+  );
+}
 
 export function App() {
   const route = useRoute();
@@ -16,7 +58,7 @@ export function App() {
     case "setup":
       return <Wizard key={route.hive} hive={route.hive} />;
     case "warroom":
-      return <WarRoom key={route.hive} hive={route.hive} backTo={route.legacy ? undefined : hrefFor.home()} />;
+      return <HiveRoot key={route.hive} route={route} />;
     case "notfound":
       return (
         <Shell>

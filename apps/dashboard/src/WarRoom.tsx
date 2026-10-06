@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useReducer, useState } from "react";
+import { HiveFooter } from "./shell";
 import { DEMO_PROMPTS } from "./demo";
 import { Composer, Lanes, LedgerPanel, MainTrack, ModelBoard, ReleaseTimeline, Sites, Ticker, TopBar } from "./components";
 import { currentRelease, siteReleaseView } from "./releases";
@@ -9,9 +10,17 @@ import { useQueenSocket } from "./useQueenSocket";
 // A build-time constant (replaced by Vite), so the mock is tree-shaken from production bundles.
 const useRoomSocket = import.meta.env.VITE_MOCK_API === "1" ? useMockQueen : useQueenSocket;
 
-export function WarRoom({ hive, backTo }: { hive: string; backTo?: string }) {
+/** The live link to one hive: reducer state plus the socket. Owned by the hive root so it survives page changes. */
+export function useRoom(hive: string) {
   const [state, dispatch] = useReducer(reducer, initialState);
-  const { status, latencyMs, retryAt, send } = useRoomSocket(hive, dispatch);
+  const link = useRoomSocket(hive, dispatch);
+  return { state, dispatch, ...link };
+}
+export type Room = ReturnType<typeof useRoom>;
+
+/** The lanes drill-down (today's War Room): lanes, release timeline, Sites, Model Board, ticker. */
+export function WarRoom({ hive, room, backTo }: { hive: string; room: Room; backTo?: string }) {
+  const { state, dispatch, status, latencyMs, retryAt, send } = room;
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [swarming, setSwarming] = useState(false);
 
@@ -73,6 +82,7 @@ export function WarRoom({ hive, backTo }: { hive: string; backTo?: string }) {
         </aside>
       </div>
       {selected && <LedgerPanel card={selected.card} lane={selected.lane} onClose={closeLedger} />}
+      <HiveFooter hive={hive} />
     </div>
   );
 }

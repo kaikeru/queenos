@@ -2,6 +2,8 @@ import { useEffect, useRef, type ReactNode } from "react";
 import { api, errorMessage, isAuthError } from "./api";
 import { useEscape, useResource } from "./hooks";
 import { Link } from "./router";
+import { hrefFor } from "./route";
+import type { ConnStatus } from "./useQueenSocket";
 
 /** Header shared by the projects home and the wizard: brand, crumbs, signed-in user. */
 export function Shell(props: { crumbs?: { label: string; to?: string }[]; actions?: ReactNode; children: ReactNode; wide?: boolean }) {
@@ -77,4 +79,52 @@ export function Modal(props: { title: string; onClose: () => void; children: Rea
 
 export function StatusChip({ status }: { status: string }) {
   return <span className={`chip chip--${status.toLowerCase()}`}>{status}</span>;
+}
+
+/** Status chip for a work-item status (WORK_STATUSES), reusing the train chip palette. */
+export function ItemChip({ status, sub }: { status: string; sub?: string | null }) {
+  return <span className={`chip chip--w-${status.toLowerCase()}`}>{sub ? `${status} · ${sub}` : status}</span>;
+}
+
+/** Header for hive pages: brand, breadcrumbs, link state, page actions. */
+export function HiveHeader(props: { hive: string; crumbs?: { label: string; to?: string }[]; status: ConnStatus; latencyMs: number | null; actions?: ReactNode }) {
+  const label = props.status === "open" ? `linked${props.latencyMs !== null ? ` ${props.latencyMs}ms` : ""}` : props.status;
+  return (
+    <header className="hh">
+      <Link to={hrefFor.home()} className="hh__brand" aria-label="QueenOS projects">
+        <span className="brand__mark">♛</span>
+        <b>QUEENOS</b>
+      </Link>
+      <nav className="hh__crumbs" aria-label="Breadcrumbs">
+        <Link to={hrefFor.status(props.hive)}>{props.hive}</Link>
+        {props.crumbs?.map((c, i) => (
+          <span key={i}>
+            {" / "}
+            {c.to ? <Link to={c.to}>{c.label}</Link> : <b>{c.label}</b>}
+          </span>
+        ))}
+      </nav>
+      <div className="hh__right">
+        {props.actions}
+        <div className={`conn conn--${props.status}`} role="status">
+          <i />
+          {label}
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/** Drill-down links shown at the foot of every hive page. */
+export function HiveFooter({ hive }: { hive: string }) {
+  return (
+    <footer className="hf">
+      <Link to={hrefFor.status(hive)}>status ▸</Link>
+      <Link to={hrefFor.lanes(hive)}>lanes ▸</Link>
+      <Link to={hrefFor.queue(hive)}>queue ▸</Link>
+      <Link to={hrefFor.events(hive)}>events ▸</Link>
+      <Link to={hrefFor.metrics(hive)}>metrics ▸</Link>
+      <Link to={`${hrefFor.lanes(hive)}#models`}>models ▸</Link>
+    </footer>
+  );
 }
