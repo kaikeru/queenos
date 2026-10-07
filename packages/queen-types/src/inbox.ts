@@ -85,7 +85,10 @@ export const SubmissionSchema = z.object({
 export type Submission = z.infer<typeof SubmissionSchema>;
 export type SubmissionInput = z.input<typeof SubmissionSchema>;
 
-/** A contributor's inbox (row of `inboxes`; `openItems` is counted, not stored). */
+/**
+ * @deprecated Rev 1 (per-contributor inbox forks). Rev 2 uses the git proxy and one fork per push; kept exported
+ * so nothing breaks, unused (human-push design §5).
+ * A contributor's inbox (row of `inboxes`; `openItems` is counted, not stored). */
 export const InboxSchema = z.object({
   hive: z.string(),
   /** The owner (Access email): the accountable contributor, never the commit author. */
@@ -98,7 +101,9 @@ export const InboxSchema = z.object({
 });
 export type Inbox = z.infer<typeof InboxSchema>;
 
-/** The edge's `POST /api/hives/:hive/inbox` response. Carries a token: never stored, logged or broadcast. */
+/**
+ * @deprecated Rev 1; unused in rev 2 (see {@link InboxSchema}).
+ * The edge's `POST /api/hives/:hive/inbox` response. Carries a token: never stored, logged or broadcast. */
 export const InboxOpenResultSchema = z.object({
   handle: z.string(),
   repo: z.string(),
@@ -122,6 +127,13 @@ export const SubmitOutcomeKindSchema = z.enum([
   "ignored:revoked",
   "ignored:over-cap",
   "ignored:paused",
+  // v2 (git proxy): refused at push time, or the intake aborted. `ignored:inbox-main|unknown-inbox|revoked`
+  // above stay for old rows and are unused.
+  "refused:duplicate",
+  "refused:over-cap",
+  "refused:unknown-item",
+  "refused:rule",
+  "aborted:transient",
 ]);
 export type SubmitOutcomeKind = z.infer<typeof SubmitOutcomeKindSchema>;
 
@@ -180,7 +192,8 @@ export interface SubmissionTrailers {
   raw: Record<string, string>;
 }
 
-const TRAILER_RE = /^(queen(?:-[a-z]+)?)\s*:\s*(.+?)\s*$/i;
+/** `Queen`, `Queen-Item`, `Queen-Replies-To`, ... (any number of `-segment`s), a colon, a value. */
+export const TRAILER_RE = /^(queen(?:-[a-z]+)*)\s*:\s*(.+?)\s*$/i;
 
 /**
  * Parse the `Queen`, `Queen-Item` and `Queen-Origin` trailers of a commit message (case-insensitive keys,

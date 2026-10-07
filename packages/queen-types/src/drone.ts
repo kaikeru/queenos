@@ -3,6 +3,7 @@ import { DroneRoleSchema } from "./state.js";
 import { ModelChoiceSchema } from "./models.js";
 import { MergeMemberSchema } from "./queue.js";
 import { TraceContextSchema } from "./trace.js";
+import { MAX_NOTE_TOTAL } from "./executors.js";
 
 /** What a drone workflow instance must do with its train fork. */
 /** v2: MERGE = the merge-queue drone that 3-way merges a car's members (deterministic, no LLM). */
@@ -51,6 +52,11 @@ export const DroneTaskSchema = z.object({
   seed: DroneSeedSchema.optional(),
   /** REWORK of inbox code: push the new head back to the contributor's branch (fast-forward only, else `<ref>-queen`). */
   writeBack: DroneWriteBackSchema.optional(),
+  /**
+   * v2: the rendered v1 note text of the rejected commit (REWORK brief). Information for the drone,
+   * never permission (human-push design §7.2-7.3).
+   */
+  brief: z.string().max(MAX_NOTE_TOTAL).optional(),
 });
 export type DroneTask = z.infer<typeof DroneTaskSchema>;
 export type DroneTaskInput = z.input<typeof DroneTaskSchema>;

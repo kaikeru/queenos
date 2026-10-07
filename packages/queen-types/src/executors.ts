@@ -19,6 +19,9 @@ const Trace = TraceContextSchema.optional();
 /** Longest text one NOTE command appends. */
 export const MAX_NOTE_TEXT = 2000;
 
+/** Longest rendered v1 note for one commit (all its entries; human-push design §7.4). */
+export const MAX_NOTE_TOTAL = 8000;
+
 export const ProvisionCommandSchema = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("FORK"),
@@ -28,6 +31,8 @@ export const ProvisionCommandSchema = z.discriminatedUnion("op", [
     trainId: z.string().min(1),
     /** Repo to fork from: the hive repo, or the predecessor train's fork. */
     sourceRepo: z.string().min(1),
+    /** v2: fork from this repo instead (a seeded REWORK forks the contributor's train fork). Absent: `sourceRepo`. */
+    from: z.string().min(1).optional(),
     /** Fork name chosen by the Queen up front (`<ns>-train-<12hex>`). */
     forkName: z.string().min(1),
     /** The train's prompt: the Provisioner recalls hive memories for it (absent: no recall). */
