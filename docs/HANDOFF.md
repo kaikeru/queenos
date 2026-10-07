@@ -1,104 +1,153 @@
 # QueenOS: session handoff
 
-Last updated **2026-10-06** by the coordinating Claude session. Read this, then `CLAUDE.md`, `README.md` and `docs/v2-design.md`, before doing anything.
+Last updated **2026-10-06** by the coordinating Claude session. Read this, then `CLAUDE.md`, `README.md` and `docs/v2-design.md` (§1 principles, §10 decisions), before doing anything. Memory files in `~/.claude/projects/-Users-kyle-repositories-queenos/memory/` repeat the key working rules.
 
-## What this is
-QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog.cloudflare.com/next-git-platform-on-cloudflare/), **due 2026-10-14**. Submissions need a 5–10 minute video, an OSS license (MIT; done), and run instructions.
-- **Direction (user, 2026-10-05):** QueenOS is an **army of virtual engineers** applying decades of software-engineering practice (tickets, design review, trunk-based dev, merge queues, canaries, SLOs, runbooks, postmortems), adapted for thousands of agents. **Autonomous by default; humans only on escalation.** "Thousands" is theoretical; the MVP proves the vision (D10: no quota increase asked; the video says "dozens live, thousands by design"). Design: `docs/v2-design.md` (decisions D1–D11 in §10; D10 declined).
-- **Not** a GitHub clone: an OS for agent swarms.
-- **The judges want** multiple agents working on changes concurrently.
+## 1. What this is, the direction, how we work
+
+QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog.cloudflare.com/next-git-platform-on-cloudflare/), **due 2026-10-14**. Submissions need a 5-10 minute video (the user's), an OSS license (MIT; done) and run instructions (README).
+
+- **Direction (user, 2026-10-05):** an **army of virtual engineers** applying decades of software-engineering practice (tickets, design review, trunk-based dev, merge queues, canaries, SLOs, runbooks, postmortems), adapted for thousands of agents. **Autonomous by default; humans only on escalation.** Scale line: "dozens live, thousands by design" (D10: no Workers AI quota increase requested).
+- **Not** a GitHub clone: an OS for agent swarms. The judges want multiple agents working on changes concurrently.
 - **The three questions it answers:**
-  - Awareness: the Queen DO (single source of truth), the event log and trace, and hive memory (plus the Cognitive Ledger).
-  - Conflicts: path affinity plus a speculative, batched merge queue (3-way merge, integration gate, bisect, conflict -> rework).
-  - Review: gates, the LLM reviewer, the Scribe, the integration gate, Sentinel, and error budgets.
-
-**Live (pre-v2 version):** https://queenos.kaikeru.com, behind Cloudflare Access (team `kaikeru`, `@kaikeru.com` emails, one-time-PIN login). The demo hive is `demo`; its prod is https://demo-app.kyle-477.workers.dev and staging is https://demo-staging.kyle-477.workers.dev.
-
-## How the user wants us to work
-- **Orchestrate.** The coordinator NEVER edits code or docs itself. Every change goes to a right-sized subagent (Opus for research and subtle core logic, Sonnet for implementation, Haiku for trivial work). The coordinator reads, verifies, commits and coordinates. See memory `orchestration-style`.
-- **Phases run as parallel subagents with disjoint file ownership.** Write the shared contract in `packages/queen-types` first, and keep the lockfile with one writer (pre-install deps yourself).
-- **Verify per package before committing:** the coordinator checks each package's own tests AND a test typecheck (`tsc -p test`); a vitest pass alone isn't enough. Full gate: `pnpm turbo run build typecheck lint test --force --continue` (**43/43 tasks** green at handoff; turbo concurrency is capped at 4). Use **Node 24**: `export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH`, because wrangler needs ≥22.
-- **Usage limits can kill all running agents at once.** Resume them with SendMessage, in smaller batches if needed.
-- **Commit AND push** `main` after each verified package/milestone. The remote is `origin` = github.com/kaikeru/queenos. The user files GitHub issues for things they find; reference them in commits (`Closes #n` / `Refs #n`). The roadmap stays the priority over the issue backlog. End messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Before committing, scan for the token: `/usr/bin/grep -rlF --exclude-dir=node_modules --exclude-dir=.wrangler --exclude-dir=.git -e "$CLOUDFLARE_API_TOKEN" .` (exit 1 means clean; `grep` is aliased to ugrep in this shell, and a `--` before the excludes makes grep read them as filenames)
-- **Prefer Cloudflare-native tech** ("a boon"), and keep things simple. The user makes product calls fast; give a recommendation, not a menu.
+  - Awareness: the Queen DO (single source of truth), event log and trace, hive memory (Vectorize) plus the Cognitive Ledger.
+  - Conflicts: path affinity, then a speculative, batched merge queue (3-way merge, integration gate, bisect, conflict -> rework).
+  - Review: gates, LLM reviewer, Scribe, integration gate, Sentinel, error budgets.
 - **The Queen is an orchestrator ONLY.** It decides, records and dispatches; executors do all external I/O. Exceptions: fire-and-forget Analytics Engine points (D1) and the `SwarmGovernor` lease before `decide()` (D9).
+- **Prefer Cloudflare-native tech**, keep things simple. The user makes product calls fast: give a recommendation, not a menu.
 
-## v2 status (2026-10-06): Phases 0–2 DONE, Phase 3 progress
-Plan and acceptance: `docs/v2-design.md` §8. Queen internals: `apps/queen/README.md`.
-- **Phase 0:** contracts (`packages/queen-types`) and migrations v8–v11.
-- **Phase 1 (13 packages):** work ledger + path affinity, parallel BUILD lane and races, autonomy/escalation/auto-ship, merge queue, git merge/land (`hive-kit`), observability (event log, rollups, trace), Oracle, drones, gatekeepers/Sentinel (integration gate), Herald/Provisioner config, sim fakes, dashboard data layer, scale plumbing (state cache, coalesced broadcast, `SwarmGovernor`).
-- **Contract patch:** migration v13 (verified, budget boost, REST view schemas, Oracle cap 24, queue `passed_at` for waitMs).
-- **Phase 2:** QueenNode `decide()` integration with e2e (a)–(j), status-first dashboard, trace/events/metrics UI, edge metrics proxy (allowlisted Analytics Engine SQL), swarm floor and merge-queue UI.
-- **Fixes:** a decomposed goal no longer inherits one child's `[race]` hint (d27f934); turbo concurrency capped at 4 (workerd test flakes from CPU oversubscription, 7f4ac9b).
-- **Proven in sim** (coordinator, in a browser against `pnpm dev:sim`): the 24-item "Swarm demo" ran fan-out -> parallel builds -> races -> merge-queue cars -> auto-release -> all 25 items SHIPPED with no human. After the race-width fix: 24 distinct items build at once with 1 race.
-- **Phase 3 (all main, green 43/43):** README rewritten for v2 (3b41399); demo script rewritten for v2, 13 shots, sim-backed with live inserts (ae1427d); queue wait computed from `passed_at` (migration v13, 7c034b8); sim `[batch-fail]` reliably bisects in swarm demo; dashboard SIM badge (hive status `mode`), release strip with auto-ship and prod link, guardrails panel, swarm title line, retry on first load (5bbe20d); `[spot-bug]` keeps its kind (7c034b8); load test (500/500 landed, 0 SQLite loads/report, ≤10 frames/s, 15.9 RPCs/BUILD, via paced broadcast + batched appendAudits, 72e3fbf); `maxOpenItems` max raised to 1000, default 40 (72e3fbf).
-- **NOT yet deployed to live.** Live still runs pre-v2 version.
+### How the user wants us to work
+| Rule | Detail |
+|---|---|
+| Coordinator never edits | The coordinator NEVER edits code or docs. Right-sized subagents do: **Opus** for subtle logic and research, **Sonnet** for implementation, **Haiku** for trivial work. Disjoint file ownership per agent; contracts first in `packages/queen-types`; one lockfile writer (pre-install deps yourself). |
+| Coordinator verifies | Per package: its own tests AND `tsc -p test` (vitest alone isn't enough). Then the full gate: `pnpm turbo run build typecheck lint test --force --continue` (**43/43 tasks** green). Then commit AND push `main` (`origin` = github.com/kaikeru/queenos). |
+| Token scan before every commit | `/usr/bin/grep -rlF --exclude-dir=node_modules --exclude-dir=.wrangler --exclude-dir=.git -e "$CLOUDFLARE_API_TOKEN" .` Exit 1 = clean. Use `/usr/bin/grep`: plain `grep` is aliased to ugrep here, and a `--` before the excludes makes grep read them as filenames. |
+| Commit messages | End with the attribution line your session's system reminder specifies (previous sessions used `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`). The user files GitHub issues: reference them (`Closes #n` / `Refs #n`); the roadmap outranks the issue backlog. |
+| Node 24 | `export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH` (wrangler needs 22+). Full gate is capped at **turbo concurrency 4** (workerd suites flake under CPU oversubscription; Queen tests have a 20 s timeout). |
+| Production deploys are the USER's | Auto mode blocks them. Give the user exact commands (a short list, or a scratchpad script; long pasted lines wrap and break). |
+| Usage limits | They kill ALL running agents at once. Resume them with SendMessage, in smaller batches. |
+| Live sim checks | Run parallel ones on distinct ports (e.g. 8797, 5191). **Never `pkill`** (`-f vite`/`-f wrangler` once killed every vitest/wrangler on the machine, other projects included). Kill only PIDs you started. |
 
-## Phase 3: going live (needs the user)
-1. **Analytics token** (Account Analytics Read): `cd apps/edge && wrangler secret put ANALYTICS_API_TOKEN --env=""`.
-2. **Vectorize metadata index `kind` on `queenos-memory`:** ALREADY CREATED.
-3. **Deploy the Oracle alone first:** `cd apps/oracle && wrangler deploy --env=""`.
-4. **Then `./scripts/deploy.sh`.** It deploys the Queen first and adds the `SwarmGovernor` DO (migration tag v2) and the `ANALYTICS` dataset. Its new **R16 guard** reads each hive's snapshot through the edge, so it needs `CF_ACCESS_CLIENT_ID`/`CF_ACCESS_CLIENT_SECRET` (an Access service token) or `CF_ACCESS_TOKEN`, or `--force` after checking the War Room by hand. **Untested against the live edge.**
-5. **After deploy,** existing hives (`demo`) are `supervised` (D2). Flip to autonomous with `PATCH /hives/demo/settings` or the dashboard's autonomy dropdown. New hives default to `autonomous`.
-6. **Then** the live checks in design §8 WP3.1 (the 4-bullet Goals prompt, a 12-item live swarm, an AI burst test to set `SWARM_AI_RPM`).
+## 2. State of the system: v2 complete, live on demo
 
-**Do NOT deploy the Queen from a commit between 33d28ed and 191c167:** parallel builds without the queue reworked on NOT_FAST_FORWARD. Main is fine now.
+Phases 0-3 are DONE and on `main` (green 43/43). Plan and acceptance: `docs/v2-design.md` §8. Queen internals: `apps/queen/README.md`.
 
-Auto mode blocks production deploys from Claude, so the user runs them: write the commands in a scratchpad script (long pasted lines wrap and break).
+**Backend (all built and tested):**
+- **Work ledger:** items with kind/priority/acceptance/deps and a state machine; path affinity; caps and dedupe (migrations v8-v13).
+- **Oracle** (Workflow): fan-out of a goal into items (deps, difficulty, predicted paths; one item per explicit bullet), bug triage. Falls back to one item = whole prompt.
+- **Parallel builds:** independent items fork from `main` together; hard items race 2-3 models.
+- **Merge queue:** cars, batching, 3-way merge (MERGE drone), integration gate on the merged tree, LANDER fast-forward, bisect on failed batch, conflict -> REWORK, infra errors re-dispatch the same car.
+- **Autonomy and escalations:** auto-ship while budget green; error budget and rollback streak degrade to `supervised`; runbook-enum escalations.
+- **Self-filed bugs:** drone follow-ups, out-of-diff gate findings, P0 on rollback (caps and dedupe).
+- **Observability:** one trace id end to end, `event_log`, hourly rollups, Analytics Engine sink, Workers observability logs.
+- **Scale plumbing:** state cache, coalesced/paced broadcast, batched `appendAudits`, `SwarmGovernor` lease. Sim load test: 500/500 landed (`pnpm --filter @queenos/queen test:load`, opt-in).
 
-## Architecture (11 Workers; v1 ones live, Oracle and v2 Queen not yet)
+**Dashboard (apps/dashboard):** status home, swarm floor (tiles by phase, race boxes), **merge-train graph** (821e12d: a git-graph view of parallel branches, batched cars, bisects, conflicts; status home shows 30 min, `/p/:hive/queue` shows 24 h with a car payload panel), item page, trace waterfall, event log, metrics, lanes, Model Board, **SIM badge** (hive status `mode`), release strip (auto-ship, prod link), guardrails panel.
+
+**Sim:** `pnpm dev:sim` runs the real Queen + dashboard with fake executors (see README for prompt markers).
+
+## 3. Proven live on queenos.kaikeru.com (hive `demo`, 2026-10-06)
+
+| Run | What happened | Fix |
+|---|---|---|
+| 1 | Oracle collapsed 12 bullets into one item. Release auto-shipped with no tap. | 5ab8ee2 (Oracle: one item per bullet); auto-ship dc7126d |
+| 2 | 12 parallel builds. Workers AI 429s (3021) and Artifacts 503s were blamed on the code -> REWORK_EXHAUSTED and a fake rollback bug. All 12 shipped after fixes plus retries. | ff3b0f5 (transient infra never blames the change) |
+| 2b | Smoke gate false negatives on endpoints correctly returning 400 (leapyear/hex) caused repeated bisects. | 1d0d268 (feature routes pass on any non-404 under 500) |
+| 2c | 503s in drone MERGE/LAND ejected cars and cascaded supersedes. | b21d68f (drones retry; Queen re-dispatches same car) |
+| 2d | A deferred dispatch retry stalled a car about 5 min. | fd0a025 (retry in 15 s; undispatched drones get a deadline) |
+| 2e | fd0a025 regressed the sim by overwriting a past-due alarm. | 2b2cd55 (never move an alarm later; track re-arm inside `alarm()`; sim runs due jobs inside the alarm) |
+| 3 "toy box" | 11-item goal ("Toy box" on `/` plus 10 widget fragments) plus the user's follow-up goal. All SHIPPED autonomously. | n/a |
+
+- Live prod page https://demo-app.kyle-477.workers.dev/ has the Toy box chips and "Try a feature" buttons (dice, emoji, colors verified working).
+- **Totals by end of day:** about 25 items landed, several auto-shipped releases, error budget **0/2** (counts only real change failures after the infra fix; old rows age out of the window).
+
+## 4. Deploy state (CRITICAL)
+
+**Last production deploys (UTC 2026-10-06):** queen 20:00 (about b21d68f), drones 20:01, gatekeepers 19:47, herald/sentinel/oracle/edge about 19:26-19:27.
+
+**PENDING, the user must run:**
+
+| Command | Ships |
+|---|---|
+| `./scripts/deploy.sh --only queen` | fd0a025 + 2b2cd55 (dispatch retry + alarm fix). **Never deploy fd0a025 without 2b2cd55; `main` has both.** |
+| `./scripts/deploy.sh --only edge` | Merge-train graph + dashboard (821e12d and earlier dashboard commits since 19:27). Builds the dashboard first. |
+
+Preamble for both:
+```
+cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
+```
+- `deploy.sh` runs a v1-train safety check (R16 guard: reads each hive snapshot through the edge; needs `CF_ACCESS_CLIENT_ID`/`CF_ACCESS_CLIENT_SECRET` or `CF_ACCESS_TOKEN`). `--force` skips it. With no in-flight trains, a plain `--only <worker>` is fine. The "one-time manual steps" footer prints every time; ignore it.
+- **Live config:**
+  - Governor lease 12 builds (`SWARM_AI_RPM` 240, `SWARM_RPM_PER_BUILD` 20).
+  - Hive `demo`: autonomous; guardrails raised by the user to `maxChildrenPerItem` 12.
+  - `ANALYTICS_API_TOKEN` is NOT set, by design: the metrics page uses the Queen rollups.
+- **Do not deploy the Queen from a commit between 33d28ed and 191c167** (parallel builds without the queue). Main is fine.
+
+## 5. How to run and watch a live swarm
+
+- **Dashboard:** the user is signed in to Access in Chrome. Drive it with the Chrome tools (load via ToolSearch): `get_page_text` to read, `form_input` for the composer textarea. Clicks via `find` refs sometimes don't register; coordinates work.
+- **Workflow instances** via the Cloudflare API (`CLOUDFLARE_API_TOKEN` is in the user's shell): `GET /accounts/{id}/workflows/<name>/instances?per_page=...` for `oracle-workflow`, `drone-workflow`, `gatekeeper-workflow`, `herald-workflow`, `sentinel-workflow`, `provisioner-workflow`. Step outputs are truncated.
+  - Watcher pattern: a script polling every 30 s, emitting only on change. The previous watcher omitted the provisioner; add it.
+- **Queen event log** through the edge: `https://queenos.kaikeru.com/hives/demo/events?limit=40` (needs the Access cookie).
+- **Queue page `/p/demo/queue`** is the best debugging view (now with the merge-train graph and car payloads).
+- **Workers observability logs** exist for the Queen DO.
+- Live latency: builds 40-220 s; drone generation budget 200 s; watchdog 10 min.
+
+## 6. Open items and next steps (prioritized)
+
+1. **User deploys queen + edge** (section 4).
+2. **Clean live 12-item swarm** as the final proof with every fix deployed; watch the merge-train graph live.
+3. **Dashboard polish:** nested `<li>` in the GoalTree Row; "N landed" counts cars + members (36 for 24); the `prod ▸` link is sometimes missing from the release strip.
+4. **Demo prod cleanup:** old internal feature slugs on the Toy box chips (add-simple-webpage..., we-are-doing-a-test-deploy). The user can prompt a cleanup.
+5. **Still-open gaps:**
+   - no reliable live reviewer REJECT (the sim has `[review-fail]`);
+   - the dashboard shows recalled memories but not whether the builder used them;
+   - 390 px layout only verified in headless;
+   - mock mode (`VITE_MOCK_API=1`) has no POST actions; use `pnpm dev:sim`.
+6. **Transient Artifacts/Workflows errors** still occur under load; each now costs retries, not failures. Consider asking Cloudflare about Artifacts 503 rates.
+7. **Update `docs/demo-script.md`:** it predates the merge-train graph; redo the merge-queue shots with it (its Gaps section also lists items since closed: swarm title, SIM badge, release strip, guardrails panel, queue wait).
+8. **Screenshots and video stay deferred** until the user asks.
+
+**Roadmap to Oct 14:** Oct 12-13 rehearsal on a throwaway hive then recording per the demo script (go/no-go: all-sim cut if live rehearsal hasn't passed by Oct 12 noon); Oct 14 submit. **Dropped or stubbed:** bisect + auto-revert on *staging* failure (a P0 bug is filed instead), real npm builds, custom domains for project sites, everything in design §9.
+
+## 7. Architecture (11 components: 10 Workers plus the dashboard)
+
 | Worker (dir) | Role |
 |---|---|
-| `queen` (apps/queen) | `QueenNode` DO per hive: SQLite state, work ledger, `decide()` pipeline (train/queue/release/work/escalation planners), merge queue, races, autonomy and error budget, model router (AIMD tier floor), watchdog, event log; coalesced WS room. Also hosts the `SwarmGovernor` DO (global lease). Only reachable through the edge. `sim` env = local fakes (localhost-only). |
-| `queenos-edge` (apps/edge) | The `queenos.kaikeru.com` front door: Access JWT verification, dashboard static assets, `/api/*` and `/hives/*` routing, the `HiveRegistry` DO, `/api/metrics/:hive` (allowlisted Analytics Engine SQL). `dev` env = auth bypass (localhost-only). |
-| `queenos-oracle` (apps/oracle) | Workflow: DECOMPOSE a goal into items (deps, difficulty, predicted paths) and TRIAGE bugs (dedupe). Falls back to "one item, the whole prompt". |
-| `queenos-provisioner` | Workflow: Artifacts fork/delete; CREATE_HIVE seeds a repo from `templates/worker-starter`. On FORK, recalls hive memories. Bindings: AI + MEMORY. |
-| `queenos-drones` | Workflow: BUILD/REWORK/MERGE/LAND. Live LLM on the Queen's `modelChoice` + fallbacks (429s back off, never count as model failures). Builder is a Think tool-loop agent (`docs/harness-design.md`). Reports `changedPaths`, `followUps`, `verified`. |
-| `queenos-gatekeepers` | Workflow on `cf.artifacts.repo.pushed`: policy/security scans, preview smoke, **LLM reviewer**, Scribe, Vectorize failure log, hive memory write. QUEUE cars get the **integration gate** (no reviewer). Out-of-diff findings become follow-up bugs. |
-| `queenos-herald` | Workflow: Worker Preview per train, `<hive>-staging`, canary splits on `<hive>-app`, rollback. Credentials come from the Vault. |
-| `queenos-sentinel` | Workflow: readiness gate, then synthetic probes pinned per version, then PROMOTE/ROLLBACK (or inconclusive). |
-| `queenos-vault` | Per-hive AES-GCM envelope-encrypted creds. `VaultWriter` (edge) / `VaultReader` (herald) entrypoints. |
-| `queenos-genesis` | The onboarding wizard DO: chat -> charter -> connect Cloudflare -> CREATE_HIVE -> first flight. |
-| dashboard (apps/dashboard) | React War Room: status-first home, swarm floor, merge-queue rail/page, item page, lanes drill-down, trace waterfall, event log, metrics, Model Board, Sites panel. Served by the edge. |
+| `queen` (apps/queen) | `QueenNode` DO per hive: SQLite state, work ledger, `decide()` pipeline (train/queue/release/work/escalation planners), merge queue, races, autonomy and error budget, model router (AIMD tier floor), watchdog, event log, coalesced WS room. Also hosts the **`SwarmGovernor` DO** (global lease). Reachable only through the edge. `sim` env = localhost-only fakes. |
+| `queenos-edge` (apps/edge) | `queenos.kaikeru.com` front door: Access JWT, dashboard assets, `/api/*` and `/hives/*` routing, `HiveRegistry` DO, `/api/metrics/:hive` (allowlisted Analytics Engine SQL). `dev` env = auth bypass (localhost-only). |
+| `queenos-oracle` | Workflow: DECOMPOSE goals, TRIAGE bugs. |
+| `queenos-provisioner` | Workflow: Artifacts fork/delete, CREATE_HIVE seeds from `templates/worker-starter`, recalls hive memories on FORK. |
+| `queenos-drones` | Workflow: BUILD/REWORK/MERGE/LAND. Builder is a Think tool-loop agent (`docs/harness-design.md`) verifying in a Dynamic Worker. 429s back off, 503s retry. |
+| `queenos-gatekeepers` | Workflow on `cf.artifacts.repo.pushed`: policy/security scans, preview smoke, LLM reviewer, Scribe, Vectorize failure log, hive memory write. Queue cars get the integration gate (no reviewer). |
+| `queenos-herald` | Workflow: Worker Preview per train, `<hive>-staging`, canary splits on `<hive>-app`, rollback. Creds from the Vault. |
+| `queenos-sentinel` | Workflow: readiness gate, synthetic probes per version, PROMOTE/ROLLBACK/inconclusive. |
+| `queenos-vault` | Per-hive AES-GCM envelope-encrypted creds (`VaultWriter`/`VaultReader`). |
+| `queenos-genesis` | Onboarding wizard DO. |
+| dashboard (apps/dashboard) | React + Vite War Room, served by the edge. |
 
-**Packages:**
-- `queen-types`: all contracts (onboarding, executors, work, oracle, autonomy, observability, queue, releases, models, telemetry).
-- `hive-kit`: isomorphic-git + memfs (3-way merge, registry merge driver), the binding-based AI client, the Cloudflare REST client, the ledger, `HiveMemory` (Vectorize memory client), structured log and metric helpers.
+**Packages:** `queen-types` (all Zod contracts), `hive-kit` (isomorphic-git + memfs, AI client, Cloudflare REST client, ledger, `HiveMemory`, log/metric helpers).
 
-**Flow (v2):** prompt -> Oracle decomposes into work items -> Queen dispatches independent items (path affinity, caps, budget) -> **parallel BUILD trains all fork from main** (hard items race 2–3 models) -> gatekeepers per build -> passed builds board merge-queue **cars** -> MERGE drone 3-way merges members -> integration gate on the merged tree -> LANDER fast-forwards main (failed batch bisects, conflict -> REWORK) -> release: staging -> Sentinel -> **auto-ship if autonomous and budget green** (supervised hives wait for a human tap) -> canary 1/10/50/100 with Sentinel each step -> SHIPPED, or auto-rollback + P0 bug. One trace id runs end to end. Escalations (runbook enum) are the only human touchpoint.
+**Flow:** prompt -> Oracle -> work items -> Queen dispatches independent items (affinity, caps, budget) -> parallel BUILD trains forked from main (hard items race) -> gatekeepers -> passed builds board cars -> MERGE drone -> integration gate -> LANDER fast-forward (bisect/conflict handling) -> release: staging -> Sentinel -> auto-ship if autonomous and budget green (supervised waits for a tap) -> canary 1/10/50/100 -> SHIPPED, or auto-rollback + P0 bug. Escalations are the only human touchpoint.
 
-## Account and infra facts (no secrets here)
-- **Account:** `4773fbabdff038e3b907b14cd212c062`, workers.dev subdomain `kyle-477`. `CLOUDFLARE_API_TOKEN` (account-owned) is in the user's shell. Set `CLOUDFLARE_ACCOUNT_ID` for wrangler. Verify via `/accounts/{id}/tokens/verify`.
-- **Access:** app "QueenOS" (id `798aa993-…`); its AUD is in `apps/edge/wrangler.jsonc`. The Zero Trust team was renamed from modernmythtools to kaikeru at the user's request.
-- **AI:** gateway `queenos` (authenticated); all LLM calls use the Workers `ai` binding, so there are no tokens. Models come from `MODEL_CATALOG` in `packages/queen-types/src/models.ts`, all Workers AI `@cf/…`, ordered by `docs/model-bakeoff.md`. The user chose gateway models over Anthropic.
-- **Other resources:** Vectorize indexes `queenos-failures` (768, cosine) and `queenos-memory` (768, cosine, metadata indexes `namespace` and `kind`); Artifacts namespace `queenos`; Analytics Engine dataset `queenos_events` (created on first Queen deploy).
-- **Secrets set:** `VAULT_KEK` (backup at `~/.queenos/vault-kek.backup`; the user was asked to move it to a password manager) and `QUEEN_INTERNAL_TOKEN`. Pending: edge `ANALYTICS_API_TOKEN`.
-- **Deploy:** `./scripts/deploy.sh`, two passes because cross-script bindings form cycles. For a single NEW worker, deploy it alone first with `wrangler deploy --env=""` to avoid the bootstrap pass. To redeploy one existing Worker: `./scripts/deploy.sh --only <dir>` (its "one-time manual steps" footer prints every time; ignore it). Executors and most Workers have `workers_dev:false`.
-- **Monitoring:** Workflow instances via `GET /accounts/{id}/workflows/<name>/instances` (names: `drone-workflow`, `herald-workflow`, `sentinel-workflow`, `gatekeeper-workflow`, `provisioner-workflow`, `oracle-workflow`). Step outputs are truncated in that API. v2 adds Workers Logs (`observability`) and the in-Queen event log/trace view.
-- **Hive memory:** gatekeepers write one memory per gate verdict; the Provisioner recalls up to 5 at FORK (cosine ≥ 0.6, same hive) into `DroneTask.ragContext`. The Queen never touches Vectorize. Contract `packages/queen-types/src/memory.ts`, client `packages/hive-kit/src/memory.ts`. **Gotcha:** Vectorize writes take up to ~1 min to become queryable, and `wrangler vectorize info` / `list-vectors` show stale counts (0); use `get-vectors --ids`.
-- **Live proof (pre-v2, on `demo`):** Genesis wizard; live-LLM builds through preview, gate, land; tap-to-ship with a full canary (1->100%) that SHIPPED; the memory loop (a build recalled the previous build's memory). The old AWAITING_TAP release on `demo` may be superseded; check the War Room before tapping.
+## 8. Account and infra facts (no secrets here)
 
-## Known gaps and gotchas
-- **v2 gaps:**
-  - 390 px layout not verified in a real narrow browser (the old release-timeline label overlap at 390px may remain);
-  - mock mode (`VITE_MOCK_API=1`) doesn't support POST actions; use `pnpm dev:sim`;
-  - the dashboard shows recalled memories but not whether the builder used them;
-  - no reliable LIVE reviewer reject (the sim has one).
-- **Live latency:** builds take 40–220s, and the drone generation budget is 200s. The watchdog is 10 min.
-- **Templates:** the no-build template only serves features at `/features/<slug>` unless a feature declares its own `path`.
-- **Sentinel** uses synthetic probes only. With little traffic on demo apps, that's the real signal.
-- **Pinned preview URLs** (`<8hex>-<worker>…`) outlive teardown (a Cloudflare behavior). Herald reports alias URLs instead.
-- **A failed first prod deploy** stays FAILED while the candidate serves 100% (there's no stable version to roll back to). The summary says so.
-- **Dashboard tabs** opened before a deploy show an "updated, reload" banner on new message types.
-- **Chrome automation:** clicks via `find` refs sometimes don't register; coordinates work.
-- **Never `pkill -f vite` / `pkill -f wrangler`:** a subagent once did, killing every vitest/wrangler on the machine, other projects included. Agents kill only the PIDs they started. Parallel live sim checks use distinct ports (e.g. 8797, 5191).
-- **Test flakiness:** workerd suites flake under CPU oversubscription; turbo concurrency is capped at 4 and the Queen tests have a 20s timeout for cold starts.
+- **Account** `4773fbabdff038e3b907b14cd212c062`, workers.dev subdomain `kyle-477`. Verify the token via `/accounts/{id}/tokens/verify`.
+- **Access:** app "QueenOS" (id `798aa993-...`), AUD in `apps/edge/wrangler.jsonc`; team `kaikeru`, `@kaikeru.com` emails, one-time PIN. Demo hive prod https://demo-app.kyle-477.workers.dev, staging https://demo-staging.kyle-477.workers.dev.
+- **AI:** gateway `queenos`; all LLM calls via the Workers `ai` binding (no tokens). Models from `MODEL_CATALOG` (`packages/queen-types/src/models.ts`, Workers AI `@cf/...`, ordered by `docs/model-bakeoff.md`).
+- **Other resources:** Vectorize `queenos-failures` and `queenos-memory` (768, cosine; metadata indexes `namespace`, `kind`); Artifacts namespace `queenos`; Analytics Engine `queenos_events`.
+- **Secrets set:** `VAULT_KEK` (backup `~/.queenos/vault-kek.backup`; user asked to move to a password manager), `QUEEN_INTERNAL_TOKEN`. Not set: edge `ANALYTICS_API_TOKEN` (intentional).
+- **Deploy:** `./scripts/deploy.sh` (two passes for cross-script binding cycles); a single NEW worker: `wrangler deploy --env=""` alone first; one existing worker: `--only <dir>`.
+- **Hive memory:** one memory per gate verdict; recall up to 5 at FORK (cosine >= 0.6, same hive). Vectorize writes take up to ~1 min to become queryable and `wrangler vectorize info` shows stale counts; use `get-vectors --ids`.
 
-## Remaining roadmap to Oct 14
-1. **Phase 3 (Oct 11):** live rollout (above); docs (new README pitch, `docs/demo-script.md`, this file); a 500-item sim load test per design §8 WP3.4 (`apps/queen/test/load.test.ts`); hardening/fix pool. Cut lines: design §8.
-2. **Oct 12–13:** rehearsal on a throwaway hive, then recording per `docs/demo-script.md`. **That script predates v2** and needs a rewrite around the status home, swarm floor and merge queue. Screenshots and video are deferred until the user asks.
-3. **Oct 14:** submit (the video is the user's).
-4. **Dropped or stubbed:** bisect + auto-revert on *staging* failure (`stagingFailed()` files a P0 bug instead), real npm builds (`@cloudflare/worker-bundler` works per the spike, but is deferred), custom domains for project sites, and everything in design §9.
+## 9. Gotchas
 
-## Key docs
-`README.md` (judge-facing; v1 pitch until Phase 3), `CLAUDE.md` (rules), `docs/v2-design.md` (v2 design, plan, decisions), `apps/queen/README.md` (decide pipeline, routes, planner, router, release semantics), `docs/discovery.md` + `docs/deploy-discovery.md` (API research), `docs/day1-results.md` (real-account facts), `docs/model-bakeoff.md`, `docs/harness-spike.md`, `docs/harness-design.md`, `docs/harness-build-brief.md`, `docs/demo-script.md` (pre-v2).
+- Templates: the no-build template serves features at `/features/<slug>` unless a feature declares its own `path`.
+- Sentinel uses synthetic probes only (little traffic on demo apps).
+- Pinned preview URLs (`<8hex>-<worker>...`) outlive teardown; Herald reports alias URLs.
+- A failed first prod deploy stays FAILED while the candidate serves 100% (no stable version to roll back to).
+- Dashboard tabs opened before a deploy show an "updated, reload" banner.
+- Hives created before v2 stay `supervised` until switched (`PATCH /hives/<hive>/settings` or the dashboard dropdown).
+
+## 10. Key docs
+
+`README.md` (judge-facing, v2), `CLAUDE.md` (rules), `docs/v2-design.md` (design, plan, decisions D1-D11 in §10), `apps/queen/README.md` (decide pipeline, routes, planners, release semantics), `docs/demo-script.md` (13 shots, sim-backed; needs the merge-train graph update), `docs/discovery.md` + `docs/deploy-discovery.md` (API research), `docs/day1-results.md` (real-account facts), `docs/day1-verification.md`, `docs/model-bakeoff.md`, `docs/harness-spike.md`, `docs/harness-design.md`, `docs/harness-build-brief.md`.
