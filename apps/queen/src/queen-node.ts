@@ -54,7 +54,7 @@ import {
   TrainResultSchema,
   UpdateHiveSettingsSchema,
   WorkActionSchema,
-  GuardrailsSchema,
+  GuardrailOverridesSchema,
   parseTraceparent,
   spanIdFor,
   traceIdFromUuid,
@@ -248,7 +248,7 @@ export function routerPolicy(env: { ROUTER_BACKOFF_STREAK?: string | number; ROU
 export function defaultGuardrailOverrides(env: { HIVE_DEFAULT_GUARDRAILS?: string }): Partial<HiveSettings["guardrails"]> {
   if (!env.HIVE_DEFAULT_GUARDRAILS) return {};
   try {
-    const parsed = GuardrailsSchema.partial().safeParse(JSON.parse(env.HIVE_DEFAULT_GUARDRAILS));
+    const parsed = GuardrailOverridesSchema.safeParse(JSON.parse(env.HIVE_DEFAULT_GUARDRAILS));
     return parsed.success ? parsed.data : {};
   } catch {
     return {};
@@ -1445,7 +1445,7 @@ export class QueenNode extends DurableObject<Env> {
       for (const t of acc.trains.values()) merged.set(t.trainId, t);
       const building = [...merged.values()].filter((t) => isActive(t) && !isCar(t)).length;
       const dispatch = acc.work(wp.dispatchReady({ activeBuilds: building, leasedSlots: leased }));
-      for (const s of dispatch.submissions) {
+      for (const s of dispatch.dispatches) {
         const item = acc.items.get(s.itemId) ?? state.items.find((i) => i.itemId === s.itemId);
         acc.train(
           tp.submit({

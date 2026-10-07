@@ -71,7 +71,8 @@ export const PrioritySchema = z.number().int().min(0).max(3);
 export const DifficultySchema = z.enum(["normal", "hard"]);
 export type Difficulty = z.infer<typeof DifficultySchema>;
 
-export const WorkSourceKindSchema = z.enum(["user", "oracle", "drone", "gatekeeper", "sentinel", "queen"]);
+/** `agent`: code an external agent pushed to its person's inbox (`Queen-Origin: agent:<name>`); a human stays `user` (actor = email). */
+export const WorkSourceKindSchema = z.enum(["user", "oracle", "drone", "gatekeeper", "sentinel", "queen", "agent"]);
 export type WorkSourceKind = z.infer<typeof WorkSourceKindSchema>;
 
 export const WorkSourceSchema = z.object({
@@ -83,6 +84,23 @@ export const WorkSourceSchema = z.object({
   commandId: z.string().optional(),
 });
 export type WorkSource = z.infer<typeof WorkSourceSchema>;
+
+/** Who decides a race (§10.2): the Queen's ranking (`auto`), or a human pick among the passed candidates. */
+export const RaceJudgeSchema = z.enum(["auto", "human"]);
+export type RaceJudge = z.infer<typeof RaceJudgeSchema>;
+
+/**
+ * An item whose code arrived through a person's inbox (human-push design §5): the branch it came from.
+ * `handoff`: the contributor handed the item to the swarm (`Queen: rework` trailer or the `handoff` action).
+ */
+export const WorkItemInboxSchema = z.object({
+  repo: z.string().min(1),
+  ref: z.string().regex(/^refs\/heads\/.+/),
+  handle: z.string().regex(/^[a-z0-9]{1,24}$/),
+  headSha: z.string().regex(/^[0-9a-f]{40}$/),
+  handoff: z.boolean(),
+});
+export type WorkItemInbox = z.infer<typeof WorkItemInboxSchema>;
 
 export const WorkItemSchema = z.object({
   /** UUID for root items; `<goalId>-c<n>` for decomposed children (idempotent re-delivery). */
@@ -119,6 +137,10 @@ export const WorkItemSchema = z.object({
   escalationId: z.string().nullable(),
   createdAt: z.number().int(),
   updatedAt: z.number().int(),
+  /** Inbox origin (human or agent push): the branch and its latest head. Absent / null: Queen-solicited work. */
+  inbox: WorkItemInboxSchema.nullable().optional(),
+  /** Race judge for this item (§10.2); absent = the hive's `settings.race.judge`. Inert until T9a. */
+  judge: RaceJudgeSchema.optional(),
 });
 export type WorkItem = z.infer<typeof WorkItemSchema>;
 export type WorkItemInput = z.input<typeof WorkItemSchema>;
@@ -146,19 +168,22 @@ export const FileWorkItemSchema = z.object({
   bestOf: z.number().int().min(1).max(5).optional(),
   difficulty: DifficultySchema.optional(),
   paths: z.array(PathPatternSchema).max(10).default([]),
+  /** `human`: a race of this item waits for a pick (§10.2). Inert until T9a. */
+  judge: RaceJudgeSchema.optional(),
 });
 export type FileWorkItem = z.infer<typeof FileWorkItemSchema>;
 export type FileWorkItemInput = z.input<typeof FileWorkItemSchema>;
 
 /** POST /hives/:hive/items/:id/actions. */
 export const WorkActionSchema = z.object({
-  action: z.enum(["retry", "cancel", "not_duplicate"]),
+  /** `handoff`: an inbox item's contributor hands it to the swarm (a REWORK drone seeded with their head). */
+  action: z.enum(["retry", "cancel", "not_duplicate", "handoff"]),
   note: z.string().max(500).optional(),
 });
 export type WorkAction = z.infer<typeof WorkActionSchema>;
 
-/** Per-hive hard caps (§2.9). Defaults in GUARDRAIL_DEFAULTS; overrides clamped to GUARDRAIL_MAX. */
-export const GuardrailsSchema = z.object({
+/** Each guardrail's bounds (the "max" column of §2.9). */
+const GUARDRAIL_FIELDS = {
   maxChildrenPerItem: z.number().int().min(1).max(24),
   maxDepth: z.number().int().min(1).max(3),
   maxOpenItems: z.number().int().min(1).max(1000),
@@ -169,8 +194,32 @@ export const GuardrailsSchema = z.object({
   maxQueueBatch: z.number().int().min(1).max(16),
   maxQueueDepth: z.number().int().min(1).max(8),
   maxConflictReworks: z.number().int().min(0).max(4),
+  /** Human-push design §6.2: open inbox items per contributor; past it a push is `ignored:over-cap`. */
+  maxInboxOpenPerContributor: z.number().int().min(1).max(10),
+  /** Inbox pushes per contributor per hour. */
+  maxInboxPushesPerHour: z.number().int().min(1).max(60),
+  /** Races held in PICKING at once (§10.3); one more auto-decides (`queen:cap`). Inert until T9a. */
+  maxPickingRaces: z.number().int().min(0).max(5),
+};
+
+/**
+ * Per-hive hard caps (§2.9). Defaults in GUARDRAIL_DEFAULTS; overrides clamped to GUARDRAIL_MAX.
+ * Caps added after v2 default on parse, so payloads from older Queens still parse.
+ */
+export const GuardrailsSchema = z.object({
+  ...GUARDRAIL_FIELDS,
+  maxInboxOpenPerContributor: GUARDRAIL_FIELDS.maxInboxOpenPerContributor.default(3),
+  maxInboxPushesPerHour: GUARDRAIL_FIELDS.maxInboxPushesPerHour.default(20),
+  maxPickingRaces: GUARDRAIL_FIELDS.maxPickingRaces.default(2),
 });
 export type Guardrails = z.infer<typeof GuardrailsSchema>;
+
+/**
+ * Guardrail overrides (stored settings, PATCH, env defaults): every key optional and, unlike
+ * `GuardrailsSchema.partial()`, no defaults filled in, so an absent key stays absent.
+ */
+export const GuardrailOverridesSchema = z.object(GUARDRAIL_FIELDS).partial();
+export type GuardrailOverrides = z.infer<typeof GuardrailOverridesSchema>;
 
 export const GUARDRAIL_DEFAULTS = {
   maxChildrenPerItem: 8,
@@ -183,6 +232,9 @@ export const GUARDRAIL_DEFAULTS = {
   maxQueueBatch: 4,
   maxQueueDepth: 3,
   maxConflictReworks: 2,
+  maxInboxOpenPerContributor: 3,
+  maxInboxPushesPerHour: 20,
+  maxPickingRaces: 2,
 } as const satisfies Guardrails;
 
 /** The "max" column of §2.9: per-hive overrides are clamped to these (same as GuardrailsSchema's bounds). */
@@ -197,6 +249,9 @@ export const GUARDRAIL_MAX = {
   maxQueueBatch: 16,
   maxQueueDepth: 8,
   maxConflictReworks: 4,
+  maxInboxOpenPerContributor: 10,
+  maxInboxPushesPerHour: 60,
+  maxPickingRaces: 5,
 } as const satisfies Guardrails;
 
 /** TRIAGE: an auto-filed item scoring ≥ this against an open item is a DUPLICATE. */
@@ -206,14 +261,41 @@ export const CHILD_DEDUPE_THRESHOLD = 0.92;
 /** After a race's first passing candidate, the others get this long to report. */
 export const RACE_GRACE_MS = 90_000;
 
-export const RaceStateSchema = z.enum(["RACING", "DECIDED", "ABANDONED"]);
+/** PICKING (§10.2): `judge = human` and ≥ 2 candidates passed; held for a human pick until `pickDeadlineAt`. */
+export const RaceStateSchema = z.enum(["RACING", "PICKING", "DECIDED", "ABANDONED"]);
 export type RaceState = z.infer<typeof RaceStateSchema>;
 
-/** Best-of-N (§2.3.6): w BUILD trains of one item on different models; the best passing one boards a car. */
+/** A PICKING race's default and longest pick window (§10.2). */
+export const PICK_WINDOW_DEFAULT_MS = 15 * 60_000;
+export const PICK_WINDOW_MAX_MS = 2 * 3_600_000;
+
+/**
+ * Who decided a race (`Race.decidedBy`, `race.decided` event `data.by`): `human:<email>`, or the Queen:
+ * `queen:auto` (ranking), `queen:single` (one passed), `queen:deadline` (pick window ran out),
+ * `queen:cap` (over `maxPickingRaces`). Only `human:*` decisions move preference ratings (§10.5).
+ */
+export const RaceDecidedBySchema = z.string().regex(/^(human:.+|queen:(auto|single|deadline|cap))$/).max(340);
+export type RaceDecidedBy = z.infer<typeof RaceDecidedBySchema>;
+
+/** A candidate a human rejected while the race was PICKING (§10.4). */
+export const RaceRejectionSchema = z.object({
+  trainId: z.string().min(1),
+  /** `human:<email>`. */
+  by: z.string().min(1).max(340),
+  reason: z.string().min(1).max(300),
+});
+export type RaceRejection = z.infer<typeof RaceRejectionSchema>;
+
+/**
+ * Best-of-N (§2.3.6): w BUILD trains of one item on different models; the best passing one boards a car.
+ * Candidates are trains of any origin (`MergeTrain.origin`; a human or agent candidate has no model).
+ * Width 1 is allowed (human-push design: every item can carry a race so a submission always has one to
+ * enter); `width` counts the Queen-dispatched candidates, and `trainIds` grows as external entries join.
+ */
 export const RaceSchema = z.object({
   raceId: z.string(),
   itemId: z.string(),
-  width: z.number().int().min(2).max(5),
+  width: z.number().int().min(1).max(5),
   state: RaceStateSchema,
   trainIds: z.array(z.string()),
   winnerTrainId: z.string().nullable(),
@@ -221,5 +303,29 @@ export const RaceSchema = z.object({
   deadlineAt: z.number().int().nullable(),
   createdAt: z.number().int(),
   decidedAt: z.number().int().nullable(),
+  /** Submissions targeting the item join as candidates until this time (null: until decided). Inert until T1. */
+  entryClosesAt: z.number().int().nullable().optional(),
+  // Human-judged races (§10.7; all optional, absent on older Queens; inert until T9a).
+  /** PICKING: when the Queen auto-picks its recommendation (`queen:deadline`). */
+  pickDeadlineAt: z.number().int().nullable().optional(),
+  /** The `rankCandidates` winner at PICKING entry, and why. */
+  recommendedTrainId: z.string().nullable().optional(),
+  recommendReason: z.string().max(300).nullable().optional(),
+  decidedBy: RaceDecidedBySchema.nullable().optional(),
+  rejections: z.array(RaceRejectionSchema).max(16).optional(),
 });
 export type Race = z.infer<typeof RaceSchema>;
+
+/** POST /hives/:hive/races/:raceId/pick (user route, §10.2). 409 unless the race is PICKING and `trainId` a live passed candidate. */
+export const PickRaceSchema = z.object({
+  trainId: z.string().min(1),
+  reason: z.string().max(300).optional(),
+});
+export type PickRace = z.infer<typeof PickRaceSchema>;
+
+/** POST /hives/:hive/races/:raceId/reject (user route, §10.4): one candidate, or `"all"` (none of these). */
+export const RejectRaceSchema = z.object({
+  trainId: z.union([z.literal("all"), z.string().min(1)]),
+  reason: z.string().min(1).max(300),
+});
+export type RejectRace = z.infer<typeof RejectRaceSchema>;

@@ -630,8 +630,8 @@ describe("dispatchReady", () => {
     const p1a = s.feature("p1a", { priority: 1 });
     const p1b = s.feature("p1b", { priority: 1 });
     const r = s.dispatch();
-    expect(r.submissions.map((x) => x.itemId)).toEqual([p1a, p1b, low]);
-    expect(r.submissions[0]).toMatchObject({ width: 1, promptText: "p1a", difficulty: "normal", traceId: s.item(p1a).traceId });
+    expect(r.dispatches.map((x) => x.itemId)).toEqual([p1a, p1b, low]);
+    expect(r.dispatches[0]).toMatchObject({ width: 1, promptText: "p1a", difficulty: "normal", traceId: s.item(p1a).traceId });
     expect(s.settings!.dispatches).toBe(3);
   });
 
@@ -639,7 +639,7 @@ describe("dispatchReady", () => {
     const s = new WSim();
     const a = s.feature("a");
     s.ctx = { autonomy: "paused" };
-    expect(s.dispatch().submissions).toEqual([]);
+    expect(s.dispatch().dispatches).toEqual([]);
     expect(s.item(a).waitReason).toBe("paused");
   });
 
@@ -647,19 +647,19 @@ describe("dispatchReady", () => {
     const s = new WSim();
     const a = s.feature("a");
     s.settings = { ...s.settings!, overrides: { budget: { dailyDispatches: 1 } }, dispatches: 1 };
-    expect(s.dispatch().submissions).toEqual([]);
+    expect(s.dispatch().dispatches).toEqual([]);
     expect(s.item(a).waitReason).toBe("budget");
     s.dispatch();
     expect(s.open("BUDGET_EXHAUSTED")).toHaveLength(1);
     s.now += 24 * 3_600_000; // next UTC day resets the counters
-    expect(s.dispatch().submissions.map((x) => x.itemId)).toEqual([a]);
+    expect(s.dispatch().dispatches.map((x) => x.itemId)).toEqual([a]);
   });
 
   it("credits over the daily limit also exhaust the budget", () => {
     const s = new WSim();
     s.feature("a");
     s.settings = { ...s.settings!, overrides: { budget: { dailyCredits: 10 } }, creditsUsed: 10 };
-    expect(s.dispatch().submissions).toEqual([]);
+    expect(s.dispatch().dispatches).toEqual([]);
   });
 
   it("slots: active builds + width ≤ min(maxActiveTrains, leasedSlots); width lowered to fit; the rest wait on capacity", () => {
@@ -667,7 +667,7 @@ describe("dispatchReady", () => {
     const race = s.feature("race", { bestOf: 3 });
     const b = s.feature("b");
     const r = s.dispatch({ activeBuilds: 2, leasedSlots: 4 });
-    expect(r.submissions).toEqual([expect.objectContaining({ itemId: race, width: 2 })]);
+    expect(r.dispatches).toEqual([expect.objectContaining({ itemId: race, width: 2 })]);
     expect(s.item(b).waitReason).toBe("capacity 4/4");
     expect(s.settings!.dispatches).toBe(2);
   });
@@ -675,14 +675,14 @@ describe("dispatchReady", () => {
   it("race width: hard → race.hardWidth, capped by maxRaceWidth; ctx.widthOf overrides", () => {
     const s = new WSim();
     s.feature("hard", { difficulty: "hard" });
-    expect(s.dispatch().submissions[0]!.width).toBe(3);
+    expect(s.dispatch().dispatches[0]!.width).toBe(3);
     const t = new WSim();
     t.feature("x", { bestOf: 5 });
-    expect(t.dispatch().submissions[0]!.width).toBe(3);
+    expect(t.dispatch().dispatches[0]!.width).toBe(3);
     const u = new WSim();
     u.feature("x", { bestOf: 3 });
     u.ctx = { widthOf: () => 1 };
-    expect(u.dispatch().submissions[0]!.width).toBe(1);
+    expect(u.dispatch().dispatches[0]!.width).toBe(1);
   });
 
   it("goals and non-READY items are never dispatched", () => {
@@ -690,7 +690,7 @@ describe("dispatchReady", () => {
     s.goal();
     const a = s.feature("a");
     s.feature("b", { dependsOn: [a] });
-    expect(s.dispatch().submissions.map((x) => x.itemId)).toEqual([a]);
+    expect(s.dispatch().dispatches.map((x) => x.itemId)).toEqual([a]);
   });
 
   describe("affinity", () => {
@@ -700,14 +700,14 @@ describe("dispatchReady", () => {
       const b = s.feature("b", { paths: ["src/lib/"] });
       const c = s.feature("c", { paths: ["src/other.js"] });
       const r = s.dispatch();
-      expect(r.submissions.map((x) => x.itemId)).toEqual([a, c]);
+      expect(r.dispatches.map((x) => x.itemId)).toEqual([a, c]);
       expect(s.item(b).waitReason).toBe(`affinity: src/lib/ held by ${a}`);
       expect(r.events.filter((e) => e.type === "affinity.wait")).toHaveLength(1);
       expect(s.claimsOf(a).map((x) => x.path)).toEqual(["src/lib/theme.js"]);
       // Still waiting on the same holder: no second event.
       expect(s.dispatch().events.filter((e) => e.type === "affinity.wait")).toHaveLength(0);
       s.landed(a);
-      expect(s.dispatch().submissions.map((x) => x.itemId)).toEqual([b]);
+      expect(s.dispatch().dispatches.map((x) => x.itemId)).toEqual([b]);
     });
 
     it("a P0 waiter goes first when the claim frees", () => {
@@ -721,7 +721,7 @@ describe("dispatchReady", () => {
       expect(s.item(p0).waitReason).toContain(holder);
       s.landed(holder);
       const r = s.dispatch();
-      expect(r.submissions.map((x) => x.itemId)).toEqual([p0]);
+      expect(r.dispatches.map((x) => x.itemId)).toEqual([p0]);
       expect(s.item(p2).waitReason).toBe(`affinity: src/theme.js held by ${p0}`);
     });
 
@@ -730,7 +730,7 @@ describe("dispatchReady", () => {
       s.feature("a", { paths: ["src/a.js"] });
       s.feature("b", { paths: [] });
       s.feature("c", { paths: [] });
-      expect(s.dispatch().submissions).toHaveLength(3);
+      expect(s.dispatch().dispatches).toHaveLength(3);
     });
 
     it("generated paths never wait", () => {
@@ -740,7 +740,7 @@ describe("dispatchReady", () => {
       s.items.set(a, { ...s.item(a), paths: ["src/features/index.js"] });
       const b = s.feature("b");
       s.items.set(b, { ...s.item(b), paths: ["src/features/index.js"] });
-      expect(s.dispatch().submissions).toHaveLength(2);
+      expect(s.dispatch().dispatches).toHaveLength(2);
       expect(s.claimsOf(a)).toEqual([]);
     });
 
@@ -750,7 +750,7 @@ describe("dispatchReady", () => {
       s.dispatch();
       const b = s.feature("b", { paths: ["src/lib/format.js"] });
       s.absorb({ memberFailures: [{ trainId: "t", itemId: a, cause: "conflict", claimPaths: ["src/lib/format.js"] }] });
-      expect(s.dispatch().submissions).toEqual([]);
+      expect(s.dispatch().dispatches).toEqual([]);
       expect(s.item(b).waitReason).toBe(`affinity: src/lib/format.js held by ${a}`);
     });
 

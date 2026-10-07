@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { TraceIdSchema } from "./trace.js";
-import { GUARDRAIL_DEFAULTS, GuardrailsSchema } from "./work.js";
+import { GUARDRAIL_DEFAULTS, GuardrailOverridesSchema, GuardrailsSchema, PICK_WINDOW_MAX_MS, RaceJudgeSchema } from "./work.js";
 
 /**
  * Autonomy, escalations and hive settings (v2 design §2.4, §2.5, §2.8, §2.9).
@@ -121,12 +121,24 @@ export function escalationActions(reason: EscalationReason): EscalationAction[] 
 export const ResolveEscalationSchema = z.object({ action: EscalationActionSchema, note: z.string().max(500).optional() });
 export type ResolveEscalation = z.infer<typeof ResolveEscalationSchema>;
 
+/**
+ * Race settings. `judge` (default `auto`) and `pickWindowMs` (default PICK_WINDOW_DEFAULT_MS) are the
+ * human-judged race settings (human-push design §10.2): optional, absent on older Queens, inert until T9a.
+ */
+export const RaceSettingsSchema = z.object({
+  reworkWidth: z.number().int().min(1).max(5),
+  hardWidth: z.number().int().min(1).max(5),
+  judge: RaceJudgeSchema.optional(),
+  pickWindowMs: z.number().int().min(60_000).max(PICK_WINDOW_MAX_MS).optional(),
+});
+export type RaceSettings = z.infer<typeof RaceSettingsSchema>;
+
 export const HiveSettingsSchema = z.object({
   autonomy: AutonomyLevelSchema,
   guardrails: GuardrailsSchema,
   budget: z.object({ dailyCredits: z.number().int().min(0), dailyDispatches: z.number().int().min(0) }),
   slo: z.object({ changeSuccessTarget: z.number().min(0.5).max(1), window: z.number().int().min(5).max(100) }),
-  race: z.object({ reworkWidth: z.number().int().min(1).max(5), hardWidth: z.number().int().min(1).max(5) }),
+  race: RaceSettingsSchema,
 });
 export type HiveSettings = z.infer<typeof HiveSettingsSchema>;
 
@@ -141,7 +153,7 @@ export const HIVE_SETTINGS_DEFAULTS: HiveSettings = {
 
 /** Per-hive overrides of HIVE_SETTINGS_DEFAULTS, as stored (`hive_settings.settings`); autonomy has its own column. */
 export const HiveSettingsOverridesSchema = z.object({
-  guardrails: GuardrailsSchema.partial().optional(),
+  guardrails: GuardrailOverridesSchema.optional(),
   budget: HiveSettingsSchema.shape.budget.partial().optional(),
   slo: HiveSettingsSchema.shape.slo.partial().optional(),
   race: HiveSettingsSchema.shape.race.partial().optional(),
@@ -162,7 +174,7 @@ export type BudgetBoost = z.infer<typeof BudgetBoostSchema>;
 /** PATCH /hives/:hive/settings. */
 export const UpdateHiveSettingsSchema = z.object({
   autonomy: AutonomyLevelSchema.optional(),
-  guardrails: GuardrailsSchema.partial().optional(),
+  guardrails: GuardrailOverridesSchema.optional(),
   budget: HiveSettingsSchema.shape.budget.partial().optional(),
   race: HiveSettingsSchema.shape.race.partial().optional(),
 });

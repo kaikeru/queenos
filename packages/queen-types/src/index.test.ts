@@ -74,6 +74,25 @@ import {
   type AuditEvent,
   type MergeTrain,
   type PromptRun,
+  GuardrailOverridesSchema,
+  HiveSettingsOverridesSchema,
+  INBOX_REPO_RE,
+  InboxOpenResultSchema,
+  InboxSchema,
+  ModelPreferenceSchema,
+  ModelStatsSchema,
+  PickRaceSchema,
+  RaceDecidedBySchema,
+  RaceStateSchema,
+  RejectRaceSchema,
+  SubmissionSchema,
+  SubmitOutcomeSchema,
+  EventTypeSchema,
+  inboxRepoName,
+  itemIdFromRef,
+  parseInboxRepo,
+  parseSubmissionTrailers,
+  targetFromRef,
 } from "./index.js";
 
 const note = {
@@ -692,8 +711,131 @@ describe("v1 payloads (no v2 fields) still parse unchanged", () => {
   });
 
   it("keeps the v1 drone actions and model roles, adding MERGE and planner", () => {
-    expect(DroneActionSchema.options).toEqual(["BUILD", "LAND", "REWORK", "MERGE"]);
+    expect(DroneActionSchema.options).toEqual(["BUILD", "LAND", "REWORK", "MERGE", "PIN"]);
     expect(ModelRoleSchema.options).toEqual(["builder", "rework", "scribe", "genesis", "planner"]);
     expect(MODEL_CATALOG.filter((m) => m.roles.includes("planner")).map((m) => m.label)).toEqual(["DeepSeek V4 Flash", "GLM-5.3 Flash"]);
+  });
+});
+
+describe("human-push design T0 contracts (inbox, Submission, races)", () => {
+  const SHA = "a".repeat(40);
+  const sub = {
+    hive: "demo",
+    repo: "demo-in-kyle",
+    ref: "refs/heads/tip-jar",
+    headSha: SHA,
+    origin: { kind: "human", id: "kyle@example.com" },
+    title: "Add a tip jar",
+  };
+
+  it("parses a Submission, defaulting provenance to {}", () => {
+    expect(SubmissionSchema.parse(sub)).toEqual({ ...sub, provenance: {} });
+    const drone = { ...sub, repo: "demo-train-abc", ref: "refs/heads/main", origin: { kind: "drone", id: "t-build" }, itemId: "i1",
+      provenance: { trainId: "t", raceId: null, candidate: 0, attempt: 1, action: "BUILD", model: "m", verified: true } };
+    expect(roundTrip(SubmissionSchema, drone)).toEqual(drone);
+    expect(SubmissionSchema.safeParse({ ...sub, headSha: "abc" }).success).toBe(false);
+    expect(SubmissionSchema.safeParse({ ...sub, ref: "refs/notes/queen" }).success).toBe(false);
+    expect(SubmissionSchema.safeParse({ ...sub, origin: { kind: "robot", id: "x" } }).success).toBe(false);
+  });
+
+  it("parses inbox rows, the open result and submit outcomes", () => {
+    const inbox = { hive: "demo", email: "kyle@example.com", handle: "kyle", repo: "demo-in-kyle", createdAt: 1, revokedAt: null, openItems: 0 };
+    expect(roundTrip(InboxSchema, inbox)).toEqual(inbox);
+    expect(InboxSchema.safeParse({ ...inbox, handle: "Kyle.W" }).success).toBe(false);
+    const open = { handle: "kyle", repo: "demo-in-kyle", remote: "https://x.artifacts.cloudflare.net/git/q/demo-in-kyle.git", username: "queen", password: "p", expiresAt: "2026-10-08T14:02:11Z", mainSha: SHA };
+    expect(roundTrip(InboxOpenResultSchema, open)).toEqual(open);
+    expect(SubmitOutcomeSchema.parse({ outcome: "ignored:duplicate" })).toEqual({ outcome: "ignored:duplicate" });
+    expect(SubmitOutcomeSchema.safeParse({ outcome: "ignored:nope" }).success).toBe(false);
+  });
+
+  it("names and recognises inbox repos (the handle has no '-')", () => {
+    expect(inboxRepoName("demo", "kyle")).toBe("demo-in-kyle");
+    expect(parseInboxRepo("demo-in-kyle")).toEqual({ hive: "demo", handle: "kyle" });
+    expect(parseInboxRepo("my-in-hive-in-kyle")).toEqual({ hive: "my-in-hive", handle: "kyle" });
+    expect(parseInboxRepo("demo")).toBeNull();
+    expect(parseInboxRepo("demo-train-0123456789ab")).toBeNull();
+    expect(INBOX_REPO_RE.test("demo-in-UPPER")).toBe(false);
+  });
+
+  it("parses head-commit trailers case-insensitively, and item/<id> branches", () => {
+    const t = parseSubmissionTrailers("Add a tip jar\n\nbody\n\nqueen: Rework\nQUEEN-ITEM: 3c1e-9\nQueen-Origin: agent:claude-code");
+    expect(t).toMatchObject({ rework: true, itemId: "3c1e-9", agent: "claude-code" });
+    expect(t.raw).toEqual({ queen: "Rework", "queen-item": "3c1e-9", "queen-origin": "agent:claude-code" });
+    expect(parseSubmissionTrailers("just a commit")).toEqual({ rework: false, raw: {} });
+    expect(parseSubmissionTrailers("Queen-Origin: human").agent).toBeUndefined();
+    expect(itemIdFromRef("refs/heads/item/3c1e")).toBe("3c1e");
+    expect(itemIdFromRef("refs/heads/tip-jar")).toBeNull();
+  });
+
+  it("extends the existing contracts additively", () => {
+    expect(DroneTaskSchema.parse({ promptId: "p", trainId: "t", namespace: "n", artifactRepo: "r", baseRef: "main", promptText: "x", role: "BUILDER", action: "PIN",
+      seed: { repo: "demo-in-kyle", ref: "refs/heads/tip-jar", headSha: SHA }, writeBack: { repo: "demo-in-kyle", ref: "refs/heads/tip-jar" } }).seed?.headSha).toBe(SHA);
+    const note = { op: "NOTE", commandId: "t-note-1", hive: "h", trainId: "t", repo: "demo-in-kyle", sha: SHA, text: "queen: PASSED" };
+    expect(roundTrip(ProvisionCommandSchema, note)).toEqual(note);
+    expect(ProvisionCommandSchema.safeParse({ ...note, text: "x".repeat(2001) }).success).toBe(false);
+    expect(ProvisionResultSchema.parse({ commandId: "c", op: "NOTE", trainId: "t", ok: true }).op).toBe("NOTE");
+    expect(WorkActionSchema.parse({ action: "handoff" }).action).toBe("handoff");
+    expect(FileWorkItemSchema.parse({ kind: "feature", title: "t", judge: "human" }).judge).toBe("human");
+    expect(SubmitPromptSchema.parse({ namespace: "n", promptText: "t", judge: "human" }).judge).toBe("human");
+    const origin = { kind: "agent", id: "codex@kyle@example.com" };
+    expect(MergeTrainSchema.parse({ ...train, origin }).origin).toEqual(origin);
+    expect(GateTargetSchema.parse({ trainId: "t", lane: "BUILD", promptId: "p", promptText: "x", previewUrl: null, phase: "TESTING", traceId: null, baseSha: SHA, origin }).origin).toEqual(origin);
+    expect(EventTypeSchema.options).toEqual(expect.arrayContaining(["race.picking", "race.rejected", "submission.received", "note.failed"]));
+  });
+
+  it("guardrails: new caps default on parse, overrides never fill defaults", () => {
+    const v2: Record<string, number> = { ...GUARDRAIL_DEFAULTS };
+    for (const k of ["maxInboxOpenPerContributor", "maxInboxPushesPerHour", "maxPickingRaces"]) delete v2[k];
+    expect(GuardrailsSchema.parse(v2)).toEqual(GUARDRAIL_DEFAULTS);
+    expect(GUARDRAIL_DEFAULTS).toMatchObject({ maxInboxOpenPerContributor: 3, maxInboxPushesPerHour: 20, maxPickingRaces: 2 });
+    expect(GUARDRAIL_MAX).toMatchObject({ maxInboxOpenPerContributor: 10, maxInboxPushesPerHour: 60, maxPickingRaces: 5 });
+    expect(GuardrailOverridesSchema.parse({ maxOpenItems: 5 })).toEqual({ maxOpenItems: 5 });
+    expect(HiveSettingsOverridesSchema.parse({ guardrails: {}, race: { judge: "human" } })).toEqual({ guardrails: {}, race: { judge: "human" } });
+    expect(UpdateHiveSettingsSchema.parse({ guardrails: { maxPickingRaces: 0 } })).toEqual({ guardrails: { maxPickingRaces: 0 } });
+    expect(HiveSettingsSchema.parse({ ...HIVE_SETTINGS_DEFAULTS, race: { reworkWidth: 2, hardWidth: 3, judge: "human", pickWindowMs: 900_000 } }).race.judge).toBe("human");
+    expect(HiveSettingsSchema.safeParse({ ...HIVE_SETTINGS_DEFAULTS, race: { reworkWidth: 2, hardWidth: 3, pickWindowMs: 3 * 3_600_000 } }).success).toBe(false);
+  });
+
+  it("races: PICKING, pick/reject inputs, decidedBy and the new optional fields", () => {
+    expect(RaceStateSchema.options).toEqual(["RACING", "PICKING", "DECIDED", "ABANDONED"]);
+    const race = { raceId: "r", itemId: "i", width: 3, state: "PICKING", trainIds: ["a", "b", "c"], winnerTrainId: null, reason: null, deadlineAt: 5, createdAt: 1, decidedAt: null,
+      pickDeadlineAt: 900_005, recommendedTrainId: "a", recommendReason: "verified, smallest diff", decidedBy: null, rejections: [{ trainId: "c", by: "human:kyle@example.com", reason: "wrong colour" }] };
+    expect(roundTrip(RaceSchema, race)).toEqual(race);
+    expect(PickRaceSchema.parse({ trainId: "b" })).toEqual({ trainId: "b" });
+    expect(PickRaceSchema.safeParse({ trainId: "b", reason: "x".repeat(301) }).success).toBe(false);
+    expect(RejectRaceSchema.parse({ trainId: "all", reason: "none fit" }).trainId).toBe("all");
+    expect(RejectRaceSchema.safeParse({ trainId: "a", reason: "" }).success).toBe(false);
+    for (const by of ["human:kyle@example.com", "queen:auto", "queen:single", "queen:deadline", "queen:cap"]) expect(RaceDecidedBySchema.parse(by)).toBe(by);
+    expect(RaceDecidedBySchema.safeParse("queen:whim").success).toBe(false);
+  });
+
+  it("the item is the inbox: targets, dispositions, width-1 races with an entry window", () => {
+    expect(targetFromRef("refs/heads/item/3c1e")).toEqual({ kind: "item", itemId: "3c1e" });
+    expect(targetFromRef("refs/heads/goal/tip-jar")).toEqual({ kind: "goal", goal: "tip-jar" });
+    expect(targetFromRef("refs/heads/tip-jar")).toBeNull();
+    const targeted = { ...sub, ref: "refs/heads/goal/tip-jar", target: { kind: "goal", goal: "tip-jar" } };
+    expect(roundTrip(SubmissionSchema, targeted)).toEqual({ ...targeted, provenance: {} });
+    expect(SubmissionSchema.safeParse({ ...sub, target: { kind: "goal", goal: "a b" } }).success).toBe(false);
+    expect(SubmitOutcomeSchema.parse({ outcome: "applied", disposition: "late-new-item", itemId: "i2" }).disposition).toBe("late-new-item");
+    const solo = { raceId: "r", itemId: "i", width: 1, state: "RACING", trainIds: ["a", "human-entry"], winnerTrainId: null, reason: null, deadlineAt: null, createdAt: 1, decidedAt: null, entryClosesAt: 90_000 };
+    expect(roundTrip(RaceSchema, solo)).toEqual(solo);
+  });
+
+  it("model preference and pick counts", () => {
+    const p = { model: "@cf/zai-org/glm-5.3", kind: "feature", rating: 1512.5, n: 3, updatedAt: 1 };
+    expect(roundTrip(ModelPreferenceSchema, p)).toEqual(p);
+    const stats = { model: "m", role: "builder", attempts: 1, passes: 1, failures: 0, avgBuildMs: null, updatedAt: 1 };
+    expect(roundTrip(ModelStatsSchema, stats)).toEqual(stats);
+    expect(ModelStatsSchema.parse({ ...stats, picks: 2, picksAgainstRecommendation: 1 }).picks).toBe(2);
+  });
+
+  it("pre-T0 payloads still parse unchanged", () => {
+    const item = { itemId: "i", hive: "h", kind: "feature", title: "t", body: "", acceptance: [], priority: 2, status: "READY", parentId: null, rootId: "i", depth: 0, dependsOn: [],
+      source: { kind: "user", actor: "a" }, traceId: "0".repeat(31) + "1", spanId: "0".repeat(15) + "1", difficulty: "normal", bestOf: null, attempts: 0, conflicts: 0, paths: [],
+      waitReason: null, duplicateOf: null, blockedReason: null, releaseId: null, escalationId: null, createdAt: 1, updatedAt: 1 };
+    expect(roundTrip(WorkItemSchema, item)).toEqual(item);
+    const race = { raceId: "r", itemId: "i", width: 2, state: "DECIDED", trainIds: ["a", "b"], winnerTrainId: "a", reason: "x", deadlineAt: null, createdAt: 1, decidedAt: 2 };
+    expect(roundTrip(RaceSchema, race)).toEqual(race);
+    expect(HiveSettingsSchema.parse(HIVE_SETTINGS_DEFAULTS).race).toEqual({ reworkWidth: 2, hardWidth: 3 });
   });
 });

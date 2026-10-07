@@ -132,7 +132,7 @@ export interface WorkError {
 }
 
 /** A READY item handed to `TrainPlanner.submit` (prompt_runs.prompt_id = itemId). */
-export interface DispatchSubmission {
+export interface ItemDispatch {
   itemId: string;
   promptText: string;
   /** Race width (≥ 1, already fitted to the free slots and the dispatch budget). */
@@ -164,7 +164,7 @@ export interface WorkPlanResult {
   events: EventDraft[];
   effects: WorkEffect[];
   /** dispatchReady only: items to submit, in dispatch order. */
-  submissions: DispatchSubmission[];
+  dispatches: ItemDispatch[];
   /** reconcile only: the SwarmGovernor lease should be renewed before the next decide(). */
   leaseDue?: boolean;
 }
@@ -412,7 +412,7 @@ export class WorkPlanner {
   private settingsDirty = false;
   private events: EventDraft[] = [];
   private effects: WorkEffect[] = [];
-  private submissions: DispatchSubmission[] = [];
+  private pendingDispatches: ItemDispatch[] = [];
 
   constructor(
     state: WorkState,
@@ -995,7 +995,7 @@ export class WorkPlanner {
       this.event("affinity.claimed", item, `claimed ${claims.map((c) => c.path).join(", ")}`, { paths: claims.map((c) => c.path), source: "predicted" }, "queen", "debug");
     }
     this.updateSettings({ dispatches: this.settings.dispatches + width });
-    this.submissions.push({
+    this.pendingDispatches.push({
       itemId: item.itemId,
       promptText: composePrompt(item),
       width,
@@ -1025,7 +1025,16 @@ export class WorkPlanner {
         return this.cancel(itemId, actor, a.note);
       case "not_duplicate":
         return this.notDuplicate(itemId, actor, a.note);
+      case "handoff":
+        return this.handoff(itemId);
     }
+  }
+
+  /** Inbox item → the swarm (human-push design §6.3). T0 seam: answers 409 until T1 wires the seeded REWORK. */
+  handoff(itemId: string): WorkPlanResult {
+    const item = this.items.get(itemId);
+    if (!item) return this.notFound(itemId);
+    return this.invalid(item, "handoff", "not implemented: handoff (human-push design T1)");
   }
 
   /** FAILED → READY (or BLOCKED): attempts and conflicts reset; its REWORK_EXHAUSTED escalation resolves. */
@@ -1471,7 +1480,7 @@ export class WorkPlanner {
       ...(this.settingsDirty ? { settings: { ...this.settings, degradedBy: [...this.settings.degradedBy] } } : {}),
       events: this.events,
       effects: [...this.effects, ...broadcasts],
-      submissions: this.submissions,
+      dispatches: this.pendingDispatches,
       ...(extra.leaseDue !== undefined ? { leaseDue: extra.leaseDue } : {}),
     };
     this.dirtyItems.clear();
@@ -1481,7 +1490,7 @@ export class WorkPlanner {
     this.settingsDirty = false;
     this.events = [];
     this.effects = [];
-    this.submissions = [];
+    this.pendingDispatches = [];
     return result;
   }
 }

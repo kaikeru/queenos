@@ -30,6 +30,20 @@ import {
   upsertRace,
   upsertTrain,
   upsertWorkItem,
+  applyModelStatDelta,
+  applyPickDelta,
+  countSubmissionsSince,
+  findInbox,
+  getSubmission,
+  insertSubmission,
+  latestSubmissionOnRef,
+  listModelPreference,
+  listModelStats,
+  pruneSubmissions,
+  submissionsByHead,
+  updateSubmission,
+  upsertInbox,
+  upsertModelPreference,
 } from "../src/db";
 import type { QueenNode } from "../src/queen-node";
 import type { WorkItemRecord } from "../src/records";
@@ -56,26 +70,28 @@ const columns = (sql: SqlStorage, table: string) =>
 const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v FROM _migrations").one().v);
 
 describe("migrations", () => {
-  it("a fresh DO migrates to v13", async () => {
-    expect(SCHEMA_VERSION).toBe(13);
+  it("a fresh DO migrates to v14", async () => {
+    expect(SCHEMA_VERSION).toBe(14);
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
-      expect(version(q.sql)).toBe(13);
+      expect(version(q.sql)).toBe(14);
       const t = tables(q.sql);
-      for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims"]) {
+      for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims", "inboxes", "submissions", "model_preference"]) {
         expect(t.has(name), name).toBe(true);
       }
-      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at"]) {
+      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at", "origin_json"]) {
         expect(columns(q.sql, "merge_trains").has(c), c).toBe(true);
       }
-      for (const c of ["paths", "wait_reason", "conflicts"]) expect(columns(q.sql, "work_items").has(c), c).toBe(true);
+      for (const c of ["entry_closes_at", "pick_deadline_at", "recommended_train_id", "recommend_reason", "decided_by", "rejections"]) expect(columns(q.sql, "races").has(c), c).toBe(true);
+      for (const c of ["picks", "picks_against_recommendation"]) expect(columns(q.sql, "model_stats").has(c), c).toBe(true);
+      for (const c of ["paths", "wait_reason", "conflicts", "inbox_json", "judge"]) expect(columns(q.sql, "work_items").has(c), c).toBe(true);
       for (const c of ["leased_slots", "lease_expires_at", "car_infra_failures", "budget_boost"]) expect(columns(q.sql, "hive_settings").has(c), c).toBe(true);
       expect(columns(q.sql, "releases").has("trace_id")).toBe(true);
       expect(columns(q.sql, "prompt_runs").has("race_width")).toBe(true);
       // A new hive has no settings row yet (it gets one, autonomous, at its first v2 filing).
       expect(loadHiveSettings(q.sql)).toBeNull();
       // Idempotent: re-running is a no-op.
-      expect(migrate(state.storage)).toBe(13);
-      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(13);
+      expect(migrate(state.storage)).toBe(14);
+      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(14);
     });
   });
 
@@ -140,8 +156,8 @@ describe("migrations", () => {
       };
 
       // ── migrate ──
-      expect(migrate(state.storage)).toBe(13);
-      expect(version(sql)).toBe(13);
+      expect(migrate(state.storage)).toBe(SCHEMA_VERSION);
+      expect(version(sql)).toBe(SCHEMA_VERSION);
 
       // 3 work_items: user feature items with the prompt ids, v2 trace ids and first-line titles.
       const items = sql.exec("SELECT * FROM work_items ORDER BY seq").toArray().map(rowToWorkItem);
@@ -391,6 +407,119 @@ describe("v2 row mappers round-trip", () => {
       expect(rowToAudit(sql.exec("SELECT * FROM audit_trail WHERE event_id = 'au1'").one())).toEqual(audit);
       // The audit event carries the item's (not a minted) trace.
       expect(rowToEvent(sql.exec("SELECT * FROM event_log WHERE event_id = 'au1'").one()).traceId).toBe(item.traceId);
+    });
+  });
+});
+
+describe("v14: inbox, submissions, races, preference", () => {
+  it("a populated v13 hive migrates to v14 with every existing row unchanged", async () => {
+    const hive = newHive();
+    const stub = stubFor(hive);
+    // Populate through the real RPCs at v14, then roll the schema back to a v13 copy of the same data.
+    const res = await stub.submitPrompt({ namespace: hive, promptText: "Add a /health endpoint", bestOf: 2 });
+    await runInDurableObject(stub, (q: QueenNode, state) => {
+      const sql = q.sql;
+      const before = {
+        items: sql.exec("SELECT * FROM work_items ORDER BY item_id").toArray().map(rowToWorkItem),
+        trains: sql.exec("SELECT * FROM merge_trains ORDER BY train_id").toArray().map(rowToTrain),
+        races: sql.exec("SELECT * FROM races ORDER BY race_id").toArray().map(rowToRace),
+      };
+      expect(before.items.length).toBeGreaterThan(0);
+      expect(before.items.map((i) => i.itemId)).toContain(res.promptId);
+      // Undo v14 (DO SQLite supports DROP COLUMN), leaving a v13 database with the same rows.
+      sql.exec(`DROP TABLE inboxes; DROP TABLE submissions; DROP TABLE model_preference; DROP INDEX races_item;
+        ALTER TABLE work_items DROP COLUMN inbox_json; ALTER TABLE work_items DROP COLUMN judge;
+        ALTER TABLE merge_trains DROP COLUMN origin_json;
+        ALTER TABLE races DROP COLUMN entry_closes_at; ALTER TABLE races DROP COLUMN pick_deadline_at;
+        ALTER TABLE races DROP COLUMN recommended_train_id; ALTER TABLE races DROP COLUMN recommend_reason;
+        ALTER TABLE races DROP COLUMN decided_by; ALTER TABLE races DROP COLUMN rejections;
+        ALTER TABLE model_stats DROP COLUMN picks; ALTER TABLE model_stats DROP COLUMN picks_against_recommendation;
+        DELETE FROM _migrations WHERE version = 14;`);
+      expect(version(sql)).toBe(13);
+      expect(migrate(state.storage)).toBe(14);
+      expect(sql.exec("SELECT * FROM work_items ORDER BY item_id").toArray().map(rowToWorkItem)).toEqual(before.items);
+      expect(sql.exec("SELECT * FROM merge_trains ORDER BY train_id").toArray().map(rowToTrain)).toEqual(before.trains);
+      expect(sql.exec("SELECT * FROM races ORDER BY race_id").toArray().map(rowToRace)).toEqual(before.races);
+      for (const i of before.items) expect(i).not.toHaveProperty("inbox");
+    });
+    // The snapshot still parses with the current contracts.
+    await runInDurableObject(stub, (q: QueenNode) => {
+      expect(QueenServerMessageSchema.safeParse(q.getSnapshot()).success).toBe(true);
+    });
+  });
+
+  it("inboxes and submissions: dedupe on (repo, headSha), supersede key, own-push, caps, prune", async () => {
+    await runInDurableObject(stubFor(newHive()), (q: QueenNode) => {
+      const sql = q.sql;
+      const inbox = { email: "kyle@example.com", handle: "kyle", repo: "demo-in-kyle", createdAt: 1, revokedAt: null };
+      upsertInbox(sql, inbox);
+      expect(findInbox(sql, { email: "kyle@example.com" })).toEqual(inbox);
+      expect(findInbox(sql, { repo: "demo-in-kyle" })).toEqual(inbox);
+      expect(findInbox(sql, { handle: "nobody" })).toBeNull();
+      upsertInbox(sql, { ...inbox, revokedAt: 9 });
+      expect(findInbox(sql, { handle: "kyle" })?.revokedAt).toBe(9);
+
+      const A = "a".repeat(40), B = "b".repeat(40);
+      const sub = { repo: "demo-in-kyle", headSha: A, ref: "refs/heads/tip-jar", originKind: "human" as const, originId: "kyle@example.com",
+        itemId: null, trainId: null, outcome: "applied" as const, disposition: "filed" as const, target: null, createdAt: 100 };
+      expect(insertSubmission(sql, sub)).toBe(true);
+      expect(insertSubmission(sql, { ...sub, ref: "refs/heads/other" })).toBe(false); // same SHA, second branch: duplicate
+      updateSubmission(sql, { repo: sub.repo, headSha: A }, { itemId: "i1", trainId: "t1" });
+      expect(getSubmission(sql, sub.repo, A)).toEqual({ ...sub, itemId: "i1", trainId: "t1" });
+      const target = { kind: "item" as const, itemId: "i1" };
+      insertSubmission(sql, { ...sub, headSha: B, createdAt: 200, disposition: "joined-race", target });
+      expect(latestSubmissionOnRef(sql, sub.repo, sub.ref)).toMatchObject({ headSha: B, target });
+      insertSubmission(sql, { ...sub, repo: "demo-train-x", headSha: B, originKind: "drone", originId: "t-rework", createdAt: 250 });
+      expect(submissionsByHead(sql, B).map((s) => s.originKind)).toEqual(["human", "drone"]);
+      insertSubmission(sql, { ...sub, headSha: "c".repeat(40), outcome: "ignored:over-cap", disposition: null, createdAt: 300 });
+      expect(countSubmissionsSince(sql, "kyle@example.com", 150)).toBe(2);
+      expect(countSubmissionsSince(sql, "kyle@example.com", 0, "ignored:over-cap")).toBe(1);
+      expect(pruneSubmissions(sql, 220)).toBe(2);
+      expect(getSubmission(sql, sub.repo, A)).toBeNull();
+    });
+  });
+
+  it("v14 columns round-trip: item inbox and judge, train origin, race pick fields, picks and preference", async () => {
+    const hive = newHive();
+    const stub = stubFor(hive);
+    const res = await stub.submitPrompt({ namespace: hive, promptText: "Add a tip jar" });
+    await runInDurableObject(stub, (q: QueenNode) => {
+      const sql = q.sql;
+      const item = rowToWorkItem(sql.exec("SELECT * FROM work_items WHERE item_id = ?", res.promptId).one());
+      const inbox = { repo: `${hive}-in-kyle`, ref: "refs/heads/tip-jar", handle: "kyle", headSha: "a".repeat(40), handoff: false };
+      const withInbox: WorkItemRecord = { ...item, inbox, judge: "human" };
+      upsertWorkItem(sql, withInbox);
+      expect(rowToWorkItem(sql.exec("SELECT * FROM work_items WHERE item_id = ?", item.itemId).one())).toEqual(withInbox);
+      upsertWorkItem(sql, { ...withInbox, inbox: null, judge: undefined });
+      const cleared = rowToWorkItem(sql.exec("SELECT * FROM work_items WHERE item_id = ?", item.itemId).one());
+      expect(cleared).not.toHaveProperty("inbox");
+      expect(cleared).not.toHaveProperty("judge");
+
+      const train = rowToTrain(sql.exec("SELECT * FROM merge_trains LIMIT 1").one());
+      const origin = { kind: "human" as const, id: "kyle@example.com" };
+      upsertTrain(sql, { ...train, origin });
+      expect(rowToTrain(sql.exec("SELECT * FROM merge_trains WHERE train_id = ?", train.trainId).one()).origin).toEqual(origin);
+      upsertTrain(sql, { ...train, origin: null });
+      expect(rowToTrain(sql.exec("SELECT * FROM merge_trains WHERE train_id = ?", train.trainId).one())).not.toHaveProperty("origin");
+
+      const race = { raceId: "r1", itemId: item.itemId, width: 1, state: "PICKING" as const, trainIds: ["a", "b"], winnerTrainId: null, reason: null,
+        deadlineAt: 5, createdAt: 1, decidedAt: null, entryClosesAt: 90_000, pickDeadlineAt: 900_000, recommendedTrainId: "a",
+        recommendReason: "verified", decidedBy: "human:kyle@example.com", rejections: [{ trainId: "b", by: "human:kyle@example.com", reason: "no" }] };
+      upsertRace(sql, race);
+      expect(rowToRace(sql.exec("SELECT * FROM races WHERE race_id = 'r1'").one())).toEqual(race);
+      const plain = { raceId: "r2", itemId: item.itemId, width: 2, state: "RACING" as const, trainIds: [], winnerTrainId: null, reason: null, deadlineAt: null, createdAt: 1, decidedAt: null };
+      upsertRace(sql, plain);
+      expect(rowToRace(sql.exec("SELECT * FROM races WHERE race_id = 'r2'").one())).toEqual(plain);
+
+      applyModelStatDelta(sql, { model: "m", role: "builder", attempts: 1, passes: 1, failures: 0 }, 1);
+      expect(listModelStats(sql)[0]).not.toHaveProperty("picks");
+      applyPickDelta(sql, { model: "m", role: "builder", againstRecommendation: true }, 2);
+      applyPickDelta(sql, { model: "m", role: "builder", againstRecommendation: false }, 3);
+      expect(listModelStats(sql)[0]).toMatchObject({ attempts: 1, passes: 1, picks: 2, picksAgainstRecommendation: 1 });
+
+      upsertModelPreference(sql, { model: "m", kind: "feature", rating: 1512, n: 1, updatedAt: 1 });
+      upsertModelPreference(sql, { model: "m", kind: "feature", rating: 1530.5, n: 2, updatedAt: 2 });
+      expect(listModelPreference(sql)).toEqual([{ model: "m", kind: "feature", rating: 1530.5, n: 2, updatedAt: 2 }]);
     });
   });
 });

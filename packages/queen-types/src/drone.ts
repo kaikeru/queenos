@@ -6,8 +6,23 @@ import { TraceContextSchema } from "./trace.js";
 
 /** What a drone workflow instance must do with its train fork. */
 /** v2: MERGE = the merge-queue drone that 3-way merges a car's members (deterministic, no LLM). */
-export const DroneActionSchema = z.enum(["BUILD", "LAND", "REWORK", "MERGE"]);
+/** PIN = copy an inbox submission's head into the train fork's `main` (deterministic, no LLM; human-push design §2.3). */
+export const DroneActionSchema = z.enum(["BUILD", "LAND", "REWORK", "MERGE", "PIN"]);
 export type DroneAction = z.infer<typeof DroneActionSchema>;
+
+/** Where a seeded drone's starting code is (an inbox branch, or a race loser's train fork). */
+export const DroneSeedSchema = z.object({
+  repo: z.string().min(1),
+  ref: z.string().regex(/^refs\/heads\/.+/),
+  headSha: z.string().regex(/^[0-9a-f]{40}$/),
+});
+export type DroneSeed = z.infer<typeof DroneSeedSchema>;
+
+export const DroneWriteBackSchema = z.object({
+  repo: z.string().min(1),
+  ref: z.string().regex(/^refs\/heads\/.+/),
+});
+export type DroneWriteBack = z.infer<typeof DroneWriteBackSchema>;
 
 /** Workflow instance params for a Drone. */
 export const DroneTaskSchema = z.object({
@@ -29,6 +44,13 @@ export const DroneTaskSchema = z.object({
   trace: TraceContextSchema.optional(),
   /** v2: MERGE and LAND of a car: its members, in merge order. `promptText` is "queue car <carId>: <n> members". */
   members: z.array(MergeMemberSchema).max(16).optional(),
+  /**
+   * PIN, and REWORK of inbox code: the submitted head to start from. The drone fetches `repo` `ref`,
+   * checks the tip is `headSha` (else "head not found"), and force-pushes it to the train fork's `main`.
+   */
+  seed: DroneSeedSchema.optional(),
+  /** REWORK of inbox code: push the new head back to the contributor's branch (fast-forward only, else `<ref>-queen`). */
+  writeBack: DroneWriteBackSchema.optional(),
 });
 export type DroneTask = z.infer<typeof DroneTaskSchema>;
 export type DroneTaskInput = z.input<typeof DroneTaskSchema>;

@@ -25,6 +25,15 @@ import {
   ReleaseSchema,
   SentinelVerdictSchema,
   WorkItemSchema,
+  InboxSchema,
+  ModelPreferenceSchema,
+  RaceJudgeSchema,
+  RaceRejectionSchema,
+  SubmissionOriginSchema,
+  SubmissionTargetSchema,
+  SubmitDispositionSchema,
+  SubmitOutcomeKindSchema,
+  WorkItemInboxSchema,
   spanIdFor,
   traceIdFromUuid,
   type AuditEvent,
@@ -39,6 +48,16 @@ import {
   type QueenEvent,
   type RecalledMemory,
   type SentinelVerdict,
+  type Inbox,
+  type ModelPreference,
+  type ModelRole,
+  type RaceRejection,
+  type SubmissionOrigin,
+  type SubmissionOriginKind,
+  type SubmissionTarget,
+  type SubmitDisposition,
+  type SubmitOutcomeKind,
+  type WorkItemInbox,
 } from "@queenos/queen-types";
 import { INITIAL_FLOOR, type FloorState, type RouterStats } from "./models/router";
 import type { EscalationRecord, HiveSettingsRecord, MetricDelta, PathClaim, PathClaimSource, RaceRecord, WorkItemRecord } from "./records";
@@ -417,6 +436,52 @@ const MIGRATIONS: readonly Migration[] = [
   -- v13: dedicated gate-pass timestamp (was overloading drone_issued_at, the watchdog clock).
   ALTER TABLE merge_trains ADD COLUMN passed_at INTEGER;
   `,
+  `
+  -- v14: the inbox and unified intake (docs/human-push-design.md §5), human-judged races (§10.7) and
+  -- human preference ratings (§10.5). Additive only: every existing row keeps its meaning
+  -- (NULL origin = drone code, NULL judge = the hive default, NULL race columns = an auto race).
+  CREATE TABLE inboxes (
+    email TEXT PRIMARY KEY,                 -- the owner (Access email): the accountable contributor
+    handle TEXT NOT NULL UNIQUE,            -- [a-z0-9]{1,24}
+    repo TEXT NOT NULL UNIQUE,              -- <hive>-in-<handle>
+    created_at INTEGER NOT NULL,
+    revoked_at INTEGER                      -- set: later pushes are ignored:revoked
+  );
+  -- One row per (repo, headSha) ever submitted: the dedupe key. (repo, ref) is the supersede key.
+  -- Pruned with the event log.
+  CREATE TABLE submissions (
+    repo TEXT NOT NULL, head_sha TEXT NOT NULL, ref TEXT NOT NULL,
+    origin_kind TEXT NOT NULL CHECK (origin_kind IN ('drone','human','agent')), origin_id TEXT NOT NULL,
+    item_id TEXT, train_id TEXT,
+    outcome TEXT NOT NULL,                  -- SubmitOutcomeKind
+    disposition TEXT,                       -- SubmitDisposition (applied only)
+    target TEXT,                            -- JSON SubmissionTarget (item/<id>, goal/<goal>, Queen-Item)
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, head_sha)
+  );
+  CREATE INDEX submissions_ref ON submissions(repo, ref, created_at);
+  CREATE INDEX submissions_head ON submissions(head_sha);          -- ignored:own-push (a head the Queen wrote)
+  CREATE INDEX submissions_origin ON submissions(origin_id, created_at); -- maxInboxPushesPerHour
+  CREATE INDEX submissions_item ON submissions(item_id);
+  CREATE INDEX submissions_created ON submissions(created_at);     -- pruning
+  ALTER TABLE work_items ADD COLUMN inbox_json TEXT;               -- JSON WorkItemInbox
+  ALTER TABLE work_items ADD COLUMN judge TEXT;                     -- auto | human (NULL: the hive's race.judge)
+  ALTER TABLE merge_trains ADD COLUMN origin_json TEXT;            -- JSON SubmissionOrigin (NULL: drone)
+  ALTER TABLE races ADD COLUMN entry_closes_at INTEGER;
+  ALTER TABLE races ADD COLUMN pick_deadline_at INTEGER;
+  ALTER TABLE races ADD COLUMN recommended_train_id TEXT;
+  ALTER TABLE races ADD COLUMN recommend_reason TEXT;
+  ALTER TABLE races ADD COLUMN decided_by TEXT;
+  ALTER TABLE races ADD COLUMN rejections TEXT;                    -- JSON RaceRejection[]
+  CREATE INDEX races_item ON races(item_id);
+  CREATE TABLE model_preference (
+    model TEXT NOT NULL, kind TEXT NOT NULL,
+    rating REAL NOT NULL DEFAULT 1500, n INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL,
+    PRIMARY KEY (model, kind)
+  );
+  ALTER TABLE model_stats ADD COLUMN picks INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE model_stats ADD COLUMN picks_against_recommendation INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -544,7 +609,14 @@ export function rowToTrain(r: Row): TrainRecord {
     waitForCarSeq: num(r.wait_for_car_seq),
     bisectOf: str(r.bisect_of ?? null),
     ...(r.verified !== null && r.verified !== undefined ? { verified: Number(r.verified) === 1 } : {}),
+    // v14: whose code (absent = drone).
+    ...withValue("origin", parseJson(r.origin_json ?? null, schemaCheck<SubmissionOrigin>(SubmissionOriginSchema))),
   };
+}
+
+/** `{[key]: v}` when v is set, else `{}` (optional fields stay absent, so pre-v14 records compare equal). */
+function withValue<K extends string, V>(key: K, v: V | null | undefined): { [P in K]?: V } {
+  return (v === null || v === undefined ? {} : { [key]: v }) as { [P in K]?: V };
 }
 
 /** Validates a parsed JSON value: the value, or null when it does not fit. */
@@ -723,9 +795,9 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        fork_issued_at, delete_issued_at, deploy_issued_at, teardown_issued_at, drone_issued_at, drone_attempt,
        model, model_reason, model_choice, model_choice_attempt, model_outcome, model_probe, memories,
        trace_id, race_id, candidate, race_outcome, gate_score, credits,
-       lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of, verified, passed_at)
+       lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of, verified, passed_at, origin_json)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
        status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
@@ -744,7 +816,7 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        lane = excluded.lane, members = excluded.members, car_id = excluded.car_id, passed_seq = excluded.passed_seq,
        conflict = excluded.conflict, changed_paths = excluded.changed_paths,
        wait_for_car_seq = excluded.wait_for_car_seq, bisect_of = excluded.bisect_of, verified = excluded.verified,
-       passed_at = excluded.passed_at`,
+       passed_at = excluded.passed_at, origin_json = excluded.origin_json`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -797,6 +869,7 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     t.bisectOf ?? null,
     t.verified === null || t.verified === undefined ? null : t.verified ? 1 : 0,
     t.passedAt ?? null,
+    json(t.origin),
   );
 }
 
@@ -826,8 +899,14 @@ export function listRouterStats(sql: SqlStorage): RouterStats[] {
     });
 }
 
-/** ModelStats rows for the War Room (snapshot / models.updated). */
+/** ModelStats rows for the War Room (snapshot / models.updated). Pick counts (v14) only once nonzero. */
 export function listModelStats(sql: SqlStorage): ModelStats[] {
+  const picks = new Map(
+    sql
+      .exec("SELECT model, role, picks, picks_against_recommendation FROM model_stats WHERE picks > 0 OR picks_against_recommendation > 0")
+      .toArray()
+      .map((r) => [`${String(r.role)}\u0000${String(r.model)}`, { picks: Number(r.picks), picksAgainstRecommendation: Number(r.picks_against_recommendation) }]),
+  );
   return listRouterStats(sql).map((s) => ({
     model: s.model,
     role: s.role,
@@ -836,7 +915,51 @@ export function listModelStats(sql: SqlStorage): ModelStats[] {
     failures: s.failures,
     avgBuildMs: s.avgBuildMs,
     updatedAt: s.updatedAt,
+    ...picks.get(`${s.role}\u0000${s.model}`),
   }));
+}
+
+/** A human pick (§10.3): +1 pick for the winner's (model, role), and +1 against the recommendation when it differed. */
+export function applyPickDelta(sql: SqlStorage, d: { model: string; role: ModelRole; againstRecommendation: boolean }, now: number): void {
+  const against = d.againstRecommendation ? 1 : 0;
+  sql.exec(
+    `INSERT INTO model_stats (model, role, picks, picks_against_recommendation, updated_at) VALUES (?, ?, 1, ?, ?)
+     ON CONFLICT(model, role) DO UPDATE SET picks = picks + 1,
+       picks_against_recommendation = picks_against_recommendation + excluded.picks_against_recommendation, updated_at = excluded.updated_at`,
+    d.model,
+    d.role,
+    against,
+    now,
+  );
+}
+
+// ── v14: human preference ratings (§10.5) ──────────────────────────────
+
+export function rowToModelPreference(r: Row): ModelPreference {
+  return ModelPreferenceSchema.parse({ model: r.model, kind: r.kind, rating: Number(r.rating), n: Number(r.n), updatedAt: Number(r.updated_at) });
+}
+
+export function listModelPreference(sql: SqlStorage): ModelPreference[] {
+  return sql
+    .exec("SELECT * FROM model_preference ORDER BY kind, model")
+    .toArray()
+    .flatMap((r) => {
+      const p = ModelPreferenceSchema.safeParse({ model: r.model, kind: r.kind, rating: Number(r.rating), n: Number(r.n), updatedAt: Number(r.updated_at) });
+      return p.success ? [p.data] : [];
+    });
+}
+
+/** Replace a (model, kind) rating (the caller folds the Elo update; same transaction as its race event). */
+export function upsertModelPreference(sql: SqlStorage, p: ModelPreference): void {
+  sql.exec(
+    `INSERT INTO model_preference (model, kind, rating, n, updated_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(model, kind) DO UPDATE SET rating = excluded.rating, n = excluded.n, updated_at = excluded.updated_at`,
+    p.model,
+    p.kind,
+    p.rating,
+    p.n,
+    p.updatedAt,
+  );
 }
 
 export function applyModelStatDelta(sql: SqlStorage, d: ModelStatDelta, now: number): void {
@@ -1041,6 +1164,9 @@ export function rowToWorkItem(r: Row): WorkItemRecord {
     escalationId: str(r.escalation_id),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    // v14 (absent when NULL, so pre-v14 items compare equal).
+    ...withValue("inbox", parseJson(r.inbox_json ?? null, schemaCheck<WorkItemInbox>(WorkItemInboxSchema))),
+    ...withValue("judge", RaceJudgeSchema.safeParse(r.judge ?? null).data),
   });
   return {
     ...base,
@@ -1057,7 +1183,7 @@ const WORK_ITEM_COLUMNS = [
   "item_id", "seq", "hive", "kind", "title", "body", "acceptance", "priority", "status", "parent_id", "root_id", "depth",
   "depends_on", "source_kind", "source_actor", "source_ref", "trace_id", "span_id", "difficulty", "best_of", "attempts",
   "duplicate_of", "blocked_reason", "release_id", "escalation_id", "command_id", "command_issued_at", "normalized_title",
-  "created_at", "updated_at", "landed_at", "shipped_at", "paths", "wait_reason", "conflicts",
+  "created_at", "updated_at", "landed_at", "shipped_at", "paths", "wait_reason", "conflicts", "inbox_json", "judge",
 ] as const;
 /** Identity columns an upsert never rewrites. */
 const WORK_ITEM_FIXED = new Set<string>(["item_id", "seq", "hive", "root_id", "trace_id", "span_id", "source_kind", "source_actor", "source_ref", "created_at"]);
@@ -1105,6 +1231,8 @@ export function upsertWorkItem(sql: SqlStorage, w: WorkItemRecord): void {
     JSON.stringify(w.paths),
     w.waitReason,
     w.conflicts,
+    json(w.inbox),
+    w.judge ?? null,
   );
 }
 
@@ -1120,15 +1248,26 @@ export function rowToRace(r: Row): RaceRecord {
     deadlineAt: num(r.deadline_at),
     createdAt: r.created_at,
     decidedAt: num(r.decided_at),
+    // v14 (absent when NULL, so pre-v14 races compare equal).
+    ...withValue("entryClosesAt", num(r.entry_closes_at ?? null)),
+    ...withValue("pickDeadlineAt", num(r.pick_deadline_at ?? null)),
+    ...withValue("recommendedTrainId", str(r.recommended_train_id ?? null)),
+    ...withValue("recommendReason", str(r.recommend_reason ?? null)),
+    ...withValue("decidedBy", str(r.decided_by ?? null)),
+    ...withValue("rejections", parseJson(r.rejections ?? null, schemaCheck<RaceRejection[]>(RaceRejectionSchema.array()))),
   });
 }
 
 export function upsertRace(sql: SqlStorage, r: RaceRecord): void {
   sql.exec(
-    `INSERT INTO races (race_id, item_id, width, state, train_ids, winner_train_id, reason, deadline_at, created_at, decided_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO races (race_id, item_id, width, state, train_ids, winner_train_id, reason, deadline_at, created_at, decided_at,
+       entry_closes_at, pick_deadline_at, recommended_train_id, recommend_reason, decided_by, rejections)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(race_id) DO UPDATE SET state = excluded.state, train_ids = excluded.train_ids, winner_train_id = excluded.winner_train_id,
-       reason = excluded.reason, deadline_at = excluded.deadline_at, decided_at = excluded.decided_at`,
+       reason = excluded.reason, deadline_at = excluded.deadline_at, decided_at = excluded.decided_at,
+       entry_closes_at = excluded.entry_closes_at, pick_deadline_at = excluded.pick_deadline_at,
+       recommended_train_id = excluded.recommended_train_id, recommend_reason = excluded.recommend_reason,
+       decided_by = excluded.decided_by, rejections = excluded.rejections`,
     r.raceId,
     r.itemId,
     r.width,
@@ -1139,6 +1278,12 @@ export function upsertRace(sql: SqlStorage, r: RaceRecord): void {
     r.deadlineAt,
     r.createdAt,
     r.decidedAt,
+    r.entryClosesAt ?? null,
+    r.pickDeadlineAt ?? null,
+    r.recommendedTrainId ?? null,
+    r.recommendReason ?? null,
+    r.decidedBy ?? null,
+    r.rejections?.length ? JSON.stringify(r.rejections) : null,
   );
 }
 
@@ -1359,4 +1504,144 @@ export function upsertClaim(sql: SqlStorage, c: PathClaim): void {
 /** Release every claim of an item (LANDED, FAILED or CANCELLED). */
 export function deleteClaims(sql: SqlStorage, itemId: string): void {
   sql.exec("DELETE FROM path_claims WHERE item_id = ?", itemId);
+}
+
+// ── v14: inboxes and submissions (human-push design §5, §6.2) ──────────
+
+/** Row of `inboxes` (Inbox without the hive, which is the DO's, and the counted `openItems`). */
+export type InboxRecord = Omit<Inbox, "hive" | "openItems">;
+
+export function rowToInbox(r: Row): InboxRecord {
+  const i = InboxSchema.parse({
+    hive: "-",
+    email: r.email,
+    handle: r.handle,
+    repo: r.repo,
+    createdAt: Number(r.created_at),
+    revokedAt: num(r.revoked_at),
+    openItems: 0,
+  });
+  return { email: i.email, handle: i.handle, repo: i.repo, createdAt: i.createdAt, revokedAt: i.revokedAt };
+}
+
+export function upsertInbox(sql: SqlStorage, i: InboxRecord): void {
+  sql.exec(
+    `INSERT INTO inboxes (email, handle, repo, created_at, revoked_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET revoked_at = excluded.revoked_at`,
+    i.email,
+    i.handle,
+    i.repo,
+    i.createdAt,
+    i.revokedAt,
+  );
+}
+
+/** The inbox owned by `email`, or the one at `repo` (an Artifacts push event names the repo). */
+export function findInbox(sql: SqlStorage, by: { email: string } | { repo: string } | { handle: string }): InboxRecord | null {
+  const [col, v] = "email" in by ? ["email", by.email] : "repo" in by ? ["repo", by.repo] : ["handle", by.handle];
+  const r = sql.exec(`SELECT * FROM inboxes WHERE ${col} = ?`, v).toArray()[0];
+  return r ? rowToInbox(r) : null;
+}
+
+/** Row of `submissions`: one per (repo, headSha) ever submitted, with what the Queen did with it. */
+export interface SubmissionRecord {
+  repo: string;
+  headSha: string;
+  ref: string;
+  originKind: SubmissionOriginKind;
+  originId: string;
+  itemId: string | null;
+  trainId: string | null;
+  outcome: SubmitOutcomeKind;
+  disposition: SubmitDisposition | null;
+  target: SubmissionTarget | null;
+  createdAt: number;
+}
+
+export function rowToSubmission(r: Row): SubmissionRecord {
+  const kind = SubmissionOriginSchema.shape.kind.parse(r.origin_kind);
+  return {
+    repo: String(r.repo),
+    headSha: String(r.head_sha),
+    ref: String(r.ref),
+    originKind: kind,
+    originId: String(r.origin_id),
+    itemId: str(r.item_id),
+    trainId: str(r.train_id),
+    outcome: SubmitOutcomeKindSchema.parse(r.outcome),
+    disposition: SubmitDispositionSchema.safeParse(r.disposition ?? null).data ?? null,
+    target: parseJson(r.target ?? null, schemaCheck<SubmissionTarget>(SubmissionTargetSchema)),
+    createdAt: Number(r.created_at),
+  };
+}
+
+/** Record a submission. Returns false (and writes nothing) when (repo, headSha) was already submitted: ignored:duplicate. */
+export function insertSubmission(sql: SqlStorage, s: SubmissionRecord): boolean {
+  const row = sql
+    .exec(
+      `INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, disposition, target, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(repo, head_sha) DO NOTHING RETURNING head_sha`,
+      s.repo,
+      s.headSha,
+      s.ref,
+      s.originKind,
+      s.originId,
+      s.itemId,
+      s.trainId,
+      s.outcome,
+      s.disposition,
+      json(s.target),
+      s.createdAt,
+    )
+    .toArray()[0];
+  return row !== undefined;
+}
+
+/** Link a recorded submission to its item / train, or change its outcome. */
+export function updateSubmission(
+  sql: SqlStorage,
+  key: { repo: string; headSha: string },
+  patch: Partial<Pick<SubmissionRecord, "itemId" | "trainId" | "outcome" | "disposition">>,
+): void {
+  const cols = (["itemId", "trainId", "outcome", "disposition"] as const).filter((k) => k in patch);
+  if (!cols.length) return;
+  const name = { itemId: "item_id", trainId: "train_id", outcome: "outcome", disposition: "disposition" } as const;
+  sql.exec(
+    `UPDATE submissions SET ${cols.map((k) => `${name[k]} = ?`).join(", ")} WHERE repo = ? AND head_sha = ?`,
+    ...cols.map((k) => patch[k] ?? null),
+    key.repo,
+    key.headSha,
+  );
+}
+
+export function getSubmission(sql: SqlStorage, repo: string, headSha: string): SubmissionRecord | null {
+  const r = sql.exec("SELECT * FROM submissions WHERE repo = ? AND head_sha = ?", repo, headSha).toArray()[0];
+  return r ? rowToSubmission(r) : null;
+}
+
+/** Submissions of `headSha` in any repo (a Queen-written head pushed back to an inbox is ignored:own-push). */
+export function submissionsByHead(sql: SqlStorage, headSha: string): SubmissionRecord[] {
+  return sql.exec("SELECT * FROM submissions WHERE head_sha = ? ORDER BY created_at", headSha).toArray().map(rowToSubmission);
+}
+
+/** The latest applied submission on (repo, ref): the supersede key. */
+export function latestSubmissionOnRef(sql: SqlStorage, repo: string, ref: string): SubmissionRecord | null {
+  const r = sql
+    .exec("SELECT * FROM submissions WHERE repo = ? AND ref = ? AND outcome = 'applied' ORDER BY created_at DESC LIMIT 1", repo, ref)
+    .toArray()[0];
+  return r ? rowToSubmission(r) : null;
+}
+
+/** A contributor's submissions since `since` (maxInboxPushesPerHour), optionally of one outcome. */
+export function countSubmissionsSince(sql: SqlStorage, originId: string, since: number, outcome?: SubmitOutcomeKind): number {
+  const r = outcome
+    ? sql.exec("SELECT COUNT(*) AS n FROM submissions WHERE origin_id = ? AND created_at >= ? AND outcome = ?", originId, since, outcome).one()
+    : sql.exec("SELECT COUNT(*) AS n FROM submissions WHERE origin_id = ? AND created_at >= ?", originId, since).one();
+  return Number(r.n);
+}
+
+/** Drop submissions older than `before` (pruned with the event log). Returns rows deleted. */
+export function pruneSubmissions(sql: SqlStorage, before: number): number {
+  return sql.exec("DELETE FROM submissions WHERE created_at < ?", before).rowsWritten;
 }

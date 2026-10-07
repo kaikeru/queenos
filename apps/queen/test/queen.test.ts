@@ -515,35 +515,40 @@ describe("command watchdog (alarm)", () => {
       (q.ports.dispatcher as RecordingDispatcher).failNext = n;
     });
 
-  it("a MERGE infra failure re-dispatches <car>-merge-2 with a full MERGE task (members, baseRef)", async () => {
+  it("a MERGE infra failure retires the car after one round; its member re-boards a fresh car forked from main", async () => {
     const ns = newHive();
     const { carId, memberId } = await carMerging(ns);
     const r = await post(ns, "/internal/webhook/merge-result", {
       trainId: carId, ok: false, cause: "infra", merged: [], conflicts: [], fastForward: false, summary: "Merge drone failed: HttpError: HTTP Error: 503 Service Unavailable",
     });
-    expect(await r.json()).toMatchObject({ outcome: "applied", train: { phase: "BUILDING" } });
-    expect((await droneIds(ns)).at(-1)).toBe(`${carId}-merge-2`);
-    expect((await inspect(ns)).tasks.at(-1)).toMatchObject({ trainId: carId, action: "MERGE", role: "LANDER", baseRef: "main", members: [expect.objectContaining({ trainId: memberId })] });
+    expect(await r.json()).toMatchObject({ outcome: "applied", train: { phase: "EJECTED" } });
+    expect(await droneIds(ns)).not.toContain(`${carId}-merge-2`);
+    const s = await inspect(ns);
+    const cars = s.trains.filter((t) => (t as unknown as { lane: string }).lane === "QUEUE" && t.train_id !== carId);
+    expect(cars).toHaveLength(1);
+    expect(JSON.parse(String((cars[0] as unknown as { members: string }).members))).toEqual([memberId]);
+    expect(cars[0]).toMatchObject({ fork_source: ns });
   });
 
   it("a re-dispatch whose Workflows create fails is retried within RECONCILE_DELAY_MS, even with a later alarm already armed", async () => {
     const ns = newHive();
-    const { carId } = await carMerging(ns);
-    // The MERGE drone's watchdog alarm is ~10 min out.
+    const { carId, memberId } = await carMerging(ns);
+    // Fast path to LANDING: the LANDER is the drone that retries the same car on infra.
+    const merged = await post(ns, "/internal/webhook/merge-result", { trainId: carId, ok: true, headSha: "c".repeat(40), baseSha: "b".repeat(40), merged: [memberId], fastForward: true });
+    expect(await merged.json()).toMatchObject({ outcome: "applied", train: { phase: "LANDING" } });
+    // The LANDER's watchdog alarm is ~10 min out.
     expect(await alarmAt(ns)).toBeGreaterThan(Date.now() + T / 2);
     await failDrones(ns, 1);
     const t0 = Date.now();
-    const r = await post(ns, "/internal/webhook/merge-result", {
-      trainId: carId, ok: false, cause: "infra", merged: [], conflicts: [], fastForward: false, summary: "Merge drone failed: HttpError: HTTP Error: 503 Service Unavailable",
-    });
-    expect(await r.json()).toMatchObject({ outcome: "applied", train: { phase: "BUILDING" } });
-    expect((await droneIds(ns)).filter((id) => id === `${carId}-merge-2`)).toEqual([]); // create failed: no instance
+    const r = await post(ns, "/internal/webhook/land-result", { trainId: carId, landed: false, cause: "infra", summary: "Lander failed: HttpError: HTTP Error: 503 Service Unavailable" });
+    expect(await r.json()).toMatchObject({ outcome: "applied", train: { phase: "LANDING" } });
+    expect((await droneIds(ns)).filter((id) => id === `${carId}-land-2`)).toEqual([]); // create failed: no instance
     const armed = await alarmAt(ns);
     expect(armed).not.toBeNull();
     expect(armed!).toBeLessThanOrEqual(Date.now() + RECONCILE_DELAY_MS + 2_000);
     expect(armed!).toBeGreaterThanOrEqual(t0);
     expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
-    expect((await droneIds(ns)).at(-1)).toBe(`${carId}-merge-2`);
+    expect((await droneIds(ns)).at(-1)).toBe(`${carId}-land-2`);
     expect((await inspect(ns)).trains.find((t) => t.train_id === carId)).toMatchObject({ dispatched: 1 });
     // Dispatched: back on the ~10 min watchdog clock.
     expect(await alarmAt(ns)).toBeGreaterThan(Date.now() + T / 2);
@@ -946,10 +951,10 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([13, 13, 13]);
+    expect([state.before, state.after, state.version]).toEqual([14, 14, 14]);
     expect(state.tables).toEqual([
-      "audit_trail", "deployments", "escalations", "event_log", "hive_settings", "merge_trains", "metrics_hourly", "model_router",
-      "model_stats", "path_claims", "prompt_runs", "races", "releases", "sentinel_verdicts", "sqlite_sequence", "work_items",
+      "audit_trail", "deployments", "escalations", "event_log", "hive_settings", "inboxes", "merge_trains", "metrics_hourly", "model_preference", "model_router",
+      "model_stats", "path_claims", "prompt_runs", "races", "releases", "sentinel_verdicts", "sqlite_sequence", "submissions", "work_items",
     ]);
     ws.close(1000, "done");
   });

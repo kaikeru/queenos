@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { WorkKindSchema } from "./work.js";
 
 /**
  * Model catalog and routing. Every LLM call goes through the Workers `ai`
@@ -76,8 +77,25 @@ export const ModelStatsSchema = z.object({
   failures: z.number().int().min(0),
   avgBuildMs: z.number().min(0).nullable(),
   updatedAt: z.number().int(),
+  /** Human-judged races (§10.3): races this model's candidate won by a human pick, and those against the Queen's recommendation. */
+  picks: z.number().int().min(0).optional(),
+  picksAgainstRecommendation: z.number().int().min(0).optional(),
 });
 export type ModelStats = z.infer<typeof ModelStatsSchema>;
+
+/**
+ * Human preference rating per (model, item kind) (§10.5, table `model_preference`): Elo from human picks
+ * and rejects, starting at 1500. A fold of `race.decided` / `race.rejected` events. Inert until T9c.
+ */
+export const ModelPreferenceSchema = z.object({
+  model: z.string().min(1),
+  kind: WorkKindSchema,
+  rating: z.number(),
+  /** Pairwise comparisons folded in (confidence = n / (n + 5)). */
+  n: z.number().int().min(0),
+  updatedAt: z.number().int(),
+});
+export type ModelPreference = z.infer<typeof ModelPreferenceSchema>;
 
 /** Hive-wide builder tier floor (AIMD): raised on failures, lowered after a streak of passes. */
 export const RouterFloorSchema = z.object({

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SubmissionOriginSchema } from "./inbox.js";
 import { GitNotesPayloadSchema } from "./ledger.js";
 import { RecalledMemorySchema } from "./memory.js";
 import { MergeConflictSchema, TrainLaneSchema } from "./queue.js";
@@ -77,6 +78,7 @@ export const MergeTrainSchema = z.object({
   waitForCarSeq: z.number().int().nullable().optional(), // wait_for_car_seq (BUILD: conflict/integration rework)
   carSeq: z.number().int().optional(), // QUEUE: the car's seq (queue rail ordering)
   fastForward: z.boolean().optional(), // QUEUE: a single member fast-forwarded (car gate skipped)
+  origin: SubmissionOriginSchema.nullable().optional(), // origin_json (BUILD: whose code; absent = drone. Dashboard badge, gate fail-closed)
 });
 export type MergeTrain = z.infer<typeof MergeTrainSchema>;
 

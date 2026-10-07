@@ -14,7 +14,10 @@ const Summary = z.string().max(500);
 /** v2: optional W3C trace context on every command (absent from v1 Queens). */
 const Trace = TraceContextSchema.optional();
 
-// ---------- Provisioner (Artifacts fork / delete) ----------
+// ---------- Provisioner (Artifacts fork / delete / notes) ----------
+
+/** Longest text one NOTE command appends. */
+export const MAX_NOTE_TEXT = 2000;
 
 export const ProvisionCommandSchema = z.discriminatedUnion("op", [
   z.object({
@@ -48,6 +51,21 @@ export const ProvisionCommandSchema = z.discriminatedUnion("op", [
     /** Serialized Charter JSON, committed as .queen/charter.json. */
     charterJson: z.string().min(2).max(64_000),
   }),
+  z.object({
+    /**
+     * Human-push design §7: append `text` to the git note on `repo@sha` under `refs/notes/queen`
+     * (fetch, append after a separator, push without force, retry on non-fast-forward). `repo` is a
+     * contributor's inbox or the train fork; `commandId` is `<trainId>-note-<n>`.
+     */
+    op: z.literal("NOTE"),
+    commandId: CommandId,
+    trace: Trace,
+    hive: z.string().min(1),
+    trainId: z.string().min(1),
+    repo: z.string().min(1),
+    sha: z.string().regex(/^[0-9a-f]{40}$/),
+    text: z.string().min(1).max(MAX_NOTE_TEXT),
+  }),
 ]);
 
 /** CREATE_HIVE outcome. The Provisioner reports it to Genesis (GenesisNode RPC `reportHiveCreated`), not to the Queen. */
@@ -64,7 +82,7 @@ export type ProvisionCommand = z.infer<typeof ProvisionCommandSchema>;
 
 export const ProvisionResultSchema = z.object({
   commandId: CommandId,
-  op: z.enum(["FORK", "DELETE"]),
+  op: z.enum(["FORK", "DELETE", "NOTE"]),
   trainId: z.string().min(1),
   ok: z.boolean(),
   /** FORK: the created (or reused) fork repo name. */

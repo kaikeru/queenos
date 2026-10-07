@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { FollowUpSchema, PrioritySchema } from "./work.js";
+import { FollowUpSchema, PrioritySchema, RaceJudgeSchema } from "./work.js";
 
 export const TrainStateSchema = z.enum(["BUILDING", "TESTING", "MERGED", "EJECTED"]);
 export type TrainState = z.infer<typeof TrainStateSchema>;
@@ -38,6 +38,8 @@ export const SubmitPromptSchema = z.object({
   bestOf: z.number().int().min(1).max(5).optional(),
   /** v2: item priority (0..3 = P0..P3; default 2). */
   priority: PrioritySchema.optional(),
+  /** `human` ("you pick"): a race of the filed item waits for a human pick (§10.2). Inert until T9a. */
+  judge: RaceJudgeSchema.optional(),
 });
 export type SubmitPrompt = z.infer<typeof SubmitPromptSchema>;
 

@@ -18,6 +18,13 @@ export const EventTypeSchema = z.enum([
   "train.phase",
   "race.started",
   "race.decided",
+  // Human-push design (§6, §7, §10): inbox intake, notes, human-judged races.
+  "race.picking",
+  "race.rejected",
+  "inbox.opened",
+  "inbox.revoked",
+  "submission.received",
+  "note.failed",
   "queue.car",
   "queue.merged",
   "queue.conflict",

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SubmissionOriginSchema } from "./inbox.js";
 import { TraceIdSchema } from "./trace.js";
 import { TrainPhaseSchema } from "./train.js";
 
@@ -79,8 +80,13 @@ export const GateTargetSchema = z.object({
   previewUrl: z.string().nullable(),
   phase: TrainPhaseSchema,
   traceId: TraceIdSchema.nullable(),
-  /** The car's base (integration gate scans `baseSha..head`). */
+  /**
+   * The diff base the gate scans (`baseSha..head`): a car's base, and (human-push design §2.4 row 7)
+   * a BUILD train's fork base (the merge base with hive main for pinned inbox code).
+   */
   baseSha: z.string().nullable(),
+  /** Whose code a BUILD train carries (absent = drone). A non-drone origin fails closed when the reviewer is unavailable. */
+  origin: SubmissionOriginSchema.optional(),
   /** QUEUE lane only. */
   members: z.array(GateTargetMemberSchema).max(16).optional(),
 });

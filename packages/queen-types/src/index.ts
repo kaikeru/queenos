@@ -11,6 +11,7 @@ export * from "./models.js";
 export * from "./memory.js";
 export * from "./trace.js";
 export * from "./work.js";
+export * from "./inbox.js";
 export * from "./oracle.js";
 export * from "./autonomy.js";
 export * from "./observability.js";
