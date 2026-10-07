@@ -1499,6 +1499,7 @@ The rules from `docs/HANDOFF.md` apply:
   - **Unified intake.** All code, drone-written included, enters as a `Submission {repo, ref, headSha, origin, itemId?, provenance?}`. Provenance (model, race, attempt) is metadata for races, rework counts and the router, never a separate code path.
     - An inbox submission is pinned into an ordinary train fork by a deterministic PIN drone, so every downstream consumer is unchanged.
     - Drones keep fork + dispatch; their `BuildResult` is adapted to a Submission. The adapter can slip without blocking the inbox.
+  - **The item is the competition, and the item is the inbox (2026-10-07).** A submission that targets an item (branch `item/<id>` or `goal/<slug>`, or `Queen-Item` / `Queen` / `Queen-Origin` trailers) joins that item's race as a candidate (`joined-race`; a race is created lazily at width 1). An uncorrelated push is treated as having already won a race: `filed`, a new item with no race record, straight to gate, car, land, with every gate still applied. A late entry becomes a follow-up item (`late-new-item`), never a rejection. There is no goal-level fork repo; every submission forks from hive `main`.
   - **Same rules, same consequences.** No auto-rework for human code unless the contributor hands off to the swarm. A rollback of human code is a real change failure.
   - **Human-judged races (opt-in "you pick").** They are separately shippable: a `PICKING` race state after machine pre-review, a deadline auto-pick, manual reject, and capped Elo preference weighting in the router.
 

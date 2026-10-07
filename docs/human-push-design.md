@@ -40,8 +40,8 @@ The pipeline after intake consumes only Submissions:
 Submission ─▶ (pin) ─▶ train DEPLOYING ─▶ preview ─▶ gate ─▶ PASSED ─▶ car ─▶ MERGE ─▶ integration gate ─▶ LANDER ─▶ release ladder
 ```
 
-- **Solicited** submissions have an `itemId`. They come from drones the Queen dispatched for an item, or from a human who targets an item on purpose (§3.4). They link to the existing item.
-- **Unsolicited** submissions have no `itemId`, as with a plain inbox push. Intake files a new item for them: a `feature` whose title is the head commit's subject.
+- **Correlated** submissions have a target or an `itemId` (user decision 2026-10-07: the item is the competition, and the item is the inbox). They come from drones the Queen dispatched for an item, or from a human or agent who addresses an item or goal on purpose (§3.4). They **join that item's race** as a candidate (disposition `joined-race`, §2.5).
+- **Uncorrelated** submissions have neither, as with a plain inbox push. They are treated as having **already won a race**: intake files a new item (a `feature` whose title is the head commit's subject, disposition `filed`) with **no race record**, and its single train goes straight to gate, car, land. "Already won" means no competition, never no vetting: every gate (policy, security, smoke, reviewer) still applies.
 - **Provenance** is metadata only: drone id, model, failed models, usage, race id, candidate index, attempt, `verified`. It feeds races, rework attempt counts, the model router's AIMD floor and stats, and the Model Board. **It is never a separate code path.** A human submission simply has no `model`. The router already ignores models that are not in the catalog (`apps/queen/README.md` "Stats"), so human code never moves the floor.
 
 ### 2.2 Physical forks, logical inbox
@@ -50,6 +50,13 @@ Submission ─▶ (pin) ─▶ train DEPLOYING ─▶ preview ─▶ gate ─▶
   - A drone's train fork (`<hive>-train-<12hex>`) is an ephemeral, per-train inbox.
   - A human's inbox fork (`<hive>-in-<handle>`) is persistent, one per person (D12).
 - **The "feature inbox" is logical, not a repo.** The *item* is the inbox, and candidates arrive in it from any fork.
+- **No goal-level fork repo (decided 2026-10-07).** Every submission forks from hive `main`, whatever goal it targets. The rejected alternative was a physical fork per goal that collects that goal's submissions. It fails because:
+  - it is a long-lived feature branch that drifts from `main`;
+  - it needs a two-level merge (submission into goal fork, goal fork into `main`), with conflicts at both levels;
+  - it ships a goal all at once, against the swarm's item-by-item landing;
+  - it concentrates pushes and forks on one repo, which is worse for the Artifacts 503s.
+
+  A goal stays a logical grouping in the work ledger; its items land independently.
 - **We do not use a shared per-item repo:**
   - Artifacts' own guidance is one repo per agent (discovery §1, "Do not use one shared repo as a queue for many autonomous agents").
   - Races need isolated trees.
@@ -91,9 +98,14 @@ Pinning costs one FORK (~2 s, day1 row 5) plus one drone start (~2 s, row 10) an
 
 ### 2.5 Best-of-N generalises
 
-A submission that targets an item (§3.4) can be a race candidate. A human's code then races the drones under the same gate and the same `rankCandidates` ordering. A human has no `verified` (the builder's verify tool), so they lose ties on that key. External agents are first-class contributors: they push to their person's inbox, with `Queen-Origin: agent:<name>` in the commit.
+**The item is the competition, and the item is the inbox.** Every submission that targets an item (§3.4), drone, human or agent, enters that item's race as a candidate. A human's code races the drones under the same gate and the same `rankCandidates` ordering. A human has no `verified` (the builder's verify tool), so they lose ties on that key. External agents are first-class contributors: they push to their person's inbox, with `Queen-Origin: agent:<name>` in the commit.
 
-**By Oct 14:** a targeted submission to a READY or FAILED item becomes that item's next attempt. **Stretch:** joining an in-flight race (a `RACING` race gains a candidate). Joining an ACTIVE non-race build is post-Oct 14.
+**Joining an in-flight race is core, not a stretch.** A `RACING` race gains a candidate (`Race.trainIds` grows; `width` counts only the Queen-dispatched ones).
+- A race is created **lazily at width 1** if the targeted item has none.
+- `Race.entryClosesAt` bounds entries (null: until decided).
+- **Late entry:** the race is decided, the item's code is already in a car, or it has landed. The submission becomes a follow-up item (disposition `late-new-item`). It is never rejected.
+- A targeted submission to a READY or FAILED item with no live race becomes that item's next attempt (a width-1 race).
+- Joining an ACTIVE non-race build is post-Oct 14.
 
 ### 2.6 Delivery: an adapter, not a rewrite
 
@@ -162,7 +174,8 @@ Later milestones are appended to the same note: `PASSED`, `QUEUED in car <id>`, 
   ```bash
   git pull queen tip-jar      # the drone's fix, on top of your commit
   ```
-- **Trailers** (head commit only, case-insensitive):
+- **Addressing** (user decision 2026-10-07). Branch `item/<id>` targets that item. Branch `goal/<slug>` resolves to the goal's single item when it has exactly one; otherwise it files a new item under that goal (no guessing). Any other branch is uncorrelated (§6.2).
+- **Trailers** (head commit only, case-insensitive; see `parseSubmissionTrailers`):
   - `Queen: rework`: hand off automatically on a reject.
   - `Queen-Item: <itemId>`: target an existing item. The branch name `item/<itemId>` does the same.
   - `Queen-Origin: agent:<name>`: declare that an agent wrote this.
@@ -250,8 +263,13 @@ export const SubmissionSchema = z.object({
   /** Merge base with hive main (gate diff base); the PIN drone fills it for inbox code. */
   baseSha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
   origin: SubmissionOriginSchema,
-  /** Solicited (or targeted with Queen-Item / item/<id>): link. Absent: intake files an item. */
+  /** Solicited (or targeted with Queen-Item / item/<id>): link. Absent with no target: intake files an item. */
   itemId: z.string().max(64).optional(),
+  /** What an external submission addressed (branch name or trailer); the Queen resolves it to `itemId`. */
+  target: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("item"), itemId: z.string().min(1).max(64) }),
+    z.object({ kind: z.literal("goal"), goal: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) }),
+  ]).optional(),
   /** Head commit subject (≤120) and message (≤4000): the intent of unsolicited code. */
   title: z.string().max(120).optional(),
   message: z.string().max(4000).optional(),
@@ -268,12 +286,21 @@ export const InboxOpenResultSchema = z.object({          // edge response; never
   handle: z.string(), repo: z.string(), remote: z.string().url(),
   username: z.literal("queen"), password: z.string(), expiresAt: z.string(), mainSha: z.string(),
 });
+export const SubmitDispositionSchema = z.enum(["filed", "joined-race", "reopened", "superseded", "late-new-item"]);
 export const SubmitOutcomeSchema = z.object({
   outcome: z.enum(["applied", "ignored:duplicate", "ignored:own-push", "ignored:inbox-main",
                    "ignored:unknown-inbox", "ignored:revoked", "ignored:over-cap", "ignored:paused"]),
+  disposition: SubmitDispositionSchema.optional(),   // with `applied`
   itemId: z.string().optional(), trainId: z.string().optional(),
 });
 ```
+
+`inbox.ts` also exports `inboxRepoName`, `INBOX_REPO_RE`, `parseInboxRepo`, `parseSubmissionTrailers`, `targetFromRef` and `itemIdFromRef`. **Dispositions:**
+- `filed`: uncorrelated; a new item, no race record (§6.2).
+- `joined-race`: correlated; a candidate in the item's race.
+- `reopened`: a re-push to a FAILED inbox item.
+- `superseded`: a re-push replaced a train not yet in a car.
+- `late-new-item`: the target's race was decided, or its code is in a car or landed; filed as a follow-up.
 
 Changes to existing schemas (all optional, so old payloads parse):
 
@@ -284,17 +311,23 @@ Changes to existing schemas (all optional, so old payloads parse):
 | `ProvisionCommandSchema` (executors.ts) | + op `NOTE {commandId, hive, trainId, repo, sha, text ≤2000}`. `ProvisionResult.op` gains `"NOTE"`. |
 | `WorkItemSchema` (work.ts) | + `inbox?: {repo, ref, handle, headSha, handoff: boolean} \| null`. `WorkSourceKindSchema` + `"agent"` (a human stays `"user"`, `actor` = email). |
 | `WorkActionSchema` (work.ts) | + `"handoff"` |
-| `GuardrailsSchema` (work.ts) | + `maxInboxOpenPerContributor` (default 3, max 10), `maxInboxPushesPerHour` (default 20, max 60) |
+| `GuardrailsSchema` (work.ts) | + `maxInboxOpenPerContributor` (default 3, max 10), `maxInboxPushesPerHour` (default 20, max 60). Guardrails need parse-time defaults, so **stored overrides and PATCH use the new `GuardrailOverridesSchema`** (`z.object(GUARDRAIL_FIELDS).partial()`; Zod 4 `.partial()` still fills defaults, so a partial override parses to the full set). |
+| `RaceSchema` (work.ts) | `width` minimum is now **1** (it was 2); + `entryClosesAt?` (§2.5). |
+| `observability.ts` | + event types `race.picking`, `race.rejected`, `inbox.opened`, `inbox.revoked`, `submission.received`, `note.failed`. |
+| `HiveSettings.race` (autonomy.ts) | `judge` / `pickWindowMs` are **optional** until T9a adds them to `effectiveSettings` (`apps/queen/src/work/guardrails.ts`). |
 | `MergeTrainSchema` (state.ts) | + `origin?: SubmissionOrigin` (dashboard badge, gate fail-closed) |
 | `GateTargetSchema` (queue.ts) | + `origin?`; `baseSha` also set for BUILD trains (the diff base) |
 
 **Naming clash:** `WorkPlanResult.submissions: DispatchSubmission[]` (work/ledger.ts:167) already means "items to dispatch". T0 renames it to `dispatches`, a mechanical change in `ledger.ts` and `queen-node.ts`, so "submission" means one thing.
 
-**SQLite v14** (`apps/queen/src/db.ts`):
-- `inboxes(email PK, handle UNIQUE, repo, created_at, revoked_at)`;
-- `submissions(repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, created_at, PRIMARY KEY(repo, head_sha))`, pruned with the event log;
-- `work_items.inbox_json`;
-- `merge_trains.origin_json`.
+**SQLite v14** (`apps/queen/src/db.ts`, as built; additive only):
+- `inboxes(email PK, handle UNIQUE, repo UNIQUE, created_at, revoked_at)`;
+- `submissions(repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, disposition, target, created_at, PRIMARY KEY(repo, head_sha))`, with indexes on `(repo, ref, created_at)`, `head_sha`, `(origin_id, created_at)`, `item_id` and `created_at`; `target` is the JSON `SubmissionTarget`; pruned with the event log (`pruneSubmissions`);
+- `work_items.inbox_json`, `work_items.judge`;
+- `merge_trains.origin_json`;
+- `races.entry_closes_at`, `pick_deadline_at`, `recommended_train_id`, `recommend_reason`, `decided_by`, `rejections` (JSON), plus index `races_item(item_id)`;
+- `model_preference(model, kind, rating, n, updated_at, PRIMARY KEY(model, kind))`;
+- `model_stats.picks`, `model_stats.picks_against_recommendation`.
 
 ---
 
@@ -311,7 +344,10 @@ There are no new phases.
 
 | Event | Rule |
 |---|---|
-| Push, new `(inbox, ref)` | File a `feature`: title = head subject, body = head message, acceptance = `- ` lines under an `Acceptance:` line if present. Then **READY**, skipping TRIAGE (users are not deduped, §2.2 of v2-design). `paths: []`, so it is optimistic. The PIN train's `changedPaths` widen the claims. |
+| **Correlated** push (a target: branch `item/<id>` or `goal/<slug>`, or a `Queen-Item` trailer; or an `itemId`) | Disposition **`joined-race`**: the head enters the resolved item's race as a candidate. A race is created lazily at width 1 if the item has none, and `entryClosesAt` bounds entries. `goal/<slug>` resolves to the goal's single item when it has exactly one; otherwise a new item is filed under the goal. |
+| **Uncorrelated** push (no target, no `itemId`) | Treated as having **already won a race**: disposition **`filed`**, a new item with **no race record**, and its single train goes straight to gate, car, land (the row below). "Already won" means no competition, never no vetting: every gate still applies. |
+| **Late entry** (the target's race is decided, its code is in a car, or it has landed) | Disposition **`late-new-item`**: a follow-up item ("<title> (follow-up)"). Never a rejection. |
+| Push, new `(inbox, ref)` (uncorrelated) | File a `feature`: title = head subject, body = head message, acceptance = `- ` lines under an `Acceptance:` line if present. Then **READY**, skipping TRIAGE (users are not deduped, §2.2 of v2-design). `paths: []`, so it is optimistic. The PIN train's `changedPaths` widen the claims. |
 | Duplicate `(repo, headSha)` | `ignored:duplicate`. The same SHA pushed to a second branch is also a duplicate. **The dedupe key is `(repo, after)`, as day1 row 8 says; `(repo, ref)` is the supersede key.** |
 | `headSha` equals a head the Queen wrote (the REWORK write-back) | `ignored:own-push` |
 | Re-push to `(inbox, ref)` while its train is **not yet in a car** (`carId = null`) | Eject the old train (`superseded by push <sha>`, no attempt charged, fork deleted), then start a new PIN train for the same item. |
@@ -384,6 +420,7 @@ There are no new phases.
 | `InboxKeys.open` fails (fork or 503) | The edge returns 503 and the call can be retried; the fork is idempotent (`ALREADY_EXISTS` = success, day1 row 5b). The Queen's contributor row exists either way. |
 | NOTE fails after retries | Recorded (`note.failed` event). The dashboard is the source of truth; nothing is ejected. |
 | Write-back is not a fast-forward | Pushed to `<ref>-queen` instead, and the note says so. |
+| **Deploy-order hazard (NOTE vs DELETE).** Before the guard, the provisioner treated any unknown op as DELETE, so a NOTE sent to it could delete an inbox (or any named repo). | The guard now lands: NOTE returns a non-destructive failure until T2 gives it real support. **Rule: the provisioner with real NOTE support (T2) must deploy before any Queen that sends NOTE.** |
 | Hive `paused` or budget exhausted | The item waits READY, with `waitReason` shown on the dashboard. A note "queued: hive paused" is sent once. |
 
 ---
@@ -423,7 +460,7 @@ Passed candidates wait in TESTING with their previews LIVE until then, so the pr
   - **After that:** it files a **targeted Submission** of B's head (`repo` = B's train fork, `itemId` = the item, origin `human`). This is §2's machinery: a loser's fork is just another inbox. If the winner already landed, the item gains a follow-up item.
   - The deferred delete is a planner flag (`deleteAfter`) checked in the alarm.
 - **Preference data.** Picks are recorded per `(model, role)` in `model_stats` as `picks` and `picksAgainstRecommendation`. The Model Board shows a "human picks" column. §10.5 turns picks into a capped routing signal (T9c).
-- **Your own version in the race.** With §2.5, a human's targeted submission to a RACING item joins as a candidate, so the picker compares the agents' versions with their own. Stretch: it needs the "join an in-flight race" path.
+- **Your own version in the race.** With §2.5 (core), a human's targeted submission to a RACING item joins as a candidate, so the picker compares the agents' versions with their own.
 
 ### 10.4 Manual reject (T9b)
 
@@ -475,14 +512,15 @@ The race box (swarm floor and item page) gains a **Pick** view: candidates side 
 ### 10.7 Contracts (in T0, inert until T9a)
 
 - `RaceStateSchema` gains `"PICKING"`.
-- `RaceSchema` gains `pickDeadlineAt`, `recommendedTrainId`, `recommendReason`, `decidedBy`, and `rejections: {trainId, by, reason}[]`.
-- `HiveSettings.race` gains `judge` and `pickWindowMs`.
+- `RaceSchema` gains `entryClosesAt`, `pickDeadlineAt`, `recommendedTrainId`, `recommendReason`, `decidedBy`, and `rejections: {trainId, by, reason}[]`; `width` minimum is 1.
+- `HiveSettings.race` gains `judge` and `pickWindowMs` (optional until T9a adds them to `effectiveSettings`).
 - `SubmitPrompt`, `FileWorkItem` and `WorkItem` gain `judge?`.
-- `GuardrailsSchema` gains `maxPickingRaces`.
+- `GuardrailsSchema` gains `maxPickingRaces` (schema min 0; the planner must clamp it to at least 1, see §13 seams). Stored overrides and PATCH use `GuardrailOverridesSchema`.
+- `observability.ts` event types: `race.picking`, `race.rejected`, `inbox.opened`, `inbox.revoked`, `submission.received`, `note.failed`.
 - `PickRaceSchema = {trainId, reason ≤300}` and `RejectRaceSchema = {trainId | "all", reason 1..300}`.
 - `ModelPreferenceSchema = {model, kind, rating, n, updatedAt}`.
 - `ModelChoice.reason` is unchanged in shape.
-- Migration v14 adds the `races` and `work_items` columns and `model_preference`.
+- Migration v14 adds the `races` and `work_items` columns, `model_preference`, and `model_stats.picks` / `picks_against_recommendation`.
 
 ### 10.8 Sim and acceptance
 
@@ -508,7 +546,7 @@ The race box (swarm floor and item page) gains a **Pick** view: candidates side 
 3. One branch is one item. There are no stacked branches.
 4. The commit author is not authenticated. The inbox owner is accountable.
 
-**Out of scope:** org and permission models, PR discussion threads, per-line comments, pre-receive rejection, service-token (non-email) contributors, joining a non-race build in flight.
+**Out of scope:** org and permission models, PR discussion threads, per-line comments, pre-receive rejection, service-token (non-email) contributors, joining a non-race build in flight, a physical fork per goal (§2.2).
 
 ---
 
@@ -544,21 +582,26 @@ The human path **ships without T1b**. If the drone adapter slips, cut it: drones
 
 | Task | Model | Owns (exclusive) | Depends | Effort |
 |---|---|---|---|---|
-| **T0 Contracts + migration** | Opus | `packages/queen-types/src/{inbox.ts,drone.ts,executors.ts,work.ts,state.ts,queue.ts,train.ts,autonomy.ts,models.ts,index.ts,index.test.ts}` (inbox and race/pick/preference contracts, §5 and §10.7); `apps/queen/src/db.ts` (v14: inbox, submissions, race and preference columns, mappers); `apps/queen/test/migrations.test.ts`; rename `submissions` → `dispatches` in `apps/queen/src/work/ledger.ts` + `queen-node.ts` (mechanical); seams with `not implemented` for `work/inbox.ts` | none | 0.5 d (Oct 7 AM) |
+| **T0 Contracts + migration** **DONE** | Opus | `packages/queen-types/src/{inbox.ts,drone.ts,executors.ts,work.ts,state.ts,queue.ts,train.ts,autonomy.ts,models.ts,observability.ts,index.ts,index.test.ts}` (inbox and race/pick/preference contracts, §5 and §10.7; new event types in `observability.ts`); `apps/queen/src/db.ts` (v14: inboxes, submissions, model_preference, race / work_item / merge_train / model_stats columns, mappers); `apps/queen/test/{migrations.test.ts,work-ledger.test.ts}`; rename `submissions` → `dispatches` (and `DispatchSubmission` → `ItemDispatch`) in `apps/queen/src/work/ledger.ts` + `queen-node.ts` + `test/work-ledger.test.ts` (mechanical); seams with `NotImplementedError` in `work/inbox.ts` | none | 0.5 d (Oct 7 AM) |
 | **T1 Queen intake + planner** | Opus | `apps/queen/src/work/inbox.ts`, `train/planner.ts`, `queen-node.ts`, `index.ts`, `executors.ts`; `apps/queen/test/{inbox.test.ts,planner.test.ts,v2-flow.test.ts}`; `apps/queen/README.md` | T0 | 1 d |
 | **T1b Drone adapter** | Opus (same agent, after T1) | `planner.ts` `buildResult` → `submission()`; `submissionFromBuildResult` in queen-types | T1 | 0.25 d, **cuttable** |
-| **T2 Provisioner** | Sonnet | `apps/provisioner/**` (`InboxKeys` entrypoint, NOTE op, wrangler entrypoint export) | T0 | 0.5 d |
+| **T2 Provisioner** | Sonnet | `apps/provisioner/**` (`InboxKeys` entrypoint, real NOTE op replacing the interim non-destructive failure guard, wrangler entrypoint export). **Must deploy before any Queen that sends NOTE** (§9 deploy-order hazard). | T0 | 0.5 d |
 | **T3 Drones** | Sonnet | `apps/drones/**` (PIN, seeded REWORK, write-back) | T0 | 0.5 d |
 | **T4 Gatekeepers** | Sonnet | `apps/gatekeepers/**` (inbox classify → submit; `changedBetween` for BUILD; fail-closed reviewer; protected-path policy) | T0 | 0.5 d |
 | **T5 Edge** | Haiku | `apps/edge/src/app.ts`, `apps/edge/wrangler.jsonc` (`PROVISIONER_KEYS` service, entrypoint `InboxKeys`), `apps/edge/test/**` | T0 | 0.25 d |
 | **T6 Sim** | Sonnet | `apps/queen/src/sim/{sim-ports.ts,sim-v2.ts,worker.ts}`, `apps/queen/test/sim-ports.test.ts` | T0 | 0.5 d |
 | **T7 Dashboard** | Sonnet | `apps/dashboard/src/{ItemView.tsx,homeLogic.ts,api.ts,components.tsx,SwarmFloor.tsx}` + a new `PushCode.tsx`, tests | T0 | 0.5 d |
 | **T8 Live + docs** | coordinator + user | deploy commands; `docs/HANDOFF.md`, `docs/demo-script.md`, `README.md` | all | Oct 9 |
-| **T9a You-pick races** (§10.1–10.3) | Opus | new `apps/queen/src/train/pick.ts` (pure: enter PICKING, pick, re-pick, deadline, cap) + `apps/queen/test/pick.test.ts` from Oct 7 PM; then, **after T1 merges**, the `maybeDecide` branch in `planner.ts`, `watchdogDeadline`, the `pick` RPC and route in `queen-node.ts` / `index.ts`; sim `[you-pick]` in `sim-v2.ts` (after T6) | T0; T1 for the wiring | 0.75 d |
+| **T9a You-pick races** (§10.1–10.3) | Opus | new `apps/queen/src/train/pick.ts` (pure: enter PICKING, pick, re-pick, deadline, cap) + `apps/queen/test/pick.test.ts` from Oct 7 PM; `apps/queen/src/work/guardrails.ts` (`effectiveSettings` gains race `judge` / `pickWindowMs`, and the `maxPickingRaces` clamp); then, **after T1 merges**, the `maybeDecide` branch in `planner.ts`, `watchdogDeadline`, the `pick` RPC and route in `queen-node.ts` / `index.ts`; sim `[you-pick]` in `sim-v2.ts` (after T6) | T0; T1 for the wiring | 0.75 d |
 | **T9b Manual reject** (§10.4) | same agent as T9a, after it | `pick.ts` reject / none-of-these; `reject` RPC and route; tests (h)(i) | T9a | 0.25 d |
 | **T9c Preference weighting** (§10.5) | Sonnet | `apps/queen/src/models/{router.ts,preference.ts}`, `apps/queen/test/{router.test.ts,preference.test.ts}`; the Model Board column in `apps/dashboard/src/Home.tsx` (or the Model Board component); the event-fold rebuild test | T9a events | 0.5 d, **can slip without blocking T9a/T9b** |
 | **T9d Pick UI** | Sonnet | new `apps/dashboard/src/RacePick.tsx` + test, mounted by T7 in the race box under that agreed export name | T0 | 0.5 d |
 
+- **Seams T0 left** (each throws or answers 409 until its owner lands):
+  - **T1:** `work/inbox.ts` `NotImplementedError` stubs (`handleFor`, `decideIntake`, `resolveTarget`, `itemFromMessage`); `WorkPlanner.handoff` answers 409 ("not implemented"); `TrainAction` still lacks `PIN`; calling `pruneSubmissions` (db.ts) from the Queen alarm; filling `GateTarget.origin` / `baseSha` and `MergeTrain.origin` when trains are created.
+  - **T9a:** `effectiveSettings` (guardrails.ts) must add race `judge` / `pickWindowMs`; the `maxPickingRaces` min-1 clamp (the schema allows 0, and a 0 cap would auto-decide every race).
+  - **T9c:** preference reads and writes on `model_preference` and `model_stats.picks`.
+- **Infra fixes landed** (alongside T0): provisioner forks may now be named `<hive>-train-<12hex>-rN`, the gatekeeper `TRAIN_REPO_RE` accepts that, and cars retire after one infra round. **Inbox-related parsing must accept `-rN` train names too** (`INBOX_REPO_RE` is anchored `-in-<handle>`, so it does not clash, but any train-name regex T1/T3/T4 add must allow the suffix).
 - **Schedule:** T0 on Oct 7 morning. T1–T7 run in parallel from Oct 7 afternoon to Oct 8. T1b runs Oct 8 if T1 is green. Live on Oct 9.
 - **Races schedule:** T9a's pure `pick.ts` and T9d start Oct 7 afternoon. T9a's planner wiring and T9b follow T1 (Oct 8 afternoon to Oct 9). T9c runs Oct 9–10. Each one ships alone, and none blocks the inbox path.
 - **Deploy order:** provisioner (new entrypoint) → queen (v14; no active trains, R16) → drones, gatekeepers → edge (binds to the new entrypoint, so two passes are not needed). Check: `pnpm turbo run build typecheck lint test --force --continue`.
@@ -601,7 +644,7 @@ This closes HANDOFF §6.5's "no reliable live reviewer REJECT" by showing a reli
 | Q7 | Notes push to Artifacts receive-pack | **Verified** (day1 row 1). A non-forced, appending push under contention is UNVERIFIED and is covered by the retry. |
 | Q8 | Push event delivery: at-least-once? ordered? | UNVERIFIED. Dedupe makes it safe; rescan covers loss. |
 | Q9 | Service-token agents (no Access email; edge `access.ts:153` rejects them) | Post-Oct 14. Agents push through their person's inbox with `Queen-Origin`. |
-| Q10 | Should a targeted human submission join an in-flight race? | Stretch only (§2.5). Ranking needs no change. |
+| Q10 | ~~Should a targeted human submission join an in-flight race?~~ | **Decided (user, 2026-10-07): yes, core.** The item is the competition, and the item is the inbox (§2.5). Ranking needs no change. |
 | Q11 | Preference granularity: `(model, item kind)` has 4 kinds × ~8 models, so it is sparse at demo volume. | Keep the per-kind key; `confidence = n/(n+5)` keeps sparse cells near neutral. Revisit with a per-hive key after Oct 14. |
 | Q12 | Should `judge: human` be the default for `[hard]` items in a `supervised` hive? | No. It stays opt-in; autonomy is the default (D12 keeps auto as the hive default). |
 | Q13 | Live previews of 3 candidates for up to 15 min: Worker Preview quota and cost | UNVERIFIED (deploy-discovery has no preview count limit). `maxPickingRaces` 2 bounds it at 6 previews. |
