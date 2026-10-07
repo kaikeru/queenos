@@ -1,7 +1,7 @@
-# QueenOS inbox: every change is a Submission (human `git push`, external agents, drones)
+# QueenOS: agent-native git. Every change is a Submission, and the front door is a git proxy
 
-Status: design, 2026-10-07. Builds Oct 7–8; it is live by Oct 9 and goes into the demo. It also covers human-judged races (§10), which ship separately. Decision D12 in `docs/v2-design.md` §10.
-Read with `docs/v2-design.md` (§1.2 principles, §2.3 lanes and queue), `apps/queen/README.md` and `docs/day1-results.md` (rows 1, 3, 5, 8, 8b, 8c).
+Status: design, rev 2, 2026-10-07. **Rev 2 (user direction, 2026-10-07): "agent-native git".** The git layer is the product, and the swarm, merge queue, deploy pipeline and SRE are the supporting products that prove it. The front door is a **git proxy** at `https://queenos.kaikeru.com/git/<hive>`. It looks like GitHub, but it isn't: no Artifacts token ever leaves our side. Rev 2 replaces rev 1's per-person inbox forks, `InboxKeys` tokens, the PIN drone and the provisioner `NOTE` op (§16 lists what went away). Builds Oct 8–11; live by Oct 11 and in the demo. Human-judged races (§10) ship separately. Decision D12 in `docs/v2-design.md` §10 (amended by rev 2; record the amendment there in T8).
+Read with `docs/v2-design.md` (§1.2 principles, §2.3 lanes and queue), `apps/queen/README.md`, `docs/day1-results.md` (rows 1, 3, 5, 8, 8b, 8c) and the proxy probes (§3.6). Spike code (not in the repo): `scratchpad/proxy-spike/src/index.ts` of the 2026-10-07 session; T2 starts from a copy of it.
 
 Anything marked **UNVERIFIED** has not been checked against the real account or the code.
 
@@ -11,18 +11,20 @@ Anything marked **UNVERIFIED** has not been checked against the real account or 
 
 QueenOS lands code only when the Queen asks for it. Today a change exists only because the Queen dispatched a BUILDER drone into a fork it made. People and outside agents (Claude Code, Codex) have no way in. A hackathon judge's first question is "can I push to it?", and the honest answer today is no.
 
-**The inbox is a different paradigm from a pull request.**
+**Agent-native git.** `git clone https://queenos.kaikeru.com/git/demo`, `git push origin HEAD:item/14`. The remote speaks plain git smart-HTTP, so every git client and every coding agent works unchanged. Behind it, the push is not a branch on a shared repo: it is a **Submission**. The proxy checks the rules at push time and answers in the push output (`remote: QueenOS: submission received → item 14`). The swarm vets the code, and the verdict comes back as git notes on the commit.
 
-| | Pull request | QueenOS inbox push |
+**A push is a different paradigm from a pull request.**
+
+| | Pull request | QueenOS push |
 |---|---|---|
 | What the contributor says | "Please review my branch." | "Here's code. Vet it." |
 | Who does the work after the push | The contributor opens, shepherds, pings reviewers, rebases and merges. | The swarm does: gates, LLM reviewer, merge queue, integration gate, lander, canary. |
 | What the contributor does next | Babysits the PR. | Nothing. They read the verdict (a git note and the dashboard) and either push a fix or hand off to the swarm. |
-| Rules | Branch protection, chosen per repo. | The same rules every drone gets. There is no human fast lane. |
+| Rules | Branch protection, chosen per repo. | The same rules every drone gets, enforced at push time (§4.3) and at the gate. There is no human fast lane. |
 
 **Pitch: "A human's `git push` rides the same train as 12 agents, under the same rules."**
 
-**The bigger claim (user direction, 2026-10-07):** the inbox is not a side door for humans. It is the **universal intake**. Every piece of code, drone-written included, arrives as a **Submission** ("here's code, vet it"), and the pipeline consumes only Submissions (§2). A drone is just a contributor that the Queen asked for code. A human is a contributor that nobody asked.
+**The bigger claim (user direction, 2026-10-07):** intake is not a side door for humans. It is the **universal intake**. Every piece of code, drone-written included, arrives as a **Submission** ("here's code, vet it"), and the pipeline consumes only Submissions (§2). A drone is just a contributor that the Queen asked for code. A human is a contributor that nobody asked.
 
 ---
 
@@ -37,125 +39,130 @@ Submission = { repo, ref, headSha, origin: {kind: drone|human|agent, id}, itemId
 The pipeline after intake consumes only Submissions:
 
 ```
-Submission ─▶ (pin) ─▶ train DEPLOYING ─▶ preview ─▶ gate ─▶ PASSED ─▶ car ─▶ MERGE ─▶ integration gate ─▶ LANDER ─▶ release ladder
+Submission ─▶ train DEPLOYING ─▶ preview ─▶ gate ─▶ PASSED ─▶ car ─▶ MERGE ─▶ integration gate ─▶ LANDER ─▶ release ladder
 ```
 
-- **Correlated** submissions have a target or an `itemId` (user decision 2026-10-07: the item is the competition, and the item is the inbox). They come from drones the Queen dispatched for an item, or from a human or agent who addresses an item or goal on purpose (§3.4). They **join that item's race** as a candidate (disposition `joined-race`, §2.5).
-- **Uncorrelated** submissions have neither, as with a plain inbox push. They are treated as having **already won a race**: intake files a new item (a `feature` whose title is the head commit's subject, disposition `filed`) with **no race record**, and its single train goes straight to gate, car, land. "Already won" means no competition, never no vetting: every gate (policy, security, smoke, reviewer) still applies.
+- **Correlated** submissions have a target or an `itemId` (user decision 2026-10-07: the item is the competition). They come from drones the Queen dispatched for an item, or from a human or agent who addresses an item or goal on purpose (§4.4). They **join that item's race** as a candidate (disposition `joined-race`, §2.5).
+- **Uncorrelated** submissions have neither, as with a plain `git push origin HEAD:tip-jar`. They are treated as having **already won a race**: intake files a new item (a `feature` whose title is the head commit's subject, disposition `filed`) with **no race record**, and its single train goes straight to gate, car, land. "Already won" means no competition, never no vetting: every gate (policy, security, smoke, reviewer) still applies.
 - **Provenance** is metadata only: drone id, model, failed models, usage, race id, candidate index, attempt, `verified`. It feeds races, rework attempt counts, the model router's AIMD floor and stats, and the Model Board. **It is never a separate code path.** A human submission simply has no `model`. The router already ignores models that are not in the catalog (`apps/queen/README.md` "Stats"), so human code never moves the floor.
+- For a pushed submission, `repo` is the **train fork the proxy created** (§2.2) and `ref` is the **branch the client pushed** (`refs/heads/item/14`): the supersede key. Physically the code is on the fork's `main`.
 
-### 2.2 Physical forks, logical inbox
+### 2.2 Topology: one fork per push, made by the proxy (decided rev 2)
 
-- **Every contributor keeps its own fork.**
-  - A drone's train fork (`<hive>-train-<12hex>`) is an ephemeral, per-train inbox.
-  - A human's inbox fork (`<hive>-in-<handle>`) is persistent, one per person (D12).
-- **The "feature inbox" is logical, not a repo.** The *item* is the inbox, and candidates arrive in it from any fork.
-- **No goal-level fork repo (decided 2026-10-07).** Every submission forks from hive `main`, whatever goal it targets. The rejected alternative was a physical fork per goal that collects that goal's submissions. It fails because:
-  - it is a long-lived feature branch that drifts from `main`;
-  - it needs a two-level merge (submission into goal fork, goal fork into `main`), with conflicts at both levels;
-  - it ships a goal all at once, against the swarm's item-by-item landing;
-  - it concentrates pushes and forks on one repo, which is worse for the Artifacts 503s.
+```
+git client ──smart-HTTP──▶ edge /git/* (git token) ──service binding──▶ git Worker ──Artifacts token (server-only)──▶ Artifacts
+                                                                          │  reads:  hive main  (<hive>, read token)
+                                                                          │  pushes: fresh fork <hive>-train-<12hex>, ref → main
+                                                                          └─ RPC ─▶ Queen DO (decide, record; notes projection)
+```
 
-  A goal stays a logical grouping in the work ledger; its items land independently.
-- **We do not use a shared per-item repo:**
-  - Artifacts' own guidance is one repo per agent (discovery §1, "Do not use one shared repo as a queue for many autonomous agents").
-  - Races need isolated trees.
-  - Concentrating pushes on one repo could make the Artifacts 503s worse (HANDOFF §6.6).
+- **Reads** (`clone`, `fetch`, `ls-remote`) are proxied to the hive's main repo. The proxy advertises only `HEAD` and `refs/heads/main` (plus the synthesized notes refs, §7.5).
+- **Every push becomes its own train fork.** The proxy forks hive main into `<hive>-train-<12hex>` (the same name scheme as drone trains), then forwards the client's receive-pack body into it with the ref rewritten to `refs/heads/main`. That fork **is** the train's repo. There is no inbox repo, no PIN copy and no per-person fork. **Proven (§3.6 probe 5):** Artifacts accepts a pack the client built against hive main's advertisement when the receive-pack goes to a fresh fork, including a branch based on an older main (a non-fast-forward rewrite) and a commit built on objects that exist only on a non-default branch of the parent.
+- **Why not a per-person inbox behind the proxy?** It would keep a persistent repo per person, a mirror `main` to sync, and a PIN copy into a train fork, so the push would land in a repo that is not the train's. Fork-per-push puts the code where the pipeline already expects it (train fork `main`; `TrainPlanner.cleanUp`, the MERGE drone, `getGateTarget`, the lander all unchanged) and spreads pushes across fresh repos, which is the best shape for the Artifacts per-repo 503 episodes (commit 1deb7ab: a repo goes 503 for 40 s to 7+ min right after a push; a fresh fork is healthy).
+- **The "feature inbox" is logical, not a repo.** The *item* is the inbox; candidates arrive in it from any fork.
+- **No goal-level fork repo (decided 2026-10-07).** Every submission forks from hive `main`, whatever goal it targets. A physical fork per goal is a long-lived feature branch that drifts from `main`, needs a two-level merge, ships a goal all at once against the swarm's item-by-item landing, and concentrates pushes on one repo. A goal stays a logical grouping in the work ledger; its items land independently.
+- **No shared per-item repo:** Artifacts' own guidance is one repo per agent (discovery §1); races need isolated trees.
 
-### 2.3 The pin: why an inbox push is not gated in place
+### 2.3 Why there is no PIN step any more
 
-An inbox submission is first **pinned**: a deterministic `PIN` drone copies `inbox@headSha` into a fresh train fork forked from hive main, and pushes it as that fork's `main`. After that, the train is an ordinary BUILD-lane train. A drone submission is already in a Queen-owned train fork, so its pin is a no-op.
+Rev 1 needed a PIN drone because the human's code sat on a branch of a person-owned inbox repo, which broke every consumer of `train.artifactRepo` (cleanup would delete the inbox, MERGE fetches `main`, one repo had many trains, inbox notes were forgeable, force-pushes could remove `headSha` from under a car). With fork-per-push, **the push itself produces a Queen-owned train fork with the code on `main`**:
 
-The first sketch said the train would "skip BUILD and enter at DEPLOYING" with the inbox as the train's repo. **The code rules that out:**
-
-| Consumer | What it assumes about `train.artifactRepo` | Breaks if it is the inbox |
+| Consumer | Assumption | Fork-per-push |
 |---|---|---|
-| `TrainPlanner.cleanUp` → `deleteFork` (planner.ts ~1480) | It is Queen-owned and deleted on MERGED or EJECTED. | It would delete the person's inbox. |
-| MERGE drone `mergeCar` (drones/merge.ts, design §2.3.4) | It fetches the member fork's `refs/heads/main`. | The human's code is on a branch, not on `main`. |
-| `getGateTarget(repo)` (gatekeepers orchestrate.ts:174) | One repo is one train. | One inbox has many branches, so many trains. |
-| Lander `carryNotes` (drones/land.ts:84) | Member-fork notes are Queen-written. | Inbox notes can be forged by their owner and would land in the hive ledger. |
-| Car stability | The member head stays fetchable. | A human force-push can remove `headSha` from under a car. |
+| `TrainPlanner.cleanUp` → `deleteFork` (planner.ts ~1480) | `artifactRepo` is Queen-owned and deleted on MERGED or EJECTED | Holds. The proxy forks under a name the Queen chose (§4.2). |
+| MERGE drone `mergeCar` (drones/merge.ts) | It fetches the member fork's `refs/heads/main` | Holds: the ref is rewritten to `main`. |
+| `getGateTarget(repo)` (gatekeepers orchestrate.ts:174) | One repo is one train | Holds. |
+| Lander `carryNotes` (drones/land.ts:84) | Member-fork notes are Queen-written | Holds: the proxy refuses any push to `refs/notes/*`, and v1 notes are not stored in Artifacts at all (§7.5). |
+| Car stability | The member head stays fetchable | Holds: nobody but the Queen's executors holds a token for the fork. A re-push is a new fork. |
 
-Pinning costs one FORK (~2 s, day1 row 5) plus one drone start (~2 s, row 10) and a fetch and push. In return, **every downstream consumer is unchanged.** The PIN drone runs in the BUILDING phase, the way the MERGE drone already does for cars.
+The train therefore enters the pipeline exactly where a drone's build result does (`BUILDING` → `DEPLOYING`), with no extra fork, drone start or copy. That saves ~10 s per human submission (rev 1: FORK + drone start + PIN).
 
 ### 2.4 Where the code special-cases drones today, and how each case maps onto Submission
 
 | # | Drone-only today | Where | As a Submission |
 |---|---|---|---|
-| 1 | **Solicitation:** `submit` → `enqueue` → FORK → `dispatchBuilder` (BUILDER, `modelChoice`) | planner.ts `submit`, `enqueue`, `dispatchBuilder` | **Unchanged.** This is how the Queen *asks* for a submission. Unsolicited code gets a PIN train instead of a BUILDER. |
-| 2 | **Completion:** `reportBuildResult` → `buildResult()` → DEPLOYING | planner.ts:804 | **Adapter:** `submissionFromBuildResult(train, r)`, then one `submission()` transition. `BuildResult` stays on the wire. |
-| 3 | `recordBuild`: model stats, `failedModels`, usage; gate verdict → `model_outcome` | planner.ts `recordBuild`; models/router.ts | Read from `provenance`. An absent `model` means no counting (the catalog-only rule already exists). |
+| 1 | **Solicitation:** `submit` → `enqueue` → FORK → `dispatchBuilder` (BUILDER, `modelChoice`) | planner.ts `submit`, `enqueue`, `dispatchBuilder` | **Unchanged.** This is how the Queen *asks* for a submission. Unsolicited code gets a **pre-forked train** (§6.1) instead of a BUILDER. |
+| 2 | **Completion:** `reportBuildResult` → `buildResult()` → DEPLOYING | planner.ts:804 | **Adapter:** `submissionFromBuildResult(train, r)`, then one `submission()` transition. The proxy's `gitPushed` calls the same `submission()`. |
+| 3 | `recordBuild`: model stats, `failedModels`, usage; gate verdict → `model_outcome` | planner.ts `recordBuild`; models/router.ts | Read from `provenance`. An absent `model` means no counting. |
 | 4 | Races: `racingRaceOf`, `rankCandidates` (`verified`, `changedBytes`) | train/race.ts | `provenance.raceId` and `candidate`. A human candidate ranks with `verified` absent (§2.5). |
 | 5 | `fail()` → `rework()` auto-enqueues a REWORK drone | planner.ts:1426–1465 | Branches on origin. Drone: unchanged. Human or agent: the item goes FAILED ("awaiting contributor") with no auto-rework, unless the contributor handed off (§6.3). |
-| 6 | The gate's `builderReasoning` from the BUILDER ledger (hive memory) | gatekeepers orchestrate.ts:178 | Provenance. It is `[]` for humans. |
-| 7 | **`collectChange`** finds changed paths from *added* files plus paths named in drone-style commit messages ("a pure modification by a non-drone commit is invisible") | gatekeepers inspect.ts:186–213 | **Must become `changedBetween(baseSha, head)`** (hive-kit `changedPaths`) for every BUILD gate. Without it, a human's edit to an existing file is "out of diff", and its policy and security findings become follow-up bugs **instead of failing the gate** (`splitOutOfDiff`). This is a security bypass for inbox code, and a latent bug for drones. |
-| 8 | Scripted test runner: a `[fail]` marker and a `queen(rework)` message prefix | gatekeepers test-runner.ts:14, 64 | Applies to any origin. Prod runs `GATE_TEST_MODE: scripted`, so a human commit message that contains `[fail]` fails the "tests". Documented; harmless. |
-| 9 | Gatekeeper filter: train forks only (`TRAIN_REPO_RE`) | gatekeepers event.ts:121 | Adds `INBOX_REPO_RE`, which classifies an inbox push as `intake` (§5.2). |
-| 10 | Lander carries notes from member forks | drones/land.ts:84 | Member = the pinned train fork. **Inbox notes are never carried.** |
-| 11 | `cleanUp` deletes `artifactRepo` | planner.ts | Train forks only. The train lifecycle never touches the inbox. |
-| 12 | Sim gate markers keyed on `task.action === "BUILD"` | sim-ports.ts:526–580 | Treat `PIN` like `BUILD`. |
-| 13 | Path claims widen from `BuildResult.changedPaths` | work/ledger.ts `absorb` | The PIN drone reports `changedPaths` (`mergeBase(main, head)..head`). |
+| 6 | The gate's `builderReasoning` from the BUILDER ledger | gatekeepers orchestrate.ts:178 | Provenance. It is `[]` for humans. |
+| 7 | **`collectChange`** finds changed paths from *added* files plus paths named in drone-style commit messages | gatekeepers inspect.ts:186–213 | **Must become `changedBetween(baseSha, head)`** (hive-kit `changedPaths`, base = merge base with hive main) for every BUILD gate. Without it, a human's edit to an existing file is "out of diff", and its policy and security findings become follow-up bugs **instead of failing the gate**. A security bypass for pushed code, and a latent bug for drones. |
+| 8 | Scripted test runner: a `[fail]` marker and a `queen(rework)` message prefix | gatekeepers test-runner.ts:14, 64 | Applies to any origin. Documented; harmless. |
+| 9 | Gatekeeper filter: train forks only (`TRAIN_REPO_RE`) | gatekeepers event.ts:121 | **Unchanged.** A proxy push lands in a train fork, so the existing gate path picks it up. No inbox classification. |
+| 10 | Lander carries notes from member forks | drones/land.ts:84 | Unchanged (`refs/notes/queen` only). v1 notes never exist in Artifacts. |
+| 11 | `cleanUp` deletes `artifactRepo` | planner.ts | Unchanged, plus `deleteAfter` for rejected human/agent forks kept for handoff (§6.3). |
+| 12 | Sim gate markers keyed on `task.action === "BUILD"` | sim-ports.ts:526–580 | The sim git push enters as a pre-forked BUILD train, so the markers apply as is. |
+| 13 | Path claims widen from `BuildResult.changedPaths` | work/ledger.ts `absorb` | The gatekeeper's `changedBetween` result widens the claims (reported with the train result). |
 
 ### 2.5 Best-of-N generalises
 
-**The item is the competition, and the item is the inbox.** Every submission that targets an item (§3.4), drone, human or agent, enters that item's race as a candidate. A human's code races the drones under the same gate and the same `rankCandidates` ordering. A human has no `verified` (the builder's verify tool), so they lose ties on that key. External agents are first-class contributors: they push to their person's inbox, with `Queen-Origin: agent:<name>` in the commit.
+**The item is the competition.** Every submission that targets an item (§4.4), drone, human or agent, enters that item's race as a candidate. A human's code races the drones under the same gate and the same `rankCandidates` ordering. A human has no `verified` (the builder's verify tool), so they lose ties on that key. External agents are first-class contributors: they push through the proxy with their person's git token, with `Queen-Origin: agent:<name>` in the commit.
 
 **Joining an in-flight race is core, not a stretch.** A `RACING` race gains a candidate (`Race.trainIds` grows; `width` counts only the Queen-dispatched ones).
 - A race is created **lazily at width 1** if the targeted item has none.
 - `Race.entryClosesAt` bounds entries (null: until decided).
-- **Late entry:** the race is decided, the item's code is already in a car, or it has landed. The submission becomes a follow-up item (disposition `late-new-item`). It is never rejected.
+- **Late entry:** the race is decided, the item's code is already in a car, or it has landed. The submission becomes a follow-up item (disposition `late-new-item`). It is never rejected, and the push output says so (§4.3).
 - A targeted submission to a READY or FAILED item with no live race becomes that item's next attempt (a width-1 race).
 - Joining an ACTIVE non-race build is post-Oct 14.
 
 ### 2.6 Delivery: an adapter, not a rewrite
 
 - Drones keep fork and dispatch.
-- Their completion emits a Submission inside the Queen: `buildResult()` becomes `submission(submissionFromBuildResult(...))`. This lands in the same change that adds the inbox path.
-- **The plan (§13) is ordered so the human inbox path ships alone if the drone adapter slips.** The adapter is one task (T1b) with its own tests. Without it, `buildResult()` stays as it is and only inbox submissions use `submission()`.
+- Their completion emits a Submission inside the Queen: `buildResult()` becomes `submission(submissionFromBuildResult(...))`.
+- **The plan (§13) is ordered so the push path ships alone if the drone adapter slips.** The adapter is one task (T1b) with its own tests. Without it, `buildResult()` stays as it is and only pushed submissions use `submission()`.
 
 ---
 
 ## 3. UX walkthrough
 
-### 3.1 Get an inbox (once; re-run to refresh the token)
+### 3.1 Get a git token (once)
 
-From the dashboard, **Push code** (project header) shows the commands below with copy buttons. From a terminal behind Access:
+On the dashboard, **Push code** (project header) → **Create git token**. It is shown once, with copy buttons for:
 
 ```bash
-cloudflared access curl -X POST https://queenos.kaikeru.com/api/hives/demo/inbox
+git clone https://queenos.kaikeru.com/git/demo
+# Username: your email (any value works)   Password: <git token>
 ```
 
-```json
-{
-  "handle": "kyle",
-  "repo": "demo-in-kyle",
-  "remote": "https://<ACCOUNT_ID>.artifacts.cloudflare.net/git/queenos/demo-in-kyle.git",
-  "username": "queen",
-  "password": "art_v2_…",            // the token with ?expires= stripped (Basic auth)
-  "expiresAt": "2026-10-08T14:02:11Z", // 24 h
-  "mainSha": "9f2c…"                  // inbox main fast-forwarded to hive main
-}
-```
+- The token is a **QueenOS git token** (`qgt_…`), minted by the edge behind Access, bound to your Access email, stored only as a hash, valid 30 days by default, revocable at once from the same panel. It is **not** an Artifacts token; it opens nothing but `https://queenos.kaikeru.com/git/*`.
+- Git's normal credential flow stores it (macOS keychain, `git credential-manager`, `credential.helper store`). After that, `git clone`, `fetch` and `push` just work, like GitHub with a PAT.
+- If you already use `cloudflared`: `git -c http.extraHeader="cf-access-token: $(cloudflared access token -app=https://queenos.kaikeru.com)" clone …` also works (§8.1). No git token needed, but it expires with your Access session.
 
 ### 3.2 Push
 
 ```bash
-git clone https://<ACCOUNT_ID>.artifacts.cloudflare.net/git/queenos/demo-in-kyle.git && cd demo-in-kyle
-#   or, in an existing clone:  git remote add queen <remote>
 git switch -c tip-jar
 $EDITOR src/features/tip-jar.js
 git commit -am "Add a tip jar at /features/tip-jar"
-git push queen tip-jar                # username: queen, password: <password>
+git push origin HEAD:tip-jar           # uncorrelated: a new item
+git push origin HEAD:item/14           # join item 14's race
 ```
 
-- **Credentials:** use Basic auth with any username and password = the token without `?expires=`. Or set a header: `git -c http.extraHeader="Authorization: Bearer <full token>" push …` (discovery §1).
-- **`git push` always succeeds** (§11, item 1). The push is a proposal; the train decides.
-- **Pushes to inbox `main` are ignored.** `main` is a mirror of hive main, refreshed on every `POST …/inbox`. Push branches.
+```
+remote: QueenOS: submission received → item 3c1e… "Add a tip jar at /features/tip-jar" (new item, fully gated)
+remote: QueenOS: train 7a90… · verdict in ~2 min
+remote: QueenOS: git fetch origin '+refs/notes/*:refs/notes/*' && git log --notes=verdict -1
+To https://queenos.kaikeru.com/git/demo
+ * [new branch]      HEAD -> tip-jar
+```
+
+The push takes about 4–8 s (the proxy forks hive main first; §3.6). A push that breaks a rule is refused **in the push output** (§4.3):
+
+```
+remote: QueenOS: push refused
+remote: QueenOS:   refs/heads/main: pushes to main are refused (the lander owns main)
+remote: QueenOS: push a branch instead, e.g. git push origin HEAD:item/<id>
+ ! [remote rejected] HEAD -> main (pushes to main are refused (the lander owns main))
+```
+
+- **Your branch is not stored on the hive remote.** It became a submission in its own train fork. `git fetch` will not show `origin/tip-jar`, and `git fetch --prune` deletes your local tracking ref. Keep working on your local branch and push it again to update the submission.
+- The push being accepted means "submission received", never "passed". The verdict is asynchronous.
 
 ### 3.3 Read the verdict
 
 ```bash
-git fetch queen 'refs/notes/*:refs/notes/*'
+git fetch origin '+refs/notes/*:refs/notes/*'
 git log --notes=verdict --notes=review -1
 ```
 ```
@@ -167,178 +174,166 @@ Notes (verdict):
     Queen-Verdict: REJECTED
     Queen-Item: 3c1e…
     Queen-Train: 7a90…
-    Queen-Origin: drone:gatekeeper
 Notes (review):
     Queen-Note: v1
     Queen-Kind: finding
     Queen-Finding: error src/features/tip-jar.js:12 fetch to non-allowlisted host "tips.example.com"
 ```
 
-This is the machine-readable note format v1 (§7.1). It is the same loop for a human, Claude Code, Codex or a script: fetch the notes, read the rejection, fix, push. See `docs/agent-protocol.md` and the Claude Code plugin at `plugins/queenos/`.
-
-Later milestones are appended as further verdict notes on the same commit: `PASSED`, `QUEUED in car <id>`, `CONFLICT`, `LANDED main@<sha>`, `SHIPPED <release>` or `ROLLED BACK`. The dashboard shows the same item with a **human** (or **agent**) origin badge.
+- Fetch notes **with their own command** and the leading `+` (§7.5, §11). The notes are a projection of the Queen's ledger, served by the proxy; every fetch returns the current state.
+- Later milestones replace the note: `PASSED`, `QUEUED in car <id>`, `CONFLICT`, `LANDED main@<sha>`, `SHIPPED <release>` or `ROLLED BACK`. The note holds the milestones in order, and the **last** `Queen-Verdict` is the current state. The dashboard shows the same item with a **human** (or **agent**) origin badge.
 
 ### 3.4 Fix it yourself, or hand off to the swarm
 
-- **Fix:** commit and `git push queen tip-jar` again. Intake reopens the same item (§6.2).
-- **Hand off:** press **Let the swarm fix it** on the item page (`workAction: handoff`), or put `Queen: rework` in the commit message up front. A REWORK drone starts from *your* head, applies the reviewer and scan findings, and pushes its commit onto your branch:
+- **Fix:** commit and `git push origin HEAD:tip-jar` again. Intake reopens the same item (§6.2). Put `Queen-Replies-To: <rejected sha>` in the commit to link the chain.
+- **Hand off:** press **Let the swarm fix it** on the item page (`workAction: handoff`), or put `Queen: rework` in the commit message up front. A REWORK drone starts from *your* head (its train fork is forked from your rejected submission's fork), applies the findings and goes through the gate. To get its fix before it lands:
   ```bash
-  git pull queen tip-jar      # the drone's fix, on top of your commit
+  git pull https://queenos.kaikeru.com/git/demo/t/<trainId> main     # read-only view of one train fork
   ```
-- **Addressing** (user decision 2026-10-07). Branch `item/<id>` targets that item. Branch `goal/<slug>` resolves to the goal's single item when it has exactly one; otherwise it files a new item under that goal (no guessing). Any other branch is uncorrelated (§6.2).
+  The REWORK's verdict note names the train. After it lands, the fix is on `origin/main` anyway.
+- **Addressing** (user decision 2026-10-07). Branch `item/<id>` targets that item. Branch `goal/<slug>` resolves to the goal's single item when it has exactly one; otherwise it files a new item under that goal (no guessing). Any other branch is uncorrelated. **Resolution now happens at push time**, so an unknown item is refused in the push output (§4.3).
 - **Trailers** (head commit only, case-insensitive; see `parseSubmissionTrailers`):
   - `Queen: rework`: hand off automatically on a reject.
   - `Queen-Item: <itemId>`: target an existing item. The branch name `item/<itemId>` does the same.
   - `Queen-Origin: agent:<name>`: declare that an agent wrote this.
+  - `Queen-Replies-To: <sha>`: this commit answers that rejected commit.
+
+### 3.5 External agents
+
+Exactly the same commands. The agent gets the git token through the environment (`QUEENOS_GIT_TOKEN`) and a credential helper, never in the URL. See `docs/agent-protocol.md` and the Claude Code plugin at `plugins/queenos/`.
+
+### 3.6 Probe evidence (2026-10-07, local `wrangler dev` with the Artifacts binding `remote: true`, real account, stock git 2.50.1)
+
+| # | Probe | Result | Evidence |
+|---|---|---|---|
+| 1 | Read path: `info/refs` + `git-upload-pack`, streaming | **WORKS** | `git clone` through the proxy with `protocol.version` 2, 1 and 0, and `--depth 1`, all gave the right tree. Upstream v2 caps: `ls-refs=unborn`, `fetch=shallow filter sideband-all`, `object-format=sha1`, `agent=gitty/1.0`. Stock git requests `sideband-all`. |
+| 2 | Write path: receive-pack (v1), body streamed | **WORKS** | Small pushes (Content-Length kept with `FixedLengthStream`) and a **20 MB incompressible push** sent by git with chunked encoding: upstream fetch started at 1 ms, body chunks forwarded from 1 ms to 1609 ms, never buffered; Artifacts accepted the chunked body (`unpack ok`), push 12.4 s total. Artifacts advertises only `report-status delete-refs ofs-delta side-band-64k`. |
+| 3 | Pre-receive: parse commands, reject before forwarding | **WORKS** | Push to `main` → `remote: QueenOS: …` lines plus `! [remote rejected] HEAD -> main (pushes to main are refused …)`, exit 1, nothing forwarded (reject in 1 ms). Also tested: a two-ref push (the other ref reported "atomic push refused") and a branch delete. |
+| 4 | `remote:` messages on success | **WORKS** | Sideband-2 packets injected before the final flush render as `remote: QueenOS: submission received -> item 14 (joined its race)` in stock git. (The spike buffers the upstream report, which is under 1 KB, then re-emits it.) |
+| 5 | Redirect a push into a fresh fork B of A, ref rewritten | **WORKS** | Advertisement from A, POST to new fork B: `refs/heads/item/77` → B `refs/heads/main` (old = B's main) accepted; B's log shows the commit on main. Also accepted: a commit built on a branch that exists **only in A** (not in B's refs; `defaultBranchOnly` fork), and B's full clone passes `git fsck` (forks carry all of A's objects); a branch based on an **older** main (non-fast-forward rewrite onto B main); a rewrite to a new ref `refs/heads/submission` (zero old). Fork on the push path took 3.3–6.4 s (day 1: ~2 s). The report-status is rewritten back to the client's ref name, so git shows `* [new branch] HEAD -> item/77`. |
+| 6 | Notes fetch | **WORKS (option c)** | The proxy answered v2 `ls-refs` (prefix `refs/notes/`) and `fetch` itself with a pack it built (blobs, a notes tree, a parentless commit; zlib via `CompressionStream("deflate")`, SHA-1 via Web Crypto). Stock git: `* [new ref] refs/notes/verdict`, `git log --notes=verdict --notes=review` shows the notes on commits that live only in forks; `git fsck` clean. A changed ledger gives a new commit: `+` refspec → `(forced update)`; without `+` → `! [rejected] (non-fast-forward)`. A mixed refspec (heads + notes in one fetch) gets heads only (by design, §7.5). |
+| 7 | Limits and Access | **Partly verified** | Stock git against the live host: `302` to `kaikeru.cloudflareaccess.com/cdn-cgi/access/login/…` → `fatal: unable to update url base from redirection` (Basic auth ignored). So git cannot pass Access as configured. Limits from docs: Workers request body 100 MB (Free/Pro), 200 MB (Business); Paid CPU 30 s default, 5 min max; **no wall-clock limit for HTTP while the client is connected**; 128 MB memory. `cloudflared access token -app=…` + `cf-access-token` header is documented for CLI clients (UNVERIFIED here: cloudflared not installed). Access path rules: the most specific path wins, so a `/git` app with its own policy overrides the host app (docs; UNVERIFIED on this account). |
 
 ---
 
 ## 4. Architecture and sequence
 
-**Rule kept:** the Queen decides, records and dispatches. Every Artifacts call runs in an executor.
+**Rule kept:** the Queen decides, records and dispatches. Every Artifacts call runs in an executor. **The git Worker is the intake executor:** it is synchronous because git waits on the HTTP response, the same shape as the Vault's `VaultWriter` entrypoint. It asks the Queen before it forks and reports after it pushes; it never decides.
 
-**One deliberate exception in shape (not in principle):** opening an inbox has to hand a token back to a person on the request path. The Queen cannot do I/O, the provisioner Workflow is asynchronous, and a token must never sit in Queen SQLite or in a broadcast. So the edge calls a **synchronous RPC entrypoint on the provisioner** (`InboxKeys`), the same pattern as the Vault's `VaultWriter` (edge `wrangler.jsonc` `services`). The Queen still makes the decision first: it records the contributor, applies caps and chooses the repo name.
+### 4.1 Components
 
-| Component | New responsibility |
+| Component | Responsibility |
 |---|---|
-| **edge** (`apps/edge/src/app.ts`) | `POST` and `DELETE /api/hives/:hive/inbox` behind Access: Queen `registerInbox`, then `InboxKeys.open` or `revoke`. Never logs the token. |
-| **provisioner** (`apps/provisioner`) | `InboxKeys` entrypoint: `open` gets or forks `<hive>-in-<handle>`, fast-forwards inbox `main` to hive main (the lander's fetch-then-push pattern), mints a write token (24 h) and returns it. `revoke` revokes the inbox's tokens. New Workflow op **`NOTE`** appends a note on `repo@sha` under `ref` (default `refs/notes/verdict`). **It mints tokens only for names that match `^<hive>-in-[a-z0-9]{1,24}$`.** |
-| **gatekeepers** (`event.ts`, `orchestrate.ts`) | `classifyPush`: an inbox repo with `refs/heads/*` (not `main`) → `intake`, then one step: Queen `submit(Submission)`. Notes refs are already ignored (event.ts:119). Every BUILD gate scans `changedBetween(baseSha, head)`. A non-drone origin fails closed when the reviewer is unavailable. |
-| **Queen** (`work/inbox.ts` new, planner, queen-node) | `registerInbox`; `submit`: dedupe, contributor lookup, caps, file or reopen the item, supersede; PIN trains; NOTE effects at milestones; `handoff`. |
-| **drones** | `PIN` action (no LLM): fetch `inbox ref`, check `headSha`, push it to train fork `main` (force), report `BuildResult` with `changedPaths`. REWORK with `seed`: pin first, then build. Then write back to the inbox branch (fast-forward only, else `<branch>-queen`). |
-| **dashboard** | Origin badge; **Push code** panel; **Let the swarm fix it** button. |
+| **edge** (`apps/edge`) | `/git/*` route **outside the Access middleware**: authenticates the git token (Basic password or `Authorization: Bearer`) or an Access JWT in `cf-access-token`; 401 with `WWW-Authenticate: Basic realm="QueenOS"` otherwise; rate-limits failures; forwards to the git Worker over a service binding with `x-queen-user` (never trusts a client value). Behind Access: `POST/GET/DELETE /api/git-tokens` (mint, list, revoke). Tokens live hashed in the `HiveRegistry` DO SQLite (`git_tokens`). |
+| **git Worker** (`apps/git`, new, `queenos-git`, `workers_dev:false`, no routes) | Smart-HTTP proxy. Artifacts binding; Queen DO binding (`script_name: "queen"`). Reads: hive main with a **read** token, advertisement filtered to `HEAD` + `refs/heads/main`, upload-pack streamed, GET and (small, buffered) POST retried on 503. Notes: v2 `ls-refs` / `fetch` for `refs/notes/{verdict,review,provenance}` answered from the Queen's projection (§7.5). Writes: pre-receive (§4.3), Queen `gitIntent`, fork, readiness probe, ref rewrite, streamed body, report-status rewrite, `remote:` lines, `readCommit`, Queen `gitPushed`. Read-only `/git/<hive>/t/<trainId>` for one train fork. Artifacts tokens exist only in module memory, minted per repo, never logged. |
+| **Queen** (`work/inbox.ts`, planner, queen-node) | RPCs `gitIntent` (pre-decision: rules that need state, dedupe, caps, target resolution, train id and fork name), `gitPushed` (the Submission: file, join or reopen the item, supersede; the train enters DEPLOYING), `gitAborted`, `notesFor` (the v1 notes projection). `handoff`, `deleteAfter` for rejected human forks, intent watchdog. |
+| **gatekeepers** | Unchanged event path (a train fork push). `changedBetween(baseSha, head)` for every BUILD gate; a non-drone origin fails closed when the reviewer is unavailable; protected-path policy. Findings go to the Queen (`appendAudits`), never to notes. |
+| **drones / provisioner** | REWORK takes its brief as the rendered v1 note text in the task (§7.2) and writes `Queen-Replies-To`. Provisioner `FORK` gains an optional `from` repo (seeded REWORK forks the rejected submission's fork). No `NOTE` op, no `InboxKeys`. |
+| **dashboard** | **Push code** panel (clone URL, create, list and revoke git tokens), origin badge, **Let the swarm fix it**. |
 
-### Sequence (unsolicited human push)
+### 4.2 Sequence (a human `git push origin HEAD:item/14`)
 
 ```
-human        Artifacts            gatekeepers          Queen (decide)                provisioner / drones / herald
-  │ git push   │                      │                     │                                 │
-  │──────────▶│ demo-in-kyle          │                     │                                 │
-  │  ok       │ refs/heads/tip-jar    │                     │                                 │
-  │◀──────────│── repo.pushed ───────▶│ classify: intake    │                                 │
-  │           │   (2–5.5 s, row 8)    │── submit(Sub) ─────▶│ dedupe (repo, after); file item │
-  │           │                       │                     │ READY → dispatchReady (slots,    │
-  │           │                       │                     │ budget, paused, affinity)        │
-  │           │                       │                     │ PIN train: FORK main ──────────▶│ fork demo-train-x
-  │           │                       │                     │◀── provision-result ────────────│
-  │           │                       │                     │ dispatch PIN drone ────────────▶│ fetch inbox@sha → push train main
-  │           │◀── push demo-train-x ─│─────────────────────│◀── build-result (Submission) ───│
-  │           │── repo.pushed ───────▶│ classify: gate      │ DEPLOYING → Herald preview ────▶│
-  │           │                       │ lookup → TESTING    │◀── deploy-result ───────────────│
-  │           │                       │ scans, smoke, REVIEWER (always for BUILD lane)        │
-  │           │                       │── train-result ────▶│ PASSED → car → … (unchanged)    │
-  │           │                       │                     │ or FAILED: NOTE effect ────────▶│ provisioner NOTE → inbox
-  │           │◀───────────────── refs/notes/verdict push (filtered: notes-ref) ────────────────│
+git client        edge            git Worker                    Queen (decide)                 Artifacts
+  │ GET info/refs?service=git-receive-pack ──▶ token ok ──▶ advert of <hive> (HEAD, main) ─────────────────────▶│
+  │◀──────────────────────────────────────────────────────── filtered advert ◀──────────────────────────────────│
+  │ POST git-receive-pack (cmds + pack) ─▶│──────────────▶│ read cmds (pkt-lines), local rules                   │
+  │                                       │               │── gitIntent{user, ref, old, new} ─▶│ dedupe, caps,  │
+  │                                       │               │                                    │ resolve item/14│
+  │                                       │               │◀─ accept{trainId, repo, item} ─────│ train BUILDING │
+  │                                       │               │── fork <hive> → <hive>-train-x ───────────────────────▶│ ~2–6 s
+  │                                       │               │── GET info/refs on the fork (503 → re-fork -rN) ──────▶│
+  │                                       │               │── POST receive-pack: old(main) new refs/heads/main + streamed pack ─▶│
+  │                                       │               │◀─ report-status ok ────────────────────────────────────│
+  │                                       │               │── readCommit(new) ────────────────────────────────────▶│
+  │                                       │               │── gitPushed{trainId, headSha, baseSha, title, msg, trailers} ─▶│ submission():
+  │                                       │               │◀─ {disposition, itemId, messages} ─│ joined-race, DEPLOYING │
+  │◀── remote: QueenOS … + ok refs/heads/item/14 ─────────│                                    │                │
+  │                                                         (fork push event → gatekeeper → preview → gate, unchanged)
 ```
 
-**Latency (estimate, UNVERIFIED end to end):**
-- event 2–5 s;
-- fork about 2 s plus Workflow start 0.4–4.8 s;
-- PIN about 5 s;
-- the train push event 2–5 s;
-- preview deploy;
-- gate 30–90 s.
+- `gitIntent` returns `refuse{reason}` for state rules (duplicate, over cap, unknown item, hive archived); the proxy drains the body and answers `ng` with `remote:` lines. Nothing is forked.
+- If the fork, push or `readCommit` fails, the proxy calls `gitAborted{trainId, reason}` (the Queen ejects the train with no attempt and deletes the fork) and answers `ng <ref> transient: retry the push`. If the proxy dies, the Queen's intent watchdog does the same after 10 min.
+- **Latency:** the push takes about 4–8 s (fork 2–6 s plus the upload). After it: push event 2–5 s, preview deploy, gate 30–90 s. **The first verdict note is readable about 1.5–2.5 minutes after `git push`** (UNVERIFIED end to end); rev 1's PIN step (~10 s) is gone.
 
-**The first note arrives about 1.5–3 minutes after `git push`.** This is slower than the "2–5 s" in the brief, which counted only the push event.
+### 4.3 Pre-receive rules (push time)
+
+Local (proxy, no state; evaluated on the command pkt-lines before the pack is read):
+
+| Rule | Refusal text |
+|---|---|
+| Exactly one ref update per push | `push one branch per submission` |
+| Only `refs/heads/*` (no tags, no `refs/notes/*`, nothing else) | `only branches can be pushed` |
+| Not `refs/heads/main` (or the hive's default branch) | `pushes to main are refused (the lander owns main)` |
+| No deletes (`new` = zeros) | `branch deletion is refused` |
+| Branch name: `item/<id>` / `goal/<slug>` with `[A-Za-z0-9_-]{1,64}`, or any other valid ref | `bad target: item/<id> takes [A-Za-z0-9_-]{1,64}` |
+| Token scope `push`; hive exists | `this token cannot push` / `no hive <hive>` |
+| Pack size ≤ 50 MB (counted while streaming; abort the upstream request, delete the fork) | `push too large (50 MB cap)` |
+
+Queen (`gitIntent`, state):
+
+| Rule | Outcome |
+|---|---|
+| `(hive, headSha)` already submitted | refuse: `already submitted as item <id> (train <t>)` |
+| More than `maxInboxOpenPerContributor` open items, or `maxInboxPushesPerHour` | refuse: `over cap: 3 open items; wait for a verdict` |
+| `item/<id>` unknown | refuse: `no item <id> in <hive>` |
+| `item/<id>` race decided, in a car or landed | **accept** as `late-new-item`: `item <id> already decided; filed follow-up item <id2>` |
+| Hive `paused` or budget exhausted | **accept**; `queued: hive paused` (the train waits) |
+| Re-push of the same `(user, ref)` before boarding | **accept**, supersede: `replaces your earlier push <sha> (train <t>)` |
+
+Content rules that need the diff (protected paths `.queen/**`, `wrangler.*`, `package.json` from a non-drone origin; 500-file cap; scans) stay at the gate, because the proxy never inflates the pack. The proxy could reject them at push time later by indexing the pack (post-Oct 14).
+
+### 4.4 Addressing
+
+`item/<id>` → that item (join its race; §2.5). `goal/<slug>` → the goal's single item if it has exactly one, else a new item under the goal. Anything else → uncorrelated, a new `feature`. A `Queen-Item` trailer overrides an uncorrelated branch name; it is applied in `gitPushed` (the proxy reads the commit after the push), so a bad `Queen-Item` trailer cannot be refused at push time: it files a new item and the `remote:` line says so.
 
 ---
 
-## 5. Contracts (`packages/queen-types`, first)
+## 5. Contracts (`packages/queen-types`)
 
-New file `src/inbox.ts`, exported from `index.ts`:
+T0 is **done** (inbox, Submission, race and pick contracts; SQLite v14). Rev 2 adds, in **T0b** (one owner for `notes.ts`, `git.ts`, `inbox.ts`, `index.ts`, `index.test.ts`):
 
 ```ts
-export const SubmissionOriginSchema = z.object({
-  kind: z.enum(["drone", "human", "agent"]),
-  /** drone: drone Workflow instance id; human: Access email; agent: "<name>@<owner email>". */
-  id: z.string().min(1).max(320),
+// git.ts (new)
+export const GitPushIntentSchema = z.object({
+  hive: HiveSlugSchema, user: z.string().email(),           // from the edge, never the client
+  ref: z.string().regex(/^refs\/heads\/.+/), oldSha: Sha40, newSha: Sha40,
 });
-
-/** Metadata only (races, rework counts, router stats, Model Board). Never a code path. */
-export const SubmissionProvenanceSchema = z.object({
-  trainId: z.string(), raceId: z.string().nullable(), candidate: z.number().int().min(0),
-  attempt: z.number().int().min(0), action: z.enum(["BUILD", "REWORK", "PIN"]),
-  model: z.string(), failedModels: z.array(z.string()).max(5), usage: BuildUsageSchema,
-  verified: z.boolean(), buildMs: z.number().int().min(0),
-  followUps: z.array(FollowUpSchema).max(5),
-  /** Inbox origin: the push event id (day1 row 8b) and the head commit's trailers. */
-  eventId: z.string(), trailers: z.record(z.string(), z.string()),
-}).partial();
-
-export const SubmissionSchema = z.object({
-  hive: z.string().min(1),
-  /** The fork the code is in: a train fork (drone) or an inbox fork. */
-  repo: z.string().min(1),
-  ref: z.string().regex(/^refs\/heads\/.+/),
-  headSha: z.string().regex(/^[0-9a-f]{40}$/),
-  /** Merge base with hive main (gate diff base); the PIN drone fills it for inbox code. */
-  baseSha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
-  origin: SubmissionOriginSchema,
-  /** Solicited (or targeted with Queen-Item / item/<id>): link. Absent with no target: intake files an item. */
-  itemId: z.string().max(64).optional(),
-  /** What an external submission addressed (branch name or trailer); the Queen resolves it to `itemId`. */
-  target: z.discriminatedUnion("kind", [
-    z.object({ kind: z.literal("item"), itemId: z.string().min(1).max(64) }),
-    z.object({ kind: z.literal("goal"), goal: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) }),
-  ]).optional(),
-  /** Head commit subject (≤120) and message (≤4000): the intent of unsolicited code. */
-  title: z.string().max(120).optional(),
-  message: z.string().max(4000).optional(),
-  changedPaths: z.array(z.string().max(200)).max(200).optional(),
-  provenance: SubmissionProvenanceSchema.default({}),
+export const GitIntakeDecisionSchema = z.discriminatedUnion("verdict", [
+  z.object({ verdict: z.literal("accept"), trainId: z.string(), repo: z.string(),   // <hive>-train-<12hex>
+             messages: z.array(z.string().max(200)).max(5) }),
+  z.object({ verdict: z.literal("refuse"), reason: z.string().max(200), messages: z.array(z.string().max(200)).max(5) }),
+]);
+export const GitPushedSchema = z.object({
+  hive: HiveSlugSchema, trainId: z.string(), repo: z.string(), ref: z.string(), headSha: Sha40,
+  baseSha: Sha40,                                             // hive main at fork time (the gate computes the merge base)
+  title: z.string().max(120), message: z.string().max(4000), trailers: z.record(z.string(), z.string()),
 });
-
-export const InboxSchema = z.object({
-  hive: z.string(), email: z.string(), handle: z.string().regex(/^[a-z0-9]{1,24}$/),
-  repo: z.string(), createdAt: z.number().int(), revokedAt: z.number().int().nullable(),
-  openItems: z.number().int().min(0),
+export const GitPushedResultSchema = z.object({
+  disposition: SubmitDispositionSchema, itemId: z.string(), messages: z.array(z.string().max(200)).max(5),
 });
-export const InboxOpenResultSchema = z.object({          // edge response; never stored
-  handle: z.string(), repo: z.string(), remote: z.string().url(),
-  username: z.literal("queen"), password: z.string(), expiresAt: z.string(), mainSha: z.string(),
+export const GitTokenSchema = z.object({
+  id: z.string(), email: z.string().email(), scopes: z.array(z.enum(["read", "push"])).min(1),
+  createdAt: z.number().int(), expiresAt: z.number().int(), lastUsedAt: z.number().int().nullable(),
+  revokedAt: z.number().int().nullable(),
 });
-export const SubmitDispositionSchema = z.enum(["filed", "joined-race", "reopened", "superseded", "late-new-item"]);
-export const SubmitOutcomeSchema = z.object({
-  outcome: z.enum(["applied", "ignored:duplicate", "ignored:own-push", "ignored:inbox-main",
-                   "ignored:unknown-inbox", "ignored:revoked", "ignored:over-cap", "ignored:paused"]),
-  disposition: SubmitDispositionSchema.optional(),   // with `applied`
-  itemId: z.string().optional(), trainId: z.string().optional(),
+export const GitTokenMintResultSchema = GitTokenSchema.extend({ token: z.string() });  // shown once; never stored
+export const NotesProjectionSchema = z.object({
+  ref: z.enum(["refs/notes/verdict", "refs/notes/review", "refs/notes/provenance"]),
+  version: z.number().int(),                                  // ledger version: cache key
+  notes: z.array(z.object({ sha: Sha40, text: z.string().max(8000) })).max(1000),
 });
 ```
 
-`inbox.ts` also exports `inboxRepoName`, `INBOX_REPO_RE`, `parseInboxRepo`, `parseSubmissionTrailers`, `targetFromRef` and `itemIdFromRef`. **Dispositions:**
-- `filed`: uncorrelated; a new item, no race record (§6.2).
-- `joined-race`: correlated; a candidate in the item's race.
-- `reopened`: a re-push to a FAILED inbox item.
-- `superseded`: a re-push replaced a train not yet in a car.
-- `late-new-item`: the target's race was decided, or its code is in a car or landed; filed as a follow-up.
+- `SubmitOutcomeSchema.outcome` gains `refused:duplicate`, `refused:over-cap`, `refused:unknown-item`, `refused:rule`, `aborted:transient`. The `ignored:inbox-main`, `ignored:unknown-inbox`, `ignored:revoked` values stay in the enum for old rows, unused.
+- `InboxSchema` and `InboxOpenResultSchema` are **deprecated** (kept exported, unused). The v14 `inboxes` table stays (additive migration), unused.
+- `DroneTaskSchema.seed` stays but means "fork from this repo" (`{repo, headSha}`); `writeBack` is dropped from use. `DroneTaskSchema` gains `brief?: string` (rendered v1 note text). `ProvisionCommandSchema` FORK gains `from?: string`. The `NOTE` op stays in the schema behind its non-destructive guard and is never sent.
+- **T0b fixes in `inbox.ts`:** `TRAILER_RE` (inbox.ts:183, today `/^(queen(?:-[a-z]+)?)\s*:\s*(.+?)\s*$/i`) must accept multi-segment keys such as `Queen-Replies-To` (`/^(queen(?:-[a-z]+)*)\s*:\s*(.+?)\s*$/i`), with a test. The note summary line must **not** start with `queen:` (it would parse as a `Queen:` trailer); the renderer starts it with the verdict word (`REJECTED by SECURITY: …`).
+- Sim and Queen routes keep `POST /hives/:hive/sim/…` shapes (§12).
 
-Changes to existing schemas (all optional, so old payloads parse):
+**Naming clash** (done in T0): `WorkPlanResult.submissions` → `dispatches`.
 
-| Schema (file) | Change |
-|---|---|
-| `DroneActionSchema` (drone.ts) | + `"PIN"` |
-| `DroneTaskSchema` (drone.ts) | + `seed?: {repo, ref, headSha}` (PIN, and REWORK of inbox code); + `writeBack?: {repo, ref}` |
-| `ProvisionCommandSchema` (executors.ts) | + op `NOTE {commandId, hive, trainId, repo, sha, text ≤2000}`. `ProvisionResult.op` gains `"NOTE"`. |
-| `WorkItemSchema` (work.ts) | + `inbox?: {repo, ref, handle, headSha, handoff: boolean} \| null`. `WorkSourceKindSchema` + `"agent"` (a human stays `"user"`, `actor` = email). |
-| `WorkActionSchema` (work.ts) | + `"handoff"` |
-| `GuardrailsSchema` (work.ts) | + `maxInboxOpenPerContributor` (default 3, max 10), `maxInboxPushesPerHour` (default 20, max 60). Guardrails need parse-time defaults, so **stored overrides and PATCH use the new `GuardrailOverridesSchema`** (`z.object(GUARDRAIL_FIELDS).partial()`; Zod 4 `.partial()` still fills defaults, so a partial override parses to the full set). |
-| `RaceSchema` (work.ts) | `width` minimum is now **1** (it was 2); + `entryClosesAt?` (§2.5). |
-| `observability.ts` | + event types `race.picking`, `race.rejected`, `inbox.opened`, `inbox.revoked`, `submission.received`, `note.failed`. |
-| `HiveSettings.race` (autonomy.ts) | `judge` / `pickWindowMs` are **optional** until T9a adds them to `effectiveSettings` (`apps/queen/src/work/guardrails.ts`). |
-| `MergeTrainSchema` (state.ts) | + `origin?: SubmissionOrigin` (dashboard badge, gate fail-closed) |
-| `GateTargetSchema` (queue.ts) | + `origin?`; `baseSha` also set for BUILD trains (the diff base) |
-
-**Naming clash:** `WorkPlanResult.submissions: DispatchSubmission[]` (work/ledger.ts:167) already means "items to dispatch". T0 renames it to `dispatches`, a mechanical change in `ledger.ts` and `queen-node.ts`, so "submission" means one thing.
-
-**SQLite v14** (`apps/queen/src/db.ts`, as built; additive only):
-- `inboxes(email PK, handle UNIQUE, repo UNIQUE, created_at, revoked_at)`;
-- `submissions(repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, disposition, target, created_at, PRIMARY KEY(repo, head_sha))`, with indexes on `(repo, ref, created_at)`, `head_sha`, `(origin_id, created_at)`, `item_id` and `created_at`; `target` is the JSON `SubmissionTarget`; pruned with the event log (`pruneSubmissions`);
-- `work_items.inbox_json`, `work_items.judge`;
-- `merge_trains.origin_json`;
-- `races.entry_closes_at`, `pick_deadline_at`, `recommended_train_id`, `recommend_reason`, `decided_by`, `rejections` (JSON), plus index `races_item(item_id)`;
-- `model_preference(model, kind, rating, n, updated_at, PRIMARY KEY(model, kind))`;
-- `model_stats.picks`, `model_stats.picks_against_recommendation`.
+**SQLite v14** (as built): see rev 1 (`inboxes`, `submissions`, race and pick columns, `model_preference`). Rev 2 needs no Queen migration: an intent is a train row in BUILDING with `forkState` PENDING and `origin` set; `submissions` rows record outcomes including `refused:*`. The edge `HiveRegistry` gains `git_tokens(id PK, email, hash UNIQUE, scopes, created_at, expires_at, last_used_at, revoked_at)` (its own migration, T3).
 
 ---
 
@@ -347,65 +342,63 @@ Changes to existing schemas (all optional, so old payloads parse):
 ### 6.1 Trains
 
 There are no new phases.
-- A PIN train is a BUILD-lane train whose BUILDING phase runs the PIN drone, as a car's BUILDING phase runs the MERGE drone.
-- `TrainAction` gains `PIN`.
-- `submission()` keeps `buildResult()`'s guards: phase BUILDING, `forkState` READY, stale and duplicate checks.
+- A **pre-forked train** is a BUILD-lane train created by `gitIntent` in BUILDING with `forkState: PENDING` and no drone. `gitPushed` moves it through `submission()` (same guards as `buildResult()`: phase BUILDING, stale and duplicate checks) to DEPLOYING; `forkState` becomes READY.
+- `gitAborted`, or the intent watchdog (10 min without `gitPushed`), ejects it with no attempt charged and deletes the fork if it exists.
+- `TrainAction` does **not** gain `PIN` (rev 1 plan dropped).
 
-### 6.2 Items (WorkPlanner, new pure `work/inbox.ts`)
+### 6.2 Items (WorkPlanner, pure `work/inbox.ts`)
 
 | Event | Rule |
 |---|---|
-| **Correlated** push (a target: branch `item/<id>` or `goal/<slug>`, or a `Queen-Item` trailer; or an `itemId`) | Disposition **`joined-race`**: the head enters the resolved item's race as a candidate. A race is created lazily at width 1 if the item has none, and `entryClosesAt` bounds entries. `goal/<slug>` resolves to the goal's single item when it has exactly one; otherwise a new item is filed under the goal. |
-| **Uncorrelated** push (no target, no `itemId`) | Treated as having **already won a race**: disposition **`filed`**, a new item with **no race record**, and its single train goes straight to gate, car, land (the row below). "Already won" means no competition, never no vetting: every gate still applies. |
-| **Late entry** (the target's race is decided, its code is in a car, or it has landed) | Disposition **`late-new-item`**: a follow-up item ("<title> (follow-up)"). Never a rejection. |
-| Push, new `(inbox, ref)` (uncorrelated) | File a `feature`: title = head subject, body = head message, acceptance = `- ` lines under an `Acceptance:` line if present. Then **READY**, skipping TRIAGE (users are not deduped, §2.2 of v2-design). `paths: []`, so it is optimistic. The PIN train's `changedPaths` widen the claims. |
-| Duplicate `(repo, headSha)` | `ignored:duplicate`. The same SHA pushed to a second branch is also a duplicate. **The dedupe key is `(repo, after)`, as day1 row 8 says; `(repo, ref)` is the supersede key.** |
-| `headSha` equals a head the Queen wrote (the REWORK write-back) | `ignored:own-push` |
-| Re-push to `(inbox, ref)` while its train is **not yet in a car** (`carId = null`) | Eject the old train (`superseded by push <sha>`, no attempt charged, fork deleted), then start a new PIN train for the same item. |
+| **Correlated** push (`item/<id>`, `goal/<slug>`, or `Queen-Item`) | Disposition **`joined-race`**: the head enters the resolved item's race as a candidate. A race is created lazily at width 1 if the item has none; `entryClosesAt` bounds entries. |
+| **Uncorrelated** push | **Already won a race**: disposition **`filed`**, a new item with no race record; its single train goes straight to gate, car, land. Every gate still applies. |
+| **Late entry** (race decided, code in a car, or landed) | Disposition **`late-new-item`**: a follow-up item ("<title> (follow-up)"). Never a rejection; the push output says so. |
+| New `(user, ref)`, uncorrelated | File a `feature`: title = head subject, body = head message, acceptance = `- ` lines under an `Acceptance:` line. Then **READY**, skipping TRIAGE. `paths: []`, so it is optimistic; the gate's `changedBetween` widens the claims. |
+| Duplicate `(hive, headSha)` | Refused at push time (`refused:duplicate`). The dedupe key is the head SHA; `(user, ref)` is the supersede key. |
+| Re-push to `(user, ref)` while its train is **not yet in a car** | Eject the old train (`superseded by push <sha>`, no attempt charged, fork deleted), and the new pre-forked train takes its place for the same item. |
 | Re-push while the train **is in a car**, or the item is LANDED or SHIPPED | File a **new** item ("<title> (follow-up)"). The earlier code lands on its own. |
-| Re-push to a **FAILED** inbox item | FAILED → READY (attempts + 1). |
-| Gate reject (any check) on human or agent origin | Train EJECTED; item **FAILED** with `blockedReason "awaiting contributor"`; NOTE. **No escalation and no auto-rework.** The contributor was told by the note. |
-| …with `inbox.handoff` (`Queen: rework`) or `workAction handoff` | `rework()` as for drones: a REWORK train with `seed = inbox@head`, under `maxReworks`. Exhaustion is `REWORK_EXHAUSTED`, as today. |
-| Merge conflict or integration failure | As for drones (D7, `waitForCarSeq`), but the rework is not automatic: FAILED plus a NOTE ("conflicts with work that landed: src/x.js; rebase on `queen/main` and push, or hand off"). |
-| Caps | More than `maxInboxOpenPerContributor` open items, or more than `maxInboxPushesPerHour`, gives `ignored:over-cap` plus one NOTE per hour. `maxOpenItems` and the daily budget apply as for any item. `paused` holds the item READY. |
+| Re-push to a **FAILED** item | FAILED → READY (attempts + 1). |
+| Gate reject (any check) on human or agent origin | Train EJECTED; item **FAILED** with `blockedReason "awaiting contributor"`; the fork is kept (`deleteAfter` = 24 h or until the item leaves FAILED) for handoff. **No escalation and no auto-rework.** The note tells the contributor. |
+| …with `Queen: rework` or `workAction handoff` | `rework()` as for drones: a REWORK train **forked from the rejected fork** (`seed`), under `maxReworks`. |
+| Merge conflict or integration failure | As for drones (D7), but not automatic for human/agent origin: FAILED plus a verdict note ("conflicts with work that landed: src/x.js; rebase on `origin/main` and push, or hand off"). |
+| Caps | Refused at push time over `maxInboxOpenPerContributor` / `maxInboxPushesPerHour`. `maxOpenItems` and the daily budget apply as for any item. `paused` holds the item READY. |
 
-**Autonomy and the error budget are unchanged.** Inbox code auto-ships when the budget is green. If a release that carries inbox code rolls back, that is a **real change failure**: it counts against the SLO and the rollback streak exactly as drone code does, the P0 bug goes to the swarm (`source.kind: sentinel`), and the contributor's commit gets a `ROLLED BACK` note. Same rules means same consequences.
+**Autonomy and the error budget are unchanged.** Pushed code auto-ships when the budget is green. A rollback of a release that carries pushed code is a real change failure, the P0 goes to the swarm, and the commit's note gets `ROLLED BACK`. Same rules means same consequences.
 
-### 6.3 Handoff: human and agent on one branch
+### 6.3 Handoff: human and agent on one item
 
-1. The REWORK drone is dispatched with `seed`. It runs the PIN body (train `main` = the human's head), then the builder, and pushes the train fork. **Its brief is the note(s) on the rejected commit** (`refs/notes/verdict` rework brief and verdict, `refs/notes/review` findings), fetched and read exactly as a human or external agent would read them (§7). The Queen still decides to rework, from its ledger; the notes are only the brief (§7.3).
-2. It reports `BuildResult`, which is a Submission with origin `drone` and the item linked. Its head commit's note carries `Queen-Replies-To: <rejected sha>`, so the rework chain can be followed in history.
-3. Then it writes back: it pushes the new head to `inbox refs/heads/<ref>` if that is a fast-forward (the human has not pushed since); otherwise it pushes to `<ref>-queen`.
-4. The resulting push event is `ignored:own-push`. The Queen recorded the head in step 2, before the write-back.
+1. The Queen decides to rework (ledger: attempts, `maxReworks`, origin, handoff). The provisioner forks the **rejected submission's fork** (`FORK from`), so the REWORK train's `main` is the human's head. No PIN, no copy.
+2. The REWORK drone's brief is `DroneTask.brief`: the v1 verdict and findings text rendered by the T0b renderer from the ledger, byte-identical to what `git log --notes` shows the human (§7.2).
+3. It reports `BuildResult` (a Submission with origin `drone`, item linked). Its commit message carries `Queen-Replies-To: <rejected sha>`, and its projected note does too.
+4. **No write-back** to anybody's branch (there is no inbox). The human fetches the fix read-only from `/git/<hive>/t/<trainId>` (§3.4), or from `origin/main` once it lands.
 
 ---
 
 ## 7. Notes are the protocol, the ledger is the truth
 
-Decided by the user, 2026-10-07. This section both defines the notes protocol (7.1 to 7.9) and keeps the write-back mechanics (7.10).
+Decided by the user, 2026-10-07. Rev 2 keeps the protocol (7.1–7.4, 7.8, 7.9) and changes **where notes live**: they are a projection of the ledger served by the proxy, never stored in Artifacts.
 
 ### 7.1 Principle
 
-Git notes are QueenOS's **outward feedback protocol for humans and agents**. Verdicts, review findings, rework briefs and provenance are attached to the exact commit they judge. They travel with `fetch` and `fork` and show up in `git log --notes=...`, with no SDK or API needed. Any agent that speaks git (Claude Code, Codex, a script) can close the loop: fetch the notes, read the rejection, fix, push. External agents: see `docs/agent-protocol.md` and the Claude Code plugin at `plugins/queenos/`.
+Git notes are QueenOS's **outward feedback protocol for humans and agents**. Verdicts, review findings, rework briefs and provenance are attached to the exact commit they judge. They travel with `fetch` and show up in `git log --notes=...`, with no SDK or API needed. Any agent that speaks git can close the loop: fetch the notes, read the rejection, fix, push.
 
 ### 7.2 Rework reads notes
 
-The Queen still **decides** rework (from its SQLite ledger: attempts, `maxReworks`, origin, handoff) and dispatches the drone. The REWORK drone's **brief is the note(s) on the rejected commit**, read exactly as a human or external agent would read them. The rework commit's own note carries `Queen-Replies-To: <rejected sha>`, so the chain (reject, rework, reject, rework, pass) can be followed in plain `git log --notes`.
+The Queen **decides** rework from its SQLite ledger and dispatches the drone. The REWORK drone's brief is the v1 note text for the rejected commit, rendered by the same T0b renderer the proxy uses, so it is exactly what a human or external agent reads. The rework commit carries `Queen-Replies-To: <rejected sha>`, so the chain (reject, rework, reject, rework, pass) can be followed in plain `git log --notes`.
 
 ### 7.3 Notes are never authority
 
-Inbox owners can write notes into their own fork, so a forged `Queen-Verdict: PASSED` is possible.
-- The Queen decides **only from its ledger**. Notes are a projection of it.
-- Drones treat notes as a **brief, not permission**. A note can tell a drone what to fix; it can never make code pass, land or skip a gate.
-- The lander carries forward **only Queen-written notes** (those the provisioner's `NOTE` op wrote into a train fork), never notes from an inbox fork (§2.4 row 10, §8).
-- Any note the Queen relies on (for example a rework brief) must be **re-derivable from the ledger**. If the fetched note is missing or does not match, the Queen regenerates the brief from its ledger and the drone uses that.
+- The Queen decides **only from its ledger**. Notes are a projection of it, regenerated on every fetch.
+- Nobody can write a v1 note: the proxy refuses pushes to `refs/notes/*`, and v1 notes are not stored in any Artifacts repo. Rev 1's forged-note problem (an inbox owner writing `Queen-Verdict: PASSED`) is gone.
+- Drones still treat a brief as information, never permission. A note can tell a drone what to fix; it can never make code pass, land or skip a gate.
+- A note a client fetched earlier and kept locally can be stale or edited locally; only a fresh fetch from the proxy is the current verdict.
 
 ### 7.4 Note format v1
 
-A human-readable summary line, an optional body, then trailer lines. Total at most `MAX_NOTE_TEXT` (2000 characters, `executors.ts`).
+A human-readable summary line, an optional body, then trailer lines. Each entry at most `MAX_NOTE_TEXT` (2000 characters, `executors.ts`); a commit's note holds its entries in order (newest last), at most 8 KB.
 
 ```
-<summary line>
+<summary line>               (starts with the verdict word, never "queen:")
 
 <optional body>
 
@@ -423,77 +416,80 @@ Queen-Memory: <memoryId> used|ignored        (repeatable; kind memory)
 ```
 
 - **Unknown keys are ignored** (forward compatible); `Queen-Note: v1` is the version gate.
-- **Contract (T0b):** a Zod schema plus a renderer and a parser in `packages/queen-types/src/notes.ts`. The renderer clips the body and findings to fit 2000 characters (findings dropped last-first, with a "+N more" line). The parser follows `parseSubmissionTrailers` (`inbox.ts`): case-insensitive keys, trailers on lines of their own, validated ids. Both ends (Queen, provisioner, drones, gatekeepers, the plugin) use these helpers; nobody hand-formats a note.
-- hive-kit already has the primitives (`addNote`, `readNote`, `pushNotes`, `NOTES_REF = refs/notes/queen` in `git.ts`). `refs/notes/queen` already holds the Cognitive Ledger `GitNotesPayload` JSON (`ledger.ts`) on hive-main commits, unchanged. The v1 note is a separate, text-first format for outward feedback and lives on **other refs** (§7.5), because git keeps one note per commit per ref and mixing formats would break both parsers.
+- **Contract (T0b):** a Zod schema plus a renderer and a parser in `packages/queen-types/src/notes.ts`. The renderer clips the body and findings to fit 2000 characters (findings dropped last-first, with a "+N more" line). The parser follows `parseSubmissionTrailers` (`inbox.ts`, with the multi-segment `TRAILER_RE` fix): case-insensitive keys, trailers on lines of their own, validated ids. The Queen, the proxy, the drones and the plugin all use these helpers; nobody hand-formats a note.
+- `refs/notes/queen` stays the **internal** Cognitive Ledger (`GitNotesPayload` JSON on hive-main commits, hive-kit `NOTES_REF`), unchanged, written by drones and the lander. Never parse it as v1, never write v1 to it.
 
-### 7.5 Refs per purpose and writer
+### 7.5 Where notes live: synthesized by the proxy from the ledger (decided rev 2)
 
-Separate refs reduce push contention and let a reader fetch only what it needs.
-
-| Ref | Holds | Written by |
+| Ref | Holds | Source |
 |---|---|---|
-| `refs/notes/verdict` | verdicts, rework briefs (v1) | provisioner `NOTE` op (the Queen's milestones) |
-| `refs/notes/review` | findings | gatekeeper (T4), through the `NOTE` op |
-| `refs/notes/provenance` | model, trace, memories (kinds `provenance`, `memory`) | drone (builder), through the `NOTE` op |
-| `refs/notes/queen` | **internal Cognitive Ledger JSON** (`GitNotesPayload`, hive-kit `NOTES_REF`); unchanged, already in hive history | drones and the lander (existing). **Never parse it as v1, never write v1 to it.** |
+| `refs/notes/verdict` | verdicts and milestones, rework briefs (v1) | Queen `notesFor(hive, ref)` projection |
+| `refs/notes/review` | findings (from the gatekeeper's `appendAudits`) | same |
+| `refs/notes/provenance` | model, trace, memories (kinds `provenance`, `memory`) | same (from the drone's `BuildResult` provenance) |
+| `refs/notes/queen` | internal Cognitive Ledger JSON | Artifacts hive main (existing); **not** advertised by the proxy |
 
-**Collision rule: one format per ref, and parsers must ignore refs they do not own.** The v1 parser reads only `verdict`, `review` and `provenance`; the ledger code reads only `queen`. A note that lacks `Queen-Note: v1` is not v1.
+**How it works.** On a v2 `ls-refs` whose `ref-prefix` list contains only `refs/notes/` (and the `refs/tags/` git adds for tag following), the proxy answers itself with the three refs. Each ref points at a deterministic, parentless notes commit: one blob per annotated commit (its entries, newest last), one flat tree keyed by the 40-hex SHA, a fixed author and timestamp. On a `fetch` whose wants are all such commits, the proxy builds the pack (no deltas; `CompressionStream("deflate")` and Web Crypto SHA-1) and answers with `acknowledgments/ready` or straight `packfile`, honouring `sideband-all`. An unchanged ledger gives the same SHA, so the client fetches nothing. The projection is bounded (the last 1000 annotated commits per ref, about 30 days) and cached per `(hive, ref, version)`. Proven in probe 6 (§3.6).
 
-Fetch everything with `git fetch queen 'refs/notes/*:refs/notes/*'`, or one ref. `NOTE` takes a `ref` (one of the three v1 refs, default `refs/notes/verdict`) and `text`. The gatekeeper filter already ignores all `refs/notes/*` pushes (event.ts:119).
+**Options considered:**
+
+| Option | Verdict |
+|---|---|
+| (a) A per-hive notes repo, with the proxy merging info/refs from two repos | Rejected. Every note is a push, and every push puts that repo into a 503 episode (40 s to 7+ min, 1deb7ab), so the busiest notes repo would be sick most of the demo. A mixed fetch (heads + notes) cannot be served by one upstream without splicing two packs. Needs the NOTE op, retries and contention handling. |
+| (b) The Queen writes notes into the hive main repo's notes refs | Rejected. It multiplies pushes to the one repo that every clone, fork and landing reads, so its 503 episodes would hit the whole pipeline. It still needs the NOTE op with append-retry under contention. |
+| (c) The proxy synthesizes notes refs from the Queen's ledger | **Chosen.** Zero Artifacts writes for feedback, no contention, no forgery, always current, works for commits that live only in forks. Cost: a small pack builder in the proxy (~150 lines in the spike). |
+
+**Rules for clients** (and the plugin):
+- Fetch notes on their own: `git fetch origin '+refs/notes/*:refs/notes/*'`. A fetch that mixes heads and notes gets heads only (the proxy does not advertise notes then). A pack-splicing mixed fetch is a post-Oct 14 option (rewrite the pack header count and trailer).
+- The leading `+` is required: each ledger change is a new parentless commit (a forced update). Local notes refs are a cache of the server's; never edit them.
+- Protocol v2 only (git ≥ 2.26 defaults to it). A v0/v1 client sees no notes refs.
 
 ### 7.6 Timing
 
-Notes are pushes, and pushes trigger the Artifacts per-repo 503 episodes (commit 1deb7ab). So:
-- Write verdict notes **after a gate finishes**, never immediately before something reads that repo (the PIN, MERGE, lander or next gate).
-- `NOTE` writes are **retried and non-blocking**. Failure after retries records a `note.failed` event; nothing waits on it or is ejected for it.
+There are no notes writes, so there is no note push contention and no 503 interaction. A note becomes visible as soon as the ledger event that causes it commits (gate verdict, conflict, integration failure, LANDED, SHIPPED, ROLLED BACK). Drone submissions get notes too (they are free now), so a landed commit's history shows the swarm's verdicts.
 
 ### 7.7 Carry-forward
 
-Rework and merge commits reference prior notes through `Queen-Replies-To` (a rework points at the rejected sha). The lander copies **Queen-written** notes from the train fork into hive main, and copies nothing from an inbox fork (§7.3).
+`Queen-Replies-To` links rework to the rejected sha. The lander's `carryNotes` keeps carrying only `refs/notes/queen` (internal) into hive main. v1 notes need no carrying: the projection covers every submission head, plus `LANDED main@<sha>` names the landed commit.
 
 ### 7.8 Memory bonus
 
-A `Queen-Kind: memory` note on `refs/notes/provenance` records which hive memories the builder was given and which it cited (`Queen-Memory: <memoryId> used|ignored`, repeatable). This closes the HANDOFF gap "the dashboard shows recalled memories but not whether the builder used them": the dashboard reads the projection from the ledger, and the note makes it visible in git.
+A `Queen-Kind: memory` note on `refs/notes/provenance` records which hive memories the builder was given and which it cited (`Queen-Memory: <memoryId> used|ignored`, repeatable). This closes the HANDOFF gap "the dashboard shows recalled memories but not whether the builder used them".
 
 ### 7.9 External agents
 
-An outside agent needs only git: `docs/agent-protocol.md` is the agent-facing protocol (get an inbox, push, fetch notes, parse the trailers, fix, re-push) and `plugins/queenos/` is the Claude Code plugin that automates that loop.
-
-### 7.10 Write-back mechanics
-
-- **Writer:** the provisioner's `NOTE` op, dispatched by the Queen as a `provision` effect with `commandId <trainId>-note-<n>` at these milestones:
-  - gate verdict (pass or reject, with the summary; up to 8 findings go to `refs/notes/review` as `Queen-Finding` trailers);
-  - conflict;
-  - integration failure;
-  - LANDED;
-  - SHIPPED or ROLLED BACK.
-- **Why the provisioner:** it already owns repo administration (fork, delete, create, tokens). This keeps drones on code. The gatekeeper does not write notes today (its verdicts are `appendAudits` to the Queen), and later milestones are the Queen's to announce anyway.
-- **Body:**
-  1. fetch the inbox's notes ref (`ref`, default `refs/notes/verdict`; depth 1);
-  2. read the existing note on `sha`;
-  3. **append** (a separator line, up to 8 KB per commit; each appended entry is one v1 note of at most 2000 characters);
-  4. `addNote` and push **without** force;
-  5. on a non-fast-forward, re-fetch and retry (3×).
-  - Day 1 pushed notes with `force: true`. Force here would lose concurrent milestones.
-- **Event loop:** a notes push fires `repo.pushed` (day1 row 8). `classifyPush` drops `refs/notes/*` before anything else (event.ts:119, verified in code). The inbox inherits the hive's `refs/notes/queen` (the internal ledger JSON) at fork time (day1 row 1), so `git log --notes=queen` shows the swarm's ledger on main's history; the outward verdicts are under `--notes=verdict`.
-- **The hive ledger:** the same NOTE is also written to the train fork, so the lander's `carryNotes` brings the (Queen-written) verdict to hive main. Notes the human writes in their own inbox are never read or carried (§7.3).
-- **Drone submissions:** no NOTE (nobody reads a train fork, and it adds Artifacts load). The verdict reaches the hive through the event log, as today.
+An outside agent needs only git: `docs/agent-protocol.md` (clone, push, fetch notes, parse the trailers, fix, re-push) and `plugins/queenos/`.
 
 ---
 
 ## 8. Security model
 
+### 8.1 Authentication (decided rev 2)
+
+Stock git cannot pass Cloudflare Access: probe 7 shows a `302` to the Access login page and `fatal: unable to update url base from redirection`. Git sends only `Authorization` (Basic/Bearer) or configured extra headers, never the browser's `CF_Authorization` cookie.
+
+| Option | Friction | Verdict |
+|---|---|---|
+| `cloudflared access token -app=…` sent as `cf-access-token` via `http.extraHeader` | Install cloudflared; token expires with the Access session (24 h); per-command header plumbing | Supported as a secondary path (verified in the Worker with the existing `access.ts` verifier, same `aud`), not the default |
+| Access service token (`CF-Access-Client-Id/Secret` headers) | Per-agent secret pair; Access-team admin work; no person attached | Post-Oct 14 (Q9) |
+| **QueenOS git token** minted on the dashboard (behind Access), sent as the Basic password | Copy once; git's credential helper remembers it, exactly like a GitHub PAT | **Chosen** |
+
+- **Access configuration (T8, manual):** add a second self-hosted Access app for `queenos.kaikeru.com/git` with a **Bypass** policy. The most specific path wins (Access app-path docs), so `/git/*` reaches the edge without the Access login while everything else stays behind Access. The edge's `/git/*` handler is the only gate there. Deploy the edge's git-token check **before** adding the bypass.
+- **Token:** `qgt_<32 random bytes, base32>`, minted only by `POST /api/git-tokens` behind Access, bound to the Access email, stored as SHA-256 (lookup by hash, so no timing oracle), scopes `read` / `push`, TTL 30 days (max 90), `last_used_at` updated at most once per minute, revocation immediate (checked on every request). The plaintext is shown once and never logged.
+- **Rate limits:** failed git auth per IP and per token id (Workers rate-limit binding, or a counter in the registry DO), plus per-user caps at `gitIntent`.
+
+### 8.2 Controls
+
 | Concern | Control |
 |---|---|
-| A human bypasses the gates or the LANDER | The only token a person ever gets is minted by `InboxKeys`, which refuses any repo name but `<hive>-in-<handle>`. Hive main is written only by the LANDER (an executor with the binding). *Correction to the brief: Artifacts tokens are not in the Vault. The Vault holds Cloudflare deploy credentials, and executors mint Artifacts tokens on demand through the `ARTIFACTS` binding. The guarantee comes from `InboxKeys`'s name check.* |
-| Token scope | `repo.createToken("write", 86400)` on the inbox repo handle. Tokens are per repo (a repo-level method; `delete()` removes "all associated tokens", discovery §1). **UNVERIFIED** that a repo token cannot authenticate to another repo; test it on day 1 of the build (§15, Q3). |
-| Token lifetime and revocation | TTL 24 h (the allowed range is 60 s to 1 y). Re-opening mints a new token; `?rotate=1` also revokes the others (`listTokens` + `revokeToken`). `DELETE …/inbox` revokes everything and marks the inbox `revoked_at`, so later pushes are `ignored:revoked`. Per person = per repo, so revocation is per contributor. **UNVERIFIED** whether revocation takes effect immediately. |
-| Who is the contributor | The **inbox owner** (Access email), never the commit author (which anyone can set). `Queen-Origin: agent:x` is a claim within the owner's accountability. |
-| Git is not behind Access | Pushes go straight to `*.artifacts.cloudflare.net`; the token is the only gate. That is why the TTL is short. |
-| Untrusted code | The same exposure as LLM code: Worker Preview per train, policy, security and allowlist scans, reviewer, integration gate, staging, Sentinel. **Fix required (T4):** scan `changedBetween(baseSha, head)` (§2.4 row 7), or modified files escape the in-diff scan. Also: changes to `.queen/**`, `wrangler.*` and `package.json` from a non-drone origin are a policy **error**, since the deploy config is not a contributor's to change. |
-| Reviewer fails open | For drones it fails open on infra (orchestrate.ts:406). For human or agent origin it **fails closed**: the train is reported as `cause: "infra"`, so it is re-gated and never passed unreviewed. |
-| Abuse | Per-contributor open-item and hourly push caps; `(repo, after)` dedupe; global `maxOpenItems` and budget. The PIN drone refuses a diff over 5 MB or 500 files (a NOTE explains). Artifacts limits: 32 MB per blob, 1 GB per repo. |
-| Forged notes | The owner can write any notes, including a forged `Queen-Verdict: PASSED`, into their own inbox. **Notes are never authority** (§7.3): the Queen decides only from its ledger, drones read notes as a brief and never as permission, the lander carries forward only Queen-written notes (never inbox notes), and any note the Queen relies on must be re-derivable from the ledger. |
+| Artifacts tokens | Never leave the git Worker. Minted per repo through the binding, cached in module memory (≤ 1 h TTL), never logged, never in a response. Hive main gets a **read** token; only fresh train forks get write tokens. A bug in the proxy cannot write hive main. Rev 1's Q3/Q4 (cross-repo token reach, revocation latency) become moot. |
+| A human bypasses the gates or the LANDER | Every push lands in a new Queen-named train fork; hive main is written only by the LANDER. Pre-receive refuses `main`, deletes, tags and notes before anything is forwarded. |
+| Who is the contributor | The **git token owner** (Access email at mint time), passed by the edge as `x-queen-user`, never the commit author. `Queen-Origin: agent:x` is a claim within the owner's accountability. |
+| Untrusted code | Same exposure as LLM code: Worker Preview per train, policy, security and allowlist scans, reviewer, integration gate, staging, Sentinel. **Fix required (T4):** scan `changedBetween(baseSha, head)` (§2.4 row 7). Changes to `.queen/**`, `wrangler.*` and `package.json` from a non-drone origin are a policy **error**. |
+| Reviewer fails open | For drones it fails open on infra (orchestrate.ts:406). For human or agent origin it **fails closed** (`cause: "infra"`, re-gated, never passed unreviewed). |
+| Abuse | Caps checked in `gitIntent` **before** the fork (so a flood costs no Artifacts operations); `(hive, headSha)` dedupe; 50 MB pack cap enforced while streaming; Workers body limit 100 MB (Free/Pro zone); global `maxOpenItems` and budget. Artifacts limits: 32 MB per blob, 1 GB per repo. |
+| Forged notes | Impossible outward: notes are synthesized from the ledger and `refs/notes/*` pushes are refused. |
+| Read exposure | Any valid token (scope `read`) can clone hive main and read every verdict in that hive. The same population can already read the dashboard (`@kaikeru.com` behind Access). Per-hive scoping of tokens is post-Oct 14. |
+| Proxy as a confused deputy | The git Worker has no public route (`workers_dev:false`, no routes); it is reachable only through the edge's service binding, and it trusts `x-queen-user` only from there. Repo names come from the Queen (`gitIntent`) or the hive registry, never from the URL beyond the hive slug and a `trainId` it validates against the Queen. |
 
 ---
 
@@ -501,25 +497,22 @@ An outside agent needs only git: `docs/agent-protocol.md` is the agent-facing pr
 
 | Failure | Behaviour |
 |---|---|
-| Push event lost or late (delivery semantics UNVERIFIED) | The next push catches up. Dashboard **Push code → Rescan** calls `POST /hives/:hive/inbox/rescan`; the Queen dispatches a provisioner op that lists inbox refs (`listServerRefs`) and replays `submit` for unknown heads. Stretch: T2 if time allows. |
-| Duplicate event | `ignored:duplicate` on `(repo, after)`. |
-| Force-push removes `headSha` before PIN | The PIN drone reports `ok: false` "head not found". If a newer push exists, the result is stale. Otherwise the item is FAILED with a note. |
-| Branch shares no history with main | PIN reports a failure ("no merge base with main"), and the item is FAILED with a note. |
-| Branch based on an old main | Allowed. The gate diffs from the merge base. The preview lacks newer main features. The car's integration gate (3-way merge onto the tip) is the safety net, and a conflict leads to a NOTE. |
-| Inbox `main` pushed by the human | Ignored (`ignored:inbox-main`), and overwritten on the next open. |
-| `InboxKeys.open` fails (fork or 503) | The edge returns 503 and the call can be retried; the fork is idempotent (`ALREADY_EXISTS` = success, day1 row 5b). The Queen's contributor row exists either way. |
-| NOTE fails after retries | Recorded (`note.failed` event). The dashboard is the source of truth; nothing is ejected. |
-| **Note push contention** (several notes on the same repo or ref; Artifacts per-repo 503 episodes, commit 1deb7ab) | Notes are split across `refs/notes/{verdict,review,provenance}` by writer; pushes are non-forced with a re-fetch and retry (3x) and back off on 503. Verdict notes are written after a gate finishes, never just before a reader touches that repo (§7.6). Non-blocking. |
-| **Late or missing notes** | The ledger and the dashboard still hold the verdict. A REWORK whose brief note is missing or does not match regenerates the brief from the ledger (§7.3). An external agent that finds no note yet waits and re-fetches; it never treats "no note" as a pass. |
-| Write-back is not a fast-forward | Pushed to `<ref>-queen` instead, and the note says so. |
-| **Deploy-order hazard (NOTE vs DELETE).** Before the guard, the provisioner treated any unknown op as DELETE, so a NOTE sent to it could delete an inbox (or any named repo). | The guard now lands: NOTE returns a non-destructive failure until T2 gives it real support. **Rule: the provisioner with real NOTE support (T2) must deploy before any Queen that sends NOTE.** |
-| Hive `paused` or budget exhausted | The item waits READY, with `waitReason` shown on the dashboard. A note "queued: hive paused" is sent once. |
+| Hive main in a 503 episode (after a landing push) | The proxy retries `info/refs` and buffered upload-pack POSTs with backoff (3×, 2/4/6 s), then answers 503 with `Retry-After`; git prints the error and the user retries. Pushes do not read hive main except the fork itself (which may inherit the episode, next row). |
+| Fresh fork inherits a 503 episode (1deb7ab) | Before reading the pack, the proxy probes `GET info/refs?service=git-receive-pack` on the fork and re-forks under `-rN` on 503 (the provisioner's pattern). The body has not been read yet, so nothing needs replaying. |
+| Upstream receive-pack fails mid-stream | The body cannot be replayed. The proxy answers `ng <ref> transient error, retry the push`, calls `gitAborted` (fork deleted, no attempt). |
+| Proxy dies between `gitIntent` and `gitPushed` | The intent watchdog ejects the train after 10 min and deletes the fork. The client saw an HTTP error and can retry; the head SHA is not marked submitted until `gitPushed`. |
+| Push accepted but the push event is lost or late | The train is already DEPLOYING (the Queen learned of it synchronously). The gate waits for its event as for any drone train; the existing gate watchdog covers loss. |
+| Branch shares no history with main | The gate's merge-base computation fails; the item goes FAILED with a verdict note ("no merge base with main"). |
+| Branch based on an old main | Accepted (probe 5 non-fast-forward case). The gate diffs from the merge base; the car's integration gate (3-way merge onto the tip) is the safety net, and a conflict leads to a verdict note. |
+| Large push slower than the client's patience | No Worker wall-clock limit while the client is connected; CPU stays low because the body is piped. The 50 MB cap bounds it. |
+| `notesFor` RPC fails | The proxy answers the notes `ls-refs` with no refs (the client sees nothing new) and logs; the dashboard still has the verdict. Never a wrong note. |
+| Hive `paused` or budget exhausted | Accepted at push time with `queued: hive paused`; the item waits READY with `waitReason`. |
 
 ---
 
 ## 10. Human-judged races (you pick)
 
-**Pitch: "Show me three live versions of this feature and I'll pick."** You get an A/B choice before merge, instead of after deploy. It is separately shippable (T9) and does not need the inbox.
+**Pitch: "Show me three live versions of this feature and I'll pick."** You get an A/B choice before merge, instead of after deploy. It is separately shippable (T9) and does not need the git proxy.
 
 ### 10.1 Today (verified in code)
 
@@ -536,7 +529,7 @@ Passed candidates wait in TESTING with their previews LIVE until then, so the pr
 | | |
 |---|---|
 | **Opt-in** | Per item: the composer's best-of control gains **you pick**, setting `judge: "human"` on `SubmitPrompt` / `FileWorkItem`, stored on the item. Per hive: `settings.race.judge: "auto" \| "human"` (default `auto`). |
-| **Machines first (pre-review)** | Only candidates that passed **every** gate enter PICKING: policy, security, preview smoke, and the LLM reviewer against the item's acceptance criteria. "Plain wrong" never reaches a human. **0 pass** → the normal ABANDONED → REWORK path, with no human. **Exactly 1 pass** → auto-decide (no real choice), `by: "queen:single"`. Inbox submissions in a race get the same pre-review (§2.5). |
+| **Machines first (pre-review)** | Only candidates that passed **every** gate enter PICKING: policy, security, preview smoke, and the LLM reviewer against the item's acceptance criteria. "Plain wrong" never reaches a human. **0 pass** → the normal ABANDONED → REWORK path, with no human. **Exactly 1 pass** → auto-decide (no real choice), `by: "queen:single"`. Pushed submissions in a race get the same pre-review (§2.5). |
 | **New race state `PICKING`** | Between "all reported or deadline" and DECIDED. Entered only when `judge = human` and **at least 2 candidates passed**. Passed candidates stay alive: TESTING, previews LIVE, forks kept, no teardown. The race records `recommendedTrainId` (the `rankCandidates` winner) and `recommendReason`, and gets `pickDeadlineAt = now + pickWindowMs` (default 15 min, max 2 h). |
 | **Pick** | `POST /hives/:hive/races/:raceId/pick {trainId, reason?}` is a Queen **user route** (`x-queen-user`). The edge already forwards `/hives/*` with the Access identity (edge app.ts:175–187), so **no edge change is needed**. It returns 409 unless the race is PICKING and `trainId` is a live passed candidate. |
 | **Decide** | The same body as `maybeDecide`'s passed branch, with the human's winner. Event `race.decided` with `data: {by: "human:<email>", reason, recommended, agreed: winner === recommended}`. |
@@ -549,7 +542,7 @@ Passed candidates wait in TESTING with their previews LIVE until then, so the pr
 - **Preview lifetime.** The candidates' previews stay up through PICKING. Losers are torn down on decide, as today. Per the HANDOFF §9 gotcha, pinned `<8hex>-<worker>` preview URLs outlive teardown: the race box links the **alias** URL Herald reports, and the dashboard stops showing a loser's link once it is LOST.
 - **Changing your mind.** Losers are EJECTED as today, but **fork deletion is deferred** until the winner's car is MERGED, or 30 min, whichever is first. Their previews are torn down. "Pick B instead" then has two cases:
   - **Before the winner boards a car:** a direct re-pick. The winner is ejected (LOST, no attempt), and B is restored to PASSED. This window is short, because cars form at once.
-  - **After that:** it files a **targeted Submission** of B's head (`repo` = B's train fork, `itemId` = the item, origin `human`). This is §2's machinery: a loser's fork is just another inbox. If the winner already landed, the item gains a follow-up item.
+  - **After that:** it files a **targeted Submission** of B's head (`repo` = B's train fork, `itemId` = the item, origin `human`). This is §2's machinery: a loser's fork is just another submission fork, already Queen-owned, so no new fork is needed. If the winner already landed, the item gains a follow-up item.
   - The deferred delete is a planner flag (`deleteAfter`) checked in the alarm.
 - **Preference data.** Picks are recorded per `(model, role)` in `model_stats` as `picks` and `picksAgainstRecommendation`. The Model Board shows a "human picks" column. §10.5 turns picks into a capped routing signal (T9c).
 - **Your own version in the race.** With §2.5 (core), a human's targeted submission to a RACING item joins as a candidate, so the picker compares the agents' versions with their own.
@@ -633,95 +626,86 @@ The race box (swarm floor and item page) gains a **Pick** view: candidates side 
 
 ## 11. Limitations (stated honestly)
 
-1. **No pre-receive.** We do not own Artifacts' receive-pack, so `git push` always succeeds. The verdict arrives asynchronously, minutes later, as a note and on the dashboard. We cannot reject in the push output the way Gerrit does. Framing: **the push is a proposal; the train decides.**
-2. The verdict takes about 1.5–3 minutes, not seconds (§4).
-3. One branch is one item. There are no stacked branches.
-4. The commit author is not authenticated. The inbox owner is accountable.
+1. **Pre-receive covers rules, not code.** Ref rules, caps, duplicates and target resolution are answered in the push output. The verdict on the *code* (gates, reviewer) is asynchronous, about 1.5–2.5 minutes later, as a note and on the dashboard. Framing: **the push is a proposal; the train decides.**
+2. A push takes about 4–8 s, because the proxy forks hive main on the push path (2–6 s measured).
+3. Your branch is not visible on the remote after the push (it is a submission in its own train fork). Re-pushing the branch updates the submission.
+4. Notes must be fetched on their own, with `+`, over protocol v2 (§7.5).
+5. One branch is one item. One ref per push. There are no stacked branches.
+6. The commit author is not authenticated. The token owner is accountable.
+7. Packs over 50 MB are refused.
 
-**Out of scope:** org and permission models, PR discussion threads, per-line comments, pre-receive rejection, service-token (non-email) contributors, joining a non-race build in flight, a physical fork per goal (§2.2).
+**Out of scope:** org and permission models, per-hive token scopes, PR discussion threads, per-line comments, content checks at push time (protected paths, file caps: they stay at the gate), service-token contributors, joining a non-race build in flight, a physical fork per goal (§2.2), SSH remotes.
 
 ---
 
 ## 12. Sim support and acceptance tests
 
 **Sim** (`pnpm --filter @queenos/queen dev:sim`, no credentials):
-- A localhost-only route `POST /hives/:hive/sim/inbox-push {email, ref, message, files?}` registers the inbox if needed, fabricates `headSha = sha1(email|ref|message|n)` and calls `submit()` exactly as the gatekeeper would.
-- The sim PIN fake: about 1.5 s, `changedPaths` from `[touch:]` markers plus `src/features/<slug>.js`.
-- Gate markers apply to PIN like BUILD: `[fail]` fails policy, `[review-fail]` makes the reviewer reject, `[collide]`.
-- The sim NOTE fake appends to an in-memory per-inbox log served at `GET /hives/:hive/sim/notes/:sha`, so "git log --notes" can be shown.
-- `Queen: rework` and the dashboard handoff dispatch the existing sim REWORK fake.
+- A localhost-only route `POST /hives/:hive/sim/git-push {email, ref, message, files?}` runs `gitIntent` then `gitPushed` exactly as the git Worker would, with a fabricated `headSha = sha1(email|ref|message|n)` and a fake fork name; a refusal returns the `remote:` lines.
+- Gate markers apply as for BUILD trains: `[fail]` fails policy, `[review-fail]` makes the reviewer reject, `[collide]`.
+- Notes: `GET /hives/:hive/sim/notes/:sha` returns the real `notesFor` projection rendered as text (the same code the proxy serves), so "git log --notes" can be shown.
+- `Queen: rework` and the dashboard handoff dispatch the existing sim REWORK fake (seeded from the sim fork).
 - In `pnpm dev:sim` the dashboard's **Push code** panel offers a "Simulate a push" form.
 
-**Acceptance** (vitest-pool-workers, sim ports):
-1. An inbox push → item (`source.kind user`, `inbox` set) → PIN train → gate → car → LANDED → SHIPPED. NOTE effects for PASSED, LANDED and SHIPPED.
-2. `[review-fail]` push → item FAILED "awaiting contributor", **no** REWORK dispatched, no escalation, a REJECTED NOTE.
-3. The same, then `workAction handoff` → REWORK with `seed` → passes → LANDED. The write-back's own push is `ignored:own-push`.
+**Acceptance** (vitest-pool-workers):
+1. Queen: `gitIntent` → `gitPushed` → item (`source.kind user`) → train DEPLOYING → gate → car → LANDED → SHIPPED; `notesFor` shows PASSED, LANDED, SHIPPED in order on the head SHA.
+2. `[review-fail]` push → item FAILED "awaiting contributor", **no** REWORK, no escalation, a REJECTED note; the fork is kept (`deleteAfter`).
+3. Then `workAction handoff` → REWORK forked from the rejected fork → passes → LANDED; its note carries `Queen-Replies-To`.
 4. A `Queen: rework` trailer gives an automatic REWORK after the reject.
-5. A re-push before boarding → the old train EJECTED (no attempt), a new PIN train, one item. A re-push after boarding → a new item.
-6. The same SHA twice, or on two branches → `ignored:duplicate`. A push to `main` → `ignored:inbox-main`. A notes ref → gatekeeper `ignored notes-ref` (an existing test, kept).
-7. Caps: a 4th open item → `ignored:over-cap`. `paused` → READY with `waitReason`.
-8. A 12-item swarm plus 2 inbox pushes: the human trains share cars with drone members, and every item LANDED.
-9. **Drone adapter (T1b):** every existing `planner.test.ts`, `v2-flow.test.ts` and `load.test.ts` passes unchanged through `submission()`. Race ranking and router stats are identical.
-10. **Gatekeepers:** an inbox-repo event → exactly one `submit`; `changedBetween` flags a *modified* file with `eval` as in-diff (a failing gate, not a follow-up); the reviewer `unavailable` on a human origin → `cause: infra`.
-11. **Provisioner:** `InboxKeys.open` refuses `demo` and `demo-train-…` (only `-in-` names); open twice → one fork; NOTE appends and retries on a non-fast-forward.
-12. **Edge:** `x-queen-user` comes from Access only; the token never appears in logs (spy on `console`).
+5. A re-push before boarding → the old train EJECTED (no attempt), one item. A re-push after boarding → a follow-up item.
+6. `gitIntent` refusals: duplicate head SHA; over cap (a 4th open item); unknown `item/<id>`. A late `item/<id>` → accept as `late-new-item`. `paused` → accept, READY with `waitReason`.
+7. A `gitIntent` with no `gitPushed` for 10 min → ejected, fork delete effect emitted.
+8. A 12-item swarm plus 2 pushed submissions: pushed trains share cars with drone members, and every item LANDED.
+9. **Drone adapter (T1b):** every existing `planner.test.ts`, `v2-flow.test.ts` and `load.test.ts` passes unchanged through `submission()`.
+10. **git Worker** (fake upstream Artifacts over `fetch` mock): advert filtered to `HEAD` + `main`; upload-pack v2 and v0 passthrough; pre-receive refusals for `main`, delete, tag, notes, two refs, size cap (abort mid-stream); report-status rewritten to the client ref with `remote:` lines; sideband and non-sideband clients; 503 on the fork probe → re-fork `-rN`; upstream failure → `gitAborted`; notes `ls-refs`/`fetch` with and without `done` and `sideband-all`, the pack round-trips through a pack parser (or a real `git index-pack` in a manual check); a mixed fetch gets no notes refs. Artifacts tokens never appear in logs (spy on `console`).
+11. **Edge:** `/git/*` without a token → 401 `WWW-Authenticate: Basic`; a revoked or expired token → 401; a `read` token cannot push; `x-queen-user` comes only from the token owner; mint returns the plaintext once and stores only the hash; `/api/git-tokens` stays behind Access.
+12. **Gatekeepers:** `changedBetween` flags a *modified* file with `eval` as in-diff (a failing gate, not a follow-up); the reviewer `unavailable` on a human origin → `cause: infra`; protected paths from a non-drone origin → policy error.
+13. **Manual live smoke (T8):** `git clone`, `git push origin HEAD:main` (refused), `git push origin HEAD:item/<id>` (`remote:` lines), wait, `git fetch origin '+refs/notes/*:refs/notes/*'`, `git log --notes=verdict -1`.
 
 ---
 
 ## 13. Implementation plan (subagents, disjoint files, contracts first)
 
-The human path **ships without T1b**. If the drone adapter slips, cut it: drones keep `buildResult()`.
+The push path **ships without T1b**. If the drone adapter slips, cut it: drones keep `buildResult()`.
 
-| Task | Model | Owns (exclusive) | Depends | Effort |
+| Task | Model | Owns (exclusive) | Depends | When |
 |---|---|---|---|---|
-| **T0 Contracts + migration** **DONE** | Opus | `packages/queen-types/src/{inbox.ts,drone.ts,executors.ts,work.ts,state.ts,queue.ts,train.ts,autonomy.ts,models.ts,observability.ts,index.ts,index.test.ts}` (inbox and race/pick/preference contracts, §5 and §10.7; new event types in `observability.ts`); `apps/queen/src/db.ts` (v14: inboxes, submissions, model_preference, race / work_item / merge_train / model_stats columns, mappers); `apps/queen/test/{migrations.test.ts,work-ledger.test.ts}`; rename `submissions` → `dispatches` (and `DispatchSubmission` → `ItemDispatch`) in `apps/queen/src/work/ledger.ts` + `queen-node.ts` + `test/work-ledger.test.ts` (mechanical); seams with `NotImplementedError` in `work/inbox.ts` | none | 0.5 d (Oct 7 AM) |
-| **T0b Note schema + helpers** | Haiku or Sonnet | `packages/queen-types/src/{notes.ts,index.ts,index.test.ts}`: the note format v1 Zod schema and a renderer and parser (§7.4), including clipping to `MAX_NOTE_TEXT`, unknown-key tolerance, a round-trip test, and the ref constants (`verdict`, `review`, `provenance`; the parser rejects `refs/notes/queen`) | T0 | 0.25 d, **before T2/T3** |
-| **T1 Queen intake + planner** | Opus | `apps/queen/src/work/inbox.ts`, `train/planner.ts`, `queen-node.ts`, `index.ts`, `executors.ts`; `apps/queen/test/{inbox.test.ts,planner.test.ts,v2-flow.test.ts}`; `apps/queen/README.md` | T0 | 1 d |
-| **T1b Drone adapter** | Opus (same agent, after T1) | `planner.ts` `buildResult` → `submission()`; `submissionFromBuildResult` in queen-types | T1 | 0.25 d, **cuttable** |
-| **T2 Provisioner** | Sonnet | `apps/provisioner/**` (`InboxKeys` entrypoint, real NOTE op replacing the interim non-destructive failure guard, wrangler entrypoint export). **The NOTE op takes `ref` and `text`** (`ref` one of `refs/notes/{verdict,review,provenance}`; `text` is a rendered v1 note). **Must deploy before any Queen that sends NOTE** (§9 deploy-order hazard). | T0, T0b | 0.5 d |
-| **T3 Drones** | Sonnet | `apps/drones/**` (PIN, seeded REWORK, write-back). **REWORK reads its brief from the notes on the rejected commit** (§7.2) and **its rework commit writes `Queen-Replies-To`**; the builder writes the provenance and memory notes. The lander copies **only Queen-written notes** (§7.3). | T0, T0b | 0.5 d |
-| **T4 Gatekeepers** | Sonnet | `apps/gatekeepers/**` (inbox classify → submit; `changedBetween` for BUILD; fail-closed reviewer; protected-path policy; **writes findings to `refs/notes/review`** (never to `refs/notes/queen`) as `Queen-Finding` trailers) | T0, T0b | 0.5 d |
-| **T5 Edge** | Haiku | `apps/edge/src/app.ts`, `apps/edge/wrangler.jsonc` (`PROVISIONER_KEYS` service, entrypoint `InboxKeys`), `apps/edge/test/**` | T0 | 0.25 d |
-| **T6 Sim** | Sonnet | `apps/queen/src/sim/{sim-ports.ts,sim-v2.ts,worker.ts}`, `apps/queen/test/sim-ports.test.ts` | T0 | 0.5 d |
-| **T7 Dashboard** | Sonnet | `apps/dashboard/src/{ItemView.tsx,homeLogic.ts,api.ts,components.tsx,SwarmFloor.tsx}` + a new `PushCode.tsx`, tests | T0 | 0.5 d |
-| **T8 Live + docs** | coordinator + user | deploy commands; `docs/HANDOFF.md`, `docs/demo-script.md`, `README.md` | all | Oct 9 |
-| **T9a You-pick races** (§10.1–10.3) | Opus | new `apps/queen/src/train/pick.ts` (pure: enter PICKING, pick, re-pick, deadline, cap) + `apps/queen/test/pick.test.ts` from Oct 7 PM; `apps/queen/src/work/guardrails.ts` (`effectiveSettings` gains race `judge` / `pickWindowMs`, and the `maxPickingRaces` clamp); then, **after T1 merges**, the `maybeDecide` branch in `planner.ts`, `watchdogDeadline`, the `pick` RPC and route in `queen-node.ts` / `index.ts`; sim `[you-pick]` in `sim-v2.ts` (after T6) | T0; T1 for the wiring | 0.75 d |
-| **T9b Manual reject** (§10.4) | same agent as T9a, after it | `pick.ts` reject / none-of-these; `reject` RPC and route; tests (h)(i) | T9a | 0.25 d |
-| **T9c Preference weighting** (§10.5) | Sonnet | `apps/queen/src/models/{router.ts,preference.ts}`, `apps/queen/test/{router.test.ts,preference.test.ts}`; the Model Board column in `apps/dashboard/src/Home.tsx` (or the Model Board component); the event-fold rebuild test | T9a events | 0.5 d, **can slip without blocking T9a/T9b** |
-| **T9d Pick UI** | Sonnet | new `apps/dashboard/src/RacePick.tsx` + test, mounted by T7 in the race box under that agreed export name | T0 | 0.5 d |
+| **T0 Contracts + migration** **DONE** | Opus | (as built; see rev 1 history) | none | done Oct 7 |
+| **T0b Contracts: notes + git intake** | Sonnet | `packages/queen-types/src/{notes.ts (new), git.ts (new), inbox.ts, drone.ts, executors.ts, index.ts, index.test.ts}`: note v1 schema, renderer and parser (§7.4: clipping to `MAX_NOTE_TEXT`, unknown-key tolerance, round trip, the three ref constants, the parser rejects `refs/notes/queen`); **`TRAILER_RE` multi-segment fix** (`Queen-Replies-To`) with a test; the summary line never starts with `queen:`; `git.ts` schemas (§5); `SubmitOutcome` `refused:*`/`aborted:*`; deprecate the inbox schemas; `DroneTask.brief`; FORK `from` | T0 | Oct 8 AM (0.5 d) |
+| **T1 Queen intake** | Opus | `apps/queen/src/{work/inbox.ts, train/planner.ts, queen-node.ts, index.ts, executors.ts}`, `apps/queen/src/work/notes.ts` (new: `notesFor` projection from the event log and audits, using the T0b renderer), `apps/queen/test/{inbox.test.ts, notes.test.ts, planner.test.ts, v2-flow.test.ts}`, `apps/queen/README.md`: RPCs `gitIntent` / `gitPushed` / `gitAborted` / `notesFor`; pre-forked trains; supersede; FAILED "awaiting contributor"; `deleteAfter`; handoff with `seed` and `brief`; intent watchdog; `pruneSubmissions` in the alarm; `GateTarget.origin` / `baseSha`, `MergeTrain.origin` | T0b | Oct 8 PM – Oct 9 (1.25 d) |
+| **T1b Drone adapter** | Opus (same agent, after T1) | `planner.ts` `buildResult` → `submission()`; `submissionFromBuildResult` | T1 | Oct 10, **cuttable** |
+| **T2 git Worker core** | Opus | new `apps/git/**` **except** `src/notes-pack.ts` and its test: `wrangler.jsonc` (Artifacts binding, Queen DO binding, no routes, `workers_dev:false`, `preview_urls:false`), `src/{index.ts, pktline.ts, receive.ts, upload.ts, upstream.ts, tokens.ts}`, tests with a fake upstream. Start from the spike. Pre-receive (§4.3), `gitIntent`, fork + readiness probe + `-rN`, ref rewrite, streamed body with the size cap, report-status rewrite, `remote:` lines, `readCommit`, `gitPushed` / `gitAborted`; read path with the filtered advert and 503 retries; read-only `/t/<trainId>` | T0b (T1 RPC names from T0b) | Oct 8 – Oct 9 (1.5 d) |
+| **T2n Notes pack** | Sonnet | `apps/git/src/notes-pack.ts` + `apps/git/test/notes-pack.test.ts`: snapshot commit/tree/blob builder, pack v2 writer, v2 `ls-refs` / `fetch` responders (with and without `done`, `sideband-all`), the notes-only prefix rule, a cache by `(hive, ref, version)`. Exports `answerNotesLsRefs` and `answerNotesFetch` for T2 to call | T0b | Oct 8 – Oct 9 (0.5 d) |
+| **T3 Edge auth** | Sonnet | `apps/edge/src/{app.ts, registry.ts, gittokens.ts (new)}`, `apps/edge/wrangler.jsonc` (service binding `GIT` → `queenos-git`; `run_worker_first` adds `/git/*`; all envs), `apps/edge/test/**`: `/git/*` before the Access middleware (Basic/Bearer git token, or `cf-access-token` JWT), 401 challenge, failure rate limit, forward with `x-queen-user`; `POST/GET/DELETE /api/git-tokens` behind Access; `git_tokens` table | T0b | Oct 8 (0.5 d) |
+| **T4 Gatekeepers** | Sonnet | `apps/gatekeepers/**`: `changedBetween` for BUILD gates (base = merge base with main), fail-closed reviewer for non-drone origin, protected-path policy, `changedPaths` in the train result. **No** inbox classification, **no** note writing | T0 | Oct 8 – Oct 9 (0.5 d) |
+| **T5 Drones + provisioner** | Sonnet | `apps/drones/**`: REWORK uses `DroneTask.brief`, writes `Queen-Replies-To` in its commit, provenance and memory facts reported in `BuildResult` (the Queen projects them). `apps/provisioner/**`: FORK `from` (seeded REWORK); the NOTE guard stays | T0b | Oct 9 (0.5 d) |
+| **T6 Sim** | Sonnet | `apps/queen/src/sim/{sim-ports.ts, sim-v2.ts, worker.ts}`, `apps/queen/test/sim-ports.test.ts`: `sim/git-push`, sim notes route, seeded sim REWORK | T1 seams | Oct 9 – Oct 10 (0.5 d) |
+| **T7 Dashboard** | Sonnet | `apps/dashboard/src/{ItemView.tsx, homeLogic.ts, api.ts, components.tsx, SwarmFloor.tsx}` + new `PushCode.tsx` (clone URL, create / list / revoke git tokens, token shown once), origin badge, **Let the swarm fix it**, tests | T0b, T3 API | Oct 9 – Oct 10 (0.5 d) |
+| **T8 Live + docs + plugin** | coordinator + user | deploy; the Access `/git` Bypass app (manual); `plugins/queenos/**` (credential helper, `+refs/notes/*` fetch); `docs/agent-protocol.md` status markers; `docs/HANDOFF.md`, `docs/demo-script.md`, `README.md`, `docs/v2-design.md` D12 amendment | all | Oct 10 – Oct 11 |
+| **T9a You-pick races** (§10.1–10.3) | Opus | new `apps/queen/src/train/pick.ts` + `apps/queen/test/pick.test.ts`; `apps/queen/src/work/guardrails.ts`; then, **after T1 merges**, the `maybeDecide` branch in `planner.ts`, `watchdogDeadline`, the `pick` RPC and route; sim `[you-pick]` in `sim-v2.ts` (after T6) | T0; T1 for the wiring | pure part Oct 8; wiring Oct 10 |
+| **T9b Manual reject** (§10.4) | same agent as T9a | `pick.ts` reject / none-of-these; `reject` RPC and route; tests (h)(i) | T9a | Oct 10 – Oct 11 |
+| **T9c Preference weighting** (§10.5) | Sonnet | `apps/queen/src/models/{router.ts, preference.ts}`, tests; the Model Board column | T9a events | Oct 10 – Oct 11, **can slip** |
+| **T9d Pick UI** | Sonnet | new `apps/dashboard/src/RacePick.tsx` + test, mounted by T7 under that export name | T0 | Oct 9 |
 
-- **Seams T0 left** (each throws or answers 409 until its owner lands):
-  - **T1:** `work/inbox.ts` `NotImplementedError` stubs (`handleFor`, `decideIntake`, `resolveTarget`, `itemFromMessage`); `WorkPlanner.handoff` answers 409 ("not implemented"); `TrainAction` still lacks `PIN`; calling `pruneSubmissions` (db.ts) from the Queen alarm; filling `GateTarget.origin` / `baseSha` and `MergeTrain.origin` when trains are created.
-  - **T9a:** `effectiveSettings` (guardrails.ts) must add race `judge` / `pickWindowMs`; the `maxPickingRaces` min-1 clamp (the schema allows 0, and a 0 cap would auto-decide every race).
-  - **T9c:** preference reads and writes on `model_preference` and `model_stats.picks`.
-- **Infra fixes landed** (alongside T0): provisioner forks may now be named `<hive>-train-<12hex>-rN`, the gatekeeper `TRAIN_REPO_RE` accepts that, and cars retire after one infra round. **Inbox-related parsing must accept `-rN` train names too** (`INBOX_REPO_RE` is anchored `-in-<handle>`, so it does not clash, but any train-name regex T1/T3/T4 add must allow the suffix).
-- **Notes protocol (§7):** T0b is a small prerequisite for T2, T3 and T4 (they import the renderer and parser). The lander rule is fixed: copy only Queen-written notes. `docs/agent-protocol.md` and `plugins/queenos/` are written separately and only reference the T0b format.
-- **Schedule:** T0 on Oct 7 morning, T0b right after it. T1–T7 run in parallel from Oct 7 afternoon to Oct 8. T1b runs Oct 8 if T1 is green. Live on Oct 9.
-- **Races schedule:** T9a's pure `pick.ts` and T9d start Oct 7 afternoon. T9a's planner wiring and T9b follow T1 (Oct 8 afternoon to Oct 9). T9c runs Oct 9–10. Each one ships alone, and none blocks the inbox path.
-- **Deploy order:** provisioner (new entrypoint) → queen (v14; no active trains, R16) → drones, gatekeepers → edge (binds to the new entrypoint, so two passes are not needed). Check: `pnpm turbo run build typecheck lint test --force --continue`.
-- **Cut lines, in order:**
-  1. T9c (preference weighting), then T9b, then T9a and T9d (races are independent of the inbox);
-  2. T1b;
-  3. rescan;
-  4. the write-back to the human's branch (the handoff still lands; the human sees the fix on main);
-  5. NOTE milestones after the gate verdict.
-
-  The demo spine is: inbox push → gate → REJECT note → handoff → LANDED.
+- **File ownership seams:** T2 and T2n share `apps/git` but not files; T2 imports T2n's two exports (agree the signatures in T0b's `git.ts` types). T1 and T9a both touch `planner.ts`, `queen-node.ts` and `index.ts`: T9a's wiring waits for T1 to merge (as in rev 1). T7 mounts T9d's component.
+- **Seams T0 left:** T1 fills the `work/inbox.ts` `NotImplementedError` stubs (`handleFor` becomes unused; `decideIntake`, `resolveTarget`, `itemFromMessage` are now called from `gitIntent` / `gitPushed`), `WorkPlanner.handoff`, `pruneSubmissions`, `GateTarget.origin` / `baseSha`, `MergeTrain.origin`. T9a: `effectiveSettings` race `judge` / `pickWindowMs` and the `maxPickingRaces` min-1 clamp. T9c: preference reads and writes.
+- **Infra (landed with T0):** train forks may be named `<hive>-train-<12hex>-rN`; the proxy's re-fork uses the same suffix, which `TRAIN_REPO_RE` already accepts.
+- **Deploy order:** queen (new RPCs; no active trains, R16) → provisioner, drones, gatekeepers → git Worker → edge (binds `GIT`; `/git/*` now token-checked) → **then** the Access `/git` Bypass app. Until the bypass exists, `/git` sits behind Access and is harmless. Check: `pnpm turbo run build typecheck lint test --force --continue`.
+- **Schedule:** Oct 8: T0b (AM), then T1, T2, T2n, T3, T4, T9a-pure in parallel. Oct 9: T1 and T2 finish, T5, T6, T7, T9d. Oct 10: T1b, T9a wiring, T9b, T9c; deploy and live smoke. Oct 11: live demo rehearsal of the git path, fixes, cut lines.
+- **Cut lines, in order:** T9c, then T9b, then T9a and T9d (races are independent of the push path); T1b; the read-only `/t/<trainId>` route (handoff still lands; the human sees the fix on main); `refs/notes/provenance` and `review` (keep `verdict`); the `cf-access-token` auth path. **The demo spine is:** `git clone` → push to main refused → push `item/<id>` with `remote:` lines → REJECT note via `git fetch` → handoff → LANDED note.
 
 ---
 
 ## 14. Demo shot (for `docs/demo-script.md`)
 
-**"Here's code, vet it."** About 75 s, recorded after the swarm shot while the 12-item swarm is still landing.
+**"Agent-native git."** About 75 s, recorded after the swarm shot while the 12-item swarm is still landing.
 
-1. Split screen: the dashboard swarm floor (12 drone tiles) and a terminal. Voice-over: *"A PR says 'please review my branch.' QueenOS has an inbox: you push code, and the swarm vets it with the same gates and the same train as the agents. You don't open, shepherd or merge anything."*
-2. `git push queen tip-jar`. It returns at once. Within seconds a tile with a **human** badge joins the floor.
-3. The change deliberately calls a non-allowlisted host, a deterministic SECURITY reject (no reliance on an LLM REJECT). The tile goes red. `git fetch queen 'refs/notes/*:refs/notes/*' && git log --notes=verdict --notes=review -1` shows the REJECTED note with the finding, in a plain terminal with no SDK. Then the **notes beat**: Claude Code with the QueenOS plugin (`plugins/queenos/`) reads the same rejection note, fixes the problem and re-pushes. That is the notes protocol working for an agent exactly as for a human (§7).
-4. Click **Let the swarm fix it**. A REWORK drone starts from the human's commit. Its tile passes and boards a car **next to drone members**, and the merge-train graph shows the human branch merging in the same car.
-5. `git pull queen tip-jar` shows the drone's fix on top of the human commit. Then `git log --notes=verdict` on it: `LANDED main@…`, then `SHIPPED`.
-6. Optional tag: push again with `[review-fail]` in sim to show the LLM reviewer's rejection text.
-
-This closes HANDOFF §6.5's "no reliable live reviewer REJECT" by showing a reliable *gate* REJECT live. The reviewer REJECT stays sim-backed.
+1. Split screen: the dashboard swarm floor (12 drone tiles) and a terminal. Voice-over: *"This looks like GitHub. It isn't. The git layer is the product: a push is a submission, the swarm vets it under the same rules as the agents, and the verdict comes back as git notes."*
+2. `git clone https://queenos.kaikeru.com/git/demo`. Then `git push origin HEAD:main`: refused in the push output, `remote: QueenOS: pushes to main are refused (the lander owns main)`.
+3. `git push origin HEAD:item/<id>`: `remote: QueenOS: submission received → item … (joined its race)`. Within seconds a tile with a **human** badge joins the floor, racing the drones' candidates.
+4. The change deliberately calls a non-allowlisted host (a deterministic SECURITY reject). The tile goes red. `git fetch origin '+refs/notes/*:refs/notes/*' && git log --notes=verdict --notes=review -1` shows the REJECTED note with the finding, in a plain terminal. Then the **notes beat**: Claude Code with the QueenOS plugin reads the same note, fixes the problem and re-pushes.
+5. Or click **Let the swarm fix it**: a REWORK drone starts from the human's commit, passes and boards a car **next to drone members** in the merge-train graph.
+6. `git log --notes=verdict` on the commit: `LANDED main@…`, then `SHIPPED`.
 
 ---
 
@@ -729,16 +713,35 @@ This closes HANDOFF §6.5's "no reliable live reviewer REJECT" by showing a reli
 
 | # | Question | Recommendation |
 |---|---|---|
-| Q1 | ~~Inbox per person or per session?~~ | **Decided (user, 2026-10-07): per person, persistent, 24 h tokens** (D12). |
-| Q2 | Should the Queen also sync inbox `main` after every landing, not only on open? | No, not by Oct 14. A re-open is cheap, and the response carries `mainSha`. |
-| Q3 | **UNVERIFIED:** can a token from `repo.createToken` authenticate to a *different* repo in the namespace? | Probe on Oct 7 with a throwaway pair of repos before T2 merges. If it can, inboxes are not isolated and the design needs per-hive namespaces. |
-| Q4 | **UNVERIFIED:** does `revokeToken` take effect at once for in-flight git operations? | Probe alongside Q3. Until then, the docs say "within the TTL". |
-| Q5 | **UNVERIFIED:** Artifacts repo-name rules (`INVALID_REPO_NAME`): length and character set for `<hive>-in-<handle>` | The handle is `[a-z0-9]{1,24}` (the email local part, stripped; on a collision, 4 hex from a hash). Probe a 63-character name. |
-| Q6 | **UNVERIFIED:** isomorphic-git force-push of a branch head that is behind the remote `main` into a train fork (PIN), and pushing hive-main commits into the inbox from a shallow fetch | The lander already pushes fork commits to another repo at `LAND_DEPTH` (proven live). PIN uses the same depth and deepens once on a missing object. |
-| Q7 | Notes push to Artifacts receive-pack | **Verified** (day1 row 1). A non-forced, appending push under contention is UNVERIFIED and is covered by the retry. |
-| Q8 | Push event delivery: at-least-once? ordered? | UNVERIFIED. Dedupe makes it safe; rescan covers loss. |
-| Q9 | Service-token agents (no Access email; edge `access.ts:153` rejects them) | Post-Oct 14. Agents push through their person's inbox with `Queen-Origin`. |
-| Q10 | ~~Should a targeted human submission join an in-flight race?~~ | **Decided (user, 2026-10-07): yes, core.** The item is the competition, and the item is the inbox (§2.5). Ranking needs no change. |
-| Q11 | Preference granularity: `(model, item kind)` has 4 kinds × ~8 models, so it is sparse at demo volume. | Keep the per-kind key; `confidence = n/(n+5)` keeps sparse cells near neutral. Revisit with a per-hive key after Oct 14. |
-| Q12 | Should `judge: human` be the default for `[hard]` items in a `supervised` hive? | No. It stays opt-in; autonomy is the default (D12 keeps auto as the hive default). |
-| Q13 | Live previews of 3 candidates for up to 15 min: Worker Preview quota and cost | UNVERIFIED (deploy-discovery has no preview count limit). `maxPickingRaces` 2 bounds it at 6 previews. |
+| Q1 | ~~Inbox per person or per session?~~ | **Superseded by rev 2:** no inbox; one fork per push. |
+| Q2 | ~~Sync inbox `main` after landings?~~ | Superseded: clients read hive main directly through the proxy. |
+| Q3 | ~~Can an Artifacts repo token reach another repo?~~ | **Moot in rev 2:** Artifacts tokens never leave the git Worker. (Still worth one probe post-Oct 14 for defence in depth.) |
+| Q4 | ~~Does `revokeToken` act at once?~~ | Moot: git tokens are ours and checked on every request. |
+| Q5 | Artifacts repo-name rules for `<hive>-train-<12hex>-rN` | Already in production for drone trains. |
+| Q6 | Fork latency on the push path (3.3–6.4 s in the probes, 2 s on day 1) under load | Accept for Oct 14; the `remote:` line reports it. Post-Oct 14: a warm pool is **unsafe** unless the pool fork is at least as new as the advertised main (the client's pack assumes those objects), so prefer forking at push time. |
+| Q7 | Is a receive-pack body that the proxy aborts mid-stream (size cap) left as a half-written repo? | Irrelevant: the fork is deleted on abort. |
+| Q8 | Push event delivery: at-least-once? ordered? | The Queen learns of a push synchronously (`gitPushed`), so intake no longer depends on events; the gate still waits for the fork's event as for drone trains. |
+| Q9 | Service-token agents (no Access email) | Post-Oct 14. Agents use their person's git token with `Queen-Origin`. |
+| Q10 | ~~Should a targeted submission join an in-flight race?~~ | **Decided: yes, core** (§2.5). |
+| Q11 | Preference granularity `(model, item kind)` | Keep; `confidence = n/(n+5)` keeps sparse cells neutral. |
+| Q12 | `judge: human` default for `[hard]` items in a `supervised` hive? | No. Opt-in. |
+| Q13 | Live previews of 3 candidates for up to 15 min: quota and cost | UNVERIFIED. `maxPickingRaces` 2 bounds it at 6 previews. |
+| Q14 | Should the proxy advertise the user's open submissions as virtual branches (`refs/heads/item/14` → its fork's head)? | Not by Oct 14: a fetch of those refs needs routing by want to many forks (the same mixed-source problem as notes). The read-only `/t/<trainId>` URL covers handoff. |
+| Q15 | Is the `kaikeru.com` zone plan Free/Pro (100 MB request body) or higher? | UNVERIFIED; the 50 MB cap fits all plans. |
+| Q16 | The Access `/git` path Bypass app on this account | UNVERIFIED (docs: the most specific path wins). Test in T8 before the demo; fallback: `cloudflared access token` as `cf-access-token`. |
+
+---
+
+## 16. What rev 2 removed from rev 1
+
+| Rev 1 | Rev 2 |
+|---|---|
+| Per-person inbox fork `<hive>-in-<handle>`, its mirror `main`, re-open to refresh | Gone. One train fork per push, made by the proxy. |
+| `InboxKeys` provisioner entrypoint; `POST/DELETE /api/hives/:hive/inbox`; 24 h Artifacts tokens handed to people (`?expires=` stripping) | Gone. QueenOS git tokens, minted by the edge; Artifacts tokens stay server-side. |
+| PIN drone, `PIN` drone/train action, `seed` copy into a train fork | Gone. The push lands in the train fork; a seeded REWORK forks the rejected fork. |
+| Provisioner `NOTE` op, append-and-retry notes pushes, note contention, forged inbox notes, lander filtering of inbox notes | Gone. Notes are synthesized from the ledger by the proxy. |
+| Gatekeeper `INBOX_REPO_RE` intake classification, `ignored:inbox-main`, `ignored:unknown-inbox`, `ignored:revoked` | Gone. A pushed submission is an ordinary train fork push. |
+| REWORK write-back to the human's branch (`<ref>-queen` fallback) | Gone. Read-only `/git/<hive>/t/<trainId>`, or `origin/main` after landing. |
+| Rescan of inbox refs for lost push events | Gone. Intake is synchronous. |
+| Limitation "no pre-receive; `git push` always succeeds" | Gone. Rule violations are refused in the push output (§4.3). |
+| Open questions Q1–Q4 (inbox per person, mirror sync, token reach, revocation) | Superseded (§15). |
