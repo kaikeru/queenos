@@ -331,3 +331,18 @@ export function scanPolicy(files: Record<string, string>, opts: PolicyOptions): 
   }
   return toReport(findings, scanned);
 }
+
+// ── protected paths (human-push design §8) ─────────────────────────────────────
+
+/** `.queen/**`, `wrangler.*` and `package.json` (at any depth): configuration a non-drone origin must not change. */
+export const PROTECTED_PATH_RE = /^\.queen\/|(?:^|\/)(?:wrangler\.[^/]+|package\.json)$/i;
+
+/** One policy error per changed (added, modified or deleted) protected path. Callers apply it to non-drone origins only. */
+export function scanProtectedPaths(changed: Iterable<string>): Finding[] {
+  const out: Finding[] = [];
+  for (const file of [...changed].sort()) {
+    if (!PROTECTED_PATH_RE.test(file)) continue;
+    out.push({ rule: "protected-path", severity: "error", file, message: "changes to .queen/**, wrangler.* and package.json are not allowed from pushed (human or agent) code; ask the Queen to make this change" });
+  }
+  return out;
+}

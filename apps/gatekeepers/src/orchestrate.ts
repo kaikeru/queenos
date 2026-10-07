@@ -16,7 +16,7 @@
  */
 import type { WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import { isTransientError, retryTransient, spanIdFor, type AppendAuditInput, type AuditEvent, type AuditStatus, type DroneRole, type FollowUp, type GateScore, type GateTarget, type GitNotesPayload, type MemoryOutcome, type TrainLane } from "@queenos/queen-types";
+import { isTransientError, retryTransient, spanIdFor, type AppendAuditInput, type AuditEvent, type AuditStatus, type DroneRole, type FollowUp, type GateScore, type GateTarget, type GitNotesPayload, type MemoryOutcome, type SubmissionOrigin, type TrainLane } from "@queenos/queen-types";
 import { AiGatewayError, LedgerError, buildGitNotesPayload, composeMemoryText, memoryIdFor } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import { classifyPush, gateInstanceId, parsePushEvent, type GateTask } from "./event";
@@ -111,6 +111,8 @@ export type ReadyLookup = {
   memberTraces: string[];
   /** The Queen-started gate that owns this TESTING round (GateTarget.gateId); null: none (or an older Queen). */
   gateId: string | null;
+  /** BUILD: whose code the train carries. Null = drone (absent on older Queens). Non-drone origins fail closed. */
+  origin: SubmissionOrigin | null;
 };
 export type Lookup = ReadyLookup | { status: "waiting"; phase: string } | { status: "ignored"; reason: string };
 
@@ -137,6 +139,7 @@ export function lookupFromTarget(t: GateTarget, builderReasoning: string[]): Loo
     routes: t.lane === "QUEUE" ? integrationRoutes(members) : [],
     memberTraces: [...new Set(members.flatMap((m) => (m.traceId ? [m.traceId] : [])))],
     gateId: t.gateId ?? null,
+    origin: t.origin ?? null,
   };
 }
 
@@ -169,6 +172,7 @@ export function lookupFromSnapshot(snap: QueenSnapshot, task: Pick<GateTask, "re
     routes: lane === "QUEUE" ? integrationRoutes([]) : [],
     memberTraces: [...new Set(memberTrains.flatMap((m) => (m.traceId ? [m.traceId] : [])))],
     gateId: null,
+    origin: train.origin ?? null,
   };
 }
 
@@ -293,9 +297,10 @@ async function gateRound(task: GateTask, step: StepRunner, ports: GatekeeperPort
 
   let inspection: Inspection;
   const spec: IntegrationSpec | undefined = integration ? { baseSha: train.baseSha, routes: train.routes } : undefined;
+  const build = integration ? undefined : { baseSha: train.baseSha, origin: train.origin };
   try {
     inspection = await step.do("inspect: clone, scan, test", INSPECT_STEP, () =>
-      retryTransient(() => inspectPush(ports, task, config, train.trainId, train.previewUrl, train.promptFull, spec), {
+      retryTransient(() => inspectPush(ports, task, config, train.trainId, train.previewUrl, train.promptFull, spec, build), {
         attempts: INSPECT_TRANSIENT_ATTEMPTS,
         baseMs: config.transientBaseMs,
         maxMs: config.transientBaseMs * 8,
@@ -324,12 +329,13 @@ async function gateRound(task: GateTask, step: StepRunner, ports: GatekeeperPort
   let counts = { satisfied: 0, missing: 0 };
   if (reviewing && inspection.review) {
     const r = await reviewGate(ctx, inspection.review);
+    if (r.infra) return failReviewerInfra(ctx, r.reason);
     if (r.rejected) return failReview(ctx, r.feedback, r.missing, r.report, inspection.changedPaths, inspection);
     reviewState = r.skipped ? "skipped" : "approved";
     counts = r.counts;
   }
   const extras = reportExtras(ctx, inspection, reviewState, counts);
-  glog(ctx, "inspect", inspection.policy.passed && inspection.security.passed ? "scanned" : "scan-failed", { ms, followUps: inspection.followUps.length, changedFiles: inspection.changedFiles });
+  glog(ctx, "inspect", inspection.policy.passed && inspection.security.passed ? "scanned" : "scan-failed", { ms, followUps: inspection.followUps.length, changedFiles: inspection.changedFiles, ...(integration ? {} : { diffSource: inspection.diffSource, origin: train.origin?.kind ?? "drone" }) });
 
   const passed = inspection.policy.passed && inspection.security.passed && (inspection.tests?.passed ?? false);
   if (passed) {
@@ -389,7 +395,7 @@ async function gateRound(task: GateTask, step: StepRunner, ports: GatekeeperPort
 
 // ── reviewer ──────────────────────────────────────────────────────────────
 
-type ReviewGate = { rejected: false; skipped: boolean; counts: { satisfied: number; missing: number } } | { rejected: true; feedback: string; missing: string[]; report: string };
+type ReviewGate = { rejected: false; infra?: undefined; skipped: boolean; counts: { satisfied: number; missing: number } } | { rejected: true; infra?: undefined; feedback: string; missing: string[]; report: string } | { rejected: false; infra: true; reason: string };
 
 async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
   const { config, ports, step, train } = ctx;
@@ -414,8 +420,14 @@ async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
     }
   }
 
+  if (outcome.kind === "unavailable" && ctx.train.origin && ctx.train.origin.kind !== "drone") {
+    // Fail closed for pushed (human / agent) code: nobody else has read it. Reported as infra, so the Queen re-gates.
+    console.warn("gatekeeper: reviewer unavailable for non-drone origin; failing closed", outcome.reason);
+    await audit(ctx, "audit: reviewer result", "REVIEWER", "REJECTED", ledgerFor(ctx, outcome.model, outcome.ms, [`reviewer unavailable, failing closed for ${ctx.train.origin.kind} origin: ${outcome.reason}`], false));
+    return { rejected: false, infra: true, reason: outcome.reason };
+  }
   if (outcome.kind === "unavailable") {
-    // Fail open: infrastructure hiccups must not eject trains.
+    // Fail open (drone origin): infrastructure hiccups must not eject trains.
     console.warn("gatekeeper: reviewer unavailable; continuing", outcome.reason);
     await audit(ctx, "audit: reviewer result", "REVIEWER", "PASSED", ledgerFor(ctx, outcome.model, outcome.ms, [`warning: reviewer unavailable, failing open: ${outcome.reason}`], true));
     return { rejected: false, skipped: true, counts: { satisfied: 0, missing: 0 } };
@@ -437,6 +449,14 @@ async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
   return { rejected: true, feedback: v.feedback, missing: v.missing, report };
 }
 
+/** Reviewer unavailable on pushed code: not a verdict. Reported as infra (the Queen re-gates, no attempt charged). */
+async function failReviewerInfra(ctx: Ctx, reason: string): Promise<GateRunResult> {
+  const summary = clip(`Reviewer unavailable for ${ctx.train.origin?.kind ?? "non-drone"} code, so the gate cannot pass it: ${reason}`, MAX_SUMMARY_CHARS);
+  const queenOutcome = await report(ctx, false, summary, { cause: "infra" });
+  glog(ctx, "gate", "reviewer-unavailable-infra", {});
+  return { status: "gated", trainId: ctx.train.trainId, passed: false, summary, queenOutcome, lane: ctx.train.lane, infra: true };
+}
+
 /** The reviewer's feedback is the Scribe summary, so the Queen's REWORK carries it to the next builder. */
 async function failReview(ctx: Ctx, feedback: string, missing: string[], rawLog: string, changedPaths: string[], inspection: Extract<Inspection, { status: "done" }>): Promise<GateRunResult> {
   const { task, train, ports } = ctx;
@@ -454,7 +474,7 @@ async function failReview(ctx: Ctx, feedback: string, missing: string[], rawLog:
   await remember(ctx, "REJECTED_BY_REVIEW", missing.length ? `${feedback} Missing: ${missing.join("; ")}` : feedback, changedPaths);
   // No score on a rejection (GateScore.review has no "rejected"); out-of-diff findings are still filed.
   const followUps = inspection.followUps.length ? { followUps: inspection.followUps } : {};
-  const queenOutcome = await report(ctx, false, summary, followUps);
+  const queenOutcome = await report(ctx, false, summary, { ...followUps, ...(claimedPaths(ctx, inspection)) });
   glog(ctx, "gate", "rejected-by-review", {});
   return { status: "gated", trainId: train.trainId, passed: false, summary, queenOutcome, lane: train.lane, review: "rejected", vectorized, ...followUps };
 }
@@ -513,12 +533,18 @@ async function audit(ctx: Ctx, name: string, role: DroneRole, status: AuditStatu
 }
 
 /** The v2 fields of `TrainResult`: the gate score, and out-of-diff findings as follow-ups. */
-function reportExtras(ctx: Ctx, inspection: Extract<Inspection, { status: "done" }>, reviewState: "approved" | "skipped" | undefined, counts: { satisfied: number; missing: number }): { score: GateScore; followUps?: FollowUp[] } {
+function reportExtras(ctx: Ctx, inspection: Extract<Inspection, { status: "done" }>, reviewState: "approved" | "skipped" | undefined, counts: { satisfied: number; missing: number }): { score: GateScore; followUps?: FollowUp[]; changedPaths?: string[] } {
   const review: GateScore["review"] = ctx.train.lane === "QUEUE" ? "skipped" : ctx.config.reviewMode === "off" ? "off" : (reviewState ?? "skipped");
   return {
     score: { review, satisfied: counts.satisfied, missing: counts.missing, changedFiles: inspection.changedFiles, changedBytes: inspection.changedBytes, checks: inspection.tests?.checks ?? 0 },
     ...(inspection.followUps.length ? { followUps: inspection.followUps } : {}),
+    ...(claimedPaths(ctx, inspection)),
   };
+}
+
+/** `TrainResult.changedPaths`: BUILD gates with a verified tree diff only (a commit-walk fallback is a heuristic, not a claim). */
+function claimedPaths(ctx: Ctx, inspection: Extract<Inspection, { status: "done" }>): { changedPaths?: string[] } {
+  return ctx.train.lane === "BUILD" && inspection.diffSource === "tree" && inspection.allChangedPaths.length ? { changedPaths: inspection.allChangedPaths } : {};
 }
 
 /** One structured log line per trace: the train's, and for a car each member's (§2.6). Never throws. */
@@ -533,7 +559,7 @@ function glog(ctx: Ctx, step: string, outcome: string, extra: Record<string, unk
   }
 }
 
-async function report(ctx: Ctx, passed: boolean, summary: string, extras: { score?: GateScore; followUps?: FollowUp[]; cause?: "infra" } = {}): Promise<string> {
+async function report(ctx: Ctx, passed: boolean, summary: string, extras: { score?: GateScore; followUps?: FollowUp[]; changedPaths?: string[]; cause?: "infra" } = {}): Promise<string> {
   return ctx.step.do("report: train result", REPORT_STEP, async () => {
     try {
       const gateId = ctx.task.commandId ? { gateId: ctx.task.commandId } : {};

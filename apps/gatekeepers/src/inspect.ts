@@ -4,12 +4,12 @@
  * in-memory clone cannot cross steps, and only a small summary comes back out
  * (step results are capped at 1 MiB; the repo token never leaves the step).
  */
-import { LAND_DEPTH, type FollowUp } from "@queenos/queen-types";
+import { LAND_DEPTH, type FollowUp, type SubmissionOrigin } from "@queenos/queen-types";
 import type { GateConfig } from "./config";
 import type { GateTask } from "./event";
 import { formatFinding, isCodePath, isSkippedPath, toReport, type Finding, type ScanReport } from "./findings";
 import type { GatekeeperPorts, GitSession } from "./ports";
-import { scanPolicy } from "./policy";
+import { scanPolicy, scanProtectedPaths } from "./policy";
 import { scanSecurity, MAX_SCAN_BYTES } from "./security";
 import { renderReviewInput, type ReviewPacket } from "./review";
 import { followUpsFrom, isOutOfDiff, PRE_EXISTING_PREFIX } from "./followups";
@@ -21,6 +21,8 @@ export const MAX_TOTAL_BYTES = 12 * 1024 * 1024;
 export const MAX_LOG_IN_STEP = 60_000;
 /** Clone depth: the pushed commit, a possible ledger-file commit, and parents to diff against. */
 export const CLONE_DEPTH = 4;
+/** `TrainResult.changedPaths` cap. */
+export const MAX_REPORTED_PATHS = 200;
 
 export interface TestSummary {
   passed: boolean;
@@ -43,6 +45,10 @@ export type Inspection =
       tests: TestSummary | null;
       /** Changed paths (sorted, capped at 30), for every outcome: hive memory and the review packet. */
       changedPaths: string[];
+      /** Every changed path (added, modified, deleted), sorted, capped at 200: `TrainResult.changedPaths`. */
+      allChangedPaths: string[];
+      /** BUILD gates: "tree" = `changedBetween(baseSha, head)`; "fallback" = no usable base, the commit-walk heuristic. */
+      diffSource: DiffSource;
       /** Evidence for the REVIEWER; null when review is off or the code did not get as far as a working preview. */
       review: ReviewPacket | null;
       /** Raw failure log for the Scribe; null when everything passed. */
@@ -56,6 +62,15 @@ export type Inspection =
       /** Integration gate: the route whose smoke failed, and the member that declared it (when it did). */
       failedRoute?: { path: string; trainId?: string; title?: string };
     };
+
+/** A BUILD gate's diff base (`GateTarget.baseSha`) and whose code it is (`GateTarget.origin`; absent = drone). */
+export interface BuildSpec {
+  baseSha: string | null;
+  origin?: SubmissionOrigin | null;
+}
+
+/** Where the changed-path set came from: a tree diff against the base, or the commit-walk fallback. */
+export type DiffSource = "tree" | "fallback";
 
 /** One route the preview must answer; `member` is set for a route a car member declared (`smokePaths`). */
 export interface SmokeRoute {
@@ -185,9 +200,11 @@ export function pathsFromMessage(message: string): string[] {
 
 /**
  * Commits in `before..after` (newest first, bounded by the shallow clone) and
- * the paths they changed: files added relative to the parent, plus files named
- * in a drone-style commit message. UNVERIFIED limit: a pure modification by a
- * non-drone commit is invisible here (no tree diff in hive-kit's GitRepo).
+ * the paths they changed relative to each parent (a tree diff when the session
+ * has `changedPaths`, so modified and deleted files count; otherwise only files
+ * added), plus files named in a drone-style commit message. This is the FALLBACK
+ * when the diff base is unknown; without `changedPaths` a pure modification by a
+ * non-drone commit is invisible here.
  */
 export async function collectChange(repo: GitSession, after: string, before: string | undefined): Promise<{ messages: string[]; changed: Set<string> }> {
   const messages: string[] = [];
@@ -201,9 +218,13 @@ export async function collectChange(repo: GitSession, after: string, before: str
     const parent: string | undefined = c.parents[0];
     if (parent && (await repo.readCommit(parent))) {
       try {
-        const [now, prev] = await Promise.all([repo.listFiles(oid), repo.listFiles(parent)]);
-        const had = new Set(prev);
-        for (const p of now) if (!had.has(p)) changed.add(p);
+        if (typeof repo.changedPaths === "function") {
+          for (const p of await repo.changedPaths(parent, oid)) changed.add(p);
+        } else {
+          const [now, prev] = await Promise.all([repo.listFiles(oid), repo.listFiles(parent)]);
+          const had = new Set(prev);
+          for (const p of now) if (!had.has(p)) changed.add(p);
+        }
       } catch {
         /* parent tree unavailable: rely on message paths */
       }
@@ -245,10 +266,12 @@ export async function inspectPush(
   /** The train's prompt, for the reviewer's evidence document. */
   prompt = "",
   integration?: IntegrationSpec,
+  /** BUILD lane: the diff base and the origin of the code. */
+  build?: BuildSpec,
 ): Promise<Inspection> {
   const startedAtMs = Date.now();
   const access = await ports.artifacts.access(task.repo, "read");
-  const repo = await ports.git.clone({ remote: access.remote, token: access.token, ref: task.branch, depth: integration ? LAND_DEPTH : CLONE_DEPTH });
+  const repo = await ports.git.clone({ remote: access.remote, token: access.token, ref: task.branch, depth: integration || build?.baseSha ? LAND_DEPTH : CLONE_DEPTH });
 
   const head = await repo.head();
   if (!head || head.oid !== task.after) return { status: "stale", headSha: head?.oid ?? null };
@@ -256,6 +279,7 @@ export async function inspectPush(
   let messages: string[];
   let changed: Set<string>;
   let scope: Set<string> | null;
+  let diffSource: DiffSource = "fallback";
   if (integration) {
     // A car's change is `baseSha..head` (merge commits included). An unreadable base scans everything as in-diff.
     const diff = integration.baseSha ? await changedBetween(repo, integration.baseSha, task.after) : null;
@@ -266,12 +290,22 @@ export async function inspectPush(
   } else {
     ({ messages, changed } = await collectChange(repo, task.after, task.before));
     scope = changed;
+    // BUILD: the change is `baseSha..head` by tree comparison (added, modified and deleted paths). The commit-walk
+    // result above stays as the fallback for a missing or unreadable base.
+    const diff = build?.baseSha ? await changedBetween(repo, build.baseSha, task.after) : null;
+    if (diff) {
+      changed = diff;
+      scope = diff;
+      diffSource = "tree";
+    }
   }
   const { files, total } = await readTree(repo);
 
   const policySplit = splitOutOfDiff(scanPolicy(files, { allowedDeps: config.allowedDeps }), scope, files);
   const securitySplit = splitOutOfDiff(scanSecurity(files, { allowedHosts: config.allowedHosts }), scope, files);
-  const policy = policySplit.report;
+  // Protected paths: a non-drone origin must not touch .queen/**, wrangler.* or package.json (deleted paths count).
+  const protectedFindings = !integration && build?.origin && build.origin.kind !== "drone" ? scanProtectedPaths(changed) : [];
+  const policy = protectedFindings.length ? toReport([...protectedFindings, ...policySplit.report.findings], policySplit.report.filesScanned) : policySplit.report;
   let security = securitySplit.report;
   const followUps = followUpsFrom(securitySplit.outOfDiff, policySplit.outOfDiff);
   let changedBytes = 0;
@@ -370,6 +404,8 @@ export async function inspectPush(
     security,
     tests,
     changedPaths: [...changed].sort().slice(0, 30),
+    allChangedPaths: [...changed].sort().slice(0, MAX_REPORTED_PATHS),
+    diffSource,
     review,
     failureLog,
     failingCheck,

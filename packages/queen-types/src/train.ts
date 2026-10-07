@@ -98,6 +98,11 @@ export const TrainResultSchema = z.object({
    * (a push-triggered gate, an older gatekeeper): accepted as before.
    */
   gateId: z.string().min(1).max(200).optional(),
+  /**
+   * Gatekeepers, BUILD lane: every path the train changed against its diff base (`changedBetween(baseSha, head)`:
+   * added, modified and deleted), sorted, capped at 200. The Queen widens the item's path claims with it.
+   */
+  changedPaths: z.array(z.string().max(200)).max(200).optional(),
 });
 export type TrainResult = z.infer<typeof TrainResultSchema>;
 
