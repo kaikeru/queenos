@@ -8,9 +8,9 @@
 import { retryTransient, type TransientRetryOptions } from "@queenos/queen-types";
 
 /** Tries per network call (first one included). */
-export const NET_ATTEMPTS = 3;
-export const NET_BASE_MS = 2_000;
-export const NET_MAX_MS = 16_000;
+export const NET_ATTEMPTS = 4;
+export const NET_BASE_MS = 5_000;
+export const NET_MAX_MS = 30_000;
 
 /** Overrides for tests (no real waiting). */
 export type NetRetry = Partial<Pick<TransientRetryOptions, "attempts" | "baseMs" | "maxMs" | "sleep" | "random" | "onRetry">>;

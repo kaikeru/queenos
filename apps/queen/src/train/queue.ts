@@ -107,6 +107,29 @@ export type CarFailureCause = "gate" | "infra";
 
 /** Consecutive infra-failed cars that open EXECUTOR_LOST and pause car formation. */
 export const CAR_INFRA_FAILURES_BEFORE_LOST = 3;
+/**
+ * The same streak when every car in it was RETIRED after one infra round (`carFailed(…, { retired: true })`):
+ * CAR_INFRA_FAILURES_BEFORE_LOST × MAX_INFRA_ATTEMPTS (3 × 3; a literal, planner.ts imports this module).
+ * An exhausted car spent MAX_INFRA_ATTEMPTS rounds on one repo before it counted; a retired car spends one,
+ * then its members re-board a fresh fork. So EXECUTOR_LOST still means about the same number of consecutive
+ * infra rounds with no car making progress (9), now across fresh forks: a stronger "executors are down"
+ * signal, and one a single sick repo (a 503 window of 40 s to 7+ min after a push) cannot trip on its own.
+ * The streak still counts CARS (the escalation says "N merge-queue cars in a row"); an exhausted car
+ * (lost executor, preview / LANDER exhausted) still opens it at CAR_INFRA_FAILURES_BEFORE_LOST.
+ */
+export const CAR_INFRA_RETIREMENTS_BEFORE_LOST = 9;
+
+/** Eject reason prefix of a car retired after one infra round (the planner reads it to avoid its fork source). */
+export const RETIRED_ON_INFRA = "retired on infra";
+
+/** carFailed options. */
+export interface CarFailedOptions {
+  /**
+   * cause "infra" only: the car hit infra once (its drone / gatekeeper retries already spent) and is RETIRED
+   * rather than retried against the same, possibly sick, repo: members re-board a fresh car.
+   */
+  retired?: boolean;
+}
 
 const ACTOR = "queen";
 const MAX_SUMMARY = 500;
@@ -441,12 +464,19 @@ export function carFailed(
   cause: CarFailureCause,
   trains: readonly TrainRecord[],
   ctx: QueueContext,
+  opts: CarFailedOptions = {},
 ): QueueDecision {
   const b = new Builder(trains, ctx.namespace);
   const own = new Set(memberPrompts(car, trains));
   const superseded = activeCars(trains).filter((c) => c.seq > car.seq && c.includedPrompts.some((p) => own.has(p)));
+  const retired = cause === "infra" && !!opts.retired;
+  const aboard = (car.members ?? []).filter((m) => {
+    const t = b.get(m);
+    return !!t && active(t);
+  }).length;
+  const reboard = `${aboard} member${aboard === 1 ? "" : "s"} re-board a fresh car`;
 
-  b.eject(car.trainId, `failed: ${summary}`);
+  b.eject(car.trainId, retired ? `${RETIRED_ON_INFRA} after 1 round; ${reboard}: ${summary}` : `failed: ${summary}`);
   for (const s of superseded) {
     b.eject(s.trainId, `superseded: car ${car.trainId} failed`);
     for (const m of s.members ?? []) {
@@ -463,7 +493,19 @@ export function carFailed(
     for (const m of members) b.patch(m, { carId: null, bisectOf: null });
     const next = ctx.carInfraFailures + 1;
     b.carInfraFailures = next;
-    if (next >= CAR_INFRA_FAILURES_BEFORE_LOST && !ctx.paused) b.executorLost = true;
+    const limit = retired ? CAR_INFRA_RETIREMENTS_BEFORE_LOST : CAR_INFRA_FAILURES_BEFORE_LOST;
+    const lost = next >= limit && !ctx.paused;
+    if (lost) b.executorLost = true;
+    const streak = `infra streak ${next}/${limit}${lost ? ": EXECUTOR_LOST, car formation paused" : ""}`;
+    b.event({
+      type: "queue.car",
+      severity: "warn",
+      trainId: car.trainId,
+      summary: retired
+        ? `car ${car.trainId} retired on infra after 1 round; ${reboard} (${streak}): ${summary}`
+        : `car ${car.trainId} failed on infra; ${members.length} member${members.length === 1 ? "" : "s"} return to the pool (${streak}): ${summary}`,
+      data: { carId: car.trainId, cause: "infra", retired, rounds: retired ? 1 : null, returned: members, superseded: superseded.map((c) => c.trainId), infraStreak: next, executorLost: lost },
+    });
     return b.build();
   }
 

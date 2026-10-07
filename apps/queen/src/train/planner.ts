@@ -121,6 +121,13 @@ export const DEFAULT_MAX_CONFLICT_REWORKS = 2;
  * that command (persisted in its command id / droneAttempt). Past it, infraExhausted(): the train is
  * EJECTED ("failed on infrastructure: …") and the item FAILED with EXECUTOR_LOST, never
  * REWORK_EXHAUSTED. Preview / gate retries wait INFRA_RETRY_BASE_MS·2^(n-1) (jittered) via the alarm.
+ *
+ * Merge-queue CARS are the exception (retireCar): an Artifacts repo can go "sick" right after a push
+ * (smart-HTTP 503s for 40 s to 7+ min, inherited by forks of it) while a fresh fork of the same content
+ * works at once. So a car whose preview deploy, integration gate or MERGE drone reports infra (that
+ * executor's in-step and Workflow retries already spent) is not retried against the same repo: it is
+ * RETIRED after that one round, its members re-board a fresh car, and that car does not stack on a
+ * suspect car ahead (carForkGuard). BUILD trains and race candidates keep MAX_INFRA_ATTEMPTS.
  */
 export const MAX_INFRA_ATTEMPTS = MAX_COMMAND_ATTEMPTS;
 export const INFRA_RETRY_BASE_MS = 30_000;
@@ -481,8 +488,19 @@ export function outstandingSince(t: TrainRecord, now: number): number[] {
     if (t.forkState === "PENDING") out.push(t.forkIssuedAt);
     if (t.phase === "DEPLOYING" && t.deployState === "PENDING") out.push(t.deployIssuedAt);
     if (droneOutstanding(t)) out.push(t.droneIssuedAt);
+    if (carGateOutstanding(t)) out.push(t.deployIssuedAt);
   }
   return out.map((x) => x ?? now);
+}
+
+/**
+ * A car waiting on its integration gate (TESTING, preview LIVE). The gatekeeper's inspect step can retry a
+ * sick repo for far longer than COMMAND_TIMEOUT_MS, so the watchdog bounds it from the preview deploy's
+ * issue time: past the timeout the car is retired like any car infra round (retireCar), and its members
+ * re-board a fresh car. BUILD trains have no gate watchdog (unchanged).
+ */
+function carGateOutstanding(t: TrainRecord): boolean {
+  return isActive(t) && isCar(t) && t.phase === "TESTING" && t.deployState === "LIVE";
 }
 
 /**
@@ -611,6 +629,8 @@ export class TrainPlanner {
   private carInfraFailures: number;
   private carInfraDirty = false;
   private executorLost = false;
+  /** Car repos a car forked from failed on infra in this plan (carForkGuard: do not stack on them). */
+  private readonly suspectRepos = new Set<string>();
   private infraFailed: { promptId: string; summary: string }[] = [];
   private readonly hooks: QueueHooks;
   private readonly activeBuildsAtStart: number;
@@ -916,18 +936,21 @@ export class TrainPlanner {
   }
 
   /**
-   * A MERGE / LAND drone whose transient Artifacts errors (5xx / 429) outlasted its own retries. Not a verdict:
-   * the SAME car's drone is re-dispatched under the next attempt (no supersede, no member charge; the drone
-   * backs off in-step, and the Workflow retries 10/20/40 s, before it reports). Past MAX_COMMAND_ATTEMPTS the
-   * existing infra-exhausted path applies (merge: infraExhausted → carFailed "infra" → 3 in a row EXECUTOR_LOST;
-   * land: landFailed). A report from an attempt other than the current one is stale.
+   * A MERGE / LAND drone whose transient Artifacts errors (5xx / 429) outlasted its own retries (the drone
+   * backs off in-step, and the Workflow retries 10/20/40 s, before it reports). Not a verdict, no member charge.
+   * MERGE: the car is RETIRED after this one round (retireCar: members re-board a fresh car, not stacked on a
+   * suspect repo). LAND: the SAME car's lander is re-dispatched under the next attempt (the car already passed
+   * its gate); past MAX_COMMAND_ATTEMPTS, landFailed. A report from an attempt other than the current one is stale.
    */
   private driveInfraFailure(t: TrainRecord, r: MergeResult | LandResult): PlanResult {
     if (!droneOutstanding(t)) return this.finish("ignored:stale");
     if (r.commandId && r.commandId !== droneInstanceId({ trainId: t.trainId, action: t.phase === "LANDING" ? "LAND" : "MERGE" }, t.droneAttempt)) {
       return this.finish("ignored:stale");
     }
-    this.redispatchDrone(t, r.summary || "drone hit an infrastructure error", true);
+    const summary = r.summary || "drone hit an infrastructure error";
+    // A car's MERGE drone: retire the car (members re-board a fresh fork); a LANDER retries the same car.
+    if (isCar(t) && t.phase === "BUILDING") this.retireCar(t, `MERGE drone hit infra: ${summary}`);
+    else this.redispatchDrone(t, summary, true);
     return this.finish("applied");
   }
 
@@ -1053,6 +1076,8 @@ export class TrainPlanner {
       } else if (t.phase === "DEPLOYING" && t.deployState === "PENDING" && expired(t.deployIssuedAt)) {
         if (commandAttempt(t.deployCommandId) < MAX_COMMAND_ATTEMPTS) this.deployPreview(t);
         else this.previewFailed(t, late("Herald DEPLOY", t.deployCommandId), t.headSha, null, true);
+      } else if (carGateOutstanding(t) && expired(t.deployIssuedAt ?? now)) {
+        this.retireCar(t, `integration gate did not report within ${Math.round(this.timeoutMs / 60_000)} min of the preview deploy (sick repo?)`);
       } else if (droneOutstanding(t) && expired(t.droneIssuedAt)) {
         this.redispatchDrone(t, late(t.phase === "LANDING" ? "LANDER drone" : isCar(t) ? "MERGE drone" : "BUILDER drone", null));
       }
@@ -1087,10 +1112,14 @@ export class TrainPlanner {
    * Repo to fork from, or null to wait:
    * - BUILD: hive main, unless a conflict / integration rework still waits for
    *   a car with seq ≤ waitForCarSeq to become terminal;
-   * - QUEUE: the car ahead once it has pushed (null until then), or main.
+   * - QUEUE: the car ahead once it has pushed (null until then), or main; a car that
+   *   avoids a suspect car ahead (carForkGuard, waitForCarSeq) waits for it to be
+   *   terminal, then forks from main.
    */
   private forkSourceFor(t: TrainRecord): string | null {
     if (isCar(t)) {
+      const wait = t.waitForCarSeq;
+      if (wait !== null && wait !== undefined) return this.cars().some((c) => c.seq <= wait && c.trainId !== t.trainId) ? null : this.ctx.namespace;
       const ahead = this.cars()
         .filter((c) => c.seq < t.seq)
         .at(-1);
@@ -1209,6 +1238,7 @@ export class TrainPlanner {
 
   private scheduleFork(t: TrainRecord): void {
     if (t.phase !== "WAITING_PARENT") return;
+    this.carForkGuard(t);
     const source = this.forkSourceFor(t);
     if (source === null) return;
     this.setTrain(t, {
@@ -1379,9 +1409,14 @@ export class TrainPlanner {
    * The train's preview deploy or gate failed on infrastructure: no attempt charged, no rework.
    * Park it (DEPLOYING, deploy FAILED, clock = now) and let the alarm re-deploy the preview after
    * infraRetryDelayMs (the gatekeeper waiting on the train re-gates once it is back in TESTING).
-   * Past MAX_INFRA_ATTEMPTS deploys: infraExhausted.
+   * Past MAX_INFRA_ATTEMPTS deploys: infraExhausted. A car is never parked: retireCar.
    */
   private infraRetry(t: TrainRecord, summary: string): void {
+    if (isCar(t)) {
+      this.setDeployment(t, { status: "FAILED", summary: clip500(`${summary} (infrastructure: car retired)`) });
+      this.retireCar(t, summary);
+      return;
+    }
     const n = commandAttempt(t.deployCommandId);
     if (n >= MAX_INFRA_ATTEMPTS) {
       this.setTrain(t, { deployState: "FAILED" }, false);
@@ -1510,10 +1545,66 @@ export class TrainPlanner {
   }
 
   /** A car failed: queue.carFailed decides (supersede, bisect, integration rework, infra count). */
-  private failCar(car: TrainRecord, summary: string, cause: queue.CarFailureCause): void {
-    this.applyQueue(this.hooks.carFailed(car, summary, cause, this.trains, this.queueContext()));
+  private failCar(car: TrainRecord, summary: string, cause: queue.CarFailureCause, opts?: queue.CarFailedOptions): void {
+    // The repo this car forked from may be sick (forks inherit it): no replacement car stacks on it.
+    if (cause === "infra" && car.forkSource && car.forkSource !== this.ctx.namespace) this.suspectRepos.add(car.forkSource);
+    const ctx = this.queueContext();
+    this.applyQueue(opts ? this.hooks.carFailed(car, summary, cause, this.trains, ctx, opts) : this.hooks.carFailed(car, summary, cause, this.trains, ctx));
     if (isActive(car)) this.eject(car, `failed: ${summary}`);
     this.maybeLand();
+  }
+
+  /**
+   * A car hit infra once, on its preview deploy, integration gate or MERGE drone (that executor's own
+   * retries already spent). Its repo, or the car ahead it forked from, may be "sick" (Artifacts 503s for
+   * minutes after a push; forks inherit it), so it is not re-deployed / re-gated / re-merged: the queue's
+   * infra path retires it (EJECTED "retired on infra …", later cars superseded, members back to the pool
+   * with no charge), formCars boards them on a fresh car, and carForkGuard keeps that car off the suspect
+   * fork source. Counts toward EXECUTOR_LOST at CAR_INFRA_RETIREMENTS_BEFORE_LOST (queue.ts).
+   */
+  private retireCar(car: TrainRecord, summary: string): void {
+    if (!isActive(car)) return;
+    this.failCar(car, summary, "infra", { retired: true });
+  }
+
+  /**
+   * The car ahead `t` would stack on is suspect when a car forked from it just failed on infra (this plan,
+   * or a retired car still loaded), or it is itself in an infra retry (a re-dispatched LANDER, a parked
+   * preview). Forking from it would likely inherit its sick repo.
+   */
+  private suspectCar(ahead: TrainRecord): string | null {
+    if (this.suspectRepos.has(ahead.artifactRepo)) return `a car forked from it failed on infra`;
+    const retired = this.trains.find(
+      (x) => isCar(x) && x.phase === "EJECTED" && x.forkSource === ahead.artifactRepo && (x.reason ?? "").startsWith(queue.RETIRED_ON_INFRA),
+    );
+    if (retired) return `car ${retired.trainId} forked from it retired on infra`;
+    if (awaitingInfraRetry(ahead)) return "it is waiting out an infra retry";
+    if (ahead.phase === "LANDING" && ahead.droneAttempt > 1) return `its LANDER is on attempt ${ahead.droneAttempt}`;
+    return null;
+  }
+
+  /**
+   * Fork-source rule for a car about to fork (WAITING_PARENT, not already waiting): when the car ahead is
+   * suspect, do not stack on it. Forking from hive main at once would test a tree without the car ahead and
+   * could never fast-forward main after it lands, so the car WAITS for every car up to the one ahead to be
+   * terminal (persisted as waitForCarSeq, the BUILD rework rule) and then forks from main. If that car
+   * fails instead, this car is superseded as usual (it carries the car's prompts) and its members re-board.
+   */
+  private carForkGuard(t: TrainRecord): void {
+    if (!isCar(t) || t.phase !== "WAITING_PARENT" || (t.waitForCarSeq ?? null) !== null) return;
+    const ahead = this.cars()
+      .filter((c) => c.seq < t.seq)
+      .at(-1);
+    if (!ahead) return;
+    const why = this.suspectCar(ahead);
+    if (!why) return;
+    this.setTrain(t, { waitForCarSeq: ahead.seq }, false);
+    this.event(t, {
+      type: "queue.car",
+      severity: "warn",
+      summary: clip500(`car ${t.trainId} will not fork from car ${ahead.trainId} (${why}); it forks from main once ${ahead.trainId} has landed`),
+      data: { carId: t.trainId, avoided: ahead.trainId, waitForCarSeq: ahead.seq, reason: why },
+    });
   }
 
   /**

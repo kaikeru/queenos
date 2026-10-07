@@ -98,7 +98,7 @@ export function readConfig(env: GateVars): GateConfig {
     phaseRetries: int(env.GATE_PHASE_RETRIES, 24, 1, 60),
     phaseWaitMs: int(env.GATE_PHASE_WAIT_MS, 5000, 0, 60_000),
     infraRounds: int(env.GATE_INFRA_ROUNDS, 3, 1, 8),
-    transientBaseMs: int(env.GATE_TRANSIENT_BASE_MS, 2000, 0, 30_000),
+    transientBaseMs: int(env.GATE_TRANSIENT_BASE_MS, 5000, 0, 30_000),
     aiGateway: { gatewayId: env.AI_GATEWAY_ID?.trim() || "queenos", model: modelForRole("SCRIBE", env) },
     reviewMode,
     reviewModel: env.MODEL_REVIEWER?.trim() || DEFAULT_MODEL_REVIEWER,

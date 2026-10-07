@@ -15,6 +15,83 @@ import { registryMergeDriver } from "./merge-driver.js";
 
 export type HttpClient = typeof webHttp;
 
+const EVIDENCE_BODY_BYTES = 200;
+
+/** Smart-HTTP endpoint kind of a request URL. */
+export function endpointKind(url: string): string {
+  const path = url.split("?")[0] ?? url;
+  if (path.endsWith("/info/refs")) return "info/refs";
+  if (path.endsWith("/git-upload-pack")) return "upload-pack";
+  if (path.endsWith("/git-receive-pack")) return "receive-pack";
+  return "other";
+}
+
+/** One line of body text: control chars flattened, tokens redacted, clipped. */
+function bodySnippet(bytes: Uint8Array): string {
+  const text = new TextDecoder().decode(bytes.subarray(0, EVIDENCE_BODY_BYTES));
+  return text
+    .replace(/art_v\d_\S+/g, "[redacted]")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/"/g, "'")
+    .trim();
+}
+
+async function drain(body: unknown): Promise<Uint8Array> {
+  const parts: Uint8Array[] = [];
+  if (body && typeof (body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator] === "function") {
+    for await (const c of body as AsyncIterable<Uint8Array>) parts.push(c);
+  } else if (body && typeof (body as Iterable<Uint8Array>)[Symbol.iterator] === "function") {
+    for (const c of body as Iterable<Uint8Array>) parts.push(c);
+  }
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+
+/**
+ * Wrap an isomorphic-git HttpClient so a non-2xx response carries evidence in
+ * its `statusMessage` (which isomorphic-git puts in HttpError.message):
+ * `Service Unavailable [HTTP 503 upload-pack cf-ray=... retry-after=... body="..."]`.
+ * The error body is read (and replayed to isomorphic-git) only for error
+ * statuses. Request headers (auth) are never read or included.
+ */
+export function withHttpEvidence(inner: HttpClient): HttpClient {
+  return {
+    ...inner,
+    request: async (req) => {
+      const res = await inner.request(req);
+      if (res.statusCode >= 200 && res.statusCode < 300) return res;
+      let bytes: Uint8Array = new Uint8Array(0);
+      try {
+        bytes = await drain(res.body);
+      } catch {
+        // body unreadable: keep what we have
+      }
+      const h = res.headers ?? {};
+      const parts = [`HTTP ${res.statusCode}`, endpointKind(req.url)];
+      if (h["cf-ray"]) parts.push(`cf-ray=${h["cf-ray"]}`);
+      if (h["retry-after"]) parts.push(`retry-after=${h["retry-after"]}`);
+      const snippet = bodySnippet(bytes);
+      if (snippet) parts.push(`body="${snippet}"`);
+      return {
+        ...res,
+        statusMessage: `${res.statusMessage ?? ""} [${parts.join(" ")}]`.trim(),
+        body: (async function* () {
+          if (bytes.length) yield bytes;
+        })(),
+      };
+    },
+  } as HttpClient;
+}
+
+/** The default transport: the web client with error-evidence capture. */
+const defaultHttp: HttpClient = withHttpEvidence(webHttp);
+
 /** The Cognitive Ledger notes ref. */
 export const NOTES_REF = "refs/notes/queen";
 export const ZERO_OID = "0000000000000000000000000000000000000000";
@@ -211,7 +288,7 @@ export class GitRepo {
     this.fs = opts.fs ?? new MemFS();
     this.dir = opts.dir ?? DEFAULT_DIR;
     this.remote = opts.remote;
-    this.http = opts.http ?? webHttp;
+    this.http = opts.http ?? defaultHttp;
   }
 
   protected get base() {
@@ -599,7 +676,7 @@ export async function cloneRepo(opts: CloneOptions): Promise<GitRepo> {
   await git.clone({
     fs: repo.fs,
     dir: repo.dir,
-    http: opts.http ?? webHttp,
+    http: opts.http ?? defaultHttp,
     url: opts.remote,
     singleBranch: true,
     noTags: true,

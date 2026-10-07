@@ -267,7 +267,7 @@ describe("runGate: infrastructure failures", () => {
     const steps = new InlineSteps();
     const out = await runGate(gateTask(after), steps, w.ports(), config());
     expect(out).toMatchObject({ status: "gated", passed: false, infra: true, summary: expect.stringContaining("artifacts is unreachable") });
-    expect(steps.log.find((l) => l.name === "inspect: clone, scan, test")).toMatchObject({ attempts: 4, ok: false }); // 1 + 3 retries
+    expect(steps.log.find((l) => l.name === "inspect: clone, scan, test")).toMatchObject({ attempts: 5, ok: false }); // 1 + 4 retries
     expect(w.queen.reports()).toEqual([expect.objectContaining({ passed: false, cause: "infra" })]);
     expect(w.queen.reports()[0]!.commandId).toBeUndefined(); // a gate report, not a drone's
   });
@@ -294,9 +294,9 @@ describe("runGate: infrastructure failures", () => {
     const { w, after } = await setup();
     let n = 0;
     const real = w.artifacts.access.bind(w.artifacts);
-    // 3 in-step tries x 4 step tries = 12 failures in round 1; round 2 succeeds.
+    // 4 in-step tries x 5 step tries = 20 failures in round 1; round 2 succeeds.
     w.artifacts.access = async (repo, scope) => {
-      if (++n <= 12) throw new Error("HttpError: HTTP Error: 503 Service Unavailable");
+      if (++n <= 20) throw new Error("HttpError: HTTP Error: 503 Service Unavailable");
       return real(repo, scope);
     };
     // Round 1 sees TESTING; after the infra report the Queen re-deploys (DEPLOYING), then TESTING again.
@@ -308,7 +308,7 @@ describe("runGate: infrastructure failures", () => {
       [false, "infra"],
       [true, null],
     ]);
-    expect(steps.log.find((l) => l.name === "inspect: clone, scan, test")).toMatchObject({ attempts: 4, ok: false });
+    expect(steps.log.find((l) => l.name === "inspect: clone, scan, test")).toMatchObject({ attempts: 5, ok: false });
     expect(steps.log.find((l) => l.name === "inspect: clone, scan, test ~r2")).toMatchObject({ attempts: 1, ok: true });
     expect(steps.sleeps.map((x) => x.name)).toContain("infra: wait for the re-deploy ~r2");
   });

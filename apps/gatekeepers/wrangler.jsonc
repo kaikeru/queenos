@@ -6,6 +6,7 @@
   // with no flags (docs/discovery.md §2). Do not add nodejs_compat.
   "compatibility_date": "2026-10-02",
   "workers_dev": false,
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
   "preview_urls": false,
   // Clone + AST scan of a whole tree is CPU-heavy; Workflow steps may use up to 5 min.
   "limits": { "cpu_ms": 300000 },

@@ -39,7 +39,14 @@ describe("push filter", () => {
     expect(classify({ repoName: "my-hive-train-0123456789ab" })).toMatchObject({ task: { hive: "my-hive" } });
   });
 
+  it("gates a provisioner fork-retry name (-r2, -r10) with the right hive", () => {
+    expect(classify({ repoName: "my-hive-train-0123456789ab-r2" })).toMatchObject({ action: "gate", task: { hive: "my-hive", repo: "my-hive-train-0123456789ab-r2" } });
+    expect(classify({ repoName: "demo-train-0123456789ab-r10" })).toMatchObject({ action: "gate", task: { hive: "demo" } });
+  });
+
   it.each([
+    ["a bad-hex train name", { repoName: "demo-train-abc" }, "not-a-train-fork"],
+    ["a non-numeric retry suffix", { repoName: "demo-train-0123456789ab-rx" }, "not-a-train-fork"],
     ["the lander's push to the hive repo", { repoName: "hive" }, "not-a-train-fork"],
     ["a notes ref", { ref: "refs/notes/queen" }, "notes-ref"],
     ["a branch deletion", { after: ZERO_SHA }, "deletion"],

@@ -136,13 +136,16 @@ describe("planner ↔ merge queue", () => {
 });
 
 describe("planner ↔ merge queue: infrastructure", () => {
-  it("a car whose integration gate could not run (cause infra) is re-deployed and re-gated, not bisected; members stay aboard", () => {
+  it("a car whose integration gate could not run (cause infra) is retired after that one round, not re-gated or bisected; members return to the pool", () => {
     const r = hive("TESTING").planner().trainResult({ trainId: "K1", passed: false, summary: "Gatekeeper could not inspect the push: HTTP Error: 503 Service Unavailable", cause: "infra" });
     expect(r.outcome).toBe("applied");
     const byId = new Map(r.trains.map((t) => [t.trainId, t]));
-    expect(byId.get("K1")).toMatchObject({ phase: "DEPLOYING", deployState: "FAILED", deployIssuedAt: 1000 });
-    for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)?.phase ?? "PASSED").toBe("PASSED");
+    expect(byId.get("K1")).toMatchObject({ phase: "EJECTED" });
+    expect(byId.get("K1")!.reason).toMatch(/^retired on infra after 1 round; 4 members re-board a fresh car: gate could not run: .*503/);
+    for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)).toMatchObject({ carId: null }); // back to the pool (no queue here: they land directly)
+    expect(r.events.some((e) => e.type === "queue.bisect")).toBe(false);
     expect(r.executorLost).toBeUndefined();
+    expect(r.carInfraFailures).toBe(1);
     expect(r.prompts.every((p) => p.attempts === 0)).toBe(true);
   });
 
@@ -157,19 +160,15 @@ describe("planner ↔ merge queue: infrastructure", () => {
   });
   const dispatches = (effects: Effect[]) => effects.filter((e): e is Extract<Effect, { type: "dispatchDrone" }> => e.type === "dispatchDrone");
 
-  it("a MERGE drone that hit transient infra re-dispatches the SAME car: no eject, no supersede, members stay aboard, nothing charged", () => {
+  it("a MERGE drone that hit transient infra (its own retries spent) retires the car after that one round: no re-merge of the same repo, members back to the pool, nothing charged", () => {
     const r = hive("BUILDING").planner().mergeResult(infraMerge());
     expect(r.outcome).toBe("applied");
     const byId = new Map(r.trains.map((t) => [t.trainId, t]));
-    expect(byId.get("K1")).toMatchObject({ phase: "BUILDING", droneAttempt: 2 });
-    for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)?.carId ?? "K1").toBe("K1"); // untouched (or unchanged)
-    for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)?.phase ?? "PASSED").toBe("PASSED");
-    expect(dispatches(r.effects).map((e) => [e.trainId, e.task.action, e.attempt])).toEqual([["K1", "MERGE", 2]]);
-    const [merge] = dispatches(r.effects);
-    expect(merge!.task).toMatchObject({ trainId: "K1", action: "MERGE", role: "LANDER", baseRef: "main" });
-    expect(merge!.task.members?.map((m) => m.trainId)).toEqual(["A", "B", "C", "D"]);
-    // Not confirmed dispatched until the DO's create succeeds: reconcile re-sends it otherwise.
-    expect(r.trains.find((t) => t.trainId === "K1")).toMatchObject({ dispatched: false });
+    expect(byId.get("K1")).toMatchObject({ phase: "EJECTED", droneAttempt: 1 });
+    expect(byId.get("K1")!.reason).toMatch(/^retired on infra after 1 round; 4 members re-board a fresh car: MERGE drone hit infra: /);
+    for (const id of ["A", "B", "C", "D"]) expect(byId.get(id)).toMatchObject({ carId: null }); // back to the pool (no queue here: they land directly)
+    expect(dispatches(r.effects).filter((e) => e.trainId === "K1")).toEqual([]); // no MERGE re-dispatch
+    expect(r.events.find((e) => e.type === "queue.car")!.summary).toMatch(/^car K1 retired on infra after 1 round; 4 members re-board a fresh car \(infra streak 1\/9\)/);
     expect(r.executorLost).toBeUndefined();
     expect(r.prompts.every((p) => p.attempts === 0 && p.status === "IN_TRAIN")).toBe(true);
   });
@@ -179,15 +178,6 @@ describe("planner ↔ merge queue: infrastructure", () => {
     expect(stale.outcome).toBe("ignored:stale");
     const plain = hive("BUILDING").planner().mergeResult(infraMerge({ cause: undefined }));
     expect(plain.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "EJECTED" });
-  });
-
-  it("infra MERGE retries are bounded: past MAX_COMMAND_ATTEMPTS the car takes the infra-exhausted path (EJECTED, members back to the pool)", () => {
-    const first = hive("BUILDING").planner().mergeResult(infraMerge());
-    expect(first.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "BUILDING", droneAttempt: 2 });
-    const r = hive("BUILDING", { droneAttempt: 3 }).planner().mergeResult(infraMerge());
-    expect(r.trains.find((t) => t.trainId === "K1")).toMatchObject({ phase: "EJECTED" });
-    for (const id of ["A", "B", "C", "D"]) expect(r.trains.find((t) => t.trainId === id)).toMatchObject({ carId: null });
-    expect(r.prompts.every((p) => p.attempts === 0)).toBe(true);
   });
 
   it("a LANDER that hit transient infra re-dispatches the same car's lander (no eject); NOT_FAST_FORWARD (no cause) still fails the car", () => {

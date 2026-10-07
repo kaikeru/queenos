@@ -95,8 +95,8 @@ export function parsePushEvent(raw: unknown): ParsedPush {
   return { ok: false, error: env.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ") };
 }
 
-/** `<hive>-train-<12 hex>` (apps/queen trainRepoName). */
-const TRAIN_REPO_RE = /^(.+)-train-([0-9a-f]{12})$/;
+/** `<hive>-train-<12 hex>` (apps/queen trainRepoName), plus the provisioner's fork-retry suffix `-r<N>`. */
+const TRAIN_REPO_RE = /^(.+)-train-([0-9a-f]{12})(?:-r\d+)?$/;
 
 /** The gate's workflow params: a push that passed the filter. */
 export const GateTaskSchema = z.object({

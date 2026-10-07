@@ -76,6 +76,22 @@ describe("runProvision FORK", () => {
   });
 });
 
+describe("runProvision NOTE", () => {
+  it("never deletes: reports a non-destructive failure", async () => {
+    const w = new FakeWorld();
+    const steps = new InlineSteps();
+    const out = await runProvision(
+      { op: "NOTE", commandId: "cmd-9", hive: "hive", trainId: "train-1", repo: "hive-train-aaaaaaaaaaaa", sha: "a".repeat(40), text: "hello" },
+      steps,
+      w.ports(),
+    );
+    expect(w.artifacts.calls.filter((c) => c.startsWith("delete"))).toEqual([]);
+    expect(w.artifacts.calls).toEqual([]);
+    expect(out).toMatchObject({ op: "NOTE", ok: false });
+    expect(w.queen.results[0]).toMatchObject({ commandId: "cmd-9", op: "NOTE", ok: false, summary: "NOTE not supported by this provisioner yet" });
+  });
+});
+
 describe("runProvision DELETE", () => {
   it("deletes and reports", async () => {
     const w = new FakeWorld();

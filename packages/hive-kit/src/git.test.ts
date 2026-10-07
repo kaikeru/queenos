@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GitError, GitRepo, MemoryGitServer, NOTES_REF, QUEEN_MERGE_IDENTITY, artifactsAuth, assertRepoPath, cloneRepo, initRepo, stripTokenExpiry } from "./git.js";
+import { GitError, GitRepo, MemoryGitServer, NOTES_REF, QUEEN_MERGE_IDENTITY, artifactsAuth, assertRepoPath, endpointKind, withHttpEvidence, cloneRepo, initRepo, stripTokenExpiry } from "./git.js";
 import { renderRegistry } from "./registry.js";
 
 const T0 = 1_790_000_000; // fixed Unix seconds
@@ -264,5 +264,70 @@ describe("MemoryGitServer + shallow history", () => {
     expect((await car.readFiles([REG]))[REG]).toBe(renderRegistry(["f.js"]));
     await car.push({ ref: "main" });
     expect(await origin.resolveRef("main")).toBe("oid" in out ? out.oid : "");
+  });
+});
+
+describe("withHttpEvidence", () => {
+  const urlBase = "https://acct.artifacts.cloudflare.net/git/ns/repo.git";
+  const fake = (status: number, body: string, headers: Record<string, string> = {}) =>
+    ({
+      request: async () => ({
+        url: urlBase,
+        method: "POST",
+        statusCode: status,
+        statusMessage: status === 503 ? "Service Unavailable" : "OK",
+        headers,
+        body: (async function* () {
+          yield new TextEncoder().encode(body);
+        })(),
+      }),
+    }) as never;
+  const read = async (b: AsyncIterable<Uint8Array>) => {
+    let s = "";
+    for await (const c of b) s += new TextDecoder().decode(c);
+    return s;
+  };
+
+  it("adds endpoint, status, cf-ray, retry-after and a body snippet to a 503, and replays the body", async () => {
+    const http = withHttpEvidence(fake(503, "upstream\nconnect error art_v2_secret123", { "cf-ray": "abc-LHR", "retry-after": "30" }));
+    const res = await http.request({ url: `${urlBase}/git-upload-pack`, method: "POST", headers: { authorization: "Basic SECRET" } });
+    expect(res.statusCode).toBe(503);
+    expect(res.statusMessage).toBe(
+      'Service Unavailable [HTTP 503 upload-pack cf-ray=abc-LHR retry-after=30 body="upstream connect error [redacted]"]',
+    );
+    expect(res.statusMessage).not.toMatch(/SECRET|secret123/);
+    expect(await read(res.body as never)).toContain("upstream");
+  });
+
+  it("clips the body to 200 bytes", async () => {
+    const http = withHttpEvidence(fake(503, "x".repeat(5000)));
+    const res = await http.request({ url: `${urlBase}/info/refs?service=git-upload-pack`, method: "GET", headers: {} });
+    expect(res.statusMessage).toContain("info/refs");
+    expect(res.statusMessage).toContain(`body="${"x".repeat(200)}"`);
+  });
+
+  it("passes 2xx responses through untouched (body not read)", async () => {
+    const inner = fake(200, "pack") as { request: (r: unknown) => Promise<{ body: unknown }> };
+    const res0 = await inner.request({ url: `${urlBase}/git-upload-pack`, headers: {} });
+    const http = withHttpEvidence({ request: async () => res0 } as never);
+    const res = await http.request({ url: `${urlBase}/git-upload-pack`, headers: {} });
+    expect(res).toBe(res0);
+    expect(await read(res.body as never)).toBe("pack");
+  });
+
+  it("keeps the HttpError classifiable: clone against a 503 mentions HTTP Error: 503 and the evidence", async () => {
+    const http = withHttpEvidence(fake(503, "overloaded", { "cf-ray": "r1" }));
+    const err = await cloneRepo({ remote: `${urlBase}`, token: "art_v2_tok?expires=1", http }).then(
+      () => null,
+      (e: Error) => e,
+    );
+    expect(err?.message).toMatch(/HTTP Error: 503 Service Unavailable \[HTTP 503 info\/refs cf-ray=r1 body="overloaded"\]/);
+    expect(err?.message).not.toContain("art_v2_tok");
+    expect((err as { data?: { statusCode?: number } }).data?.statusCode).toBe(503);
+  });
+
+  it("classifies endpoints", () => {
+    expect(endpointKind(`${urlBase}/git-receive-pack`)).toBe("receive-pack");
+    expect(endpointKind(`${urlBase}/info/refs?service=git-receive-pack`)).toBe("info/refs");
   });
 });

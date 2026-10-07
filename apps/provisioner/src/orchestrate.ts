@@ -86,20 +86,33 @@ export async function runProvision(payload: unknown, step: StepRunner, ports: Pr
 
   let work: Work;
   try {
-    work = await step.do(cmd.op === "FORK" ? "fork" : "delete", PROVISION_STEP, async (): Promise<Work> => {
+    const stepName = cmd.op === "FORK" ? "fork" : cmd.op === "DELETE" ? "delete" : "note";
+    work = await step.do(stepName, PROVISION_STEP, async (): Promise<Work> => {
       try {
-        if (cmd.op === "FORK") {
-          const r = await ports.artifacts.forkTrain(cmd.sourceRepo, cmd.forkName);
-          return { ok: true, artifactRepo: r.artifactRepo, baseSha: r.baseSha, summary: `Forked ${cmd.sourceRepo} to ${r.artifactRepo} at ${r.baseSha.slice(0, 12)}.` };
+        switch (cmd.op) {
+          case "FORK": {
+            const r = await ports.artifacts.forkTrain(cmd.sourceRepo, cmd.forkName);
+            return { ok: true, artifactRepo: r.artifactRepo, baseSha: r.baseSha, summary: `Forked ${cmd.sourceRepo} to ${r.artifactRepo} at ${r.baseSha.slice(0, 12)}.` };
+          }
+          case "DELETE": {
+            const existed = await ports.artifacts.deleteRepo(cmd.repo);
+            return { ok: true, summary: existed ? `Deleted ${cmd.repo}.` : `${cmd.repo} was already gone.` };
+          }
+          case "NOTE":
+            // Non-destructive until a real implementation lands.
+            return { ok: false, summary: "NOTE not supported by this provisioner yet" };
+          default: {
+            const unhandled: never = cmd;
+            throw new NonRetryableError(`INVALID_INPUT: unhandled provision op ${JSON.stringify(unhandled)}`);
+          }
         }
-        const existed = await ports.artifacts.deleteRepo(cmd.repo);
-        return { ok: true, summary: existed ? `Deleted ${cmd.repo}.` : `${cmd.repo} was already gone.` };
       } catch (e) {
         throw toStepError(e);
       }
     });
   } catch (e) {
-    work = { ok: false, summary: clip(`${cmd.op === "FORK" ? "Fork" : "Delete"} failed: ${messageOf(e)}`) };
+    const label = cmd.op === "FORK" ? "Fork" : cmd.op === "DELETE" ? "Delete" : "Note";
+    work = { ok: false, summary: clip(`${label} failed: ${messageOf(e)}`) };
   }
 
   // Best effort, after the fork succeeded: any failure is [] and never fails the fork.

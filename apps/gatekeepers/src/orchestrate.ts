@@ -34,11 +34,13 @@ export const LOOKUP_STEP: WorkflowStepConfig = { retries: { limit: 4, delay: "2 
 /**
  * Clone + scan + test. Inside each try, transient Artifacts errors (5xx / 429) are retried with
  * jitter first (retryTransient), so a swarm of gates does not retry in lockstep; then Workflows
- * retries the step 3 more times (10 s, 20 s, 40 s). Only then is it reported, as infra.
+ * retries the step 4 more times (15 s, 30 s, 60 s, 120 s). Only then is it reported, as infra.
+ * The timeout is per attempt: 4 in-step tries (<= 5+10+20 s of jittered sleeps at the default base)
+ * around clone/scan/test work, so 8 minutes.
  */
-export const INSPECT_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" }, timeout: "5 minutes" };
+export const INSPECT_STEP: WorkflowStepConfig = { retries: { limit: 4, delay: "15 seconds", backoff: "exponential" }, timeout: "8 minutes" };
 /** In-step jittered tries of the inspect body on transient errors. */
-export const INSPECT_TRANSIENT_ATTEMPTS = 3;
+export const INSPECT_TRANSIENT_ATTEMPTS = 4;
 export const SCRIBE_STEP: WorkflowStepConfig = { retries: { limit: 2, delay: "3 seconds", backoff: "exponential" }, timeout: "2 minutes" };
 export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
 /** The reviewer retries internally (and fails open), so Workflows must not retry it again. */
