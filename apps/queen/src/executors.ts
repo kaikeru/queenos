@@ -15,9 +15,10 @@
  *
  * v2 (§4.3, item 3): a decision may issue dozens of commands of one kind (a
  * fan-out of FORKs). `dispatchMany` groups them into Workflows `createBatch`
- * calls of at most 100 instances; `createBatch` skips ids already in use, so
- * a re-dispatch stays idempotent. Any batch error falls back to one-by-one
- * dispatch (which treats an existing instance as success).
+ * calls of at most 100 instances. `createBatch` silently leaves out ids it did
+ * not create (already in use, or a failure), so every id missing from its
+ * result, and every id of a batch that threw, falls back to one-by-one dispatch
+ * (which treats an existing instance as success).
  */
 import type { DeployCommand, OracleCommand, ProvisionCommand, SentinelCommand } from "@queenos/queen-types";
 import { QueenError } from "./errors";
@@ -59,28 +60,44 @@ export async function createOrExisting(workflow: Workflow, id: string, params: u
 }
 
 /**
- * Start many instances with `createBatch` (≤ MAX_BATCH per call). A failed
- * batch is retried one instance at a time. Returns the ids that did not start.
+ * Start many instances with `createBatch` (≤ MAX_BATCH per call). The array form of `createBatch` OMITS
+ * every instance it could not create from its result, without an error ("for example because their ID
+ * already exists", but also on a platform failure: prod 2026-10-07 lost a whole retire plan that way, and
+ * nothing re-sent it until an unrelated alarm 7 min later). So every id missing from the result, and every
+ * id of a batch that threw, is retried one at a time (createOrExisting: an existing instance is success).
+ * Returns the ids that did not start.
  */
 export async function createMany(workflow: Workflow, instances: readonly { id: string; params: unknown }[]): Promise<{ failed: string[] }> {
   const failed: string[] = [];
   for (let i = 0; i < instances.length; i += MAX_BATCH) {
     const chunk = instances.slice(i, i + MAX_BATCH);
+    let started = new Set<string>();
     try {
-      if (chunk.length === 1 || typeof workflow.createBatch !== "function") throw new Error("single");
-      await workflow.createBatch(chunk.map((c) => ({ id: c.id, params: c.params })));
-    } catch {
-      for (const c of chunk) {
-        try {
-          await createOrExisting(workflow, c.id, c.params);
-        } catch (e) {
-          console.error(`queen: could not start workflow instance ${c.id}`, e);
-          failed.push(c.id);
-        }
+      if (chunk.length > 1 && typeof workflow.createBatch === "function") {
+        const res: unknown = await workflow.createBatch(chunk.map((c) => ({ id: c.id, params: c.params })));
+        started = new Set(createdIds(res));
+      }
+    } catch (e) {
+      console.error(`queen: createBatch of ${chunk.length} instances failed; starting them one by one`, e);
+    }
+    const missing = chunk.filter((c) => !started.has(c.id));
+    if (missing.length && started.size) console.error(`queen: createBatch left out ${missing.length} of ${chunk.length} instances; starting them one by one`);
+    for (const c of missing) {
+      try {
+        await createOrExisting(workflow, c.id, c.params);
+      } catch (e) {
+        console.error(`queen: could not start workflow instance ${c.id}`, e);
+        failed.push(c.id);
       }
     }
   }
   return { failed };
+}
+
+/** Instance ids `createBatch` reports as created: the array form's handles, or the object form's `created`. */
+function createdIds(res: unknown): string[] {
+  const list = Array.isArray(res) ? res : res && typeof res === "object" && Array.isArray((res as { created?: unknown }).created) ? (res as { created: unknown[] }).created : [];
+  return list.flatMap((h) => (h && typeof h === "object" && typeof (h as { id?: unknown }).id === "string" ? [(h as { id: string }).id] : []));
 }
 
 /** Starts a Workflow instance with `id = params.commandId`; an existing instance counts as success. */

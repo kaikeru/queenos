@@ -48,6 +48,55 @@ describe("WorkflowCommandDispatcher", () => {
   });
 });
 
+describe("createBatch that silently omits instances (array form: ids it could not create are left out, no error)", () => {
+  const cmd = (n: number): ProvisionCommand => ({ op: "DELETE", commandId: `t${n}-delete-1`, hive: "h", trainId: `t${n}`, repo: `h-train-t${n}` });
+
+  /** createBatch drops every instance it is given `drop` times (prod 2026-10-07: a retire plan's 3 FORK/DELETEs never started). */
+  function droppingWorkflow(drop: number, failCreate = false) {
+    const { wf, created } = fakeWorkflow();
+    let left = drop;
+    const batches: string[][] = [];
+    const w = wf as unknown as { create(o: { id: string; params: unknown }): Promise<{ id: string }>; createBatch?: unknown };
+    const create = w.create.bind(w);
+    if (failCreate) w.create = async () => { throw new Error("workflows.api.error.internal"); };
+    w.createBatch = async (batch: { id: string; params: unknown }[]) => {
+      batches.push(batch.map((b) => b.id));
+      if (left > 0) {
+        left--;
+        return [];
+      }
+      return Promise.all(batch.map((b) => create(b)));
+    };
+    return { wf, created, batches };
+  }
+
+  it("instances the batch left out are created one by one, in the same call", async () => {
+    const { wf, created, batches } = droppingWorkflow(1);
+    const d = new WorkflowCommandDispatcher<ProvisionCommand>(wf, "PROVISIONER");
+    expect(await d.dispatchMany([cmd(1), cmd(2), cmd(3)])).toEqual({ failed: [] });
+    expect(batches).toHaveLength(1);
+    expect([...created.keys()].sort()).toEqual(["t1-delete-1", "t2-delete-1", "t3-delete-1"]);
+  });
+
+  it("left-out instances that cannot be created either are reported failed (the Queen reconciles in 15 s)", async () => {
+    const { wf, created } = droppingWorkflow(1, true);
+    const d = new WorkflowCommandDispatcher<ProvisionCommand>(wf, "PROVISIONER");
+    expect((await d.dispatchMany([cmd(1), cmd(2)])).failed.sort()).toEqual(["t1-delete-1", "t2-delete-1"]);
+    expect(created.size).toBe(0);
+  });
+
+  it("a re-dispatch whose ids already exist (left out by the batch) still counts as started", async () => {
+    const { wf, created } = droppingWorkflow(0);
+    const d = new WorkflowCommandDispatcher<ProvisionCommand>(wf, "PROVISIONER");
+    await d.dispatchMany([cmd(1), cmd(2)]);
+    const w = wf as unknown as { createBatch(b: { id: string }[]): Promise<{ id: string }[]> };
+    const real = w.createBatch.bind(w);
+    // A real createBatch omits existing ids from its result.
+    w.createBatch = async (b) => (await real(b.filter((x) => !created.has(x.id)))) ;
+    expect(await d.dispatchMany([cmd(1), cmd(2)])).toEqual({ failed: [] });
+  });
+});
+
 describe("WorkflowDroneDispatcher", () => {
   const task = {
     promptId: "p",

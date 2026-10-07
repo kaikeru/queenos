@@ -504,9 +504,38 @@ function carGateOutstanding(t: TrainRecord): boolean {
 }
 
 /**
+ * Repo a WAITING_PARENT train forks from now, or null while it must wait (`cars`: the active QUEUE cars):
+ * - BUILD: hive main, unless a conflict / integration rework still waits for a car with seq ≤ waitForCarSeq;
+ * - QUEUE: the car ahead once it has pushed (null until then), or main; a car that avoids a suspect car
+ *   ahead (carForkGuard, waitForCarSeq) waits for every car up to it to be terminal, then forks from main.
+ * The planner's scheduleFork runs carForkGuard first, which may still turn a car's "ready" into a wait.
+ */
+export function forkSourceOf(t: TrainRecord, cars: readonly TrainRecord[], namespace: string): string | null {
+  const others = cars.filter((c) => c.trainId !== t.trainId && isActive(c) && isCar(c));
+  const wait = t.waitForCarSeq;
+  if (wait !== null && wait !== undefined) return others.some((c) => c.seq <= wait) ? null : namespace;
+  if (!isCar(t)) return namespace;
+  const ahead = others.filter((c) => c.seq < t.seq).sort((a, b) => a.seq - b.seq).at(-1);
+  if (!ahead) return namespace;
+  return PUSHED.has(ahead.phase) ? ahead.artifactRepo : null;
+}
+
+/**
+ * A train still WAITING_PARENT although nothing it waits for is left (its car ahead pushed or ended, the car
+ * its rework waits for is terminal). Every transition that frees a wait runs kick(), so this only happens when
+ * a kick was missed; the alarm then forks it (reconcile → scheduleFork) instead of the train waiting forever.
+ */
+export function forkOverdue(t: TrainRecord, trains: readonly TrainRecord[]): boolean {
+  if (!isActive(t) || t.phase !== "WAITING_PARENT") return false;
+  // The namespace only names the fork source (main); readiness does not depend on it.
+  return forkSourceOf(t, trains.filter((c) => isActive(c) && isCar(c)), "main") !== null;
+}
+
+/**
  * When the DO alarm must next run: the earliest `issuedAt + timeout` over
  * every outstanding command, or the earliest RACING race deadline (v2; pass
- * `races`), or null if none.
+ * `races`), or a WAITING_PARENT train whose wait is already over (forkOverdue,
+ * UNDISPATCHED_RETRY_MS out), or null if none.
  */
 export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: number, now: number, races: readonly RaceRecord[] = []): number | null {
   const all = trains.flatMap((t) => outstandingSince(t, now)).map((x) => x + timeoutMs);
@@ -514,6 +543,7 @@ export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: numb
     const at = infraRetryAt(t, now);
     if (at !== null) all.push(at);
     if (droneUndispatched(t)) all.push(now + UNDISPATCHED_RETRY_MS);
+    if (forkOverdue(t, trains)) all.push(now + UNDISPATCHED_RETRY_MS);
   }
   for (const r of races) if (r.state === "RACING" && r.deadlineAt !== null) all.push(r.deadlineAt);
   return all.length ? Math.min(...all) : null;
@@ -1117,18 +1147,7 @@ export class TrainPlanner {
    *   terminal, then forks from main.
    */
   private forkSourceFor(t: TrainRecord): string | null {
-    if (isCar(t)) {
-      const wait = t.waitForCarSeq;
-      if (wait !== null && wait !== undefined) return this.cars().some((c) => c.seq <= wait && c.trainId !== t.trainId) ? null : this.ctx.namespace;
-      const ahead = this.cars()
-        .filter((c) => c.seq < t.seq)
-        .at(-1);
-      if (!ahead) return this.ctx.namespace;
-      return PUSHED.has(ahead.phase) ? ahead.artifactRepo : null;
-    }
-    const wait = t.waitForCarSeq;
-    if (wait !== null && wait !== undefined && this.cars().some((c) => c.seq <= wait)) return null;
-    return this.ctx.namespace;
+    return forkSourceOf(t, this.cars(), this.ctx.namespace);
   }
 
   /** Build slots still free for rework races (the plan's own usage included). */

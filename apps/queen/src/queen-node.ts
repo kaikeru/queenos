@@ -193,6 +193,12 @@ export const MAX_PROMPT_CHARS = 16_000;
 /** Ledger entries are compact reasoning, not logs. */
 export const MAX_GIT_NOTES_BYTES = 16 * 1024;
 export const RECONCILE_DELAY_MS = 15_000;
+/**
+ * Bound on one executor dispatch call (a Workflows create / createBatch). A call that hangs past it counts as
+ * failed (ioFailed: reconcile re-sends the same command ids within RECONCILE_DELAY_MS) instead of stalling the
+ * whole effect batch of a committed decision until some later alarm. Well under an executor's 30 s report step.
+ */
+export const DISPATCH_TIMEOUT_MS = 8_000;
 /** Fire the watchdog alarm a little after the deadline so the command has surely expired. */
 export const WATCHDOG_SLACK_MS = 1_000;
 /** SwarmGovernor lease length; renewed when it expires within LEASE_RENEW_MS. */
@@ -449,6 +455,11 @@ export class QueenNode extends DurableObject<Env> {
   /** Seam for tests: the clock used for planning and the watchdog. */
   protected now(): number {
     return Date.now();
+  }
+
+  /** DISPATCH_TIMEOUT_MS (a seam for tests). */
+  protected dispatchTimeoutMs(): number {
+    return DISPATCH_TIMEOUT_MS;
   }
 
   /** True only in the sim worker (simulated executors); surfaced as `HiveStatus.mode`. */
@@ -1739,6 +1750,17 @@ export class QueenNode extends DurableObject<Env> {
   private async execute(hive: string, effects: Dispatchable[]): Promise<void> {
     if (!effects.length) return;
     let failed = false;
+    const limit = this.dispatchTimeoutMs();
+    // A hung executor call must not stall the rest of the batch (or strand it until a later alarm).
+    const bounded = <T>(p: Promise<T>, what: string): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} did not settle within ${limit} ms`)), limit);
+      });
+      return Promise.race([p, late]).finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
+      });
+    };
     const group = async <C extends { commandId: string }>(
       port: { dispatch(c: C): Promise<unknown>; dispatchMany?(cs: readonly C[]): Promise<{ failed: string[] }> },
       cmds: C[],
@@ -1746,12 +1768,12 @@ export class QueenNode extends DurableObject<Env> {
       if (!cmds.length) return;
       try {
         if (cmds.length > 1 && port.dispatchMany) {
-          if ((await port.dispatchMany(cmds)).failed.length) failed = true;
+          if ((await bounded(port.dispatchMany(cmds), `dispatch of ${cmds.length} commands`)).failed.length) failed = true;
           return;
         }
         for (const c of cmds) {
           try {
-            await port.dispatch(c);
+            await bounded(port.dispatch(c), `dispatch of ${c.commandId}`);
           } catch (err) {
             console.error(`queen: dispatch of ${c.commandId} failed`, err);
             failed = true;
@@ -1771,7 +1793,7 @@ export class QueenNode extends DurableObject<Env> {
     const started: typeof drones = [];
     if (drones.length > 1 && this.ports.dispatcher.dispatchMany) {
       try {
-        const res = await this.ports.dispatcher.dispatchMany(drones.map((e) => ({ task: e.task, attempt: e.attempt })));
+        const res = await bounded(this.ports.dispatcher.dispatchMany(drones.map((e) => ({ task: e.task, attempt: e.attempt }))), `dispatch of ${drones.length} drones`);
         const bad = new Set(res.failed);
         for (const e of drones) {
           if (bad.has(droneInstanceId(e.task, e.attempt))) failed = true;
@@ -1784,7 +1806,7 @@ export class QueenNode extends DurableObject<Env> {
     } else {
       for (const e of drones) {
         try {
-          await this.ports.dispatcher.dispatch(e.task, e.attempt);
+          await bounded(this.ports.dispatcher.dispatch(e.task, e.attempt), `drone dispatch for ${e.trainId}`);
           started.push(e);
         } catch (err) {
           console.error(`queen: drone dispatch for ${e.trainId} failed`, err);

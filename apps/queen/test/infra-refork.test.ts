@@ -13,6 +13,8 @@ import {
   DEFAULT_COMMAND_TIMEOUT_MS,
   MAX_INFRA_ATTEMPTS,
   TrainPlanner,
+  UNDISPATCHED_RETRY_MS,
+  forkOverdue,
   watchdogDeadline,
   type Effect,
   type PlanResult,
@@ -345,3 +347,76 @@ describe("(d) the replacement car does not fork from a suspect car ahead", () =>
     expect(retrying.get("N1")).toMatchObject({ phase: "WAITING_PARENT", waitForCarSeq: 10 });
   });
 });
+
+describe("(f) prod K48/K49/K50: a retired car with a PASSED car stacked on it", () => {
+  /** K48 (1 member A, forked from main) DEPLOYING its preview; K49 (1 member B) stacked on K48, PASSED. */
+  function stacked() {
+    const a = base("A", { seq: 1, passedSeq: 1, carId: "K48" });
+    const b = base("B", { seq: 2, passedSeq: 2, carId: "K49" });
+    const k48 = car("K48", 10, [a], { phase: "DEPLOYING", deployState: "PENDING", previewUrl: null, deployIssuedAt: 900 });
+    const k49 = car("K49", 11, [b], { phase: "PASSED", forkSource: k48.artifactRepo }, k48.includedPrompts);
+    return new Hive([a, b, k48, k49]);
+  }
+
+  it("K48's preview deploy fails on infra: K48 retired, K49 superseded, A and B re-board one car that forks from main in the same plan", () => {
+    const h = stacked();
+    const r = h.run((p) => p.deployResult({ commandId: "K48-deploy-1", op: "DEPLOY", environment: "preview", trainId: "K48", ok: false, retryable: true, summary: "Artifacts 503" }));
+    expect(h.get("K48").phase).toBe("EJECTED");
+    expect(h.get("K49")).toMatchObject({ phase: "EJECTED", reason: "superseded: car K48 failed" });
+    const fresh = h.cars();
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0]).toMatchObject({ members: ["A", "B"], forkState: "PENDING", forkSource: "hive" });
+    expect(forks(r.effects)).toEqual([{ trainId: fresh[0]!.trainId, source: "hive" }]);
+  });
+});
+
+describe("(g) liveness: a WAITING_PARENT train whose wait is over is never stranded", () => {
+  const waitingCar = (over: Partial<TrainRecord> = {}) =>
+    car("K50", 20, [base("A", { seq: 1 })], { phase: "WAITING_PARENT", forkState: "NONE", forkSource: null, forkCommandId: null, deployState: "NONE", deployCommandId: null, previewUrl: null, headSha: null, ...over });
+
+  it("forkOverdue / watchdogDeadline: a car with nothing ahead, or whose waitForCarSeq car is gone, is due within UNDISPATCHED_RETRY_MS", () => {
+    const a = base("A", { seq: 1, passedSeq: 1, carId: "K50" });
+    const lone = waitingCar();
+    expect(forkOverdue(lone, [a, lone])).toBe(true);
+    expect(watchdogDeadline([a, lone], DEFAULT_COMMAND_TIMEOUT_MS, 5000)).toBe(5000 + UNDISPATCHED_RETRY_MS);
+    // Waiting for K49 (seq 11), which is superseded (EJECTED): over.
+    const k49 = car("K49", 11, [base("B", { seq: 2 })], { phase: "EJECTED", reason: "superseded: car K48 failed" });
+    const waits = waitingCar({ waitForCarSeq: 11 });
+    expect(forkOverdue(waits, [a, k49, waits])).toBe(true);
+    // Still waiting: K49 active, or a car ahead that has not pushed.
+    expect(forkOverdue(waits, [a, { ...k49, phase: "TESTING" }, waits])).toBe(false);
+    const ahead = car("K49", 11, [base("B", { seq: 2 })], { phase: "BUILDING", dispatched: true, droneIssuedAt: 0 });
+    expect(forkOverdue(lone, [a, ahead, lone])).toBe(false);
+    expect(watchdogDeadline([a, ahead, lone], DEFAULT_COMMAND_TIMEOUT_MS, 5000)).toBe(DEFAULT_COMMAND_TIMEOUT_MS); // K49's MERGE drone clock only
+    // A BUILD rework waiting on a car that is gone is due as well.
+    const rework = base("R", { seq: 3, phase: "WAITING_PARENT", forkState: "NONE", forkSource: null, waitForCarSeq: 11, deployState: "NONE", deployCommandId: null, previewUrl: null });
+    expect(forkOverdue(rework, [rework, k49])).toBe(true);
+    expect(forkOverdue(rework, [rework, { ...k49, phase: "PASSED" }])).toBe(false);
+  });
+
+  it("the alarm forks a stranded car from main (missed kick)", () => {
+    const a = base("A", { seq: 1, passedSeq: 1, carId: "K50" });
+    const h = new Hive([a, waitingCar()]);
+    const r = h.run((p) => p.reconcile());
+    expect(forks(r.effects)).toEqual([{ trainId: "K50", source: "hive" }]);
+  });
+});
+
+describe("(h) a conflict / integration rework waiting on a car that is SUPERSEDED (not failed) forks in the same plan", () => {
+  it("K0 fails its gate; K1 (stacked, carrying K0's prompts) is superseded; the rework that waited for K1 forks from main at once", () => {
+    const a = base("A", { seq: 1, passedSeq: 1, carId: "K0" });
+    const c = base("C", { seq: 2, passedSeq: 2, carId: "K1" });
+    const k0 = car("K0", 10, [a]);
+    const k1 = car("K1", 11, [c], { phase: "PASSED", forkSource: k0.artifactRepo }, k0.includedPrompts);
+    // Item D's conflict rework waits for every car up to K1.
+    const d = base("D", { seq: 3, phase: "WAITING_PARENT", forkState: "NONE", forkSource: null, forkCommandId: null, waitForCarSeq: 11, deployState: "NONE", deployCommandId: null, previewUrl: null, headSha: null, action: "REWORK" });
+    for (const infra of [false, true]) {
+      const h = new Hive([a, c, k0, k1, d]);
+      const r = h.run((p) => (infra ? p.trainResult(gateInfra("K0")) : p.trainResult({ trainId: "K0", passed: false, summary: "smoke red" })));
+      expect(h.get("K1")).toMatchObject({ phase: "EJECTED", reason: "superseded: car K0 failed" });
+      expect(h.get("D")).toMatchObject({ phase: "BUILDING", forkState: "PENDING", forkSource: "hive" });
+      expect(forks(r.effects)).toContainEqual({ trainId: "D", source: "hive" });
+    }
+  });
+});
+

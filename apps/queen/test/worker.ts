@@ -18,6 +18,13 @@ export class QueenNode extends ProdQueenNode {
     return Date.now() + this.clockOffset;
   }
 
+  /** Per-dispatch timeout override (tests set it via runInDurableObject); null = production default. */
+  dispatchTimeout: number | null = null;
+
+  protected override dispatchTimeoutMs(): number {
+    return this.dispatchTimeout ?? super.dispatchTimeoutMs();
+  }
+
   protected override createPorts(): QueenPorts {
     return {
       provisioner: new RecordingProvisioner(),

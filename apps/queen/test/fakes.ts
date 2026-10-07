@@ -9,8 +9,14 @@ export class RecordingCommands<C extends { commandId: string }> implements Comma
   failNext = 0;
   /** Number of dispatchMany calls (createBatch analogue). */
   batches = 0;
+  /** Never settle the next N dispatches / batches (a hung Workflows create); nothing is recorded. */
+  hangNext = 0;
 
   async dispatch(command: C): Promise<{ instanceId: string }> {
+    if (this.hangNext > 0) {
+      this.hangNext--;
+      return new Promise(() => {});
+    }
     if (this.failNext > 0) {
       this.failNext--;
       throw new Error("UNAVAILABLE: fake executor is down");
@@ -21,6 +27,10 @@ export class RecordingCommands<C extends { commandId: string }> implements Comma
 
   async dispatchMany(commands: readonly C[]): Promise<{ failed: string[] }> {
     this.batches++;
+    if (this.hangNext > 0) {
+      this.hangNext--;
+      return new Promise(() => {});
+    }
     const failed: string[] = [];
     for (const c of commands) {
       try {
