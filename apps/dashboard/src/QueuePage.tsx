@@ -1,6 +1,6 @@
 import { Fragment, useMemo, useState } from "react";
 
-import { Rail } from "./MergeQueue";
+import { MergeGraph } from "./MergeGraph.tsx";
 import type { MergeTrain } from "@queenos/queen-types";
 import { useNow } from "./components";
 import { Link } from "./router";
@@ -59,6 +59,7 @@ function CarDetail({ car, state, hive }: { car: MergeTrain; state: State; hive: 
 export function QueuePage({ hive, state }: { hive: string; state: State }) {
   const now = useNow(10_000);
   const [open, setOpen] = useState<string | null>(null);
+  const [highlight, setHighlight] = useState<string | null>(null);
   const { trains, trainOrder } = state;
   const cars = useMemo(() => {
     const all = trainOrder.map((id) => trains[id]!).filter(isQueueTrain).sort((a, b) => a.createdAt - b.createdAt || a.trainId.localeCompare(b.trainId));
@@ -69,9 +70,9 @@ export function QueuePage({ hive, state }: { hive: string; state: State }) {
   return (
     <div className="qpage">
         <Link to={hrefFor.status(hive)} className="mq__meta">◂ {hive} / merge queue</Link>
-        <section className="mq" aria-label="Rail">
-          <div className="mq__head"><h3 className="eyebrow">MERGE QUEUE RAIL</h3></div>
-          <Rail state={state} hive={hive} />
+        <section className="mq" aria-label="Merge train graph">
+          <div className="mq__head"><h3 className="eyebrow">MERGE TRAIN · LAST 24H</h3><span className="mq__meta">{state.landed.length} landed · tap a car for its payload</span></div>
+          <MergeGraph state={state} hive={hive} spanMs={DAY} density="full" highlight={highlight} />
         </section>
         <section className="mq" aria-label="Cars, last 24 hours">
           <div className="mq__head"><h3 className="eyebrow">CARS · LAST 24H</h3><span className="mq__meta">{recent.length} cars</span></div>
@@ -89,7 +90,7 @@ export function QueuePage({ hive, state }: { hive: string; state: State }) {
                     const isOpen = open === t.trainId;
                     return (
                       <Fragment key={t.trainId}>
-                        <tr>
+                        <tr className={`qrow${highlight === t.trainId ? " is-highlighted" : ""}`} onClick={() => setHighlight(t.trainId)}>
                           <td>
                             <button className="linkish" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : t.trainId)}>{isOpen ? "▾" : "▸"} {label}</button>
                           </td>

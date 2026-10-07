@@ -1,0 +1,160 @@
+/* Merge-train graph (MergeGraph.tsx). War Room palette; motion uses transform/opacity only. */
+.mg { position: relative; min-width: 0; }
+.mg-box {
+  position: relative; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; max-width: 100%;
+  border: 1px solid var(--line); border-radius: 10px; scrollbar-width: thin; scrollbar-color: var(--line-2) transparent;
+  background:
+    linear-gradient(180deg, rgba(167, 139, 250, 0.06), transparent 70px),
+    var(--bg-2);
+  -webkit-overflow-scrolling: touch;
+}
+.mg--full .mg-box { max-height: 72vh; overflow-y: auto; }
+.mg-svg { display: block; font-family: var(--mono); user-select: none; -webkit-user-select: none; }
+.mg-empty { padding: 18px 14px; }
+
+/* tones: one colour per phase */
+.mg-t--waiting { --c: var(--faint); }
+.mg-t--building, .mg-t--merging { --c: var(--cyan); }
+.mg-t--deploying { --c: #5b8cff; }
+.mg-t--gating { --c: var(--yellow); }
+.mg-t--passed { --c: #7be0c3; }
+.mg-t--racing, .mg-t--lost, .mg-t--bisect { --c: var(--violet); }
+.mg-t--landing, .mg-t--merged { --c: var(--green); }
+.mg-t--ejected, .mg-t--failed, .mg-t--conflict { --c: var(--red); }
+.mg-t--superseded, .mg-t--rework, .mg-t--reboard { --c: var(--dim); }
+.mg-t--main { --c: var(--violet); }
+
+/* grid + axis */
+.mg-grid line { stroke: var(--line); stroke-width: 1; stroke-dasharray: 2 4; }
+.mg-grid text { fill: var(--faint); font-size: 10px; }
+.mg-break text { fill: var(--dim); font-size: 13px; font-weight: 700; }
+.mg-break .mg-break__ms { font-size: 9px; font-weight: 400; fill: var(--faint); }
+.mg-trunk-label { fill: var(--violet); font: 800 12px var(--mono); letter-spacing: 0.14em; }
+
+/* edges */
+.mg-e { fill: none; stroke: var(--c, var(--dim)); stroke-width: 2; stroke-linecap: round; transition: stroke 0.4s ease, opacity 0.4s ease; }
+.mg-e--main { stroke-width: 3.5; filter: drop-shadow(0 0 5px rgba(167, 139, 250, 0.55)); }
+.mg-e--fork, .mg-e--board, .mg-e--merge { stroke-width: 1.5; opacity: 0.75; }
+.mg-e--fork { stroke-dasharray: 1; stroke-dashoffset: 0; animation: mg-draw 0.7s ease-out both; }
+.mg-e--fork.mg-e--dashed { stroke-dasharray: 2 3; animation: none; }
+.mg-e--branch { stroke-width: 2.4; }
+.mg-e--car { stroke-width: 4; opacity: 0.9; }
+.mg-e--land { stroke-width: 3; }
+.mg-e--stack { stroke-width: 1.5; stroke-dasharray: 3 3; opacity: 0.7; }
+.mg-e--bisect { stroke-width: 1.8; stroke-dasharray: 5 3; }
+.mg-e--rework, .mg-e--reboard { stroke-width: 1.2; stroke-dasharray: 1 4; opacity: 0.6; }
+.mg-e--dashed { stroke-dasharray: 5 4; }
+.mg-e--faded { opacity: 0.3; }
+.mg-t--merged.mg-e--branch, .mg-t--merged.mg-e--fork, .mg-t--merged.mg-e--board { opacity: 0.4; }
+.mg-t--superseded.mg-e--car { opacity: 0.45; }
+.mg-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: pointer; }
+.mg-hit:hover + .mg-e { stroke-width: 3.4; opacity: 1; }
+
+/* race brackets */
+.mg-race path { fill: none; stroke: var(--violet); stroke-width: 1.4; }
+.mg-race text { fill: var(--violet); font: 700 10px var(--mono); }
+.mg-race.is-decided { opacity: 0.55; }
+
+/* branch labels: on the line, haloed in the background colour */
+.mg-blabel text { font-size: 10px; fill: var(--text); paint-order: stroke; stroke: var(--bg-2); stroke-width: 4px; stroke-linejoin: round; pointer-events: none; }
+.mg--full .mg-blabel text { font-size: 10.5px; }
+.mg-blabel.mg-t--merged text, .mg-blabel.mg-t--ejected text, .mg-blabel.mg-t--conflict text { fill: var(--dim); }
+.mg-blabel.mg-e--faded { opacity: 0.4; }
+.mg-blabel.is-selected text { fill: var(--c); font-weight: 700; }
+.mg-blabel__retry { fill: var(--yellow) !important; font-weight: 700; }
+.mg-head { fill: var(--c); animation: mg-pulse 1.8s ease-in-out infinite; }
+
+/* main nodes */
+.mg-main { transition: transform 0.5s ease; }
+.mg-main circle { fill: var(--bg); stroke: var(--green); stroke-width: 2.5; filter: drop-shadow(0 0 6px rgba(53, 242, 160, 0.7)); animation: mg-pop 0.6s cubic-bezier(0.2, 1.4, 0.4, 1) both; }
+.mg-main__sha { fill: var(--green); font-size: 10px; }
+.mg-stub circle { fill: var(--panel-2); stroke: var(--faint); stroke-width: 1.5; }
+.mg-stub text { fill: var(--dim); font-size: 10px; }
+
+/* cars */
+.mg-car { cursor: pointer; outline: none; transition: transform 0.5s ease; }
+.mg-car__diamond { fill: var(--panel); stroke: var(--c); stroke-width: 2.4; animation: mg-pop 0.5s cubic-bezier(0.2, 1.4, 0.4, 1) both; transform-box: fill-box; transform-origin: center; }
+.mg-car.mg-t--merged .mg-car__diamond, .mg-car.mg-t--landing .mg-car__diamond { fill: var(--c); }
+.mg-car.mg-t--failed .mg-car__diamond, .mg-car.mg-t--ejected .mg-car__diamond { stroke-dasharray: 3 2; }
+.mg-car.mg-t--superseded { opacity: 0.5; }
+.mg-car__label { fill: var(--text); font: 700 11px var(--mono); paint-order: stroke; stroke: var(--bg-2); stroke-width: 4px; stroke-linejoin: round; }
+.mg-car.mg-t--merged .mg-car__label { fill: var(--dim); }
+.mg-car__badge { fill: var(--yellow); font-weight: 700; }
+.mg-car__ring { fill: none; stroke: var(--c); stroke-width: 1.5; opacity: 0.9; animation: mg-ring 1.6s ease-out infinite; transform-box: fill-box; transform-origin: center; }
+.mg-car:hover .mg-car__diamond, .mg-car:focus-visible .mg-car__diamond { stroke-width: 3.4; }
+.mg-car:focus-visible .mg-car__label { text-decoration: underline; }
+
+/* markers */
+.mg-conflict { cursor: pointer; }
+.mg-conflict path { fill: var(--bg-2); stroke: var(--yellow); stroke-width: 1.6; stroke-linejoin: round; }
+.mg-conflict text { fill: var(--yellow); font: 800 9px var(--mono); }
+.mg-end path { stroke: var(--c); stroke-width: 1.8; stroke-linecap: round; }
+
+/* legend */
+.mg-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font: 11px var(--mono); color: var(--dim); }
+.mg-key { display: inline-flex; align-items: center; gap: 5px; }
+.mg-key i { width: 14px; height: 3px; border-radius: 2px; background: var(--c); }
+.mg-glyph { color: var(--text); font-weight: 700; }
+.mg-glyph--warn { color: var(--yellow); }
+
+/* payload panel: a side sheet over the graph, a bottom sheet on phones */
+.mg-panel {
+  position: absolute; top: 8px; right: 8px; z-index: 5; width: min(400px, calc(100% - 16px)); max-height: calc(100% - 16px); min-height: 160px;
+  overflow-y: auto; overscroll-behavior: contain; padding: 14px 16px; border-radius: 12px;
+  background: rgba(13, 19, 27, 0.97); border: 1px solid var(--line-2); box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+  font: 12px var(--mono); animation: mg-sheet 0.25s ease-out both;
+}
+.mg--compact .mg-panel { max-height: none; }
+.mg-panel__close { position: absolute; top: 6px; right: 8px; border: 0; background: none; color: var(--dim); font: 700 20px/1 var(--mono); padding: 4px 6px; }
+.mg-panel__close:hover { color: var(--text); }
+.mg-panel__head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-right: 26px; margin-bottom: 10px; }
+.mg-panel__title { font-size: 13px; margin-bottom: 8px; }
+.mg-panel__sub { color: var(--dim); font-size: 10px; letter-spacing: 0.16em; margin: 12px 0 6px; }
+.mg-panel a { color: var(--cyan); text-decoration: none; }
+.mg-panel a:hover { text-decoration: underline; }
+.mg-pill { display: inline-block; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--c); color: var(--c); background: transparent; font: 700 12px var(--mono); margin: 0 4px 2px 0; }
+button.mg-pill { cursor: pointer; }
+.mg-phase { font-size: 10px; letter-spacing: 0.12em; color: var(--c); }
+.mg-badge { font-size: 11px; color: var(--yellow); }
+.mg-dim { color: var(--dim); }
+.mg-kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0; }
+.mg-kv dt { color: var(--dim); }
+.mg-kv dd { margin: 0; overflow-wrap: anywhere; }
+.mg-kv code { color: var(--text); }
+.mg-members { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.mg-member { display: grid; grid-template-columns: 20px 1fr; gap: 6px; padding: 6px 8px; border-radius: 8px; background: var(--bg-2); border: 1px solid var(--line); }
+.mg-member.is-conflict { border-color: rgba(255, 210, 63, 0.5); }
+.mg-member__n { color: var(--dim); font-weight: 700; text-align: right; }
+.mg-member__body { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.mg-member__title { font-family: var(--sans); font-weight: 600; overflow-wrap: anywhere; }
+.mg-member__meta { display: flex; flex-wrap: wrap; gap: 2px 10px; color: var(--dim); }
+.mg-member__conflict { color: var(--yellow); overflow-wrap: anywhere; }
+.mg-paths { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.mg-paths code { font-size: 11px; padding: 0 5px; border-radius: 4px; background: var(--panel-2); border: 1px solid var(--line); color: var(--dim); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@keyframes mg-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@keyframes mg-pop { from { transform: scale(1.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+@keyframes mg-pulse { 50% { opacity: 0.35; } }
+@keyframes mg-ring { from { transform: scale(0.8); opacity: 1; } to { transform: scale(1.35); opacity: 0.2; } }
+@keyframes mg-sheet { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+@media (max-width: 600px) {
+  .mg-panel {
+    position: fixed; left: 0; right: 0; top: auto; bottom: 0; width: 100%; max-height: 70vh; border-radius: 16px 16px 0 0;
+    padding: 18px 16px calc(16px + env(safe-area-inset-bottom)); animation-name: mg-sheet-up;
+  }
+  .mg-panel::before { content: ""; display: block; width: 40px; height: 4px; border-radius: 2px; background: var(--line-2); margin: -8px auto 10px; }
+  .mg-legend { font-size: 10px; gap: 3px 10px; }
+}
+@keyframes mg-sheet-up { from { transform: translateY(100%); } to { transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .mg-e, .mg-main, .mg-car { transition: none; }
+  .mg-e--fork, .mg-main circle, .mg-car__diamond, .mg-head, .mg-car__ring, .mg-panel { animation: none !important; }
+}
+
+/* queue table rows drive the graph highlight */
+.qtable .qrow { cursor: pointer; }
+.qtable .qrow:hover td { background: rgba(60, 217, 255, 0.04); }
+.qtable .qrow.is-highlighted td { background: rgba(60, 217, 255, 0.09); box-shadow: inset 0 1px 0 rgba(60, 217, 255, 0.35), inset 0 -1px 0 rgba(60, 217, 255, 0.35); }
+.mg-blabel__bg { fill: var(--bg-2); opacity: 0.92; pointer-events: none; }

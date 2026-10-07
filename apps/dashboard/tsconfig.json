@@ -1,1 +1,6 @@
-{ "extends": "@queenos/tsconfig/react.json", "include": ["src", "vite.config.ts"] }
+{
+  "extends": "@queenos/tsconfig/react.json",
+  // mergeGraph.ts (layout) and MergeGraph.tsx (renderer) differ only in case: import the component with its extension.
+  "compilerOptions": { "allowImportingTsExtensions": true },
+  "include": ["src", "vite.config.ts"]
+}

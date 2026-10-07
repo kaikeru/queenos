@@ -3,7 +3,7 @@ import { RUNBOOK, type Escalation, type EscalationAction } from "@queenos/queen-
 import { api, errorMessage } from "./api";
 import { SWARM_DEMO_SIZE, demoSwarmPrompt } from "./demo";
 import { ACTION_LABEL, autonomyLabel, isSimulation, compactNumber, durationText, escalationButtons, escalationSubjectLabel, meterFill, reasonText } from "./homeLogic";
-import { MergeQueue } from "./MergeQueue";
+import { MergeTrainStrip } from "./MergeGraph.tsx";
 import { Link } from "./router";
 import { hrefFor } from "./route";
 import { ReleaseStripRow, GuardrailsPanel } from "./HomePanels";
@@ -54,7 +54,7 @@ export function StatusHome({ hive, room }: { hive: string; room: Room }) {
       )}
 
       <SwarmFloor state={state} hive={hive} />
-      <MergeQueue state={state} hive={hive} />
+      <MergeTrainStrip state={state} hive={hive} />
 
       <section className="panel" aria-label="Goals">
         <p className="eyebrow">GOALS{trees.goals.length ? ` (${trees.goals.length})` : ""}</p>

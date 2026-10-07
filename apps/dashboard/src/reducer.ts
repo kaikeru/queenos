@@ -47,6 +47,14 @@ export interface LandedCommit {
   promptId: string;
 }
 
+/** When this dashboard saw a train's phase change (frame receipt time); the merge graph's clock. */
+export interface TrainTimes {
+  phase: string;
+  phaseAt: number;
+  /** First frame showing the train MERGED or EJECTED. */
+  endedAt: number | null;
+}
+
 export interface State {
   loaded: boolean;
   prompts: Record<string, PromptRun>;
@@ -55,6 +63,8 @@ export interface State {
   trains: Record<string, MergeTrain>;
   /** Train ids in creation order. */
   trainOrder: string[];
+  /** Observed phase-change times per train (live frames only; a snapshot cannot say when). */
+  trainTimes: Record<string, TrainTimes>;
   /** Deployments by deploymentId (per-train previews; staging/canary/prod from P3). */
   deployments: Record<string, Deployment>;
   /** Releases by releaseId (P3). */
@@ -109,6 +119,7 @@ export const initialState: State = {
   promptOrder: [],
   trains: {},
   trainOrder: [],
+  trainTimes: {},
   deployments: {},
   releases: {},
   releaseOrder: [],
@@ -202,6 +213,16 @@ function withLanded(s: State, train: MergeTrain): State {
   if (!merged || s.landed.some((l) => l.trainId === train.trainId)) return s;
   const sha = train.landedSha ?? train.headSha ?? train.trainId.slice(0, 8);
   return { ...s, landed: [...s.landed, { sha, trainId: train.trainId, promptId: tailOf(train) ?? "" }] };
+}
+
+const isTerminal = (t: MergeTrain) => t.status === "MERGED" || t.status === "EJECTED";
+
+function withTimes(s: State, prev: MergeTrain | undefined, t: MergeTrain, at: number): State {
+  const phase = `${t.status}/${t.phase ?? ""}`;
+  const seen = s.trainTimes[t.trainId];
+  if (seen && seen.phase === phase) return s;
+  const endedAt = seen?.endedAt ?? (isTerminal(t) && (!prev || !isTerminal(prev)) ? at : null);
+  return { ...s, trainTimes: { ...s.trainTimes, [t.trainId]: { phase, phaseAt: at, endedAt } } };
 }
 
 function reasonLabel(reason: string | null | undefined): string {
@@ -376,6 +397,7 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
         trainOrder: upsertOrdered(state.trainOrder, t.trainId, t.createdAt, { ...state.trains, [t.trainId]: t }),
       };
       next = withLanded(next, t);
+      next = withTimes(next, prev, t, at);
       const tail = tailOf(t);
       const cars = t.includedPrompts.map((id) => letterOf(next, id)).join("+");
       if (!prev) next = pushTicker(next, "status", `Train ${cars} started`, at);
