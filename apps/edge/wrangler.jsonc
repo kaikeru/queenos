@@ -19,14 +19,15 @@
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
     // Everything else is served straight from assets (Access already gates the host).
-    "run_worker_first": ["/api/*", "/hives/*", "/health"]
+    "run_worker_first": ["/api/*", "/hives/*", "/git/*", "/health"]
   },
   "durable_objects": { "bindings": [{ "name": "REGISTRY", "class_name": "HiveRegistry" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HiveRegistry"] }],
   "services": [
     { "binding": "VAULT", "service": "queenos-vault", "entrypoint": "VaultWriter" },
     { "binding": "GENESIS", "service": "queenos-genesis" },
-    { "binding": "QUEEN", "service": "queen" }
+    { "binding": "QUEEN", "service": "queen" },
+    { "binding": "GIT", "service": "queenos-git" }
   ],
   "vars": {
     "ACCESS_TEAM": "kaikeru",
@@ -49,14 +50,15 @@
         "directory": "../dashboard/dist",
         "binding": "ASSETS",
         "not_found_handling": "single-page-application",
-        "run_worker_first": ["/api/*", "/hives/*", "/health"]
+        "run_worker_first": ["/api/*", "/hives/*", "/git/*", "/health"]
       },
       "durable_objects": { "bindings": [{ "name": "REGISTRY", "class_name": "HiveRegistry" }] },
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HiveRegistry"] }],
       "services": [
         { "binding": "VAULT", "service": "queenos-vault", "entrypoint": "VaultWriter" },
         { "binding": "GENESIS", "service": "queenos-genesis" },
-        { "binding": "QUEEN", "service": "queen" }
+        { "binding": "QUEEN", "service": "queen" },
+        { "binding": "GIT", "service": "queenos-git" }
       ],
       "vars": {
         "ACCESS_TEAM": "kaikeru",

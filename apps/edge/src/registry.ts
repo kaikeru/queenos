@@ -27,6 +27,46 @@ function toProject(r: Row): Project {
   };
 }
 
+export interface GitTokenInfo {
+  id: string;
+  email: string;
+  scopes: ("read" | "push")[];
+  label: string | null;
+  createdAt: number;
+  expiresAt: number;
+  lastUsedAt: number | null;
+  revokedAt: number | null;
+}
+
+interface TokenRow extends Record<string, SqlStorageValue> {
+  id: string;
+  email: string;
+  scopes: string;
+  label: string | null;
+  created_at: number;
+  expires_at: number;
+  last_used_at: number | null;
+  revoked_at: number | null;
+}
+
+function toToken(r: TokenRow): GitTokenInfo {
+  return {
+    id: r.id,
+    email: r.email,
+    scopes: r.scopes.split(",") as GitTokenInfo["scopes"],
+    label: r.label,
+    createdAt: r.created_at,
+    expiresAt: r.expires_at,
+    lastUsedAt: r.last_used_at,
+    revokedAt: r.revoked_at,
+  };
+}
+
+/** Failed git auth: at most this many per key per window. */
+export const GIT_FAIL_LIMIT = 10;
+export const GIT_FAIL_WINDOW_MS = 5 * 60_000;
+const LAST_USED_GRANULARITY_MS = 60_000;
+
 /**
  * Project registry: one instance (idFromName("registry")). Orchestration
  * metadata only. Errors carry a code prefix: "CONFLICT:", "NOT_FOUND:", "INVALID:".
@@ -37,6 +77,12 @@ export class HiveRegistry extends DurableObject {
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS projects (
       hive TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, status TEXT NOT NULL,
       created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, urls TEXT NOT NULL)`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS git_tokens (
+      id TEXT PRIMARY KEY, email TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL, label TEXT,
+      created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER)`);
+    ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS git_tokens_email ON git_tokens (email)`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS git_auth_fails (
+      key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL)`);
   }
 
   private row(hive: string): Row | undefined {
@@ -90,5 +136,99 @@ export class HiveRegistry extends DurableObject {
   async get(hive: string): Promise<Project | null> {
     const r = this.row(hive);
     return r ? toProject(r) : null;
+  }
+
+  // ---- Git tokens (only the SHA-256 is stored) ----
+
+  async mintGitToken(input: {
+    id: string;
+    hash: string;
+    email: string;
+    scopes: ("read" | "push")[];
+    label: string | null;
+    ttlMs: number;
+  }): Promise<GitTokenInfo> {
+    const t = Date.now();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO git_tokens (id, email, hash, scopes, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      input.id,
+      input.email,
+      input.hash,
+      input.scopes.join(","),
+      input.label,
+      t,
+      t + input.ttlMs,
+    );
+    return toToken(this.ctx.storage.sql.exec<TokenRow>("SELECT * FROM git_tokens WHERE id = ?", input.id).one());
+  }
+
+  async listGitTokens(email: string): Promise<GitTokenInfo[]> {
+    return this.ctx.storage.sql
+      .exec<TokenRow>("SELECT * FROM git_tokens WHERE email = ? ORDER BY created_at DESC, id ASC", email)
+      .toArray()
+      .map(toToken);
+  }
+
+  /** Revokes the caller's own token. Returns false when there is no such token. */
+  async revokeGitToken(id: string, email: string): Promise<boolean> {
+    const rows = this.ctx.storage.sql
+      .exec<TokenRow>("SELECT * FROM git_tokens WHERE id = ? AND email = ?", id, email)
+      .toArray();
+    if (rows.length === 0) return false;
+    this.ctx.storage.sql.exec(
+      "UPDATE git_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+      Date.now(),
+      id,
+    );
+    return true;
+  }
+
+  /** Checked on every git request: revocation and expiry take effect immediately. */
+  async authGitToken(hash: string): Promise<{ email: string; scopes: ("read" | "push")[] } | null> {
+    const r = this.ctx.storage.sql.exec<TokenRow>("SELECT * FROM git_tokens WHERE hash = ?", hash).toArray()[0];
+    if (!r || r.revoked_at !== null) return null;
+    const t = Date.now();
+    if (r.expires_at <= t) return null;
+    if (r.last_used_at === null || t - r.last_used_at >= LAST_USED_GRANULARITY_MS) {
+      this.ctx.storage.sql.exec("UPDATE git_tokens SET last_used_at = ? WHERE id = ?", t, r.id);
+    }
+    return { email: r.email, scopes: r.scopes.split(",") as ("read" | "push")[] };
+  }
+
+  // ---- Failed git auth rate limit (fixed window per key) ----
+
+  /** Seconds until retry when any key is over the limit, else 0. */
+  async gitAuthBlocked(keys: string[]): Promise<number> {
+    const t = Date.now();
+    let wait = 0;
+    for (const key of keys) {
+      const r = this.ctx.storage.sql
+        .exec<{ window_start: number; count: number }>("SELECT window_start, count FROM git_auth_fails WHERE key = ?", key)
+        .toArray()[0];
+      if (r && t - r.window_start < GIT_FAIL_WINDOW_MS && r.count >= GIT_FAIL_LIMIT) {
+        wait = Math.max(wait, Math.ceil((r.window_start + GIT_FAIL_WINDOW_MS - t) / 1000));
+      }
+    }
+    return wait;
+  }
+
+  async gitAuthFailed(keys: string[]): Promise<void> {
+    const t = Date.now();
+    for (const key of keys) {
+      const r = this.ctx.storage.sql
+        .exec<{ window_start: number; count: number }>("SELECT window_start, count FROM git_auth_fails WHERE key = ?", key)
+        .toArray()[0];
+      if (!r || t - r.window_start >= GIT_FAIL_WINDOW_MS) {
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO git_auth_fails (key, window_start, count) VALUES (?, ?, 1)",
+          key,
+          t,
+        );
+      } else {
+        this.ctx.storage.sql.exec("UPDATE git_auth_fails SET count = count + 1 WHERE key = ?", key);
+      }
+    }
+    // Opportunistic cleanup keeps the table small.
+    this.ctx.storage.sql.exec("DELETE FROM git_auth_fails WHERE window_start < ?", t - GIT_FAIL_WINDOW_MS);
   }
 }

@@ -66,10 +66,11 @@ export interface Seen {
   genesis: Request[];
   queen: Request[];
   assets: Request[];
+  git: { req: Request; body: string }[];
 }
 
 export function fakeBindings(overrides: Partial<Bindings> = {}): { env: Bindings; seen: Seen } {
-  const seen: Seen = { vault: [], genesis: [], queen: [], assets: [] };
+  const seen: Seen = { vault: [], genesis: [], queen: [], assets: [], git: [] };
   const vault: VaultPort = {
     async connectCloudflare(hive, creds, email) {
       seen.vault.push(["connect", hive, creds, email]);
@@ -99,6 +100,15 @@ export function fakeBindings(overrides: Partial<Bindings> = {}): { env: Bindings
       async fetch(req) {
         seen.queen.push(req);
         return Response.json({ from: "queen", path: new URL(req.url).pathname, user: req.headers.get("x-queen-user") });
+      },
+    },
+    GIT: {
+      async fetch(req) {
+        seen.git.push({ req, body: await req.clone().text() });
+        return new Response("git-says:" + new URL(req.url).pathname + new URL(req.url).search, {
+          status: 200,
+          headers: { "content-type": "application/x-git-upload-pack-advertisement", "x-from": "git" },
+        });
       },
     },
     ASSETS: {
