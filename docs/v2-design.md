@@ -2,6 +2,7 @@
 
 Status: design, revised 2026-10-05 after the user's decisions (D1–D11 decided, §10). Build ends 2026-10-11; Oct 12–13 are for recording; the video is due 2026-10-14. Author: architect session.
 Read with `docs/HANDOFF.md`, `apps/queen/README.md` and `packages/queen-types/src/*`.
+**Addendum (2026-10-07):** `docs/human-push-design.md` covers the inbox (human and agent `git push`), the unified `Submission` intake and human-judged races (D12).
 
 ---
 
@@ -1489,6 +1490,17 @@ The rules from `docs/HANDOFF.md` apply:
 - **D9 (decided: yes, as recommended).** The Queen may make one DO-to-DO call outside `decide()`: the `SwarmGovernor` lease, as the global concurrency ceiling. The alternative is per-hive caps only, which can't honour an account-wide Workers AI quota once there is more than one busy hive. It is cut line 3 if Phase 2 is late.
 - **D10 (decided: no).** We do not ask Cloudflare for a higher Workers AI limit. "Thousands of agents" is a design target, not something v2 has to run live; the goal is an MVP that proves the vision. Live runs stay inside the default quota (the `SwarmGovernor` leases from `SWARM_AI_RPM`), the video says "dozens live, thousands by design", and it shows the sim Swarm run.
 - **D11 (decided: yes, as recommended).** The integration gate on cars skips the LLM reviewer, and it is skipped entirely on the single-member fast-forward path. The reviewer already judged each member against its acceptance criteria, and the fast path's tree is byte-identical to the gated one.
+
+### Decided (2026-10-07)
+
+- **D12 (decided by the user: the inbox; every change is a Submission).** Design: `docs/human-push-design.md`.
+  - **Humans and external agents push with plain `git push`** to a **per-person, persistent inbox fork** `<hive>-in-<handle>`, with 24 h write tokens scoped to that fork and minted only by the provisioner's `InboxKeys` entrypoint. This settles per person vs per session: per person.
+  - **The inbox is not a PR.** A PR says "please review my branch"; an inbox push says "here's code, vet it". The swarm owns the vetting (gates, reviewer, merge queue, integration gate, lander, release ladder). The contributor opens, shepherds and merges nothing, and reads the verdict as a git note (`refs/notes/queen`) and on the dashboard.
+  - **Unified intake.** All code, drone-written included, enters as a `Submission {repo, ref, headSha, origin, itemId?, provenance?}`. Provenance (model, race, attempt) is metadata for races, rework counts and the router, never a separate code path.
+    - An inbox submission is pinned into an ordinary train fork by a deterministic PIN drone, so every downstream consumer is unchanged.
+    - Drones keep fork + dispatch; their `BuildResult` is adapted to a Submission. The adapter can slip without blocking the inbox.
+  - **Same rules, same consequences.** No auto-rework for human code unless the contributor hands off to the swarm. A rollback of human code is a real change failure.
+  - **Human-judged races (opt-in "you pick").** They are separately shippable: a `PICKING` race state after machine pre-review, a deadline auto-pick, manual reject, and capped Elo preference weighting in the router.
 
 ### Open
 
