@@ -276,6 +276,8 @@ export class SimExecutors {
     private readonly store: SimStore,
     private readonly delays: SimDelays = DEFAULT_SIM_DELAYS,
     private readonly now: () => number = Date.now,
+    /** The Queen's alarm arbiter (never moves an alarm later, aware of the running alarm()); defaults to raw storage. */
+    private readonly armAlarm?: (at: number) => Promise<void>,
   ) {}
 
   /** Train ids whose preview the sim Herald tore down, in order. */
@@ -800,8 +802,10 @@ export class SimExecutors {
 
   /** Move the alarm earlier if needed (never later than an already-pending one). */
   private async arm(due: number): Promise<void> {
+    const at = Math.max(due, this.now() + 1);
+    if (this.armAlarm) return this.armAlarm(at);
     const current = await this.store.getAlarm();
-    if (current === null || due < current) await this.store.setAlarm(Math.max(due, this.now() + 1));
+    if (current === null || due < current) await this.store.setAlarm(at);
   }
 
   /** Consecutive audits in one Queen RPC (entries keep their order). */

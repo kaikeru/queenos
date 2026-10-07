@@ -1099,6 +1099,26 @@ export class QueenNode extends DurableObject<Env> {
    * event-log prune and the lease renewal. commit() re-arms the alarm.
    */
   override async alarm(): Promise<void> {
+    this.inAlarm = true;
+    this.alarmRearmAt = null;
+    try {
+      await this.beforeReconcile();
+      await this.runAlarm();
+    } finally {
+      this.inAlarm = false;
+      this.alarmRearmAt = null;
+    }
+  }
+
+  /** True while alarm() runs: the stored alarm is then the one now firing, so it is not compared against. */
+  private inAlarm = false;
+  /** Earliest alarm requested so far during this alarm() run. */
+  private alarmRearmAt: number | null = null;
+
+  /** Hook run inside alarm() (inAlarm set) before the reconcile; the sim runs its due executor jobs here. */
+  protected async beforeReconcile(): Promise<void> {}
+
+  private async runAlarm(): Promise<void> {
     const hive = this.hiveNamespace();
     if (hive === null) return;
     await this.maybeLease(hive, false);
@@ -1794,10 +1814,20 @@ export class QueenNode extends DurableObject<Env> {
     await this.alarmNoLaterThan(Date.now() + RECONCILE_DELAY_MS);
   }
 
-  /** Arm the alarm at `at` unless one is due sooner. An alarm in the past is the one now running (it will not fire again). */
-  private async alarmNoLaterThan(at: number): Promise<void> {
+  /**
+   * Arm the alarm at `at` unless one is due sooner. Never moves an alarm later: a stored alarm in the past is
+   * merely due and about to fire (e.g. the sim's now+1ms job booking), and it re-arms when it runs. Inside
+   * alarm() the stored value is the one now firing, so compare against what this run has requested instead.
+   */
+  protected async alarmNoLaterThan(at: number): Promise<void> {
+    if (this.inAlarm) {
+      if (this.alarmRearmAt !== null && this.alarmRearmAt <= at) return;
+      this.alarmRearmAt = at;
+      await this.ctx.storage.setAlarm(at);
+      return;
+    }
     const current = await this.ctx.storage.getAlarm();
-    if (current === null || at < current || current <= Date.now()) await this.ctx.storage.setAlarm(at);
+    if (current === null || at < current) await this.ctx.storage.setAlarm(at);
   }
 
   /**

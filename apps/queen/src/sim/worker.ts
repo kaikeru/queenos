@@ -37,7 +37,7 @@ export class QueenNode extends ProdQueenNode {
 
   protected override createPorts(): QueenPorts {
     // Called from the base constructor: `this.ctx` is set, subclass fields are not.
-    const sim = new SimExecutors(() => this, this.ctx.storage);
+    const sim = new SimExecutors(() => this, this.ctx.storage, undefined, undefined, (at) => this.alarmNoLaterThan(at));
     this.sim = sim;
     return { provisioner: sim.provisioner, herald: sim.herald, sentinel: sim.sentinel, oracle: sim.oracle, dispatcher: sim.drones };
   }
@@ -51,9 +51,8 @@ export class QueenNode extends ProdQueenNode {
     return text.includes(RACE_MARKER) ? { bestOf: 3 } : {};
   }
 
-  /** Simulated executors run off the DO alarm (hibernation-safe); then normal reconcile. */
-  override async alarm(): Promise<void> {
+  /** Simulated executors run off the DO alarm (hibernation-safe), inside alarm(); then normal reconcile. */
+  protected override async beforeReconcile(): Promise<void> {
     await this.sim?.runDue();
-    await super.alarm();
   }
 }

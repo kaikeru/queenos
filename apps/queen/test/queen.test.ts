@@ -451,6 +451,43 @@ describe("command watchdog (alarm)", () => {
     expect(await alarmAt(ns)).not.toBeNull(); // the delete is outstanding
   });
 
+  type AlarmApi = { alarmNoLaterThan(at: number): Promise<void>; ioFailed(): Promise<void> };
+  const api = (q: QueenNode) => q as unknown as AlarmApi;
+
+  it("alarmNoLaterThan never overwrites a past-due (sim-style now+1ms) alarm with a later one", async () => {
+    const ns = newHive();
+    await submit(ns, "A");
+    const booked = await runInDurableObject(stubFor(ns), async (q: QueenNode, state) => {
+      const at = Date.now() - 5;
+      await state.storage.setAlarm(at);
+      await api(q).alarmNoLaterThan(Date.now() + 600_000);
+      return { at, now: await state.storage.getAlarm() };
+    });
+    // The runtime may clamp a past time to "now"; what matters is that it was not pushed 10 minutes out.
+    expect(booked.now!).toBeLessThan(booked.at + 60_000);
+  });
+
+  it("ioFailed pulls a minutes-away alarm in to about RECONCILE_DELAY_MS", async () => {
+    const ns = newHive();
+    const got = await runInDurableObject(stubFor(ns), async (q: QueenNode, state) => {
+      await state.storage.setAlarm(Date.now() + 300_000);
+      await api(q).ioFailed();
+      return (await state.storage.getAlarm())! - Date.now();
+    });
+    expect(got).toBeLessThanOrEqual(RECONCILE_DELAY_MS + 1_000);
+    expect(got).toBeGreaterThan(0);
+  });
+
+  it("re-arming works inside alarm(): the outstanding command's watchdog is armed again", async () => {
+    const ns = newHive();
+    await submit(ns, "A");
+    await skew(ns, T + 2_000);
+    expect(await runDurableObjectAlarm(stubFor(ns))).toBe(true);
+    const next = await alarmAt(ns);
+    expect(next).not.toBeNull();
+    expect(next!).toBeGreaterThan(Date.now());
+  });
+
   it("a drone that never reports is re-dispatched under a new instance id", async () => {
     const ns = newHive();
     await submit(ns, "A");
