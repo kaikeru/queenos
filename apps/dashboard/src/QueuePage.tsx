@@ -7,6 +7,7 @@ import { Link } from "./router";
 import { hrefFor } from "./route";
 import type { State } from "./reducer";
 import { isQueueTrain } from "./swarm";
+import { landedCount } from "./status";
 import "./swarm.css";
 
 const DAY = 24 * 3600_000;
@@ -71,7 +72,7 @@ export function QueuePage({ hive, state }: { hive: string; state: State }) {
     <div className="qpage">
         <Link to={hrefFor.status(hive)} className="mq__meta">◂ {hive} / merge queue</Link>
         <section className="mq" aria-label="Merge train graph">
-          <div className="mq__head"><h3 className="eyebrow">MERGE TRAIN · LAST 24H</h3><span className="mq__meta">{state.landed.length} landed · tap a car for its payload</span></div>
+          <div className="mq__head"><h3 className="eyebrow">MERGE TRAIN · LAST 24H</h3><span className="mq__meta">{landedCount(state)} landed · tap a car for its payload</span></div>
           <MergeGraph state={state} hive={hive} spanMs={DAY} density="full" highlight={highlight} />
         </section>
         <section className="mq" aria-label="Cars, last 24 hours">

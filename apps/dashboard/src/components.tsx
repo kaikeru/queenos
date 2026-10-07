@@ -23,6 +23,7 @@ import { DEMO_PROMPTS } from "./demo";
 import { OUTCOME_META, laneMemories, memoryChipLabel, scorePercent } from "./memory";
 import { TIER_META, tierRank, buildModelBoard, formatDuration, modelLabel, tierClass, tierOf, type TierGroup } from "./models";
 import type { ConnStatus } from "./useQueenSocket";
+import { landedCount } from "./status";
 
 const ROLE_LABEL: Record<AuditCard["role"], string> = {
   BUILDER: "Builder",
@@ -121,7 +122,7 @@ export function MainTrack({ landed, state }: { landed: LandedCommit[]; state: St
     <section className="main-track" aria-label="main branch">
       <div className="main-track__label">
         <b>main</b>
-        <span>{landed.length} landed</span>
+        <span>{landedCount(state)} landed</span>
       </div>
       <div className="main-track__rail" ref={railRef}>
         <div className="commit commit--root" title={hidden ? `initial commit · ${hidden} earlier commits not shown` : "initial commit"}>

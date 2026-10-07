@@ -14,7 +14,7 @@ import {
   swarmFloor,
   waitingToBoard,
 } from "../src/swarm";
-import { blockedOrFailed, goalTrees, headline, openEscalations, pipelineCounts, statusTiles } from "../src/status";
+import { blockedOrFailed, goalTrees, headline, landedCount, openEscalations, pipelineCounts, statusTiles } from "../src/status";
 
 const NOW = 1_800_000_000_000;
 const fx = buildSwarmFixture("demo", NOW);
@@ -214,4 +214,13 @@ test("blocked and failed rows", () => {
   const rows = blockedOrFailed(loaded(), NOW).map((r) => r.item.itemId);
   expect(rows).toContain("s30");
   expect(rows).toContain("g1-c4");
+});
+
+test("landedCount counts distinct landed items: a batched car of 3 members is 3, not 4", () => {
+  const t = (trainId: string, extra: Record<string, unknown> = {}) => ({ trainId, status: "MERGED", ...extra });
+  const trains = { m1: t("m1"), m2: t("m2"), m3: t("m3"), car: t("car", { lane: "QUEUE", members: ["m1", "m2", "m3"] }), solo: t("solo") };
+  const landed = ["m1", "m2", "m3", "car", "solo"].map((trainId) => ({ sha: trainId, trainId, promptId: "" }));
+  expect(landedCount({ landed, trains } as never)).toBe(4);
+  expect(landedCount({ landed: landed.slice(0, 4), trains } as never)).toBe(3);
+  expect(landedCount({ landed: [], trains: {} } as never)).toBe(0);
 });

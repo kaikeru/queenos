@@ -13,10 +13,17 @@ const st = (releases: Release[], deployments: Record<string, unknown> = {}) =>
 
 describe("release strip", () => {
   it("is null with no release", () => expect(releaseStrip(st([]))).toBeNull());
-  it("shows the timeline and no prod link before SHIPPED", () => {
+  it("shows the timeline and keeps the prod link while a release is in flight", () => {
     const s = releaseStrip(st([rel({ phase: "CANARY", canaryPercent: 10, prodUrl: "https://p" })]))!;
     expect(s.steps.find((x) => x.state === "now")?.label).toBe("CANARY 10%");
-    expect(s.prodUrl).toBeNull();
+    expect(s.prodUrl).toBe("https://p");
+  });
+  it("falls back to an earlier release's prod URL when the newest has none", () => {
+    const old = rel({ releaseId: "r0", phase: "SHIPPED", prodUrl: "https://old", createdAt: 1 });
+    const cur = rel({ releaseId: "r1", phase: "STAGING", createdAt: 2 });
+    expect(releaseStrip(st([cur, old]))!.prodUrl).toBe("https://old");
+    expect(releaseStrip(st([rel({ phase: "ROLLED_BACK" })], { d1: { deploymentId: "d1", environment: "prod", status: "LIVE", url: "https://dep", updatedAt: 5 } }))!.prodUrl).toBe("https://dep");
+    expect(releaseStrip(st([rel({ phase: "STAGING" })]))!.prodUrl).toBeNull();
   });
   it("distinguishes auto-ship from a human tap and links prod when shipped", () => {
     expect(shipper(rel({ tappedBy: "queen:autonomous" }))?.kind).toBe("auto");

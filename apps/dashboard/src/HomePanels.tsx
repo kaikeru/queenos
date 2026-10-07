@@ -23,7 +23,7 @@ export function ReleaseStripRow({ hive, state }: { hive: string; state: State })
             {shipper.kind === "auto" ? "auto-shipped by the Queen" : `tapped by ${shipper.by}`}
           </span>
         )}
-        {release.phase === "SHIPPED" && prodUrl && (
+        {prodUrl && (
           <a className="rstrip__prod" href={prodUrl} target="_blank" rel="noreferrer" title={prodUrl}>prod ▸</a>
         )}
         <Link className="sh-link rstrip__more" to={hrefFor.lanes(hive)}>lanes ▸</Link>

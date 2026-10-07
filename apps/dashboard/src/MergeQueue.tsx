@@ -4,6 +4,7 @@ import type { State } from "./reducer";
 import { hrefFor } from "./route";
 import { Link } from "./router";
 import { itemIdOf, queueRail, recentBisects, recentConflicts, type CarMember, type QueueCar, type QueueStory, type WaitingBuild } from "./swarm";
+import { landedCount } from "./status";
 import "./swarm.css";
 
 function Chip({ m, hive }: { m: Pick<CarMember, "itemId" | "title" | "trainId">; hive: string }) {
@@ -95,7 +96,7 @@ export function MergeQueue({ state, hive }: { state: State; hive: string }) {
     <section className="mq" aria-label="Merge queue">
       <div className="mq__head">
         <h3 className="eyebrow">MERGE QUEUE</h3>
-        <Link to={hrefFor.queue(hive)} className="mq__meta">{landed.length} landed · queue page ▸</Link>
+        <Link to={hrefFor.queue(hive)} className="mq__meta">{landedCount(state)} landed · queue page ▸</Link>
       </div>
       <Rail state={state} hive={hive} />
       {stories.length > 0 && (

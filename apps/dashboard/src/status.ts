@@ -40,13 +40,30 @@ function deriveHeadline(state: Slice): HeadlineKind {
   return active || cars || releasing ? "SHIPPING" : "IDLE";
 }
 
+/**
+ * Distinct work items that landed. `state.landed` has one entry per MERGED train, and a landed
+ * batched car (lane QUEUE) lands together with each of its member build trains, so its length
+ * is cars + members. A car counts as its members; a build train counts as itself.
+ */
+export function landedCount(state: Pick<State, "landed" | "trains">): number {
+  const ids = new Set<string>();
+  for (const l of state.landed) {
+    const t = state.trains[l.trainId];
+    if (t?.lane === "QUEUE") {
+      if (t.members?.length) for (const m of t.members) ids.add(m);
+      else ids.add(l.trainId);
+    } else ids.add(l.trainId);
+  }
+  return ids.size;
+}
+
 /** The headline strip. Uses the Queen's `hive.headline` when present; otherwise derives it by the same rules. */
 export function headline(state: Slice): Headline {
   const kind = state.hive?.headline ?? deriveHeadline(state);
   const floor = swarmFloor(state);
   const cars = queueRail(state).cars.length;
   const needsYou = openEscalations(state).length;
-  const landedToday = state.hive?.throughput.landed24h ?? state.landed.length;
+  const landedToday = state.hive?.throughput.landed24h ?? landedCount(state);
   const building = state.hive?.concurrency?.activeBuilds ?? floor.total;
   const carsInQueue = state.hive?.concurrency?.queueDepth ?? cars;
   const label = kind === "NEEDS_YOU" ? "NEEDS YOU" : kind;

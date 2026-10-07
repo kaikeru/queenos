@@ -223,7 +223,7 @@ export interface ReleaseStrip {
   steps: TimelineStep[];
   headline: string;
   shipper: ReturnType<typeof shipper>;
-  /** Set once SHIPPED and a URL is known. */
+  /** Whenever any prod URL is known (this release, an earlier one, or a live prod deployment), whatever the phase. */
   prodUrl: string | null;
 }
 
@@ -236,6 +236,6 @@ export function releaseStrip(state: Pick<State, "releases" | "releaseOrder" | "d
     steps: timelineSteps(release, state.canaryPeak[release.releaseId] ?? 0),
     headline: phaseHeadline(release),
     shipper: shipper(release),
-    prodUrl: release.phase === "SHIPPED" ? prodUrlOf(state, release) : null,
+    prodUrl: prodUrlOf(state, release),
   };
 }

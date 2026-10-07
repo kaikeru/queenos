@@ -263,7 +263,8 @@ function rowNote(r: ItemRow): string | null {
   return r.note;
 }
 
-function Row({ hive, row, retry }: { hive: string; row: ItemRow; retry?: boolean }) {
+/** A row. `bare` renders a div for use inside an existing `<li>` (the tree node supplies the item). */
+function Row({ hive, row, retry, bare }: { hive: string; row: ItemRow; retry?: boolean; bare?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const act = async (action: "retry" | "cancel") => {
@@ -278,8 +279,9 @@ function Row({ hive, row, retry }: { hive: string; row: ItemRow; retry?: boolean
     }
   };
   const note = rowNote(row);
+  const Tag = bare ? "div" : "li";
   return (
-    <li className="sh-row">
+    <Tag className="sh-row">
       <span className={`sh-kind sh-kind--${row.item.kind}`}>{row.item.kind}</span>
       <Link className="sh-row__title" to={hrefFor.item(hive, row.item.itemId)}>{row.item.title}</Link>
       <ItemChip status={row.item.status} sub={row.subState} />
@@ -288,7 +290,7 @@ function Row({ hive, row, retry }: { hive: string; row: ItemRow; retry?: boolean
         <button type="button" className="sh-link" disabled={busy} onClick={() => void act("retry")}>{busy ? "…" : "retry ▸"}</button>
       )}
       {err && <span className="sh-err">{err}</span>}
-    </li>
+    </Tag>
   );
 }
 
@@ -297,7 +299,7 @@ function TreeNodes({ hive, nodes }: { hive: string; nodes: GoalNode[] }) {
     <ul className="sh-tree">
       {nodes.map((n) => (
         <li key={n.item.itemId} className="sh-tree__node">
-          <Row hive={hive} row={n} />
+          <Row hive={hive} row={n} bare />
           {n.children.length > 0 && <TreeNodes hive={hive} nodes={n.children} />}
         </li>
       ))}

@@ -16,6 +16,7 @@ import type { State } from "./reducer";
 import { hrefFor } from "./route";
 import { Link } from "./router";
 import { itemIdOf } from "./swarm";
+import { landedCount } from "./status";
 import "./mergeGraph.css";
 
 export type GraphSelection = { kind: "car" | "branch"; id: string } | null;
@@ -441,7 +442,7 @@ export function MergeTrainStrip({ state, hive }: { state: State; hive: string })
     <section className="mq" aria-label="Merge train">
       <div className="mq__head">
         <h3 className="eyebrow">MERGE TRAIN · LAST 30 MIN</h3>
-        <Link to={hrefFor.queue(hive)} className="mq__meta">{state.landed.length} landed · queue page ▸</Link>
+        <Link to={hrefFor.queue(hive)} className="mq__meta">{landedCount(state)} landed · queue page ▸</Link>
       </div>
       <MergeGraph state={state} hive={hive} spanMs={30 * 60_000} density="compact" />
     </section>
