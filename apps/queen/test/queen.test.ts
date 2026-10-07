@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { DeployCommand, DroneTask, ProvisionCommand, QueenServerMessage, RecalledMemory, SentinelCommand } from "@queenos/queen-types";
 import { modelPin, RECONCILE_DELAY_MS, routerPolicy, type QueenNode, type SocketAttachment } from "../src/queen-node";
 import { migrate } from "../src/db";
+import { GATE_TIMEOUT_MS } from "../src/train/planner";
 import type { RecordingDispatcher, RecordingHerald, RecordingProvisioner, RecordingSentinel } from "./fakes";
 
 const worker = exports.default;
@@ -587,14 +588,14 @@ describe("command watchdog (alarm)", () => {
     expect(await droneIds(ns)).toEqual([`${t!.train_id}-build`]);
   });
 
-  it("no alarm when nothing is outstanding; re-armed as soon as a command is issued", async () => {
+  it("TESTING waits only on its Queen-started gate (alarm at the gate deadline, not sooner); re-armed as soon as a command is issued", async () => {
     const ns = newHive();
     const { trainId } = await oneTrain(ns, { live: true });
-    // TESTING with a live preview: waiting on gatekeepers, not on an executor command.
+    // TESTING with a live preview: no executor command outstanding, only the gate (GATE_TIMEOUT_MS watchdog).
     await runInDurableObject(stubFor(ns), (_q: QueenNode, state) => state.storage.deleteAlarm());
     const dup = await post(ns, "/internal/webhook/deploy-result", { commandId: `${trainId}-deploy-1`, op: "DEPLOY", environment: "preview", trainId, ok: true, url: previewUrl(trainId) });
     expect(await dup.json()).toMatchObject({ outcome: "ignored:duplicate", train: { phase: "TESTING" } });
-    expect(await alarmAt(ns)).toBeNull();
+    expect(await alarmAt(ns)).toBeGreaterThan(Date.now() + GATE_TIMEOUT_MS - 60_000);
     await post(ns, "/internal/webhook/train-result", { trainId, passed: false, summary: "smoke failed" });
     // Ejection issues DELETE + TEARDOWN (and a rework fork): armed again.
     expect(await alarmAt(ns)).not.toBeNull();
@@ -951,7 +952,7 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([14, 14, 14]);
+    expect([state.before, state.after, state.version]).toEqual([15, 15, 15]);
     expect(state.tables).toEqual([
       "audit_trail", "deployments", "escalations", "event_log", "hive_settings", "inboxes", "merge_trains", "metrics_hourly", "model_preference", "model_router",
       "model_stats", "path_claims", "prompt_runs", "races", "releases", "sentinel_verdicts", "sqlite_sequence", "submissions", "work_items",

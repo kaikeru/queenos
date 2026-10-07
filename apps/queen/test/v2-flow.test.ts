@@ -369,6 +369,31 @@ describe("(j) budget", () => {
   });
 });
 
+describe("(l) sim: pushed code is gated by the Queen-started gate", () => {
+  it("a push parked behind a paused hive (far past the push gate's patience) is gated once it reaches TESTING, then lands; [fail] is rejected", async () => {
+    const hive = newHive();
+    const stub = sim(hive);
+    await settings(stub, { autonomy: "paused" });
+    const intake = async (ref: string, title: string) => {
+      const head = crypto.randomUUID().replace(/-/g, "").padEnd(40, "0").slice(0, 40);
+      const d = await stub.gitIntent({ hive, user: "ada@example.com", ref, oldSha: "0".repeat(40), newSha: head });
+      if (d.verdict !== "accept") throw new Error("refused");
+      const r = await stub.gitPushed({ hive, trainId: d.trainId, repo: d.repo, ref, headSha: head, baseSha: "f".repeat(40), title, message: title, trailers: {} });
+      return { ...d, head, itemId: r.itemId };
+    };
+    const ok = await intake("refs/heads/tip-jar", "Add a tip jar");
+    const bad = await intake("refs/heads/broken", "Add a broken thing [fail]");
+    await settings(stub, { autonomy: "autonomous" });
+    await pump(stub, async () => (await items(stub)).find((i) => i.item_id === ok.itemId)?.status === "SHIPPED", 40_000, "the pushed item to ship");
+    expect(await itemStatus(stub, bad.itemId)).toBe("FAILED");
+    const gated = (await rows(stub, "SELECT train_id, gate_command_id FROM merge_trains WHERE train_id IN (?, ?)", ok.trainId, bad.trainId)) as { train_id: string; gate_command_id: string | null }[];
+    expect(gated.every((t) => /-q1$/.test(t.gate_command_id ?? ""))).toBe(true);
+    const audits = await rows(stub, "SELECT train_id FROM event_log WHERE type = 'drone.audit' AND item_id = ?", bad.itemId);
+    expect(audits.length).toBeGreaterThan(0);
+    expect(audits.every((a) => a.train_id === bad.trainId)).toBe(true);
+  });
+});
+
 describe("(d) merge-queue batching", () => {
   const stubFor = (ns: string) => env.QUEEN_NODE.get(env.QUEEN_NODE.idFromName(ns));
   const post = (ns: string, path: string, body: unknown) =>
@@ -491,7 +516,7 @@ describe("(k) git intake: gitIntent → gitPushed → the same pipeline as a dro
    * release deploys, Sentinel, builders, MERGE and LANDER drones; gate every BUILD train / car that is
    * TESTING (`gate(trainId)` false = reject). Loops until nothing new happens.
    */
-  async function drive(ns: string, seen: Set<string>, gate: (t: TrainRow) => boolean = () => true): Promise<void> {
+  async function drive(ns: string, seen: Set<string>, gate: (t: TrainRow) => boolean = () => true, beforeGates?: (testing: TrainRow[]) => Promise<void>): Promise<void> {
     const stub = stubFor(ns);
     for (let round = 0; round < 40; round++) {
       const s = await look(ns);
@@ -527,8 +552,10 @@ describe("(k) git intake: gitIntent → gitPushed → the same pipeline as a dro
           await stub.reportMergeResult({ trainId: task.trainId, ok: true, headSha: sha(), baseSha: t?.base_sha || "f".repeat(40), merged: members, fastForward: members.length === 1 });
         } else if (task.action === "LAND") await stub.reportLandResult({ trainId: task.trainId, landed: true, mainSha: sha() });
       }
-      for (const t of (await look(ns)).trains) {
-        if (t.phase !== "TESTING" || !once(`gate:${t.train_id}`)) continue;
+      const testing = (await look(ns)).trains.filter((t) => t.phase === "TESTING" && !seen.has(`gate:${t.train_id}`));
+      if (testing.length && beforeGates) await beforeGates(testing);
+      for (const t of testing) {
+        if (!once(`gate:${t.train_id}`)) continue;
         const pass = t.lane === "QUEUE" || gate(t);
         await stub.reportTrainResult({ trainId: t.train_id, passed: pass, summary: pass ? "all gates green" : "REVIEWER rejected the change" });
       }
@@ -804,6 +831,71 @@ describe("(k) git intake: gitIntent → gitPushed → the same pipeline as a dro
     expect(s.items).toEqual([]);
     // The same head may be pushed again after an abort.
     expect((await stub.gitIntent({ hive: ns, user: USER, ref: "refs/heads/y", oldSha: "0".repeat(40), newSha: String(s.submissions.find((r) => r.train_id === e.trainId)!.head_sha) })).verdict).toBe("accept");
+  });
+
+  it("7b. a sick fork re-forked as <repo>-rN: gitPushed adopts it (gate target, cleanup and landing use it); anything else is refused", async () => {
+    const ns = newHive();
+    const stub = stubFor(ns);
+    const other = await stub.gitIntent({ hive: ns, user: USER, ref: "refs/heads/other", oldSha: "0".repeat(40), newSha: sha() });
+    const head = sha();
+    const d = await stub.gitIntent({ hive: ns, user: USER, ref: "refs/heads/sick", oldSha: "0".repeat(40), newSha: head });
+    if (d.verdict !== "accept" || other.verdict !== "accept") throw new Error("refused");
+    const pushed = (repo: string) =>
+      stub.gitPushed({ hive: ns, trainId: d.trainId, repo, ref: "refs/heads/sick", headSha: head, baseSha: "f".repeat(40), title: "Sick fork", message: "Sick fork", trailers: {} });
+    // Only `<the intent's repo>-r<N>`: not a look-alike, not another train's fork (or its re-fork).
+    for (const bad of [`${d.repo}-r2x`, `${d.repo}-r`, `${d.repo}r2`, `${d.repo}-r2-r3`, other.repo, `${other.repo}-r2`, `x${d.repo}-r2`]) {
+      expect(await rpcError(pushed(bad)), bad).toMatch(/INVALID_INPUT/);
+    }
+    const repo = `${d.repo}-r2`;
+    const result = await pushed(repo);
+    expect(result.disposition).toBe("filed");
+    let s = await look(ns);
+    expect(s.trains.find((t) => t.train_id === d.trainId)).toMatchObject({ artifact_repo: repo, phase: "DEPLOYING", fork_state: "READY", head_sha: head });
+    expect(s.submissions.find((r) => r.train_id === d.trainId)).toMatchObject({ repo: d.repo, outcome: "applied", disposition: "filed" });
+    expect(JSON.parse(String(s.items.find((i) => i.item_id === result.itemId)!.inbox_json))).toMatchObject({ repo });
+    expect(await stub.getGateTarget(repo)).toMatchObject({ trainId: d.trainId, lane: "BUILD", origin: { kind: "human", id: USER } });
+    expect(await stub.getGateTarget(d.repo)).toBeNull();
+    // Idempotent under the adopted name (the proxy retries gitPushed on a transport error).
+    expect(await pushed(repo)).toMatchObject({ disposition: "filed", itemId: result.itemId });
+
+    // Gate, car (MERGE takes the member from the adopted repo), land; cleanup deletes the adopted repo.
+    await drive(ns, new Set());
+    s = await look(ns);
+    expect(s.items.find((i) => i.item_id === result.itemId)).toMatchObject({ status: "SHIPPED" });
+    const merge = s.tasks.find((t) => t.action === "MERGE" && t.members?.some((m) => m.trainId === d.trainId))!;
+    expect(merge.members!.find((m) => m.trainId === d.trainId)).toMatchObject({ artifactRepo: repo, headSha: head });
+    const deletes = s.provisions.filter((c): c is Extract<ProvisionCommand, { op: "DELETE" }> => c.op === "DELETE" && c.trainId === d.trainId);
+    expect(deletes.map((c) => c.repo)).toEqual([repo]); // the proxy deleted the abandoned first fork itself
+  });
+
+  it("9. race siblings get only their own findings: per-train audits feed notesFor and the REWORK brief", async () => {
+    const ns = newHive();
+    const stub = stubFor(ns);
+    await stub.updateSettings({ hive: ns, user: USER, patch: { autonomy: "paused" } });
+    const { item } = await stub.fileWorkItem({ hive: ns, user: USER, item: { kind: "feature", title: "Dark mode" } });
+    const a = await push(ns, `refs/heads/item/${item.itemId}`, "Dark mode by Ada");
+    const b = await push(ns, `refs/heads/item/${item.itemId}`, "Dark mode by Bob", { user: "bob@example.com" });
+    if (a.decision.verdict !== "accept" || b.decision.verdict !== "accept") throw new Error("refused");
+    expect(b.result).toMatchObject({ disposition: "joined-race", itemId: item.itemId });
+    await stub.updateSettings({ hive: ns, user: USER, patch: { autonomy: "autonomous" } });
+    const finding = (trainId: string) => (trainId === (a.decision as { trainId: string }).trainId ? "[error] no-eval src/a.js:3: eval is not allowed" : "[error] no-fetch src/b.js:9: fetch to an unknown host");
+    const rejected = (steps: string[]) => ({ taskPrompt: "x", model: "queenos/security-scan-v1", temperature: 0, reasoningSteps: steps, result: "failure" as const, executionTimeMs: 1 });
+    // Both gates report their findings before either verdict (interleaved, as concurrent gates do).
+    await drive(ns, new Set(), () => false, async (testing) => {
+      for (const t of testing) await stub.appendAudits([{ promptId: item.itemId, trainId: t.train_id, commitSha: t.head_sha!, droneRole: "SECURITY", status: "REJECTED", gitNotesPayload: rejected([finding(t.train_id)]) }]);
+    });
+    const notes = await stub.notesFor(ns, "refs/notes/verdict");
+    const verdictOf = (head: string) => parseNotes(notes.notes.find((n) => n.sha === head)!.text).find((e) => e.verdict === "REJECTED")!;
+    expect(verdictOf(a.head).findings!.map((f) => f.path)).toEqual(["src/a.js"]);
+    expect(verdictOf(b.head).findings!.map((f) => f.path)).toEqual(["src/b.js"]);
+    expect(verdictOf(a.head).summary).toMatch(/^REJECTED by SECURITY/);
+    const review = await stub.notesFor(ns, "refs/notes/review");
+    expect(review.notes.find((n) => n.sha === a.head)!.text).not.toContain("src/b.js");
+    expect(review.notes.find((n) => n.sha === b.head)!.text).not.toContain("src/a.js");
+    // The REWORK brief (handoff) is the same per-head note.
+    const brief = await runInDurableObject(stub, (q: QueenNode) => q.verdictNote(a.head));
+    expect(brief).toContain("src/a.js");
+    expect(brief).not.toContain("src/b.js");
   });
 
   it("8. drone items and pushed submissions share the merge queue: everything lands", async () => {

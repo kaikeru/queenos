@@ -185,3 +185,32 @@ export const DeploymentSchema = z.object({
   updatedAt: z.number().int(),
 });
 export type Deployment = z.infer<typeof DeploymentSchema>;
+
+// ---------- Gatekeepers (Queen-started gates) ----------
+
+/** Workflows instance ids are at most 100 characters. */
+export const MAX_GATE_COMMAND_ID = 100;
+
+/**
+ * GATE: the Queen starts a gate for a train that entered TESTING (gatekeepers `GatekeeperWorkflow`, instance
+ * id = `commandId` = `gate-<repo>-<head>-q<n>`). The push-event trigger alone polls the Queen for TESTING only
+ * a couple of minutes, so a train that reaches TESTING later (parked pushed code, a slow preview) was never
+ * gated. The payload is a superset of the gatekeepers' own GateTask (`kind`, `repo`, `hive`, `branch`, `after`):
+ * an older gatekeeper runs it as an ordinary gate. `GateTarget.gateId` names the gate that owns the round; any
+ * other gate instance for the train stands down, and the Queen ignores a report carrying another `gateId`.
+ */
+export const GateCommandSchema = z.object({
+  kind: z.literal("gate"),
+  commandId: z.string().min(1).max(MAX_GATE_COMMAND_ID),
+  trace: Trace,
+  /** The hive namespace (the Queen's `idFromName`). */
+  hive: z.string().min(1),
+  trainId: z.string().min(1),
+  /** The train's fork (or a car's repo). */
+  repo: z.string().min(1),
+  /** The fork branch the head is on (`main`). */
+  branch: z.string().min(1),
+  /** The head to gate (the train's `headSha`). */
+  after: z.string().min(1),
+});
+export type GateCommand = z.infer<typeof GateCommandSchema>;

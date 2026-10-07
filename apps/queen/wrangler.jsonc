@@ -59,6 +59,15 @@
       "name": "oracle-workflow",
       "class_name": "OracleWorkflow",
       "script_name": "queenos-oracle"
+    },
+    {
+      // Gatekeepers (Queen-started gates: a GATE for every train that enters TESTING, so a train that
+      // reaches TESTING after the push-event gate gave up is still gated): apps/gatekeepers.
+      // Deploy it before the Queen (an older gatekeeper runs the command too, but gates twice).
+      "binding": "GATEKEEPER",
+      "name": "gatekeeper-workflow",
+      "class_name": "GatekeeperWorkflow",
+      "script_name": "queenos-gatekeepers"
     }
   ],
   "vars": {
@@ -135,7 +144,8 @@
         { "binding": "PROVISIONER", "name": "provisioner-workflow", "class_name": "ProvisionerWorkflow", "script_name": "queenos-provisioner" },
         { "binding": "HERALD", "name": "herald-workflow", "class_name": "HeraldWorkflow", "script_name": "queenos-herald" },
         { "binding": "SENTINEL", "name": "sentinel-workflow", "class_name": "SentinelWorkflow", "script_name": "queenos-sentinel" },
-        { "binding": "ORACLE", "name": "oracle-workflow", "class_name": "OracleWorkflow", "script_name": "queenos-oracle" }
+        { "binding": "ORACLE", "name": "oracle-workflow", "class_name": "OracleWorkflow", "script_name": "queenos-oracle" },
+        { "binding": "GATEKEEPER", "name": "gatekeeper-workflow", "class_name": "GatekeeperWorkflow", "script_name": "queenos-gatekeepers" }
       ],
       // Mirrored only to silence wrangler's "not inherited" warning: local dev keeps AE
       // writes in memory (no dataset is created); the rollups in SQLite power the Metrics page.

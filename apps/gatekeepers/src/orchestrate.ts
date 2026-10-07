@@ -7,7 +7,9 @@
  * - handlePush: the instance Artifacts starts per push event. Pure filtering,
  *   then dispatches ONE deterministic instance per (repo, after) = idempotency.
  * - runGate: that deterministic instance. Waits for the Queen to reach TESTING,
- *   clone+scan+test in one step, audits, Scribe, Vectorize, verdict.
+ *   clone+scan+test in one step, audits, Scribe, Vectorize, verdict. The Queen also
+ *   starts it directly (a GATE command, `task.commandId`) when a train enters TESTING;
+ *   then the Queen's GateTarget.gateId names the one instance that gates the round.
  *
  * Replay rules: all clock reads and I/O are inside steps; steps return small
  * serializable values.
@@ -107,6 +109,8 @@ export type ReadyLookup = {
   /** QUEUE: smoke routes (`/`, `/health`, every member's smokePaths) and the members' trace ids. */
   routes: IntegrationSpec["routes"];
   memberTraces: string[];
+  /** The Queen-started gate that owns this TESTING round (GateTarget.gateId); null: none (or an older Queen). */
+  gateId: string | null;
 };
 export type Lookup = ReadyLookup | { status: "waiting"; phase: string } | { status: "ignored"; reason: string };
 
@@ -132,6 +136,7 @@ export function lookupFromTarget(t: GateTarget, builderReasoning: string[]): Loo
     traceId: t.traceId,
     routes: t.lane === "QUEUE" ? integrationRoutes(members) : [],
     memberTraces: [...new Set(members.flatMap((m) => (m.traceId ? [m.traceId] : [])))],
+    gateId: t.gateId ?? null,
   };
 }
 
@@ -163,6 +168,7 @@ export function lookupFromSnapshot(snap: QueenSnapshot, task: Pick<GateTask, "re
     traceId: train.traceId ?? null,
     routes: lane === "QUEUE" ? integrationRoutes([]) : [],
     memberTraces: [...new Set(memberTrains.flatMap((m) => (m.traceId ? [m.traceId] : [])))],
+    gateId: null,
   };
 }
 
@@ -271,6 +277,9 @@ async function gateRound(task: GateTask, step: StepRunner, ports: GatekeeperPort
     if (i < lookups) await step.sleep(`wait for TESTING #${i}`, config.phaseWaitMs);
   }
   if (!train) return { status: "ignored", reason: "phase-timeout" };
+  // The Queen started a gate for this TESTING round and it is not this instance (the push-event gate, or a Queen
+  // gate the watchdog replaced): stand down, so one gate judges the round (no duplicate audits or verdicts).
+  if (train.gateId && train.gateId !== (task.commandId ?? null)) return { status: "ignored", reason: "queen-gate" };
 
   const ctx: Ctx = { task, step, ports, config, train };
   const integration = train.lane === "QUEUE";
@@ -477,7 +486,15 @@ type AuditRow = [DroneRole, AuditStatus, GitNotesPayload | null];
 
 /** Consecutive audits in one Queen RPC (one step, order kept). */
 async function audits(ctx: Ctx, name: string, rows: AuditRow[]): Promise<void> {
-  const inputs: AppendAuditInput[] = rows.map(([droneRole, status, gitNotesPayload]) => ({ promptId: ctx.train.promptId, droneRole, status, gitNotesPayload }));
+  // trainId + commitSha: race siblings of one item (same promptId) keep their own findings (notes, REWORK brief).
+  const inputs: AppendAuditInput[] = rows.map(([droneRole, status, gitNotesPayload]) => ({
+    promptId: ctx.train.promptId,
+    trainId: ctx.train.trainId,
+    commitSha: ctx.task.after,
+    droneRole,
+    status,
+    gitNotesPayload,
+  }));
   // Auditing never blocks the gate: permanent Queen errors are logged and skipped.
   await ctx.step.do(name, REPORT_STEP, async () => {
     try {
@@ -519,7 +536,8 @@ function glog(ctx: Ctx, step: string, outcome: string, extra: Record<string, unk
 async function report(ctx: Ctx, passed: boolean, summary: string, extras: { score?: GateScore; followUps?: FollowUp[]; cause?: "infra" } = {}): Promise<string> {
   return ctx.step.do("report: train result", REPORT_STEP, async () => {
     try {
-      const r = await ctx.ports.queen(ctx.task.hive).reportTrainResult({ trainId: ctx.train.trainId, passed, summary, commitSha: ctx.task.after, ...extras });
+      const gateId = ctx.task.commandId ? { gateId: ctx.task.commandId } : {};
+      const r = await ctx.ports.queen(ctx.task.hive).reportTrainResult({ trainId: ctx.train.trainId, passed, summary, commitSha: ctx.task.after, ...extras, ...gateId });
       return String(r.outcome);
     } catch (e) {
       if (!isPermanentQueenError(e)) throw e;

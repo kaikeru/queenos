@@ -12,6 +12,8 @@
  *   and each canary step; reports back with `reportSentinelVerdict`).
  * - ORACLE: `OracleWorkflow` in apps/oracle (DECOMPOSE / TRIAGE; reports back
  *   with `reportOracleResult`).
+ * - GATEKEEPER: `GatekeeperWorkflow` in apps/gatekeepers (a GATE for a train that
+ *   entered TESTING; reports back with `reportTrainResult`, carrying `gateId`).
  *
  * v2 (§4.3, item 3): a decision may issue dozens of commands of one kind (a
  * fan-out of FORKs). `dispatchMany` groups them into Workflows `createBatch`
@@ -20,7 +22,7 @@
  * result, and every id of a batch that threw, falls back to one-by-one dispatch
  * (which treats an existing instance as success).
  */
-import type { DeployCommand, OracleCommand, ProvisionCommand, SentinelCommand } from "@queenos/queen-types";
+import type { DeployCommand, GateCommand, OracleCommand, ProvisionCommand, SentinelCommand } from "@queenos/queen-types";
 import { QueenError } from "./errors";
 
 /** Workflows `createBatch` takes at most this many instances per call. */
@@ -44,6 +46,8 @@ export type DeployDispatcher = CommandDispatcher<DeployCommand>;
 export type SentinelDispatcher = CommandDispatcher<SentinelCommand>;
 /** Decomposes goals and triages auto-filed items (Oracle Workflow). */
 export type OracleDispatcher = CommandDispatcher<OracleCommand>;
+/** Queen-started gates (gatekeepers' GatekeeperWorkflow; instance id = GateCommand.commandId). */
+export type GatekeeperDispatcher = CommandDispatcher<GateCommand>;
 
 /** Start one instance; an instance that already exists counts as success. */
 export async function createOrExisting(workflow: Workflow, id: string, params: unknown): Promise<void> {

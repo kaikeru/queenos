@@ -283,3 +283,48 @@ describe("followUpsFrom / integrationRoutes", () => {
     expect(routes[3]!.member!.trainId).toBe("m2");
   });
 });
+
+describe("Queen-started gates (GATE command): one gate owns a TESTING round", () => {
+  const CLEAN = { "src/features/dark-mode.ts": "export const darkMode = { enabled: true } as const;\n" };
+  const QGATE = "gate-hive-train-aaaaaaaaaaaa-q1";
+  async function buildWorld(target: Partial<GateTarget>) {
+    const w = new FakeWorld();
+    await w.git.seed(REPO);
+    const after = await w.git.build(REPO, { prompt: "Add a dark mode toggle", files: CLEAN });
+    w.queen.train.headSha = after;
+    w.queen.serveTarget(buildTarget(target));
+    return { w, after };
+  }
+
+  it("the Queen's command (task.commandId = target.gateId) gates and reports its gateId", async () => {
+    const { w, after } = await buildWorld({ gateId: QGATE });
+    const out = await runGate(gateTask(after, { commandId: QGATE, trainId: "train-1" }), new InlineSteps(), w.ports(), config());
+    expect(out).toMatchObject({ status: "gated", passed: true, queenOutcome: "applied" });
+    expect(w.queen.reports()).toEqual([expect.objectContaining({ trainId: "train-1", passed: true, commitSha: after, gateId: QGATE })]);
+  });
+
+  it("the push-event gate stands down when the Queen started a gate for the round (no audits, no report)", async () => {
+    const { w, after } = await buildWorld({ gateId: QGATE });
+    const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), config());
+    expect(out).toEqual({ status: "ignored", reason: "queen-gate" });
+    expect(w.queen.audits()).toEqual([]);
+    expect(w.queen.reports()).toEqual([]);
+    expect(w.artifacts.calls).toEqual([]);
+  });
+
+  it("a replaced Queen gate (the watchdog re-dispatched the round) stands down too", async () => {
+    const { w, after } = await buildWorld({ gateId: "gate-hive-train-aaaaaaaaaaaa-q2" });
+    const out = await runGate(gateTask(after, { commandId: QGATE, trainId: "train-1" }), new InlineSteps(), w.ports(), config());
+    expect(out).toEqual({ status: "ignored", reason: "queen-gate" });
+    expect(w.queen.reports()).toEqual([]);
+  });
+
+  it("an older Queen (no gateId) or a round without a Queen gate: the push-event gate gates as before, no gateId reported", async () => {
+    for (const target of [{}, { gateId: null }]) {
+      const { w, after } = await buildWorld(target);
+      const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), config());
+      expect(out).toMatchObject({ status: "gated", passed: true });
+      expect(w.queen.reports()[0]).not.toHaveProperty("gateId");
+    }
+  });
+});

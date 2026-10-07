@@ -92,6 +92,12 @@ export const TrainResultSchema = z.object({
   cause: z.literal("infra").optional(),
   /** The reporting drone's Workflow instance id. With `cause`, a report from a superseded attempt is ignored. */
   commandId: z.string().min(1).max(200).optional(),
+  /**
+   * Gatekeepers: the Queen-started gate that judged it (`GateCommand.commandId`). A report naming another gate
+   * than the train's current one (a replaced gate, re-dispatched by the watchdog) is ignored as stale. Absent
+   * (a push-triggered gate, an older gatekeeper): accepted as before.
+   */
+  gateId: z.string().min(1).max(200).optional(),
 });
 export type TrainResult = z.infer<typeof TrainResultSchema>;
 

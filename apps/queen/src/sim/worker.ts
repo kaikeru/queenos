@@ -39,7 +39,7 @@ export class QueenNode extends ProdQueenNode {
     // Called from the base constructor: `this.ctx` is set, subclass fields are not.
     const sim = new SimExecutors(() => this, this.ctx.storage, undefined, undefined, (at) => this.alarmNoLaterThan(at));
     this.sim = sim;
-    return { provisioner: sim.provisioner, herald: sim.herald, sentinel: sim.sentinel, oracle: sim.oracle, dispatcher: sim.drones };
+    return { provisioner: sim.provisioner, herald: sim.herald, sentinel: sim.sentinel, oracle: sim.oracle, gatekeeper: sim.gatekeeper, dispatcher: sim.drones };
   }
 
   protected override isSim(): boolean {

@@ -55,6 +55,8 @@ import type {
   DeployResult,
   DroneRole,
   DroneTask,
+  GateCommand,
+  GateTarget,
   GitNotesPayload,
   LandResultInput,
   MergeResultInput,
@@ -70,7 +72,7 @@ import type {
 import { MAX_MEMORY_TEXT, MODEL_CATALOG, MAX_RECALLED_MEMORIES, MIN_RECALL_SCORE } from "@queenos/queen-types";
 import type { DroneDispatcher } from "../drones";
 import { droneInstanceId } from "../drones";
-import type { CommandDispatcher, DeployDispatcher, ProvisionerDispatcher, SentinelDispatcher } from "../executors";
+import type { CommandDispatcher, DeployDispatcher, GatekeeperDispatcher, ProvisionerDispatcher, SentinelDispatcher } from "../executors";
 import {
   BATCH_FAIL_KEY,
   BATCH_FAIL_MARKER,
@@ -122,6 +124,8 @@ export interface SimQueen {
   /** v2: open work items, for the TRIAGE duplicate check (absent: TRIAGE finds no duplicates). */
   listOpenItems?(): { itemId: string; title: string; status: string }[] | Promise<{ itemId: string; title: string; status: string }[]>;
   getSnapshot(): SimSnapshot | Promise<SimSnapshot>;
+  /** The gatekeeper's lookup (Queen-started gates; absent: the sim gatekeeper never gates on a GATE command). */
+  getGateTarget?(repo: string): GateTarget | null | Promise<GateTarget | null>;
 }
 
 export interface SimSnapshot {
@@ -195,7 +199,8 @@ type ProvisionJob = { id: string; kind: "provision"; due: number; command: Provi
 type DeployJob = { id: string; kind: "deploy"; due: number; command: DeployCommand };
 type SentinelJob = { id: string; kind: "sentinel"; due: number; command: SentinelCommand };
 type OracleJob = { id: string; kind: "oracle"; due: number; command: OracleCommand };
-type Job = DroneJob | ProvisionJob | DeployJob | SentinelJob | OracleJob;
+type GateJob = { id: string; kind: "gate"; due: number; command: GateCommand };
+type Job = DroneJob | ProvisionJob | DeployJob | SentinelJob | OracleJob | GateJob;
 
 const JOBS_KEY = "sim:jobs";
 const DONE_KEY = "sim:done";
@@ -269,6 +274,13 @@ export class SimExecutors {
   };
   readonly sentinel: SentinelDispatcher = {
     dispatch: (command) => this.enqueue({ id: command.commandId, kind: "sentinel", due: this.now() + this.delays.sentinel, command }),
+  };
+  /**
+   * Queen-started gates. Drone builds and cars are gated by the sim drone's own test job (as the push event
+   * gates them live), so this gates only contributed code (`git push`), which has no sim drone.
+   */
+  readonly gatekeeper: GatekeeperDispatcher = {
+    dispatch: (command) => this.enqueue({ id: command.commandId, kind: "gate", due: this.now() + this.delays.test, command }),
   };
 
   constructor(
@@ -365,6 +377,8 @@ export class SimExecutors {
         return this.runSentinel(job.command);
       case "oracle":
         return this.runOracle(job.command);
+      case "gate":
+        return this.runQueenGate(job.command);
       default:
         return this.runDrone(job);
     }
@@ -642,6 +656,43 @@ export class SimExecutors {
     }
   }
 
+  /**
+   * A Queen-started gate for pushed code: the same scripted verdicts as a drone build's gate (`[fail]`: SECURITY
+   * rejects; `[review-fail]`: the reviewer rejects), audits per train, the report carrying `gateId`. A gate that
+   * no longer owns the train's TESTING round (or a drone / car train) stands down.
+   */
+  private async runQueenGate(c: GateCommand): Promise<void> {
+    const target = this.queen().getGateTarget ? await this.queen().getGateTarget!(c.repo) : null;
+    if (!target || target.trainId !== c.trainId || target.phase !== "TESTING" || target.gateId !== c.commandId) return;
+    if (target.lane === "QUEUE" || !target.origin || target.origin.kind === "drone") return;
+    const task = { promptText: target.promptText };
+    const shouldFail = target.promptText.includes(FAIL_MARKER);
+    const reviewFail = !shouldFail && target.promptText.includes(REVIEW_FAIL_MARKER);
+    const audits = (rows: AuditRow[]) =>
+      this.queen().appendAudits(rows.map(([role, status, note]) => ({ promptId: target.promptId, trainId: c.trainId, commitSha: c.after, droneRole: role, status, gitNotesPayload: note })));
+    await audits([
+      ["GATEKEEPER", "PASSED", smokeNote(task, target.previewUrl ?? simPreviewUrl(c.trainId))],
+      ["POLICY", "PASSED", reviewNote(task, "policy", true)],
+      ["SECURITY", shouldFail ? "REJECTED" : "PASSED", reviewNote(task, "security", !shouldFail)],
+      ...(shouldFail ? [] : [["REVIEWER", reviewFail ? "REJECTED" : "PASSED", reviewerNote(task, !reviewFail)] as AuditRow]),
+    ]);
+    const summary = shouldFail
+      ? "Security scan rejected the change: an unbounded retry loop swallows errors. Fix it and push again, or hand off."
+      : reviewFail
+        ? REVIEW_FEEDBACK
+        : "Policy and security checks passed and the preview answered its smoke test. The reviewer approved the change.";
+    const passed = !shouldFail && !reviewFail;
+    if (!passed) await this.queen().recordScribeSummary({ promptId: target.promptId, trainId: c.trainId, summary });
+    await this.queen().reportTrainResult({
+      trainId: c.trainId,
+      passed,
+      summary,
+      commitSha: c.after,
+      gateId: c.commandId,
+      ...(passed ? { score: { review: "approved" as const, satisfied: 3, missing: 0, changedFiles: 1, changedBytes: 400, checks: 4 } } : {}),
+    });
+  }
+
   // ── v2: Oracle, MERGE and the car gate ────────────────────────────────
 
   private oracleReport(r: OracleResultInput) {
@@ -916,7 +967,7 @@ function builderNote(task: DroneTask, headSha: string, build: SimBuild = {}): Gi
   };
 }
 
-function reviewNote(task: DroneTask, kind: "policy" | "security", ok: boolean): GitNotesPayload {
+function reviewNote(task: Pick<DroneTask, "promptText">, kind: "policy" | "security", ok: boolean): GitNotesPayload {
   const failing = !ok;
   return {
     taskPrompt: task.promptText,
@@ -939,7 +990,7 @@ function reviewNote(task: DroneTask, kind: "policy" | "security", ok: boolean): 
 }
 
 /** Same shape as the live reviewer: `verdict: …`, `satisfied: …`, `missing: …`, `feedback: …`. */
-function reviewerNote(task: DroneTask, approve: boolean): GitNotesPayload {
+function reviewerNote(task: Pick<DroneTask, "promptText">, approve: boolean): GitNotesPayload {
   const reasoning = approve
     ? ["verdict: APPROVE", "satisfied: the change implements what the prompt asks for", "satisfied: a focused test covers the new behaviour", "feedback: The change satisfies the prompt."]
     : [
@@ -959,7 +1010,7 @@ function reviewerNote(task: DroneTask, approve: boolean): GitNotesPayload {
   };
 }
 
-function smokeNote(task: DroneTask, url: string): GitNotesPayload {
+function smokeNote(task: Pick<DroneTask, "promptText">, url: string): GitNotesPayload {
   return {
     taskPrompt: task.promptText,
     model: SCRIBE_MODEL,

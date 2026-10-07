@@ -153,6 +153,7 @@ import {
   WorkflowCommandDispatcher,
   type DeployDispatcher,
   type OracleDispatcher,
+  type GatekeeperDispatcher,
   type ProvisionerDispatcher,
   type SentinelDispatcher,
 } from "./executors";
@@ -167,6 +168,7 @@ import {
   isContributed,
   isParked,
   keptFork,
+  isForkOf,
   trainRepoName,
   toMergeTrainV2,
   toPromptRun,
@@ -320,6 +322,8 @@ export interface QueenPorts {
   dispatcher: DroneDispatcher;
   /** Oracle Workflow (DECOMPOSE / TRIAGE). */
   oracle: OracleDispatcher;
+  /** Gatekeepers Workflow: Queen-started gates (GATE) for trains that enter TESTING. */
+  gatekeeper: GatekeeperDispatcher;
 }
 
 /** Per-socket state; survives hibernation (<= 16 KiB). */
@@ -531,6 +535,7 @@ export class QueenNode extends DurableObject<Env> {
       herald: new WorkflowCommandDispatcher(env.HERALD, "HERALD"),
       sentinel: new WorkflowCommandDispatcher(env.SENTINEL, "SENTINEL"),
       oracle: new WorkflowCommandDispatcher(env.ORACLE, "ORACLE"),
+      gatekeeper: new WorkflowCommandDispatcher(env.GATEKEEPER, "GATEKEEPER"),
       dispatcher: new WorkflowDroneDispatcher(env.DRONES),
     };
   }
@@ -750,10 +755,12 @@ export class QueenNode extends DurableObject<Env> {
     const hive = this.hiveFor(p.hive);
     const train = this.loadTrain(p.trainId);
     if (!train || !isContributed(train)) throw new QueenError("NOT_FOUND", `push train ${p.trainId} not found`);
-    if (train.artifactRepo !== p.repo) throw new QueenError("INVALID_INPUT", `repo ${p.repo} is not train ${p.trainId}'s fork`);
     const row = this.sql.exec("SELECT * FROM submissions WHERE train_id = ? ORDER BY created_at DESC LIMIT 1", p.trainId).toArray()[0];
     const sub = row ? rowToSubmission(row) : null;
     if (!sub) throw new QueenError("NOT_FOUND", `no push intent for train ${p.trainId}`);
+    // The intent's fork name, or the proxy's re-fork of it (`<repo>-rN`, a sick first fork; 1deb7ab), which
+    // the train adopts like `forkResult` adopts the Provisioner's renamed fork. The intent's own row keys stay.
+    if (!isForkOf(sub.repo, p.repo)) throw new QueenError("INVALID_INPUT", `repo ${p.repo} is not train ${p.trainId}'s fork`);
     if (sub.headSha !== p.headSha || sub.ref !== p.ref) throw new QueenError("INVALID_INPUT", `push ${p.ref} ${short(p.headSha)} does not match the intent (${sub.ref} ${short(sub.headSha)})`);
     if (sub.outcome === "applied") {
       return { disposition: sub.disposition ?? "filed", itemId: sub.itemId ?? train.promptId, messages: remoteLines([`already received → item ${sub.itemId ?? train.promptId} (train ${p.trainId})`]) };
@@ -786,6 +793,7 @@ export class QueenNode extends DurableObject<Env> {
         d.acc.train(
           d.tp.pushed({
             trainId: p.trainId,
+            repo: p.repo,
             headSha: p.headSha,
             baseSha: p.baseSha,
             origin,
@@ -798,7 +806,7 @@ export class QueenNode extends DurableObject<Env> {
           }),
         );
         if (plan.supersedeTrainId) d.acc.train(d.tp.supersede(plan.supersedeTrainId, p.headSha));
-        d.acc.submissionUpdates.push({ key: { repo: p.repo, headSha: p.headSha }, patch: { outcome: "applied", disposition: plan.disposition, itemId: item.itemId, trainId: p.trainId } });
+        d.acc.submissionUpdates.push({ key: { repo: sub.repo, headSha: p.headSha }, patch: { outcome: "applied", disposition: plan.disposition, itemId: item.itemId, trainId: p.trainId } });
         d.acc.events.push(
           this.submissionEvent(item.itemId, p.trainId, `submission received (${plan.disposition}) from ${origin.kind}:${origin.id}: ${p.title}`, {
             outcome: "applied",
@@ -1331,6 +1339,8 @@ export class QueenNode extends DurableObject<Env> {
       status: a.status,
       gitNotesPayload: a.gitNotesPayload,
       createdAt: Date.now(),
+      ...(a.trainId ? { trainId: a.trainId } : {}),
+      ...(a.commitSha ? { commitSha: a.commitSha } : {}),
     };
     return { event, hive };
   }
@@ -1526,6 +1536,8 @@ export class QueenNode extends DurableObject<Env> {
       baseSha: t.baseSha || null,
       // T1: whose code (a non-drone origin makes the reviewer fail closed); absent = drone.
       ...(!isCar(t) && t.origin ? { origin: { ...t.origin } } : {}),
+      // The Queen-started gate that owns this TESTING round: any other gate instance for the train stands down.
+      gateId: t.phase === "TESTING" ? (t.gateCommandId ?? null) : null,
     };
     if (!isCar(t)) return base;
     const members = (t.members ?? []).flatMap((id) => {
@@ -2150,11 +2162,11 @@ export class QueenNode extends DurableObject<Env> {
         if (prev && (prev.deployCommandId === cmd.commandId || prev.sentinelCommandId === cmd.commandId || prev.rollbackCommandId === cmd.commandId)) continue;
       } else {
         const prev = prevTrains.get(e.trainId);
-        if (prev && [prev.forkCommandId, prev.deleteCommandId, prev.deployCommandId, prev.teardownCommandId].includes(cmd.commandId)) continue;
+        if (prev && [prev.forkCommandId, prev.deleteCommandId, prev.deployCommandId, prev.teardownCommandId, prev.gateCommandId].includes(cmd.commandId)) continue;
       }
       const trace = "trace" in cmd && cmd.trace ? parseTraceparent(cmd.trace.traceparent) : null;
       const owner = isRelease ? undefined : (acc.trains.get(e.trainId) ?? prevTrains.get(e.trainId));
-      const op = "op" in cmd ? cmd.op : "VERIFY";
+      const op = "op" in cmd ? cmd.op : "kind" in cmd && cmd.kind === "gate" ? "GATE" : "VERIFY";
       const env = "environment" in cmd ? cmd.environment : "";
       out.push({
         type: "command.issued",
@@ -2255,6 +2267,7 @@ export class QueenNode extends DurableObject<Env> {
     await group(this.ports.herald, effects.flatMap((e) => (e.type === "deploy" ? [e.command] : [])));
     await group(this.ports.sentinel, effects.flatMap((e) => (e.type === "sentinel" ? [e.command] : [])));
     await group(this.ports.oracle, effects.flatMap((e) => (e.type === "oracle" ? [e.command] : [])));
+    await group(this.ports.gatekeeper, effects.flatMap((e) => (e.type === "gate" ? [e.command] : [])));
 
     const drones = effects.filter((e): e is Extract<Effect, { type: "dispatchDrone" }> => e.type === "dispatchDrone");
     const started: typeof drones = [];

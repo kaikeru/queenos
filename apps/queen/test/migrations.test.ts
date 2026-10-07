@@ -70,15 +70,15 @@ const columns = (sql: SqlStorage, table: string) =>
 const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v FROM _migrations").one().v);
 
 describe("migrations", () => {
-  it("a fresh DO migrates to v14", async () => {
-    expect(SCHEMA_VERSION).toBe(14);
+  it("a fresh DO migrates to v15", async () => {
+    expect(SCHEMA_VERSION).toBe(15);
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
-      expect(version(q.sql)).toBe(14);
+      expect(version(q.sql)).toBe(15);
       const t = tables(q.sql);
       for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims", "inboxes", "submissions", "model_preference"]) {
         expect(t.has(name), name).toBe(true);
       }
-      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at", "origin_json"]) {
+      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at", "origin_json", "gate_command_id", "gate_issued_at"]) {
         expect(columns(q.sql, "merge_trains").has(c), c).toBe(true);
       }
       for (const c of ["entry_closes_at", "pick_deadline_at", "recommended_train_id", "recommend_reason", "decided_by", "rejections"]) expect(columns(q.sql, "races").has(c), c).toBe(true);
@@ -90,8 +90,8 @@ describe("migrations", () => {
       // A new hive has no settings row yet (it gets one, autonomous, at its first v2 filing).
       expect(loadHiveSettings(q.sql)).toBeNull();
       // Idempotent: re-running is a no-op.
-      expect(migrate(state.storage)).toBe(14);
-      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(14);
+      expect(migrate(state.storage)).toBe(15);
+      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(15);
     });
   });
 
@@ -434,9 +434,11 @@ describe("v14: inbox, submissions, races, preference", () => {
         ALTER TABLE races DROP COLUMN recommended_train_id; ALTER TABLE races DROP COLUMN recommend_reason;
         ALTER TABLE races DROP COLUMN decided_by; ALTER TABLE races DROP COLUMN rejections;
         ALTER TABLE model_stats DROP COLUMN picks; ALTER TABLE model_stats DROP COLUMN picks_against_recommendation;
-        DELETE FROM _migrations WHERE version = 14;`);
+        ALTER TABLE merge_trains DROP COLUMN gate_command_id; ALTER TABLE merge_trains DROP COLUMN gate_issued_at;
+        DELETE FROM _migrations WHERE version >= 14;`);
       expect(version(sql)).toBe(13);
-      expect(migrate(state.storage)).toBe(14);
+      // v14, then v15 (Queen-started gate columns): every existing row unchanged.
+      expect(migrate(state.storage)).toBe(SCHEMA_VERSION);
       expect(sql.exec("SELECT * FROM work_items ORDER BY item_id").toArray().map(rowToWorkItem)).toEqual(before.items);
       expect(sql.exec("SELECT * FROM merge_trains ORDER BY train_id").toArray().map(rowToTrain)).toEqual(before.trains);
       expect(sql.exec("SELECT * FROM races ORDER BY race_id").toArray().map(rowToRace)).toEqual(before.races);

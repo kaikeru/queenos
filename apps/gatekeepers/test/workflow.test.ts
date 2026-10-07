@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { introspectWorkflowInstance } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
+import { GateCommandSchema, type GateCommand } from "@queenos/queen-types";
 import { gateInstanceId } from "../src/event";
 import { FakeWorld, REPO, pushedEnvelope, gateTask, setWorld } from "./fakes";
 
@@ -22,6 +23,23 @@ describe("GatekeeperWorkflow (Workflows runtime, scripted mode, fake ports)", ()
     expect(await instance.getOutput()).toMatchObject({ status: "gated", passed: true, queenOutcome: "applied" });
     expect(w.queen.reports()).toEqual([{ trainId: "train-1", passed: true, summary: expect.any(String), commitSha: after, score: expect.objectContaining({ review: "approved" }) }]);
     expect(w.queen.auditSeq()).toEqual(["POLICY:RUNNING", "SECURITY:RUNNING", "POLICY:PASSED", "SECURITY:PASSED", "REVIEWER:RUNNING", "REVIEWER:PASSED"]);
+  });
+
+  it("Queen GATE command: the Queen's own payload (commandId, trainId, trace) runs as the gate and reports its gateId", async () => {
+    const w = new FakeWorld();
+    await w.git.seed(REPO);
+    const after = await w.git.build(REPO, { prompt: "Add dark mode", files: { "src/a.ts": "export const a = 1;\n" } });
+    w.queen.train.headSha = after;
+    const id = `gate-${REPO}-${after}-q1`;
+    w.queen.serveTarget({ trainId: "train-1", lane: "BUILD", promptId: "prompt-1", promptText: "Add dark mode", previewUrl: null, phase: "TESTING", traceId: null, baseSha: null, gateId: id });
+    setWorld(w);
+    const command: GateCommand = { kind: "gate", commandId: id, hive: "hive", trainId: "train-1", repo: REPO, branch: "main", after, trace: { traceparent: `00-${"a".repeat(32)}-${"b".repeat(16)}-01` } };
+    expect(GateCommandSchema.parse(command)).toEqual(command);
+    await using instance = await introspectWorkflowInstance(env.GATEKEEPER_WORKFLOW, id);
+    await env.GATEKEEPER_WORKFLOW.create({ id, params: command });
+    await instance.waitForStatus("complete");
+    expect(await instance.getOutput()).toMatchObject({ status: "gated", passed: true, queenOutcome: "applied" });
+    expect(w.queen.reports()).toEqual([expect.objectContaining({ trainId: "train-1", passed: true, commitSha: after, gateId: id })]);
   });
 
   it("gate instance: the [fail] demo fails, scribes and reports passed:false", async () => {

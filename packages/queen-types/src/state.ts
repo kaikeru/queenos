@@ -90,6 +90,10 @@ export const AuditEventSchema = z.object({
   status: AuditStatusSchema, // status
   gitNotesPayload: GitNotesPayloadSchema.nullable(), // git_notes_payload (JSON, nullable)
   createdAt: z.number().int(), // created_at (epoch ms)
+  /** The train this entry is about (gatekeepers, from the T7 follow-up); absent on older entries. */
+  trainId: z.string().min(1).max(128).optional(),
+  /** The head the entry judged (gatekeepers); absent on older entries. */
+  commitSha: z.string().min(1).max(64).optional(),
 });
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
 
@@ -99,6 +103,13 @@ export const AppendAuditSchema = z.object({
   droneRole: DroneRoleSchema,
   status: AuditStatusSchema,
   gitNotesPayload: GitNotesPayloadSchema.nullable().default(null),
+  /**
+   * The train the entry is about. Gatekeepers send it, so race siblings of one item (same `promptId`) do not
+   * share each other's findings in the notes and the REWORK brief. Optional: older senders omit it.
+   */
+  trainId: z.string().min(1).max(128).optional(),
+  /** The head the entry judged (a gate's `after`). Optional. */
+  commitSha: z.string().min(1).max(64).optional(),
 });
 export type AppendAudit = z.infer<typeof AppendAuditSchema>;
 export type AppendAuditInput = z.input<typeof AppendAuditSchema>;

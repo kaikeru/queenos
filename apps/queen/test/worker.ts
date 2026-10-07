@@ -5,7 +5,7 @@
  */
 import { QueenNode as ProdQueenNode, type QueenPorts } from "../src/queen-node";
 import { RACE_MARKER, SimExecutors, type SimDelays } from "../src/sim/sim-ports";
-import { RecordingDispatcher, RecordingHerald, RecordingOracle, RecordingProvisioner, RecordingSentinel } from "./fakes";
+import { RecordingDispatcher, RecordingGatekeeper, RecordingHerald, RecordingOracle, RecordingProvisioner, RecordingSentinel } from "./fakes";
 
 export { default } from "../src/index";
 export { SwarmGovernor } from "../src/scale/governor";
@@ -31,6 +31,7 @@ export class QueenNode extends ProdQueenNode {
       herald: new RecordingHerald(),
       sentinel: new RecordingSentinel(),
       oracle: new RecordingOracle(),
+      gatekeeper: new RecordingGatekeeper(),
       dispatcher: new RecordingDispatcher(),
     };
   }
@@ -87,6 +88,7 @@ export class SimQueenNode extends ProdQueenNode {
       herald: sim.herald,
       sentinel: sim.sentinel,
       oracle: sim.oracle,
+      gatekeeper: sim.gatekeeper,
       dispatcher: {
         dispatch: async (task, attempt) => {
           if (this.holdText && task.action === "BUILD" && task.promptText.includes(this.holdText)) {

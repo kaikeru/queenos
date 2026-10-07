@@ -14,7 +14,7 @@
  *   LANDED, so clients that wait for LANDED stop there). A REWORK seeded from a contributor's head carries
  *   `Queen-Replies-To: <that head>`.
  * - review: the rejected gate's findings (`drone.audit` REJECTED reasoning steps between the train's
- *   enqueue and its verdict).
+ *   enqueue, or its previous verdict, and this verdict; only the train's own when the audit names it).
  * - provenance: who wrote the head (model for drones, `human:` / `agent:` for pushes) and its trace.
  */
 import {
@@ -125,6 +125,26 @@ function stripGatePrefix(summary: string): string {
   return summary.replace(/^gate (passed|failed|could not run[^:]*):\s*/i, "");
 }
 
+/** The seq of the train's latest `gate.verdict` before `seq` (an INFRA round's audits are not this verdict's), or 0. */
+function lastVerdictBefore(mine: readonly QueenEvent[], seq: number): number {
+  return mine.filter((e) => e.type === "gate.verdict" && e.seq < seq).at(-1)?.seq ?? 0;
+}
+
+/**
+ * The REJECTED audits behind one gate verdict of `t`, strictly between `from` and `to` (seq). An audit that names
+ * its train (gatekeepers send `trainId`, and the head as `data.commitSha`) counts only for that train and head, so
+ * race siblings of one item never share findings. An older audit without a train falls back to the item.
+ */
+function gateAudits(t: NotesTrain, events: readonly QueenEvent[], from: number, to: number): QueenEvent[] {
+  return events.filter((a) => {
+    if (a.type !== "drone.audit" || a.auditStatus !== "REJECTED" || a.seq <= from || a.seq >= to) return false;
+    if (!a.trainId) return a.itemId === t.promptId;
+    if (a.trainId !== t.trainId) return false;
+    const sha = a.data?.commitSha;
+    return typeof sha !== "string" || !t.headSha || sha === t.headSha;
+  });
+}
+
 /** Every verdict / review / provenance entry of one train, in ledger order. */
 function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<string, NotesTrain[]>): Record<NotesRef, Dated[]> {
   const out: Record<NotesRef, Dated[]> = { [NOTES_REF_VERDICT]: [], [NOTES_REF_REVIEW]: [], [NOTES_REF_PROVENANCE]: [] } as Record<NotesRef, Dated[]>;
@@ -156,7 +176,7 @@ function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<stri
       } else if (data.outcome === "INFRA") {
         out[NOTES_REF_VERDICT].push({ seq: e.seq, entry: { ...common, kind: "verdict", verdict: "INFRA", summary: oneLine(`INFRA: the gate could not run; the Queen re-gates it (${text})`, 300) } });
       } else if (data.outcome === "FAILED") {
-        const audits = input.events.filter((a) => a.type === "drone.audit" && a.itemId === t.promptId && a.auditStatus === "REJECTED" && a.seq > start && a.seq < e.seq);
+        const audits = gateAudits(t, input.events, Math.max(start, lastVerdictBefore(mine, e.seq)), e.seq);
         const roles = [...new Set(audits.map((a) => a.droneRole ?? "GATE"))];
         const findings = audits.flatMap((a) => findingsFromSteps(a.gitNotesPayload?.reasoningSteps ?? [])).slice(0, MAX_FINDINGS);
         const by = roles[0] ?? "GATE";

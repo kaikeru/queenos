@@ -109,6 +109,14 @@ export const GateTaskSchema = z.object({
   branch: z.string().min(1),
   before: z.string().optional(),
   after: z.string().min(1),
+  /**
+   * A Queen-started gate (queen-types `GateCommand`, sent when a train enters TESTING): its instance id. The
+   * Queen's `GateTarget.gateId` names the gate that owns the round; any other instance stands down, and the
+   * verdict carries it as `gateId`. Absent: the push-event gate.
+   */
+  commandId: z.string().min(1).max(100).optional(),
+  /** A Queen-started gate: the train it was started for. */
+  trainId: z.string().min(1).optional(),
 });
 export type GateTask = z.infer<typeof GateTaskSchema>;
 

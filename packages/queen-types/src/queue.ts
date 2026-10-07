@@ -89,6 +89,12 @@ export const GateTargetSchema = z.object({
   origin: SubmissionOriginSchema.optional(),
   /** QUEUE lane only. */
   members: z.array(GateTargetMemberSchema).max(16).optional(),
+  /**
+   * The Queen-started gate that owns the current TESTING round (`GateCommand.commandId`), when there is one.
+   * Every other gate instance for this train (the push-event gate, a replaced Queen gate) stands down.
+   * Absent (an older Queen) or null: whoever reaches TESTING first gates, as before.
+   */
+  gateId: z.string().nullable().optional(),
 });
 export type GateTarget = z.infer<typeof GateTargetSchema>;
 

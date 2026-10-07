@@ -63,6 +63,7 @@
 import type {
   BuildResult,
   DeployCommand,
+  GateCommand,
   DeployResult,
   Deployment,
   DroneTask,
@@ -86,7 +87,7 @@ import type {
   TrainState,
   WorkStatus,
 } from "@queenos/queen-types";
-import { MAX_RECALL_QUERY, RACE_GRACE_MS, memoryToRagSnippet, spanIdFor, traceIdFromUuid, traceparent } from "@queenos/queen-types";
+import { MAX_GATE_COMMAND_ID, MAX_RECALL_QUERY, RACE_GRACE_MS, memoryToRagSnippet, spanIdFor, traceIdFromUuid, traceparent } from "@queenos/queen-types";
 import { droneInstanceId } from "../drones";
 import {
   DEFAULT_POLICY,
@@ -232,6 +233,12 @@ export interface TrainRecord extends MergeTrain {
   droneIssuedAt: number | null;
   /** When the BUILD train passed its gate (migration v13); the merge queue reads it for queue-wait. */
   passedAt?: number | null;
+  /**
+   * The Queen-started gate of the current TESTING round (v15; gatekeepers Workflow instance id,
+   * `gateCommandId(repo, head, n)`), and when it was issued (the gate watchdog's clock).
+   */
+  gateCommandId?: string | null;
+  gateIssuedAt?: number | null;
   /** Attempt number of the current phase's drone (instance id suffix when > 1). */
   droneAttempt: number;
   /** Router's choice, or (after the build) the model that actually built the head. */
@@ -400,6 +407,7 @@ export interface PlannerContext {
 export type Effect =
   | { type: "provision"; trainId: string; command: ProvisionCommand }
   | { type: "deploy"; trainId: string; command: DeployCommand }
+  | { type: "gate"; trainId: string; command: GateCommand }
   | { type: "dispatchDrone"; trainId: string; task: DroneTask; attempt: number }
   | { type: "broadcast"; message: QueenServerMessage };
 
@@ -481,6 +489,16 @@ export function trainRepoName(namespace: string, trainId: string): string {
   return `${namespace}-train-${trainId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12)}`;
 }
 
+/**
+ * Whether `repo` is the fork named `name`, or a re-fork of it under `name-rN` (N ≥ 2; the Provisioner's and the
+ * git proxy's retry names for a sick or ghost first fork, 1deb7ab). Nothing else: not `name-r2x`, not `name-r2-r3`.
+ */
+export function isForkOf(name: string, repo: string): boolean {
+  if (repo === name) return true;
+  if (!repo.startsWith(`${name}-r`)) return false;
+  return /^[1-9]\d{0,2}$/.test(repo.slice(name.length + 2)) && Number(repo.slice(name.length + 2)) >= 2;
+}
+
 /** Deterministic, attempt-numbered command id: `<trainId>-<op>-<n>`. */
 export function nextCommandId(trainId: string, op: string, previous: string | null): string {
   const n = previous ? Number(/-(\d+)$/.exec(previous)?.[1] ?? 0) + 1 : 1;
@@ -489,6 +507,30 @@ export function nextCommandId(trainId: string, op: string, previous: string | nu
 
 export function commandAttempt(commandId: string | null): number {
   return commandId ? Number(/-(\d+)$/.exec(commandId)?.[1] ?? 0) : 0;
+}
+
+/**
+ * Queen-started gates (GateCommand): how long a gate may run without a verdict before the watchdog re-dispatches
+ * it (once per TESTING round), then sends the train down the infra path. A live gate takes 30–90 s, but its
+ * inspect step may retry a sick repo for several minutes per attempt, so this is twice the command timeout.
+ */
+export const GATE_TIMEOUT_FACTOR = 2;
+export const GATE_TIMEOUT_MS = GATE_TIMEOUT_FACTOR * DEFAULT_COMMAND_TIMEOUT_MS;
+
+/**
+ * Workflow instance id of the n-th Queen-started gate of a train head: `gate-<repo>-<head>-q<n>` (Workflows ids:
+ * at most 100 characters of `[A-Za-z0-9_-]`; the middle is clipped, never the `-q<n>` suffix). It never equals
+ * the push-triggered gate's id (`gate-<repo>-<head>`, gatekeepers `gateInstanceId`). Round d of TESTING (the d-th
+ * preview deploy) uses n = 2d − 1, and its one watchdog re-dispatch n = 2d.
+ */
+export function gateCommandId(repo: string, head: string, n: number): string {
+  const suffix = `-q${n}`;
+  return `gate-${repo}-${head}`.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, MAX_GATE_COMMAND_ID - suffix.length) + suffix;
+}
+
+/** n of a gate command id (0 when none). */
+export function gateAttempt(id: string | null | undefined): number {
+  return id ? Number(/-q(\d+)$/.exec(id)?.[1] ?? 0) : 0;
 }
 
 /** The trace a train belongs to: its item's, else derived from its prompt id (= item id). */
@@ -507,6 +549,7 @@ const ISSUED_AT = {
   deleteCommandId: "deleteIssuedAt",
   deployCommandId: "deployIssuedAt",
   teardownCommandId: "teardownIssuedAt",
+  gateCommandId: "gateIssuedAt",
 } as const;
 
 /**
@@ -554,6 +597,19 @@ function carGateOutstanding(t: TrainRecord): boolean {
 }
 
 /**
+ * The train waits on its Queen-started gate: TESTING on a live preview, a gate issued, no verdict yet (a race
+ * candidate that passed stays in TESTING until its race is decided; that gate has reported).
+ */
+export function gateOutstanding(t: TrainRecord): boolean {
+  return isActive(t) && t.phase === "TESTING" && t.deployState === "LIVE" && !!t.gateCommandId && t.raceOutcome !== "PASSED";
+}
+
+/** In TESTING with no Queen-started gate and no verdict: a row from before v15 (reconcile gates it). */
+function ungated(t: TrainRecord): boolean {
+  return isActive(t) && t.phase === "TESTING" && t.deployState === "LIVE" && !t.gateCommandId && t.raceOutcome !== "PASSED";
+}
+
+/**
  * Repo a WAITING_PARENT train forks from now, or null while it must wait (`cars`: the active QUEUE cars):
  * - BUILD: hive main, unless a conflict / integration rework still waits for a car with seq ≤ waitForCarSeq;
  * - QUEUE: the car ahead once it has pushed (null until then), or main; a car that avoids a suspect car
@@ -595,6 +651,9 @@ export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: numb
     if (droneUndispatched(t)) all.push(now + UNDISPATCHED_RETRY_MS);
     if (forkOverdue(t, trains)) all.push(now + UNDISPATCHED_RETRY_MS);
     if (keptFork(t) && t.deleteIssuedAt !== null) all.push(t.deleteIssuedAt);
+    // BUILD gates (cars keep their retire watchdog, from the preview deploy: outstandingSince).
+    if (gateOutstanding(t) && !isCar(t)) all.push((t.gateIssuedAt ?? now) + GATE_TIMEOUT_FACTOR * timeoutMs);
+    if (ungated(t)) all.push(now + UNDISPATCHED_RETRY_MS);
   }
   for (const r of races) if (r.state === "RACING" && r.deadlineAt !== null) all.push(r.deadlineAt);
   return all.length ? Math.min(...all) : null;
@@ -829,6 +888,8 @@ export class TrainPlanner {
    */
   pushed(input: {
     trainId: string;
+    /** The fork the push landed in: the intent's repo, or the proxy's `-rN` re-fork of it (adopted). */
+    repo?: string;
     headSha: string;
     baseSha: string;
     origin: SubmissionOrigin;
@@ -853,7 +914,7 @@ export class TrainPlanner {
       headSha: input.headSha,
       baseSha: input.baseSha,
       forkState: "READY",
-      artifactRepo: t.artifactRepo,
+      artifactRepo: input.repo ?? t.artifactRepo,
     });
     let race = input.race && "join" in input.race ? this.races.get(input.race.join) : undefined;
     if (race && race.state !== "RACING") race = undefined;
@@ -1128,6 +1189,7 @@ export class TrainPlanner {
     }
     this.setTrain(t, { deployState: "LIVE", previewUrl: r.url, phase: "TESTING" });
     this.setDeployment(t, { status: "LIVE", url: r.url, versionId: r.versionId ?? null, commitSha, summary: r.summary ?? null });
+    this.dispatchGate(t, 2 * Math.max(1, commandAttempt(t.deployCommandId)) - 1);
     return this.finish("applied");
   }
 
@@ -1211,6 +1273,8 @@ export class TrainPlanner {
     if (t.phase === "WAITING_PARENT" || t.forkState !== "READY") {
       return this.finish("ignored:premature");
     }
+    // A gate the Queen replaced (watchdog re-dispatch, a later TESTING round) is not this round's judge.
+    if (r.gateId && !r.commandId && t.gateCommandId && r.gateId !== t.gateCommandId) return this.finish("ignored:stale");
     // A pass must come from testing the live preview; a failure (e.g. the
     // builder giving up) is honoured in any phase.
     if (r.passed && t.phase !== "TESTING") return this.finish("ignored:premature");
@@ -1350,6 +1414,12 @@ export class TrainPlanner {
         this.deployPreview(t);
       } else if (t.phase === "LANDING" && !t.dispatched) {
         this.dispatchLander(t);
+      } else if (gateOutstanding(t)) {
+        // Same instance id: a gate that did start is not started twice (createOrExisting).
+        this.emitGate(t);
+      } else if (ungated(t)) {
+        // In TESTING from before Queen-started gates (v15): its push-event gate may have given up long ago.
+        this.dispatchGate(t, 2 * Math.max(1, commandAttempt(t.deployCommandId)) - 1);
       }
     }
     for (const race of [...this.races.values()]) {
@@ -1428,6 +1498,12 @@ export class TrainPlanner {
       } else if (t.phase === "DEPLOYING" && t.deployState === "PENDING" && expired(t.deployIssuedAt)) {
         if (commandAttempt(t.deployCommandId) < MAX_COMMAND_ATTEMPTS) this.deployPreview(t);
         else this.previewFailed(t, late("Herald DEPLOY", t.deployCommandId), t.headSha, null, true);
+      } else if (gateOutstanding(t) && !isCar(t) && now - (t.gateIssuedAt ?? now) >= GATE_TIMEOUT_FACTOR * this.timeoutMs) {
+        const n = gateAttempt(t.gateCommandId);
+        const mins = Math.round((GATE_TIMEOUT_FACTOR * this.timeoutMs) / 60_000);
+        // Once per TESTING round (odd n: the round's first gate): a fresh gate instance; then the infra path.
+        if (n % 2 === 1) this.dispatchGate(t, n + 1, `gate ${t.gateCommandId} did not report within ${mins} min; re-gating`);
+        else this.infraRetry(t, `gate did not report within ${mins} min, twice (${t.gateCommandId})`);
       } else if (carGateOutstanding(t) && expired(t.deployIssuedAt ?? now)) {
         this.retireCar(t, `integration gate did not report within ${Math.round(this.timeoutMs / 60_000)} min of the preview deploy (sick repo?)`);
       } else if (droneOutstanding(t) && expired(t.droneIssuedAt)) {
@@ -1649,6 +1725,35 @@ export class TrainPlanner {
         artifactRepo: t.artifactRepo,
         commitSha: t.headSha!,
         trace: traceFor(t, t.deployCommandId!),
+      },
+    });
+  }
+
+  /**
+   * Start the n-th Queen-started gate of the train's head (GateCommand). The gatekeeper's GateTarget names it
+   * (`gateId`), so the push-triggered gate and any replaced gate stand down; its report carries `gateId`.
+   */
+  private dispatchGate(t: TrainRecord, n: number, why?: string): void {
+    if (!t.headSha) return;
+    this.setTrain(t, { gateCommandId: gateCommandId(t.artifactRepo, t.headSha, n) }, false);
+    if (why) this.event(t, { type: "command.result", severity: "warn", summary: clip500(`train ${t.trainId}: ${why}`), data: { kind: "gate", outcome: "lost", next: t.gateCommandId } });
+    this.emitGate(t);
+  }
+
+  private emitGate(t: TrainRecord): void {
+    if (!t.headSha || !t.gateCommandId) return;
+    this.effects.push({
+      type: "gate",
+      trainId: t.trainId,
+      command: {
+        kind: "gate",
+        commandId: t.gateCommandId,
+        hive: this.ctx.namespace,
+        trainId: t.trainId,
+        repo: t.artifactRepo,
+        branch: "main",
+        after: t.headSha,
+        trace: traceFor(t, t.gateCommandId),
       },
     });
   }

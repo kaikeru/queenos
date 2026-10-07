@@ -192,8 +192,8 @@ describe("(a) a car retires after one infra round; its members re-board a fresh 
   });
 
   it("the watchdog bounds a car's gate: no verdict within COMMAND_TIMEOUT_MS of the preview deploy retires the car", () => {
-    const h = oneCar({ deployIssuedAt: 1000 });
-    // The alarm is armed for it.
+    const h = oneCar({ deployIssuedAt: 1000, gateCommandId: "gate-hive-train-K1-q1", gateIssuedAt: 1000 });
+    // The alarm is armed for it (a car's Queen-started gate is bounded by this watchdog, not the BUILD gate one).
     expect(watchdogDeadline([...h.trains.values()], DEFAULT_COMMAND_TIMEOUT_MS, h.now)).toBe(1000 + DEFAULT_COMMAND_TIMEOUT_MS);
     h.now = 1000 + DEFAULT_COMMAND_TIMEOUT_MS - 1;
     h.run((p) => p.reconcile());

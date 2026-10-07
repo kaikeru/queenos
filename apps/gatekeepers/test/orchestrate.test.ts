@@ -28,8 +28,10 @@ describe("runGate: pass path", () => {
     expect(out).toMatchObject({ status: "gated", trainId: "train-1", passed: true, queenOutcome: "applied" });
     expect(w.queen.reports()).toEqual([{ trainId: "train-1", passed: true, summary: expect.stringContaining("Gate passed"), commitSha: after, score: { review: "off", satisfied: 0, missing: 0, changedFiles: 2, changedBytes: expect.any(Number), checks: 19 } }]);
     expect(w.queen.auditSeq()).toEqual(["POLICY:RUNNING", "SECURITY:RUNNING", "POLICY:PASSED", "SECURITY:PASSED"]);
-    // Audits are attached to the train's own prompt (tail of includedPrompts), not a predecessor's.
+    // Audits are attached to the train's own prompt (tail of includedPrompts), not a predecessor's,
+    // and name the train and head, so race siblings of one item never share findings (notes, REWORK brief).
     expect(new Set(w.queen.audits().map((a) => a.promptId))).toEqual(new Set(["prompt-1"]));
+    expect(new Set(w.queen.audits().map((a) => `${a.trainId}@${a.commitSha}`))).toEqual(new Set([`train-1@${after}`]));
     expect(w.queen.audits()[2]!.gitNotesPayload).toMatchObject({ result: "success", taskPrompt: prompt });
     expect(w.queen.scribes()).toEqual([]);
     expect(w.failures.stored).toEqual([]);

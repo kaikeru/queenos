@@ -108,6 +108,28 @@ describe("notes projection", () => {
     expect(review).toEqual([expect.objectContaining({ kind: "finding", summary: "Findings: 2 from SECURITY, REVIEWER", findings: verdict[0]!.findings })]);
   });
 
+  it("per-train findings: an audit naming its train (and head) counts only for it; an INFRA round's audits are not the later verdict's", () => {
+    const SIB = "e".repeat(40);
+    const events = [
+      ev("train.enqueued", { trainId: "t1" }),
+      ev("train.enqueued", { trainId: "t2" }),
+      // An infra round on t1: its POLICY "rejection" is the gate failing to run, not a finding of the final verdict.
+      audit("SECURITY", ["[error] infra src/infra.js:1: could not clone"], { trainId: "t1", data: { commitSha: HEAD } }),
+      ev("gate.verdict", { trainId: "t1", summary: "gate could not run (infrastructure; re-gating): 503", data: { outcome: "INFRA", applied: "applied" } }),
+      audit("SECURITY", ["[error] mine src/mine.js:1: t1's finding"], { trainId: "t1", data: { commitSha: HEAD } }),
+      audit("SECURITY", ["[error] sibling src/sibling.js:1: t2's finding"], { trainId: "t2", data: { commitSha: SIB } }),
+      audit("SECURITY", ["[error] stale src/stale.js:1: an older head of t1"], { trainId: "t1", data: { commitSha: "f".repeat(40) } }),
+      audit("REVIEWER", ["missing: legacy audit without a train"]),
+      ev("gate.verdict", { trainId: "t1", summary: "gate failed: x", data: { outcome: "FAILED", applied: "applied" } }),
+      ev("gate.verdict", { trainId: "t2", summary: "gate failed: y", data: { outcome: "FAILED", applied: "applied" } }),
+    ];
+    const input: NotesInput = { trains: [train({ phase: "EJECTED", landedSha: null }), train({ trainId: "t2", seq: 2, headSha: SIB, phase: "EJECTED", landedSha: null })], events, releases: [] };
+    const notes = projectNotes(input, "refs/notes/verdict");
+    const rejected = (sha: string) => parseNotes(notes.find((n) => n.sha === sha)!.text).find((e) => e.verdict === "REJECTED")!;
+    expect(rejected(HEAD).findings!.map((f) => f.path)).toEqual(["src/mine.js", "acceptance"]);
+    expect(rejected(SIB).findings!.map((f) => f.path)).toEqual(["src/sibling.js", "acceptance"]);
+  });
+
   it("superseded, lost races and conflicts become verdicts; a seeded REWORK replies to the contributor's head", () => {
     const events = [
       ev("train.phase", { trainId: "t1", data: { to: "EJECTED", reason: "superseded by push ccccccc" } }),

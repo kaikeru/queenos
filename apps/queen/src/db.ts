@@ -482,6 +482,12 @@ const MIGRATIONS: readonly Migration[] = [
   ALTER TABLE model_stats ADD COLUMN picks INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE model_stats ADD COLUMN picks_against_recommendation INTEGER NOT NULL DEFAULT 0;
   `,
+  `
+  -- v15: Queen-started gates. The gatekeepers Workflow instance the Queen dispatched for the train's current
+  -- TESTING round (GateCommand.commandId) and when (the gate watchdog's clock). NULL: none (older rows).
+  ALTER TABLE merge_trains ADD COLUMN gate_command_id TEXT;
+  ALTER TABLE merge_trains ADD COLUMN gate_issued_at INTEGER;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -611,6 +617,9 @@ export function rowToTrain(r: Row): TrainRecord {
     ...(r.verified !== null && r.verified !== undefined ? { verified: Number(r.verified) === 1 } : {}),
     // v14: whose code (absent = drone).
     ...withValue("origin", parseJson(r.origin_json ?? null, schemaCheck<SubmissionOrigin>(SubmissionOriginSchema))),
+    // v15: the Queen-started gate (absent = none).
+    ...withValue("gateCommandId", str(r.gate_command_id ?? null)),
+    ...withValue("gateIssuedAt", num(r.gate_issued_at)),
   };
 }
 
@@ -752,8 +761,8 @@ export function appendAuditRow(sql: SqlStorage, e: AuditEvent, hive: string): vo
     e.createdAt,
   );
   sql.exec(
-    `INSERT INTO event_log (event_id, ts, hive, type, severity, actor, trace_id, item_id, summary, drone_role, audit_status, git_notes_payload)
-     VALUES (?, ?, ?, 'drone.audit', 'info', ?, COALESCE((SELECT trace_id FROM work_items WHERE item_id = ?), ?), ?, ?, ?, ?, ?)`,
+    `INSERT INTO event_log (event_id, ts, hive, type, severity, actor, trace_id, item_id, train_id, summary, data, drone_role, audit_status, git_notes_payload)
+     VALUES (?, ?, ?, 'drone.audit', 'info', ?, COALESCE((SELECT trace_id FROM work_items WHERE item_id = ?), ?), ?, ?, ?, ?, ?, ?, ?)`,
     e.eventId,
     e.createdAt,
     hive,
@@ -761,7 +770,10 @@ export function appendAuditRow(sql: SqlStorage, e: AuditEvent, hive: string): vo
     e.promptId,
     traceIdFromUuid(e.promptId),
     e.promptId,
+    // Per-train attribution (gatekeepers send it): race siblings of one item keep their own findings.
+    e.trainId ?? null,
     `${e.droneRole} ${e.status}`,
+    e.commitSha ? JSON.stringify({ commitSha: e.commitSha }) : null,
     e.droneRole,
     e.status,
     notes,
@@ -795,9 +807,10 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        fork_issued_at, delete_issued_at, deploy_issued_at, teardown_issued_at, drone_issued_at, drone_attempt,
        model, model_reason, model_choice, model_choice_attempt, model_outcome, model_probe, memories,
        trace_id, race_id, candidate, race_outcome, gate_score, credits,
-       lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of, verified, passed_at, origin_json)
+       lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of, verified, passed_at, origin_json,
+       gate_command_id, gate_issued_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
        status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
@@ -816,7 +829,8 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        lane = excluded.lane, members = excluded.members, car_id = excluded.car_id, passed_seq = excluded.passed_seq,
        conflict = excluded.conflict, changed_paths = excluded.changed_paths,
        wait_for_car_seq = excluded.wait_for_car_seq, bisect_of = excluded.bisect_of, verified = excluded.verified,
-       passed_at = excluded.passed_at, origin_json = excluded.origin_json`,
+       passed_at = excluded.passed_at, origin_json = excluded.origin_json,
+       gate_command_id = excluded.gate_command_id, gate_issued_at = excluded.gate_issued_at`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -870,6 +884,8 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     t.verified === null || t.verified === undefined ? null : t.verified ? 1 : 0,
     t.passedAt ?? null,
     json(t.origin),
+    t.gateCommandId ?? null,
+    t.gateIssuedAt ?? null,
   );
 }
 
