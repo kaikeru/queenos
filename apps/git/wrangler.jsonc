@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // The agent-native git proxy (docs/human-push-design.md rev 2, §2.2, §4): plain git smart-HTTP in
+  // front of Artifacts. Reachable ONLY through the edge's service binding (`GIT` -> "queenos-git"), which
+  // authenticates the QueenOS git token and sets `x-queen-user` / `x-queen-scopes`. No public surface:
+  // no routes, no workers.dev, no preview URLs (§8.2 "proxy as a confused deputy").
+  "name": "queenos-git",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  // Pushes pipe the pack through (CPU stays low); the fork on the push path waits on I/O, not CPU.
+  "limits": { "cpu_ms": 30000 },
+  // Artifacts tokens are minted here per repo (read for hive main, write only for fresh train forks)
+  // and never leave this Worker.
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
+  "durable_objects": {
+    "bindings": [
+      // Cross-script DO RPC to the Queen (apps/queen wrangler "name": "queen"): gitIntent, gitPushed,
+      // gitAborted, notesFor, getGateTarget. One QueenNode per hive: QUEEN.idFromName(hive).
+      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" }
+    ]
+  },
+  "vars": {
+    // Must match the namespace of the artifacts binding above.
+    "ARTIFACTS_NAMESPACE": "queenos",
+    // §4.3: packs over this many bytes are refused (counted while streaming).
+    "MAX_PACK_BYTES": "52428800"
+  },
+  "env": {
+    // Used only by vitest (vitest.config.ts). Named envs do not inherit bindings: no ARTIFACTS
+    // (remote-only) and no cross-script QUEEN DO. Tests inject fakes into handleGit().
+    "test": {
+      "vars": {
+        "ARTIFACTS_NAMESPACE": "queenos",
+        "MAX_PACK_BYTES": "52428800"
+      }
+    }
+  }
+}
