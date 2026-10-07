@@ -5,7 +5,11 @@ import {
   BuildResultSchema,
   DeployResultSchema,
   EventQuerySchema,
+  GitAbortedSchema,
+  GitPushIntentSchema,
+  GitPushedSchema,
   LandResultSchema,
+  NotesRefSchema,
   MergeResultSchema,
   OracleResultSchema,
   ProvisionResultSchema,
@@ -39,6 +43,9 @@ export { SwarmGovernor } from "./scale/governor";
  * - user (`x-queen-user`, set by the edge after Access): tap, items, item
  *   actions, settings, escalation resolve;
  * - internal (bearer token): `/internal/*`, `/trains/*`, `/audit`, `/scribe`.
+ *
+ * The git proxy (apps/git) calls `gitIntent` / `gitPushed` / `gitAborted` / `notesFor` over DO RPC; the
+ * `/internal/git/*` routes are the same calls over HTTP (curl, debugging).
  */
 type HiveEnv = { Bindings: Env; Variables: { hive: string | null } };
 type HiveContext = Context<HiveEnv>;
@@ -263,6 +270,36 @@ hive.post("/internal/webhook/deploy-result", async (c) => {
 hive.post("/internal/webhook/sentinel-verdict", async (c) => {
   const verdict = parseOrThrow(SentinelVerdictSchema, await body(c), "sentinel verdict");
   return c.json(await stub(c, hiveOf(c)).reportSentinelVerdict(verdict));
+});
+
+// Git intake (human-push design rev 2): the proxy's pre-receive decision, the landed push, an aborted push.
+// The hive must match the path / header hive.
+function sameHive(c: HiveContext, named: string): string {
+  const h = c.get("hive");
+  if (h !== null && h !== named) throw new QueenError("INVALID_INPUT", `hive "${named}" in body does not match "${h}"`);
+  assertNamespace(named);
+  return named;
+}
+
+hive.post("/internal/git/intent", async (c) => {
+  const intent = parseOrThrow(GitPushIntentSchema, await body(c), "push intent");
+  return c.json(await stub(c, sameHive(c, intent.hive)).gitIntent(intent));
+});
+
+hive.post("/internal/git/pushed", async (c) => {
+  const pushed = parseOrThrow(GitPushedSchema, await body(c), "push");
+  return c.json(await stub(c, sameHive(c, pushed.hive)).gitPushed(pushed));
+});
+
+hive.post("/internal/git/aborted", async (c) => {
+  const aborted = parseOrThrow(GitAbortedSchema, await body(c), "push abort");
+  return c.json(await stub(c, sameHive(c, aborted.hive)).gitAborted(aborted));
+});
+
+// The v1 notes projection of one ref (refs/notes/verdict | review | provenance).
+hive.get("/internal/git/notes", async (c) => {
+  const ref = parseOrThrow(NotesRefSchema, c.req.query("ref") ?? "refs/notes/verdict", "notes ref");
+  return c.json(await stub(c, hiveOf(c)).notesFor(hiveOf(c), ref));
 });
 
 hive.post("/audit", async (c) => {

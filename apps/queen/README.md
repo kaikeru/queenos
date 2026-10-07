@@ -4,7 +4,7 @@ Hono Worker plus the `QueenNode` Durable Object: the hive's single source of tru
 
 ## v2 decision pipeline (`src/queen-node.ts`, design §3.1)
 
-Every RPC (`report*`, `submitWork`, `fileWorkItem`, `workAction`, `resolveEscalation`, `updateSettings`, `alarm`) runs one `decide()`:
+Every RPC (`report*`, `git*`, `submitWork`, `fileWorkItem`, `workAction`, `resolveEscalation`, `updateSettings`, `alarm`) runs one `decide()`:
 
 1. **Before (async, only when due):** the `SwarmGovernor` lease (D9). `want` is the hive's `maxActiveTrains` while it has work, 0 when idle; the lease lasts 120 s and is renewed when it expires within 30 s. An expired or failed lease means "no global cap" (fail open). `SWARM_LEASE=off` turns it off (cut line 3).
 2. **Plan (synchronous, no await):** settings + effective autonomy (`autonomy/policy.ts`) + budget + guardrails + lease → the warm `StateCache` (loaded from SQLite only on a cold start) → `TrainPlanner`, `ReleasePlanner`, `WorkPlanner`, `EscalationPlanner` → the triggering transition → a landed car hands all its members to `rp.landed` → `wp.absorb` (prompt → item status, path claims, releases → SHIPPED or a P0 bug, follow-ups, credits) → `ep.resolveStale` → `wp.dispatchReady` → `tp.submit` per READY item (BUILD trains, every fork from main) → `autonomyTransition` (`degraded_by`, ERROR_BUDGET_EXHAUSTED).
@@ -29,7 +29,7 @@ There is **one `QueenNode` per hive**, addressed by `idFromName(namespace)`. A h
 |---|---|---|---|
 | POST | `/prompts` | `submitWork(SubmitPrompt)` (`submitPrompt` returns just the `promptRun`) | 201 `{item, promptRun}`. Open. `decompose: true` files a goal for the Oracle; otherwise one `feature` item (v1 semantics). `promptRun` is synthesized from the item (QUEUED until dispatched) |
 | POST | `/items` | `fileWorkItem({hive, user, item})` | **User route.** 201 `{item}` (`FileWorkItem`); 400/404/409 on a bad dependency, parent or guardrail |
-| POST | `/items/:id/actions` | `workAction({hive, itemId, user, action})` | **User route.** `{outcome, item}` for `retry` / `cancel` / `not_duplicate`; 409 when the item cannot take it |
+| POST | `/items/:id/actions` | `workAction({hive, itemId, user, action})` | **User route.** `{outcome, item}` for `retry` / `cancel` / `not_duplicate` / `handoff` (a FAILED pushed item → seeded REWORK); 409 when the item cannot take it |
 | GET | `/items/:id` | `getItemDetail(itemId)` | `ItemDetail`: item, children, trains (and their cars), races, release, escalations |
 | GET | `/events?trace=&item=&release=&type=&before=&limit=` | `queryEvents(EventQuery)` | `{events}` newest first (`type` is a prefix, e.g. `queue`) |
 | GET | `/traces/:traceId` | `getTrace(traceId)` | `TraceView`: the trace's events plus the span tree |
@@ -123,6 +123,29 @@ Other v2 bindings: `SWARM_GOVERNOR` (the `SwarmGovernor` DO in this Worker; vars
 - **Reconcile:** if a dispatch throws, the DO sets an alarm, and `reconcile()` re-sends every pending command under the same id. A pending fork whose source changed gets a new id.
 
 **Seed requirement (P2 / Genesis, not owned yet):** the Herald deploys a hive only if its repo contains `.queen/deploy.json` (from `templates/worker-starter`). Nothing seeds the hive repo yet. Genesis / `createHive` must seed it.
+
+## Git intake (human-push design rev 2, T1)
+
+The git proxy Worker (`apps/git`) is the intake executor: it asks before it forks, reports after it pushes, and never decides. It calls the Queen over DO RPC (the same calls exist over HTTP behind the bearer token at `/hives/:hive/internal/git/{intent,pushed,aborted}` and `GET .../internal/git/notes?ref=`).
+
+| RPC | Contract (queen-types `git.ts`) | What the Queen does |
+|---|---|---|
+| `gitIntent(GitPushIntent)` | → `GitIntakeDecision` | Pre-receive state rules (`work/inbox.ts` `decideIntent`): `main` → `refused:rule`; a head already submitted (applied, or pending from someone else) → `refused:duplicate`; unknown `item/<id>` / `goal/<slug>` → `refused:unknown-item`; `maxInboxPushesPerHour`, and (only when the push would file a new item) `maxInboxOpenPerContributor` and `maxOpenItems` → `refused:over-cap`. Paused / budget spent never refuses (a `queued:` line). Accepted: a **pre-forked train** (BUILD, `BUILDING`, `forkState: PENDING`, `origin: human`, repo `<hive>-train-<12hex>` that the proxy forks hive main into) and a `submissions` row `pending`. A pending intent of the same `(user, ref)` is replaced. |
+| `gitPushed(GitPushed)` | → `GitPushedResult` | The Submission (`decideIntake`), then the train adopts the fork (`READY`, head, `baseSha`) and enters the pipeline exactly like a drone build-result (`DEPLOYING` → preview → gate), or is **parked** (fork READY, no drone) while its item is not ACTIVE; `dispatchReady` resumes it instead of forking a builder (so pause, budget, capacity and dependencies apply). Idempotent; a closed intent → `CONFLICT`. |
+| `gitAborted(GitAborted)` | → `{outcome}` | The intent's train is EJECTED, no attempt, fork deleted, row `aborted:transient`. A pushed train is never aborted (`ignored:stale`). |
+| `notesFor(hive, ref)` | → `NotesProjection` | The v1 notes projection (`work/notes.ts`, rendered with T0b `renderNotes`): one note per BUILD train head; `version` = newest `event_log` seq. Never input to a decision. |
+
+**Intake rules** (`decideIntake`):
+- **Uncorrelated** branch → a new `feature` (`filed`): title = head subject, body = message minus trailers, acceptance = `- ` lines under `Acceptance:`; READY (no TRIAGE), **no race** ("already won"), every gate applies.
+- **Correlated** (`item/<id>`, `goal/<slug>`: its single child, else a new child; or a `Queen-Item` trailer on any branch) → `joined-race`: joins the item's RACING race, or opens a width-1 race (`entryClosesAt` null). A FAILED item reopens (attempts + 1). An unknown `Queen-Item` files a new item and says so.
+- **Late** (item LANDED/SHIPPED/closed, its code passed / won / in a car, race entry closed, or an ACTIVE non-race build) → `late-new-item`: a follow-up item `"<title> (follow-up)"`.
+- **Re-push** of the same `(user, ref)`: before boarding a car → `superseded` (old train EJECTED "superseded by push <sha>", LOST, no attempt, fork deleted; same item); after boarding / landing → a follow-up item; to a FAILED item → `reopened`.
+- **Dedupe** is per head sha within the hive (`submissions.head_sha`; each push has its own fork repo, so `(repo, headSha)` alone would never collide).
+- `Queen-Origin: agent:<name>` → origin `agent`, `<name>@<email>`; caps count per token-owner email.
+
+**Lifecycle.** A gate reject (or a conflict / integration failure) of human/agent code does **not** rework: the train is EJECTED with its **fork kept** (`forkState: READY`; `delete_issued_at` holds the delete-after deadline, 24 h), the item goes FAILED with `blockedReason: "awaiting contributor"` and no escalation. A race of contributed candidates only that nobody passes does the same. **Handoff** (`Queen: rework` on the head commit, or `POST /items/:id/actions {action:"handoff"}` on a FAILED pushed item) reworks as for drones under `maxReworks`; the REWORK forks **from** the newest kept fork (`FORK.from`) and its `DroneTask` carries `seed` and `brief` = that commit's rendered `refs/notes/verdict` note (byte-identical to `notesFor`). Kept forks are deleted by the alarm at their deadline, or once the item left FAILED with no REWORK active. The **intent watchdog**: a pre-forked train with no `gitPushed` within `COMMAND_TIMEOUT_MS` (10 min) is ejected like `gitAborted`. A pending intent holds its targeted item READY (`waitReason: "awaiting push"`). The alarm prunes `submissions` older than 30 days. `GateTarget.origin` / `MergeTrain.origin` say whose code it is (the reviewer fails closed for non-drone origin); `GateTarget.baseSha` is the hive main the proxy forked.
+
+**Notes** (`refs/notes/verdict`): PASSED / REJECTED by <ROLE> (with findings parsed from the item's REJECTED audits between the train's enqueue and its verdict) / INFRA from `gate.verdict`; SUPERSEDED, REJECTED (lost the race / CONFLICT) from EJECTED; `LANDED main@<sha>`; then `SHIPPED in release <id>` / `ROLLED BACK` without a `Queen-Verdict` (the last verdict stays LANDED, which is what agents wait for). `refs/notes/review`: the findings. `refs/notes/provenance`: `BUILT by <model>` or `PUSHED by human:<email>`. A seeded REWORK's entries carry `Queen-Replies-To: <rejected sha>`.
 
 ## Merge train
 

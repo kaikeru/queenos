@@ -58,6 +58,7 @@ import {
   type SimilarItem,
   type WorkAction,
   type WorkItem,
+  type WorkItemInbox,
   type WorkKind,
   type WorkSource,
   type WorkStatus,
@@ -180,6 +181,8 @@ export interface AbsorbPrompt {
   conflicts?: number;
   /** FAILED on infrastructure (executor / infra retries spent), not by the change: EXECUTOR_LOST, not REWORK_EXHAUSTED. */
   infra?: boolean;
+  /** T1: contributed (human / agent) code FAILED at the gate: FAILED "awaiting contributor", no escalation. */
+  awaiting?: boolean;
 }
 
 /** Train-planner train rows (structurally: TrainRecord). */
@@ -239,6 +242,22 @@ export interface DispatchCapacity {
   activeBuilds: number;
   /** SwarmGovernor lease (§4.3); absent = no global cap. */
   leasedSlots?: number | null;
+  /** T1: items a pending push intent targets: held READY ("awaiting push") so no drone races the push in. */
+  held?: ReadonlySet<string>;
+}
+
+/** T1: a new item a pushed submission files (human-push design §6.2): a `feature`, READY, skipping TRIAGE. */
+export interface FileSubmissionInput {
+  itemId: string;
+  title: string;
+  body: string;
+  acceptance: string[];
+  /** A goal (`goal/<slug>` with ≠ 1 child) or, for a late entry, the original item's parent. */
+  parentId: string | null;
+  source: WorkSource;
+  inbox: WorkItemInbox;
+  /** The disposition, for the `item.filed` event. */
+  disposition: string;
 }
 
 export interface FileGoalInput {
@@ -351,6 +370,8 @@ export function toWorkItem(r: WorkItemRecord): WorkItem {
     escalationId: r.escalationId,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
+    // T1: pushed code (dashboard origin badge, handoff). Absent for Queen-solicited work.
+    ...(r.inbox ? { inbox: { ...r.inbox } } : {}),
   };
 }
 
@@ -365,6 +386,7 @@ function copyItem(i: WorkItemRecord): WorkItemRecord {
     dependsOn: [...i.dependsOn],
     paths: [...i.paths],
     source: { ...i.source },
+    ...(i.inbox ? { inbox: { ...i.inbox } } : {}),
   };
 }
 
@@ -753,6 +775,7 @@ export class WorkPlanner {
         }
       }
       if (p.status === "MERGED") this.setStatus(item, "LANDED", "queen");
+      else if (p.status === "FAILED" && p.awaiting) this.awaitContributor(item, p.summary ?? null);
       else if (p.status === "FAILED") this.failItem(item, p.summary ?? null, p.infra === true);
     }
 
@@ -933,6 +956,10 @@ export class WorkPlanner {
     let budgetBlocked = false;
 
     for (const item of ready) {
+      if (cap.held?.has(item.itemId)) {
+        this.setWait(item, "awaiting push");
+        continue;
+      }
       if (paused) {
         this.setWait(item, "paused");
         continue;
@@ -1026,15 +1053,99 @@ export class WorkPlanner {
       case "not_duplicate":
         return this.notDuplicate(itemId, actor, a.note);
       case "handoff":
-        return this.handoff(itemId);
+        return this.handoff(itemId, actor, a.note);
     }
   }
 
-  /** Inbox item → the swarm (human-push design §6.3). T0 seam: answers 409 until T1 wires the seeded REWORK. */
-  handoff(itemId: string): WorkPlanResult {
+  /**
+   * A pushed item's contributor hands it to the swarm (human-push design §6.3): FAILED → ACTIVE, `handoff`
+   * recorded on the item. The Queen then runs `TrainPlanner.handoff` in the same decision: a REWORK (as
+   * for drones, under maxReworks) forked from the rejected submission's kept fork. Only a FAILED item
+   * whose code was pushed (it has `inbox`) can be handed off (409 otherwise).
+   */
+  handoff(itemId: string, actor = "queen", note?: string): WorkPlanResult {
     const item = this.items.get(itemId);
     if (!item) return this.notFound(itemId);
-    return this.invalid(item, "handoff", "not implemented: handoff (human-push design T1)");
+    if (item.status !== "FAILED" || !item.inbox || item.kind === "goal") {
+      return this.invalid(item, "handoff", "only a FAILED item with pushed code can be handed off");
+    }
+    item.inbox = { ...item.inbox, handoff: true };
+    item.blockedReason = null;
+    item.waitReason = null;
+    this.resolveItemEscalation(item, "handoff", actor, note);
+    this.setStatus(item, "ACTIVE", actor, `handed off to the swarm by ${actor}${note ? `: ${note}` : ""}`);
+    for (const c of claimsFor(item, this.ctx.now)) this.putClaim(c);
+    this.updateSettings({ dispatches: this.settings.dispatches + 1 });
+    this.settle();
+    return this.finish("applied", { itemId });
+  }
+
+  // ── T1: pushed submissions ────────────────────────────────────────────
+
+  /**
+   * File the item a pushed submission becomes (uncorrelated `filed`, a goal's new child, or a late entry's
+   * follow-up): a `feature`, READY (skipping TRIAGE: users are not deduped), `paths: []` (the gate's
+   * changedBetween widens the claims). The open-item caps were checked at push time (`gitIntent`), so this
+   * never refuses: the code is already pushed.
+   */
+  fileSubmission(input: FileSubmissionInput): WorkPlanResult {
+    if (this.items.has(input.itemId)) return this.finish("ignored:duplicate", { itemId: input.itemId });
+    const parent = input.parentId ? this.items.get(input.parentId) : undefined;
+    const depth = parent ? Math.min(parent.depth + 1, 3) : 0;
+    const item = this.create({
+      itemId: input.itemId,
+      kind: "feature",
+      title: clip(input.title || "untitled push", MAX_TITLE_CHARS),
+      body: clip(input.body, MAX_BODY_CHARS),
+      acceptance: input.acceptance.slice(0, 8),
+      priority: 2,
+      status: "READY",
+      parentId: parent?.itemId ?? null,
+      rootId: parent?.rootId ?? input.itemId,
+      depth,
+      dependsOn: [],
+      source: { ...input.source },
+      traceId: parent?.traceId ?? traceIdFromUuid(input.itemId),
+      difficulty: "normal",
+      bestOf: null,
+      paths: [],
+    });
+    item.inbox = { ...input.inbox };
+    this.event("item.filed", item, `${item.kind} filed from a ${input.source.kind === "agent" ? "agent" : "human"} push: ${item.title}`, {
+      kind: item.kind,
+      source: input.source.kind,
+      status: item.status,
+      submission: true,
+      disposition: input.disposition,
+      ref: input.inbox.ref,
+      headSha: input.inbox.headSha,
+    }, input.source.actor);
+    this.settle();
+    return this.finish("applied", { itemId: item.itemId });
+  }
+
+  /**
+   * A pushed submission enters an existing item: its `inbox` (repo, ref, head, handoff) is updated; a
+   * FAILED item is reopened (FAILED → READY, attempts + 1, §6.2); a TRIAGE item skips its dedupe (its late
+   * Oracle answer becomes stale). An ACTIVE item stays ACTIVE (its race takes the push as a candidate).
+   */
+  adoptSubmission(itemId: string, input: { inbox: WorkItemInbox; reopen: boolean; actor: string }): WorkPlanResult {
+    const item = this.items.get(itemId);
+    if (!item) return this.notFound(itemId);
+    item.inbox = { ...input.inbox };
+    this.markItem(item);
+    if (input.reopen && item.status === "FAILED") {
+      item.attempts += 1;
+      item.blockedReason = null;
+      this.resolveItemEscalation(item, "push", input.actor);
+      this.setStatus(item, this.depStatus(item), input.actor, `reopened by a push from ${input.actor}`);
+    } else if (item.status === "TRIAGE") {
+      item.commandId = null;
+      item.commandIssuedAt = null;
+      this.setStatus(item, this.depStatus(item), input.actor, `pushed code from ${input.actor}: triage skipped`);
+    }
+    this.settle();
+    return this.finish("applied", { itemId });
   }
 
   /** FAILED → READY (or BLOCKED): attempts and conflicts reset; its REWORK_EXHAUSTED escalation resolves. */
@@ -1215,6 +1326,13 @@ export class WorkPlanner {
     if (status !== "ACTIVE") this.releaseClaims(item.itemId, item);
     this.markItem(item);
     this.event("item.status", item, why ?? `${from} → ${status}`, { from, to: status, kind: item.kind }, actor, status === "FAILED" ? "warn" : "info");
+  }
+
+  /** Rejected contributed code (§6.2): FAILED "awaiting contributor"; no escalation, no auto-rework. */
+  private awaitContributor(item: WorkItemRecord, summary: string | null): void {
+    this.setStatus(item, "FAILED", "queen", summary ? `rejected; awaiting contributor: ${clip(summary, 200)}` : "rejected; awaiting contributor");
+    item.blockedReason = "awaiting contributor";
+    this.markItem(item);
   }
 
   private failItem(item: WorkItemRecord, summary: string | null, infra = false): void {

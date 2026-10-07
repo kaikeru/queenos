@@ -26,6 +26,8 @@ import {
   MAX_INFRA_ATTEMPTS,
   infraRetryAt,
   infraRetryDelayMs,
+  KEEP_FORK_MS,
+  keptFork,
 } from "../src/train/planner";
 
 type Fork = Extract<ProvisionCommand, { op: "FORK" }>;
@@ -55,6 +57,8 @@ class Sim {
   queue: QueueOptions | undefined;
   events: EventDraft[] = [];
   results: PlanResult[] = [];
+  /** T1: the notes projection hook (a seeded REWORK's brief). */
+  briefFor: ((sha: string) => string | null) | undefined;
   maxPassedSeq = 0;
   private ids = 0;
   private maxTrainSeq = 0;
@@ -88,6 +92,7 @@ class Sim {
         routerPolicy: this.policy,
         ...(this.race ? { race: this.race } : {}),
         ...(this.queue ? { queue: this.queue } : {}),
+        ...(this.briefFor ? { briefFor: this.briefFor } : {}),
       },
     );
     const rs = fn(planner);
@@ -1670,4 +1675,258 @@ describe("planner: infrastructure failures (one path: no attempt charged, bounde
     expect([...s.trains.values()].filter((t) => t.action === "REWORK")).toEqual([]);
   });
 
+});
+
+// ── T1: pushed submissions (pre-forked trains; human-push design rev 2 §6) ──────────────────────────
+
+describe("planner: pushed submissions (pre-forked trains)", () => {
+  const HUMAN = { kind: "human" as const, id: "ada@example.com" };
+  const HEAD = "a".repeat(40);
+  const BASE = "b".repeat(40);
+  const item = (id: string, extra: Partial<PlannerItem> = {}): PlannerItem => ({ itemId: id, traceId: traceIdFromUuid(id), priority: 2, paths: [], bestOf: null, ...extra });
+
+  function intent(s: Sim, trainId: string, promptId: string): TrainRecord {
+    s.run((p) => p.intent({ trainId, promptId, origin: HUMAN }));
+    return s.trains.get(trainId)!;
+  }
+
+  function push(s: Sim, trainId: string, promptId: string, opts: { resume?: boolean; race?: { join: string } | { create: true } | null; head?: string; handoff?: boolean } = {}): PlanResult {
+    return s.run((p) =>
+      p.pushed({
+        trainId,
+        headSha: opts.head ?? HEAD,
+        baseSha: BASE,
+        origin: HUMAN,
+        promptId,
+        promptText: `pushed ${promptId}`,
+        attempts: 0,
+        item: item(promptId, opts.handoff ? { handoff: true } : {}),
+        race: opts.race ?? null,
+        resume: opts.resume ?? true,
+      }),
+    );
+  }
+
+  it("an intent is a pre-forked BUILD train: BUILDING, fork PENDING, origin set, nothing dispatched; its clock arms the watchdog", () => {
+    const s = new Sim();
+    const t = intent(s, "p1", "I1");
+    expect(t).toMatchObject({ phase: "BUILDING", forkState: "PENDING", lane: "BUILD", action: "BUILD", origin: HUMAN, artifactRepo: "hive-train-p1", forkIssuedAt: 1000 });
+    expect(s.effects.filter((e) => e.type !== "broadcast")).toEqual([]);
+    expect(watchdogDeadline([t], DEFAULT_COMMAND_TIMEOUT_MS, s.now)).toBe(1000 + DEFAULT_COMMAND_TIMEOUT_MS);
+    // reconcile re-sends nothing for it (the proxy forks, not the Provisioner).
+    s.run((p) => p.reconcile());
+    expect(s.effects.filter((e) => e.type !== "broadcast")).toEqual([]);
+    expect(toMergeTrainV2(s.trains.get("p1")!).origin).toEqual(HUMAN);
+  });
+
+  it("gitPushed adopts the fork and enters the pipeline like a build-result: DEPLOYING, preview, gate, PASSED, landed; no fork, no builder", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1");
+    const t = s.trains.get("p1")!;
+    expect(t).toMatchObject({ phase: "DEPLOYING", forkState: "READY", headSha: HEAD, baseSha: BASE, raceId: null });
+    expect(s.prompts.get("I1")).toMatchObject({ status: "IN_TRAIN", promptText: "pushed I1" });
+    expect(s.takeOp("FORK")).toEqual([]);
+    expect(s.take("dispatchDrone")).toEqual([]);
+    s.completeDeploys();
+    expect(s.trains.get("p1")!.phase).toBe("TESTING");
+    s.run((p) => p.trainResult({ trainId: "p1", passed: true, summary: "ok" }));
+    expect(s.trains.get("p1")!.phase).toBe("LANDING"); // no queue: lands directly (uncorrelated: no race record)
+    s.run((p) => p.landResult({ trainId: "p1", landed: true, mainSha: "m".repeat(40), summary: "" }));
+    expect(s.trains.get("p1")).toMatchObject({ phase: "MERGED", forkState: "DELETING" });
+    expect(s.races.size).toBe(0);
+  });
+
+  it("a duplicate or late gitPushed is ignored; human code never counts toward model stats", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1");
+    expect(push(s, "p1", "I1").outcome).toBe("ignored:duplicate");
+    s.completeDeploys();
+    s.run((p) => p.trainResult({ trainId: "p1", passed: false, summary: "nope" }));
+    expect(s.deltas).toEqual([]);
+  });
+
+  it("a push whose item is not dispatched yet is PARKED (fork ready, no drone, no alarm) and submit() resumes it instead of forking a builder", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1", { resume: false });
+    expect(s.trains.get("p1")).toMatchObject({ phase: "BUILDING", forkState: "READY", dispatched: false });
+    expect(s.prompts.get("I1")!.status).toBe("QUEUED");
+    s.run((p) => p.reconcile());
+    expect(s.take("dispatchDrone")).toEqual([]);
+    expect(watchdogDeadline([...s.trains.values()], DEFAULT_COMMAND_TIMEOUT_MS, s.now)).toBeNull();
+    s.run((p) => p.submit({ promptId: "I1", promptText: "pushed I1", raceWidth: 3 }));
+    expect([...s.trains.values()].filter((t) => t.promptId === "I1")).toHaveLength(1);
+    expect(s.trains.get("p1")!.phase).toBe("DEPLOYING");
+    expect(s.takeOp("FORK")).toEqual([]);
+    expect(s.takeOp("DEPLOY")).toHaveLength(1);
+  });
+
+  it("a correlated push opens a width-1 race lazily, or joins the item's RACING race as one more candidate", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1", { race: { create: true } });
+    const race = [...s.races.values()][0]!;
+    expect(race).toMatchObject({ itemId: "I1", width: 1, state: "RACING", trainIds: ["p1"], entryClosesAt: null });
+    expect(s.trains.get("p1")).toMatchObject({ raceId: race.raceId, candidate: 0, raceOutcome: "RACING" });
+    intent(s, "p2", "I1");
+    push(s, "p2", "I1", { race: { join: race.raceId }, head: "c".repeat(40) });
+    expect(s.races.get(race.raceId)).toMatchObject({ width: 1, trainIds: ["p1", "p2"] });
+    expect(s.trains.get("p2")).toMatchObject({ raceId: race.raceId, candidate: 1, raceOutcome: "RACING" });
+    s.completeDeploys();
+    s.run((p) => p.trainResult({ trainId: "p1", passed: true, summary: "ok", score: { review: "approved", satisfied: 1, missing: 0, changedFiles: 1, changedBytes: 10, checks: 3 } }));
+    expect(s.races.get(race.raceId)!.state).toBe("RACING"); // p2 still pending
+    s.run((p) => p.trainResult({ trainId: "p2", passed: false, summary: "bad" }));
+    expect(s.races.get(race.raceId)).toMatchObject({ state: "DECIDED", winnerTrainId: "p1" });
+  });
+
+  it("gitAborted before the push ejects the intent (no attempt) and deletes the fork; after the push it is ignored", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    const r = s.run((p) => p.abort("p1", "upstream receive-pack failed"));
+    expect(r.outcome).toBe("applied");
+    expect(r.abortedIntents).toEqual(["p1"]);
+    expect(s.trains.get("p1")).toMatchObject({ phase: "EJECTED", forkState: "DELETING" });
+    expect(s.takeOp("DELETE").map((c) => c.repo)).toEqual(["hive-train-p1"]);
+    intent(s, "p2", "I2");
+    push(s, "p2", "I2");
+    expect(s.run((p) => p.abort("p2", "late")).outcome).toBe("ignored:stale");
+    expect(s.run((p) => p.abort("nope", "x")).outcome).toBe("ignored:unknown");
+  });
+
+  it("the intent watchdog: no gitPushed within the command timeout → EJECTED, fork deleted, no attempt charged", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    s.now += DEFAULT_COMMAND_TIMEOUT_MS - 1;
+    s.run((p) => p.reconcile());
+    expect(s.trains.get("p1")!.phase).toBe("BUILDING");
+    s.now += 1;
+    const r = s.run((p) => p.reconcile());
+    expect(r.abortedIntents).toEqual(["p1"]);
+    expect(s.trains.get("p1")).toMatchObject({ phase: "EJECTED", forkState: "DELETING" });
+    expect(s.trains.get("p1")!.reason).toMatch(/push intent expired/);
+    expect(s.takeOp("DELETE")).toHaveLength(1);
+    expect(s.takeOp("FORK")).toEqual([]);
+  });
+
+  it("a gate reject of human code: EJECTED, fork KEPT (delete-after 24 h), prompt FAILED awaiting the contributor, no REWORK", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1");
+    s.completeDeploys();
+    const r = s.run((p) => p.trainResult({ trainId: "p1", passed: false, summary: "security: fetch to a non-allowlisted host" }));
+    expect(r.awaitingContributor).toEqual([{ promptId: "I1", summary: "security: fetch to a non-allowlisted host" }]);
+    const t = s.trains.get("p1")!;
+    expect(t).toMatchObject({ phase: "EJECTED", forkState: "READY", deleteIssuedAt: s.now + KEEP_FORK_MS });
+    expect(keptFork(t)).toBe(true);
+    expect(s.takeOp("DELETE")).toEqual([]);
+    expect(s.takeOp("TEARDOWN")).toHaveLength(1);
+    expect(s.prompts.get("I1")).toMatchObject({ status: "FAILED", attempts: 0 });
+    expect([...s.trains.values()].filter((x) => x.promptId === "I1")).toHaveLength(1); // no rework
+    // Once the preview is torn down, the delete-after deadline is what keeps the alarm armed.
+    expect(watchdogDeadline([{ ...t, deployState: "TORN_DOWN" }], DEFAULT_COMMAND_TIMEOUT_MS, s.now)).toBe(s.now + KEEP_FORK_MS);
+  });
+
+  it("a kept fork is deleted at its deadline, or once its item left FAILED with no REWORK running", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1");
+    s.completeDeploys();
+    s.run((p) => p.trainResult({ trainId: "p1", passed: false, summary: "no" }));
+    s.items = [item("I1", { status: "FAILED" })];
+    s.run((p) => p.reconcile());
+    expect(s.trains.get("p1")!.forkState).toBe("READY");
+    s.now += KEEP_FORK_MS;
+    s.run((p) => p.reconcile());
+    expect(s.trains.get("p1")!.forkState).toBe("DELETING");
+
+    const s2 = new Sim();
+    intent(s2, "p1", "I1");
+    push(s2, "p1", "I1");
+    s2.completeDeploys();
+    s2.run((p) => p.trainResult({ trainId: "p1", passed: false, summary: "no" }));
+    s2.items = [item("I1", { status: "READY" })]; // the contributor re-pushed (reopened)
+    s2.run((p) => p.reconcile());
+    expect(s2.trains.get("p1")!.forkState).toBe("DELETING");
+  });
+
+  it("`Queen: rework` (handoff): a reject reworks as for drones, the REWORK forks FROM the kept fork and carries the rendered note as its brief", () => {
+    const s = new Sim();
+    s.briefFor = (sha) => (sha === HEAD ? "REJECTED by SECURITY: nope\n\nQueen-Note: v1\nQueen-Kind: verdict\nQueen-Verdict: REJECTED" : null);
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1", { handoff: true });
+    s.items = [item("I1", { status: "ACTIVE", handoff: true })]; // persisted on the item (inbox.handoff)
+    s.completeDeploys();
+    const r = s.run((p) => p.trainResult({ trainId: "p1", passed: false, summary: "security: nope" }));
+    expect(r.awaitingContributor).toBeUndefined();
+    expect(s.trains.get("p1")!.forkState).toBe("READY"); // kept: the seed
+    const rework = [...s.trains.values()].find((t) => t.promptId === "I1" && t.action === "REWORK")!;
+    expect(rework.origin).toBeUndefined(); // a drone train
+    const [fork] = s.takeOp("FORK");
+    expect(fork).toMatchObject({ trainId: rework.trainId, sourceRepo: "hive", from: "hive-train-p1" });
+    expect(s.prompts.get("I1")!.attempts).toBe(1);
+    s.run((p) => p.provisionResult({ commandId: fork!.commandId, op: "FORK", trainId: rework.trainId, ok: true, artifactRepo: fork!.forkName, baseSha: HEAD }));
+    const task = s.take("dispatchDrone").at(-1)!.task;
+    expect(task).toMatchObject({ action: "REWORK", seed: { repo: "hive-train-p1", ref: "refs/heads/main", headSha: HEAD }, scribeSummary: "security: nope" });
+    expect(task.brief).toBe(s.briefFor(HEAD));
+    // The kept fork outlives the rework's fork creation; once no REWORK is active and the item is not FAILED, it goes.
+    s.items = [item("I1", { status: "ACTIVE", handoff: true })];
+    s.run((p) => p.reconcile());
+    expect(s.trains.get("p1")!.forkState).toBe("READY");
+  });
+
+  it("handoff() later: the FAILED item's prompt reworks (attempts + 1), seeded from the newest kept fork", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1");
+    s.completeDeploys();
+    s.run((p) => p.trainResult({ trainId: "p1", passed: false, summary: "no" }));
+    s.takeOp("FORK");
+    s.items = [item("I1", { status: "ACTIVE", handoff: true })];
+    s.run((p) => p.handoff({ promptId: "I1", promptText: "pushed I1", summary: "no", attempts: 0, item: item("I1", { status: "ACTIVE" }) }));
+    const [fork] = s.takeOp("FORK");
+    expect(fork).toMatchObject({ from: "hive-train-p1" });
+    expect(s.prompts.get("I1")).toMatchObject({ status: "QUEUED", attempts: 1 });
+    // Past maxReworks the handoff fails the prompt (→ REWORK_EXHAUSTED on the item).
+    const s2 = new Sim();
+    s2.run((p) => p.handoff({ promptId: "I9", promptText: "x", summary: null, attempts: 2, item: item("I9") }));
+    expect(s2.prompts.get("I9")!.status).toBe("FAILED");
+  });
+
+  it("supersede: a re-push replaces the train not yet in a car (EJECTED, LOST, fork deleted); the race waits for the new candidate", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1", { race: { create: true } });
+    const raceId = s.trains.get("p1")!.raceId!;
+    s.takeOp("DEPLOY");
+    intent(s, "p2", "I1");
+    push(s, "p2", "I1", { race: { join: raceId }, head: "c".repeat(40) });
+    const r = s.run((p) => p.supersede("p1", "c".repeat(40)));
+    expect(r.outcome).toBe("applied");
+    expect(s.trains.get("p1")).toMatchObject({ phase: "EJECTED", raceOutcome: "LOST", forkState: "DELETING" });
+    expect(s.trains.get("p1")!.reason).toBe("superseded by push ccccccc");
+    expect(s.races.get(raceId)!.state).toBe("RACING");
+    expect(s.prompts.get("I1")!.attempts).toBe(0);
+    // A train in a car (or landing) is never superseded.
+    const s2 = new Sim();
+    intent(s2, "q1", "I2");
+    push(s2, "q1", "I2");
+    s2.completeDeploys();
+    s2.run((p) => p.trainResult({ trainId: "q1", passed: true, summary: "ok" }));
+    expect(s2.trains.get("q1")!.phase).toBe("LANDING");
+    expect(s2.run((p) => p.supersede("q1", HEAD)).outcome).toBe("ignored:stale");
+  });
+
+  it("a race of contributed candidates only that nobody passes: the item waits for its contributor (no drone rework)", () => {
+    const s = new Sim();
+    intent(s, "p1", "I1");
+    push(s, "p1", "I1", { race: { create: true } });
+    s.completeDeploys();
+    const r = s.run((p) => p.trainResult({ trainId: "p1", passed: false, summary: "bad" }));
+    expect(r.awaitingContributor?.[0]?.promptId).toBe("I1");
+    expect(s.races.get(s.trains.get("p1")!.raceId!)!.state).toBe("ABANDONED");
+    expect([...s.trains.values()].filter((t) => t.promptId === "I1")).toHaveLength(1);
+    expect(s.trains.get("p1")!.forkState).toBe("READY");
+  });
 });

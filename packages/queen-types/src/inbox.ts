@@ -134,6 +134,8 @@ export const SubmitOutcomeKindSchema = z.enum([
   "refused:unknown-item",
   "refused:rule",
   "aborted:transient",
+  // v2 (T1): an accepted `gitIntent` whose `gitPushed` has not arrived yet (becomes `applied` or `aborted:transient`).
+  "pending",
 ]);
 export type SubmitOutcomeKind = z.infer<typeof SubmitOutcomeKindSchema>;
 

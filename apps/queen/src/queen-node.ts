@@ -32,6 +32,12 @@
  *
  * Context compaction: the Queen never stores raw code, diffs or stack traces,
  * only Scribe summaries (<= 500 chars, enforced by the queen-types schemas).
+ *
+ * Git intake (human-push design rev 2, T1): the git proxy Worker (apps/git) is the intake executor. It asks
+ * `gitIntent` before it forks (state rules, caps, target resolution; a pre-forked train), reports
+ * `gitPushed` after the push landed in that fork (the Submission: file / join / reopen / supersede; the
+ * train enters the pipeline like a drone's build) or `gitAborted`, and serves `notesFor` (the v1 notes
+ * projection of this ledger). Every outcome is a `submissions` row.
  */
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -41,7 +47,11 @@ import {
   DeployResultSchema,
   EventQuerySchema,
   FileWorkItemSchema,
+  GitAbortedSchema,
+  GitPushIntentSchema,
+  GitPushedSchema,
   LandResultSchema,
+  NotesRefSchema,
   MergeResultSchema,
   OracleResultSchema,
   ProvisionResultSchema,
@@ -57,6 +67,7 @@ import {
   GuardrailOverridesSchema,
   parseTraceparent,
   spanIdFor,
+  targetFromRef,
   traceIdFromUuid,
   type AppendAuditInput,
   type AuditEvent,
@@ -69,6 +80,11 @@ import {
   type FileWorkItemInput,
   type FollowUp,
   type GateTarget,
+  type GitAborted,
+  type GitIntakeDecision,
+  type GitPushIntent,
+  type GitPushed,
+  type GitPushedResult,
   type HiveSettings,
   type HiveStatus,
   type ItemDetail,
@@ -76,6 +92,7 @@ import {
   type MergeResultInput,
   type MergeTrain,
   type MetricsView,
+  type NotesProjection,
   type OracleResultInput,
   type PromptRun,
   type ProvisionResult,
@@ -87,6 +104,7 @@ import {
   type ScribeSummary,
   type SentinelVerdict,
   type SubmitPrompt,
+  type SubmissionOrigin,
   type TraceView,
   type TrainResult,
   type UpdateHiveSettings,
@@ -104,13 +122,16 @@ import {
   listVerdicts,
   loadHiveSettings,
   loadRouter,
+  insertSubmission,
   migrate,
+  pruneSubmissions,
   rowToDeployment,
   rowToEscalation,
   rowToEvent,
   rowToPrompt,
   rowToRace,
   rowToRelease,
+  rowToSubmission,
   rowToTrain,
   rowToWorkItem,
   saveRouter,
@@ -124,6 +145,8 @@ import {
   upsertTrain,
   upsertVerdict,
   upsertWorkItem,
+  updateSubmission,
+  type SubmissionRecord,
 } from "./db";
 import { WorkflowDroneDispatcher, droneInstanceId, type DroneDispatcher } from "./drones";
 import {
@@ -138,8 +161,13 @@ import { DEFAULT_POLICY, toRouterFloor, type FloorState, type RouterPolicy } fro
 import {
   DEFAULT_COMMAND_TIMEOUT_MS,
   TrainPlanner,
+  awaitingPush,
   isActive,
   isCar,
+  isContributed,
+  isParked,
+  keptFork,
+  trainRepoName,
   toMergeTrainV2,
   toPromptRun,
   traceOfTrain,
@@ -171,6 +199,22 @@ import { raceWidth } from "./train/race";
 import { EscalationPlanner, type EscalationIntent, type EscalationPlanResult } from "./autonomy/escalation";
 import { autonomyTransition, changeSuccessFromReleases, effectiveAutonomy, errorBudget, hiveHeadline, type EffectiveAutonomy, type SloStatus } from "./autonomy/policy";
 import { appendEvents, pruneEvents, queryEvents } from "./obs/events";
+import {
+  NOTES_HINT,
+  decideIntake,
+  decideIntent,
+  handleFor,
+  originOf,
+  remoteLines,
+  short,
+  slugify,
+  trailersOf,
+  type IntakeItem,
+  type IntakeLookup,
+  type PriorSubmission,
+} from "./work/inbox";
+import { MAX_NOTES, projectNotes, type NotesInput, type NotesTrain } from "./work/notes";
+import { composePrompt } from "./work/compose";
 import { queryMetrics, recordMetrics } from "./obs/rollup";
 import { AnalyticsSink } from "./obs/metrics-sink";
 import { logEvents } from "./obs/log";
@@ -214,6 +258,10 @@ const EVENTS_SNAPSHOT_LIMIT = 50;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 const TERMINAL_ITEMS_SQL = TERMINAL_WORK_STATUSES.map((s) => `'${s}'`).join(", ");
+/** Submission rows are pruned with the event log (30 days). */
+export const SUBMISSION_RETENTION_MS = 30 * DAY_MS;
+/** A contributor's open pushed items: not landed, shipped or closed. */
+const OPEN_PUSHED_SQL = "('LANDED', 'SHIPPED', 'CANCELLED', 'DUPLICATE')";
 
 /** COMMAND_TIMEOUT_MS (wrangler var, milliseconds); default 10 min. */
 export function commandTimeoutMs(env: { COMMAND_TIMEOUT_MS?: string | number }): number {
@@ -336,6 +384,13 @@ class Acc {
   executorLost = false;
   /** Prompts FAILED on infrastructure (→ EXECUTOR_LOST on the item, not REWORK_EXHAUSTED). */
   infraFailed = new Map<string, string>();
+  /** T1: prompts of contributed code FAILED at the gate (→ FAILED "awaiting contributor", no escalation). */
+  awaiting = new Map<string, string>();
+  /** T1: push intents ended without a push (→ their submission rows `aborted:transient`). */
+  abortedIntents: string[] = [];
+  /** T1: submission rows to insert / update in the decision's transaction. */
+  submissions: SubmissionRecord[] = [];
+  submissionUpdates: { key: { repo: string; headSha: string }; patch: Partial<Pick<SubmissionRecord, "itemId" | "trainId" | "outcome" | "disposition">> }[] = [];
   rollbackStreak?: number;
   followUps: AbsorbFollowUps[] = [];
   credits = 0;
@@ -357,6 +412,8 @@ class Acc {
     if (r.carInfraFailures !== undefined) this.carInfraFailures = r.carInfraFailures;
     if (r.executorLost) this.executorLost = true;
     for (const f of r.infraFailed ?? []) this.infraFailed.set(f.promptId, f.summary);
+    for (const f of r.awaitingContributor ?? []) this.awaiting.set(f.promptId, f.summary);
+    this.abortedIntents.push(...(r.abortedIntents ?? []));
     if (r.landed && r.landed.trainIds.length) this.onLanded?.(r.landed);
     return r;
   }
@@ -550,7 +607,28 @@ export class QueenNode extends DurableObject<Env> {
     const hive = this.hiveFor(input.hive);
     if (!this.loadItem(input.itemId)) throw new QueenError("NOT_FOUND", `item ${input.itemId} not found`);
     await this.maybeLease(hive, true);
-    const { value: res, acc } = this.decide(hive, (d) => d.acc.work(d.wp.action(input.itemId, action, `user:${input.user}`)), { items: [input.itemId] });
+    const { value: res, acc } = this.decide(
+      hive,
+      (d) => {
+        const r = d.acc.work(d.wp.action(input.itemId, action, `user:${input.user}`));
+        // T1 handoff: the item is ACTIVE again; a REWORK (as for drones) forks from the rejected submission's kept fork.
+        if (action.action === "handoff" && r.outcome === "applied") {
+          const item = d.acc.items.get(input.itemId)!;
+          const prompt = this.loadPrompt(input.itemId);
+          d.acc.train(
+            d.tp.handoff({
+              promptId: item.itemId,
+              promptText: prompt?.promptText ?? composePrompt(item),
+              summary: prompt?.summary ?? null,
+              attempts: item.attempts,
+              item: plannerItem(item),
+            }),
+          );
+        }
+        return r;
+      },
+      { items: [input.itemId] },
+    );
     await this.commit(hive, acc);
     this.throwWorkError(res);
     const item = this.loadItem(input.itemId);
@@ -563,6 +641,371 @@ export class QueenNode extends DurableObject<Env> {
       .exec(`SELECT item_id, title, status FROM work_items WHERE status NOT IN (${TERMINAL_ITEMS_SQL}) AND kind != 'goal' ORDER BY seq`)
       .toArray()
       .map((r) => ({ itemId: String(r.item_id), title: String(r.title), status: String(r.status) }));
+  }
+
+  // ── RPC surface: git intake (human-push design rev 2, T1) ─────────────
+
+  /**
+   * The git proxy's pre-receive decision, before it forks (§4.2, §4.3). State rules only: duplicate head
+   * (refused:duplicate), an unknown `item/<id>` or `goal/<slug>` (refused:unknown-item), the contributor's
+   * hourly and open-item caps and the hive's maxOpenItems (refused:over-cap), `main` (refused:rule).
+   * Accepted: a pre-forked BUILD train (BUILDING, forkState PENDING, origin human) whose `repo` the proxy
+   * forks hive main into; a submission row `pending`. A pause or a spent budget never refuses.
+   */
+  async gitIntent(input: GitPushIntent): Promise<GitIntakeDecision> {
+    const intent = parseOrThrow(GitPushIntentSchema, input, "push intent");
+    const hive = this.hiveFor(intent.hive);
+    const user = intent.user.toLowerCase();
+    const trainId = crypto.randomUUID();
+    const repo = trainRepoName(hive, trainId);
+    const placeholder = crypto.randomUUID();
+    const target = targetFromRef(intent.ref);
+    const { value: decision, acc } = this.decide(hive, (d): GitIntakeDecision => {
+      const now = d.now;
+      const prev = this.priorOnRef(user, intent.ref, null);
+      const settings = d.acc.settings ?? d.state.settings;
+      const dec = decideIntent(
+        { ref: intent.ref, newSha: intent.newSha, user },
+        {
+          now,
+          guardrails: d.hs.guardrails,
+          paused: d.eff.paused,
+          budgetExhausted: settings ? budgetExhausted(settings, d.hs.budget) : false,
+          sameHead: this.sql
+            .exec("SELECT * FROM submissions WHERE head_sha = ? AND outcome IN ('applied', 'pending') ORDER BY created_at", intent.newSha)
+            .toArray()
+            .map(rowToSubmission),
+          previousOnRef: prev,
+          lookup: this.intakeLookup(d),
+          openItems: this.openPushedItems(user),
+          pushesLastHour: Number(
+            this.sql
+              .exec("SELECT COUNT(*) AS n FROM submissions WHERE origin_id = ? AND created_at >= ? AND outcome IN ('applied', 'pending')", user, now - HOUR_MS)
+              .one().n,
+          ),
+          hiveOpenItems: Number(this.sql.exec(`SELECT COUNT(*) AS n FROM work_items WHERE status NOT IN (${TERMINAL_ITEMS_SQL})`).one().n),
+        },
+      );
+      if (dec.verdict === "refuse") {
+        d.acc.submissions.push({
+          repo: hive,
+          headSha: intent.newSha,
+          ref: intent.ref,
+          originKind: "human",
+          originId: user,
+          itemId: null,
+          trainId: null,
+          outcome: dec.outcome,
+          disposition: null,
+          target,
+          createdAt: now,
+        });
+        d.acc.events.push(this.submissionEvent(null, null, `push refused: ${dec.reason}`, { outcome: dec.outcome, ref: intent.ref, headSha: intent.newSha, user }, `user:${user}`, "warn"));
+        return { verdict: "refuse", reason: dec.reason, messages: dec.messages };
+      }
+      for (const stale of dec.supersedeIntents) d.acc.train(d.tp.abort(stale, `replaced by a newer push of ${intent.ref}`));
+      const promptId = dec.itemId ?? placeholder;
+      const origin: SubmissionOrigin = { kind: "human", id: user };
+      d.acc.train(
+        d.tp.intent({
+          trainId,
+          promptId,
+          origin,
+          traceId: d.state.items.find((i) => i.itemId === promptId)?.traceId ?? null,
+          ...(this.loadPrompt(promptId) ? {} : { promptText: `push ${intent.ref} ${short(intent.newSha)} (awaiting the push)` }),
+        }),
+      );
+      d.acc.submissions.push({
+        repo,
+        headSha: intent.newSha,
+        ref: intent.ref,
+        originKind: "human",
+        originId: user,
+        itemId: promptId,
+        trainId,
+        outcome: "pending",
+        disposition: null,
+        target,
+        createdAt: now,
+      });
+      d.acc.events.push(
+        this.submissionEvent(dec.itemId, trainId, `push intent accepted: ${intent.ref} ${short(intent.newSha)} → train ${trainId} (${repo})`, { outcome: "pending", ref: intent.ref, headSha: intent.newSha, user, repo }, `user:${user}`),
+      );
+      return { verdict: "accept", trainId, repo, messages: dec.messages };
+    });
+    await this.commit(hive, acc);
+    return decision;
+  }
+
+  /**
+   * The push landed in the pre-forked train's fork (`main` = the contributor's head): the Submission.
+   * Intake files a new item (uncorrelated: "already won", no race), enters the targeted item's race
+   * (created lazily at width 1), reopens a FAILED item, supersedes the contributor's earlier train on the
+   * same branch (not yet in a car), or files a follow-up item (late). The train then deploys its preview and
+   * is gated like a drone's build, or waits parked while its item is not dispatched (paused, budget).
+   * Idempotent: a repeat returns the recorded result.
+   */
+  async gitPushed(input: GitPushed): Promise<GitPushedResult> {
+    const p = parseOrThrow(GitPushedSchema, input, "push");
+    const hive = this.hiveFor(p.hive);
+    const train = this.loadTrain(p.trainId);
+    if (!train || !isContributed(train)) throw new QueenError("NOT_FOUND", `push train ${p.trainId} not found`);
+    if (train.artifactRepo !== p.repo) throw new QueenError("INVALID_INPUT", `repo ${p.repo} is not train ${p.trainId}'s fork`);
+    const row = this.sql.exec("SELECT * FROM submissions WHERE train_id = ? ORDER BY created_at DESC LIMIT 1", p.trainId).toArray()[0];
+    const sub = row ? rowToSubmission(row) : null;
+    if (!sub) throw new QueenError("NOT_FOUND", `no push intent for train ${p.trainId}`);
+    if (sub.headSha !== p.headSha || sub.ref !== p.ref) throw new QueenError("INVALID_INPUT", `push ${p.ref} ${short(p.headSha)} does not match the intent (${sub.ref} ${short(sub.headSha)})`);
+    if (sub.outcome === "applied") {
+      return { disposition: sub.disposition ?? "filed", itemId: sub.itemId ?? train.promptId, messages: remoteLines([`already received → item ${sub.itemId ?? train.promptId} (train ${p.trainId})`]) };
+    }
+    if (sub.outcome !== "pending" || !awaitingPush(train)) {
+      throw new QueenError("CONFLICT", `push intent ${p.trainId} is no longer open (${sub.outcome}); retry the push`);
+    }
+    const user = sub.originId;
+    const trailers = trailersOf(p.message, p.trailers);
+    const origin = originOf(user, trailers);
+    const now = this.now();
+    const prev = this.priorOnRef(user, p.ref, p.trainId, "applied");
+    const lookupState = this.activeState();
+    const newItemId = this.loadItem(train.promptId) ? crypto.randomUUID() : train.promptId;
+    const plan = decideIntake(
+      { ref: p.ref, headSha: p.headSha, title: p.title, message: p.message, trailers, newItemId },
+      { now, lookup: this.intakeLookup({ state: lookupState }), previousOnRef: prev },
+    );
+    const inbox = { repo: p.repo, ref: p.ref, handle: handleFor(user), headSha: p.headSha, handoff: trailers.rework };
+    const actor = origin.kind === "agent" ? `agent:${origin.id}` : `user:${user}`;
+    const source = origin.kind === "agent" ? { kind: "agent" as const, actor } : { kind: "user" as const, actor };
+    const parent = plan.file?.parentId ?? null;
+    const { acc } = this.decide(
+      hive,
+      (d) => {
+        if (plan.file) d.acc.work(d.wp.fileSubmission({ ...plan.file, source, inbox, disposition: plan.disposition }));
+        else d.acc.work(d.wp.adoptSubmission(plan.itemId, { inbox, reopen: plan.reopen, actor }));
+        const item = d.acc.items.get(plan.itemId) ?? d.state.items.find((i) => i.itemId === plan.itemId) ?? this.loadItem(plan.itemId);
+        if (!item) throw new QueenError("NOT_FOUND", `item ${plan.itemId} not found`);
+        d.acc.train(
+          d.tp.pushed({
+            trainId: p.trainId,
+            headSha: p.headSha,
+            baseSha: p.baseSha,
+            origin,
+            promptId: item.itemId,
+            promptText: composePrompt(item),
+            attempts: item.attempts,
+            item: plannerItem(item),
+            race: plan.race,
+            resume: item.status === "ACTIVE",
+          }),
+        );
+        if (plan.supersedeTrainId) d.acc.train(d.tp.supersede(plan.supersedeTrainId, p.headSha));
+        d.acc.submissionUpdates.push({ key: { repo: p.repo, headSha: p.headSha }, patch: { outcome: "applied", disposition: plan.disposition, itemId: item.itemId, trainId: p.trainId } });
+        d.acc.events.push(
+          this.submissionEvent(item.itemId, p.trainId, `submission received (${plan.disposition}) from ${origin.kind}:${origin.id}: ${p.title}`, {
+            outcome: "applied",
+            disposition: plan.disposition,
+            ref: p.ref,
+            headSha: p.headSha,
+            repo: p.repo,
+            origin,
+            ...(plan.supersedeTrainId ? { superseded: plan.supersedeTrainId } : {}),
+            ...(trailers.rework ? { handoff: true } : {}),
+          }, actor),
+        );
+      },
+      { trains: [p.trainId, ...(plan.supersedeTrainId ? [plan.supersedeTrainId] : [])], items: [plan.itemId, ...(parent ? [parent] : [])] },
+    );
+    await this.commit(hive, acc);
+    const item = this.loadItem(plan.itemId);
+    const waiting = item && item.status !== "ACTIVE" ? (item.waitReason ?? item.blockedReason ?? item.status.toLowerCase()) : null;
+    return {
+      disposition: plan.disposition,
+      itemId: plan.itemId,
+      messages: remoteLines([
+        ...plan.messages,
+        waiting ? `queued: ${waiting}` : `train ${p.trainId} · verdict in ~2 min`,
+        trailers.rework ? "Queen: rework — the swarm takes over if the gate rejects it" : null,
+        NOTES_HINT,
+      ]),
+    };
+  }
+
+  /**
+   * The push failed after `gitIntent` (fork, upstream receive-pack, size cap or readCommit): the pre-forked
+   * train is EJECTED with no attempt charged and its fork deleted; the submission row becomes
+   * `aborted:transient`. A train that was already pushed is never aborted (`ignored:stale`).
+   */
+  async gitAborted(input: GitAborted): Promise<{ outcome: string }> {
+    const a = parseOrThrow(GitAbortedSchema, input, "push abort");
+    const hive = this.hiveFor(a.hive);
+    const train = this.loadTrain(a.trainId);
+    if (!train || !isContributed(train)) throw new QueenError("NOT_FOUND", `push train ${a.trainId} not found`);
+    const { value: res, acc } = this.decide(hive, (d) => d.acc.train(d.tp.abort(a.trainId, a.reason)), { trains: [a.trainId] });
+    await this.commit(hive, acc);
+    return { outcome: res.outcome };
+  }
+
+  /**
+   * The v1 notes projection of one ref (§7.5): one note per submission head (drone or pushed), rendered
+   * from the event log, audits, trains and releases by the T0b renderer. `version` is the ledger version
+   * (the newest event seq): the proxy's cache key. Notes are information, never authority.
+   */
+  notesFor(hive: string, ref: string): NotesProjection {
+    const r = parseOrThrow(NotesRefSchema, ref, "notes ref");
+    const named = this.hiveNamespace();
+    if (named !== null && named !== hive) throw new QueenError("CONFLICT", `this hive is "${named}", not "${hive}"`);
+    const version = Number(this.sql.exec("SELECT COALESCE(MAX(seq), 0) AS v FROM event_log").one().v);
+    return { ref: r, version, notes: projectNotes(this.notesInput(null), r) };
+  }
+
+  /** The rendered `refs/notes/verdict` note of one commit (a seeded REWORK's brief), or null. */
+  verdictNote(sha: string): string | null {
+    if (!/^[0-9a-f]{40}$/.test(sha)) return null;
+    return projectNotes(this.notesInput(sha), "refs/notes/verdict").find((n) => n.sha === sha)?.text ?? null;
+  }
+
+  /** Rows of the notes projection: every BUILD train with a head (or only those of `sha`) and their ledger. */
+  private notesInput(sha: string | null): NotesInput {
+    const byHead = (h: string) => this.sql.exec("SELECT * FROM merge_trains WHERE lane = 'BUILD' AND head_sha = ? ORDER BY seq", h).toArray().map(rowToTrain);
+    let all: TrainRecord[];
+    if (sha) {
+      // The commit's trains, plus the contributor's trains whose head a REWORK of it started from (Queen-Replies-To).
+      all = byHead(sha);
+      for (const b of new Set(all.map((t) => t.baseSha).filter((x) => /^[0-9a-f]{40}$/.test(x) && x !== sha))) all.push(...byHead(b));
+    } else {
+      all = this.sql.exec("SELECT * FROM merge_trains WHERE lane = 'BUILD' AND head_sha IS NOT NULL ORDER BY seq DESC LIMIT ?", MAX_NOTES).toArray().map(rowToTrain);
+    }
+    // Pushed code: the branch it came from (every applied submission row; pruned at 30 days).
+    const refOf = new Map<string, string>();
+    for (const r of this.sql.exec("SELECT train_id, ref FROM submissions WHERE outcome = 'applied' AND train_id IS NOT NULL").toArray()) refOf.set(String(r.train_id), String(r.ref));
+    const trains: NotesTrain[] = all.map((t) => ({
+      trainId: t.trainId,
+      promptId: t.promptId,
+      seq: t.seq,
+      headSha: t.headSha,
+      baseSha: t.baseSha,
+      phase: t.phase,
+      reason: t.reason,
+      landedSha: t.landedSha,
+      action: t.action,
+      model: t.model,
+      traceId: traceOfTrain(t),
+      raceOutcome: t.raceOutcome ?? null,
+      conflict: t.conflict ?? null,
+      origin: t.origin ?? null,
+      ref: refOf.get(t.trainId) ?? null,
+    }));
+    const releases = this.sql
+      .exec("SELECT * FROM releases WHERE phase IN ('SHIPPED', 'ROLLED_BACK') ORDER BY seq DESC LIMIT 200")
+      .toArray()
+      .map(rowToRelease)
+      .map((r) => ({ releaseId: r.releaseId, trainIds: [...r.trainIds] }));
+    const ids = new Set(trains.map((t) => t.trainId));
+    const items = new Set(trains.map((t) => t.promptId));
+    const relIds = new Set(releases.filter((r) => r.trainIds.some((id) => ids.has(id))).map((r) => r.releaseId));
+    const since = all.length ? Math.min(...all.map((t) => t.createdAt)) - HOUR_MS : 0;
+    const events = this.sql
+      .exec(
+        // Audits are matched by item and seq window (their ts is the reporter's clock), so they are not ts-bounded.
+        `SELECT * FROM event_log WHERE (type = 'drone.audit' AND audit_status = 'REJECTED') OR (ts >= ? AND (
+           (type IN ('gate.verdict', 'train.enqueued') AND train_id IS NOT NULL)
+           OR (type = 'train.phase' AND train_id IS NOT NULL AND json_extract(data, '$.to') IN ('MERGED', 'EJECTED'))
+           OR type = 'release.phase'))
+         ORDER BY seq`,
+        sha ? 0 : since,
+      )
+      .toArray()
+      .map(rowToEvent)
+      .filter((e) => (e.trainId !== null && ids.has(e.trainId)) || (e.type === "drone.audit" && e.itemId !== null && items.has(e.itemId)) || (e.type === "release.phase" && e.releaseId !== null && relIds.has(e.releaseId)));
+    return { trains, events, releases };
+  }
+
+  // ── git intake: reads ─────────────────────────────────────────────────
+
+  /** The contributor's latest submission on `ref` (applied, or also pending), other than `exceptTrain`, with its train's state. */
+  private priorOnRef(user: string, ref: string, exceptTrain: string | null, only?: "applied"): PriorSubmission | null {
+    const row = this.sql
+      .exec(
+        `SELECT * FROM submissions WHERE origin_id = ? AND ref = ? AND outcome IN (${only ? "'applied'" : "'applied', 'pending'"})
+         AND (train_id IS NULL OR train_id != ?) ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+        user,
+        ref,
+        exceptTrain ?? "",
+      )
+      .toArray()[0];
+    if (!row) return null;
+    const submission = rowToSubmission(row);
+    const t = submission.trainId ? (this.cache.get()?.trains.find((x) => x.trainId === submission.trainId) ?? this.loadTrain(submission.trainId)) : null;
+    return {
+      submission,
+      trainActive: !!t && isActive(t),
+      trainBoarded: !!t && (!!t.carId || t.phase === "LANDING" || t.phase === "MERGED"),
+    };
+  }
+
+  /** The contributor's open pushed items (maxInboxOpenPerContributor). */
+  private openPushedItems(user: string): number {
+    return Number(
+      this.sql
+        .exec(
+          `SELECT COUNT(DISTINCT s.item_id) AS n FROM submissions s JOIN work_items w ON w.item_id = s.item_id
+           WHERE s.origin_id = ? AND s.outcome = 'applied' AND w.status NOT IN ${OPEN_PUSHED_SQL}`,
+          user,
+        )
+        .one().n,
+    );
+  }
+
+  /** Items and goals as intake sees them: rows from SQLite, races and active trains from the warm state. */
+  private intakeLookup(d: { state: ActiveState }): IntakeLookup {
+    const view = (i: WorkItemRecord): IntakeItem => {
+      const racing = d.state.races.find((r) => r.itemId === i.itemId && r.state === "RACING") ?? null;
+      const trains = d.state.trains.filter((t) => isActive(t) && !isCar(t) && t.promptId === i.itemId);
+      return {
+        itemId: i.itemId,
+        kind: i.kind,
+        status: i.status,
+        title: i.title,
+        parentId: i.parentId,
+        racing: racing ? { raceId: racing.raceId, entryClosesAt: racing.entryClosesAt ?? null } : null,
+        decided: trains.some((t) => t.phase === "PASSED" || t.phase === "LANDING" || !!t.carId || t.raceOutcome === "WON"),
+        activeNonRace: trains.some((t) => !t.raceId && !awaitingPush(t)),
+      };
+    };
+    return {
+      item: (itemId) => {
+        const i = this.loadItem(itemId);
+        return i ? view(i) : null;
+      },
+      goal: (slug) => {
+        let goal = this.loadItem(slug);
+        if (!goal || goal.kind !== "goal") {
+          goal =
+            this.sql
+              .exec("SELECT * FROM work_items WHERE kind = 'goal' ORDER BY seq DESC LIMIT 200")
+              .toArray()
+              .map(rowToWorkItem)
+              .find((g) => slugify(g.title) === slug.toLowerCase()) ?? null;
+        }
+        if (!goal || goal.kind !== "goal") return null;
+        const children = this.sql.exec("SELECT * FROM work_items WHERE parent_id = ? AND kind != 'goal' ORDER BY seq", goal.itemId).toArray().map(rowToWorkItem);
+        return { goal: view(goal), children: children.map(view) };
+      },
+    };
+  }
+
+  private submissionEvent(itemId: string | null, trainId: string | null, summary: string, data: Record<string, unknown>, actor: string, severity: EventDraft["severity"] = "info"): EventDraft {
+    return {
+      type: "submission.received",
+      severity,
+      actor: clip(actor, 340),
+      traceId: itemId ? (this.loadItem(itemId)?.traceId ?? traceIdFromUuid(itemId)) : null,
+      spanId: trainId ? spanIdFor(trainId) : null,
+      parentSpanId: itemId ? spanIdFor(itemId) : null,
+      itemId,
+      trainId,
+      summary: clip(summary, 500),
+      data,
+    };
   }
 
   // ── RPC surface: executor reports ─────────────────────────────────────
@@ -1081,6 +1524,8 @@ export class QueenNode extends DurableObject<Env> {
       phase: t.phase,
       traceId: traceOfTrain(t),
       baseSha: t.baseSha || null,
+      // T1: whose code (a non-drone origin makes the reviewer fail closed); absent = drone.
+      ...(!isCar(t) && t.origin ? { origin: { ...t.origin } } : {}),
     };
     if (!isCar(t)) return base;
     const members = (t.members ?? []).flatMap((id) => {
@@ -1141,7 +1586,10 @@ export class QueenNode extends DurableObject<Env> {
     });
     await this.commit(hive, acc);
     try {
-      this.ctx.storage.transactionSync(() => pruneEvents(this.sql, this.now()));
+      this.ctx.storage.transactionSync(() => {
+        pruneEvents(this.sql, this.now());
+        pruneSubmissions(this.sql, this.now() - SUBMISSION_RETENTION_MS);
+      });
     } catch (e) {
       console.error("queen: event prune failed", e);
     }
@@ -1252,7 +1700,10 @@ export class QueenNode extends DurableObject<Env> {
     const state = warm ?? this.cache.load(this.sql);
     this.cleanup = new Map(
       this.sql
-        .exec("SELECT * FROM merge_trains WHERE phase IN ('MERGED', 'EJECTED') AND (fork_state = 'DELETING' OR deploy_state = 'TEARING_DOWN')")
+        .exec(
+          `SELECT * FROM merge_trains WHERE phase IN ('MERGED', 'EJECTED')
+           AND (fork_state = 'DELETING' OR deploy_state = 'TEARING_DOWN' OR (fork_state = 'READY' AND origin_json IS NOT NULL))`,
+        )
         .toArray()
         .map((r) => {
           const t = rowToTrain(r);
@@ -1360,6 +1811,7 @@ export class QueenNode extends DurableObject<Env> {
         carInfraFailures: settings.carInfraFailures,
         paused: queuePaused,
       },
+      briefFor: (sha) => this.verdictNote(sha),
     });
     const releaseIds = state.releases.map((r) => r.releaseId);
     const releaseEscalations = releaseIds.length
@@ -1388,6 +1840,8 @@ export class QueenNode extends DurableObject<Env> {
         escalations: rpEscalations,
       },
     );
+    // T1: items whose pushed code is parked dispatch at width 1 (the push is the build: no drone races it).
+    let parkedItems = new Set<string>();
     const wp = new WorkPlanner(
       { items: state.items, claims: state.claims, escalations: open, settings, maxSeq: state.maxItemSeq },
       {
@@ -1398,7 +1852,7 @@ export class QueenNode extends DurableObject<Env> {
         commandTimeoutMs: commandTimeoutMs(this.env),
         itemOfTrain: (trainId) => this.itemOfTrain(trainId),
         widthOf: (item, slotsFree, s) =>
-          raceWidth({
+          parkedItems.has(item.itemId) ? 1 : raceWidth({
             action: "BUILD",
             bestOf: item.bestOf,
             difficulty: item.difficulty,
@@ -1425,6 +1879,7 @@ export class QueenNode extends DurableObject<Env> {
         attempts: p.attempts,
         ...(acc.itemConflicts.has(p.promptId) ? { conflicts: acc.itemConflicts.get(p.promptId)! } : {}),
         ...(acc.infraFailed.has(p.promptId) ? { infra: true } : {}),
+        ...(acc.awaiting.has(p.promptId) ? { awaiting: true } : {}),
       }));
       acc.work(
         wp.absorb({
@@ -1455,7 +1910,10 @@ export class QueenNode extends DurableObject<Env> {
       const merged = new Map(trainsAtStart);
       for (const t of acc.trains.values()) merged.set(t.trainId, t);
       const building = [...merged.values()].filter((t) => isActive(t) && !isCar(t)).length;
-      const dispatch = acc.work(wp.dispatchReady({ activeBuilds: building, leasedSlots: leased }));
+      // A pending push intent holds its targeted item READY; parked pushes resume at width 1.
+      const held = new Set([...merged.values()].filter(awaitingPush).map((t) => t.promptId));
+      parkedItems = new Set([...merged.values()].filter(isParked).map((t) => t.promptId));
+      const dispatch = acc.work(wp.dispatchReady({ activeBuilds: building, leasedSlots: leased, held }));
       for (const s of dispatch.dispatches) {
         const item = acc.items.get(s.itemId) ?? state.items.find((i) => i.itemId === s.itemId);
         acc.train(
@@ -1464,7 +1922,7 @@ export class QueenNode extends DurableObject<Env> {
             promptText: s.promptText,
             raceWidth: s.width,
             difficulty: s.difficulty,
-            ...(item ? { item: plannerItem(item) } : { item: { itemId: s.itemId, traceId: s.traceId, priority: s.priority, bestOf: s.bestOf } }),
+            ...(item ? { item: plannerItem(item), attempts: item.attempts } : { item: { itemId: s.itemId, traceId: s.traceId, priority: s.priority, bestOf: s.bestOf } }),
           }),
         );
       }
@@ -1574,7 +2032,11 @@ export class QueenNode extends DurableObject<Env> {
     try {
       this.ctx.storage.transactionSync(() => {
         if (acc.settings) upsertHiveSettings(this.sql, acc.settings);
-        for (const p of acc.prompts.values()) upsertPrompt(this.sql, p);
+        for (const p of acc.prompts.values()) {
+          upsertPrompt(this.sql, p);
+          // A pushed submission's prompt text is only known at gitPushed (the upsert keeps the original text).
+          this.sql.exec("UPDATE prompt_runs SET prompt_text = ? WHERE prompt_id = ? AND prompt_text != ?", p.promptText, p.promptId, p.promptText);
+        }
         for (const t of trains) upsertTrain(this.sql, t);
         for (const d of acc.deployments.values()) upsertDeployment(this.sql, d);
         for (const r of acc.releases.values()) upsertRelease(this.sql, r);
@@ -1588,6 +2050,11 @@ export class QueenNode extends DurableObject<Env> {
         if (router) saveRouter(this.sql, { dispatches: acc.routerDispatches, floor: acc.routerFloor });
         for (const [itemId, n] of acc.itemConflicts) {
           if (!acc.items.has(itemId)) this.sql.exec("UPDATE work_items SET conflicts = ? WHERE item_id = ?", n, itemId);
+        }
+        for (const sub of acc.submissions) insertSubmission(this.sql, sub);
+        for (const u of acc.submissionUpdates) updateSubmission(this.sql, u.key, u.patch);
+        for (const trainId of acc.abortedIntents) {
+          this.sql.exec("UPDATE submissions SET outcome = 'aborted:transient' WHERE train_id = ? AND outcome = 'pending'", trainId);
         }
         events = appendEvents(this.sql, drafts, { hive, ts: now });
         recordMetrics(this.sql, events, { now, activeBuilds });
@@ -1610,7 +2077,7 @@ export class QueenNode extends DurableObject<Env> {
       ...(acc.settings ? { settings: acc.settings } : {}),
     });
     for (const t of trains) {
-      if (!isActive(t) && (t.forkState === "DELETING" || t.deployState === "TEARING_DOWN")) this.cleanup.set(t.trainId, t);
+      if (!isActive(t) && (t.forkState === "DELETING" || t.deployState === "TEARING_DOWN" || keptFork(t))) this.cleanup.set(t.trainId, t);
       else this.cleanup.delete(t.trainId);
       if (t.passedSeq) this.maxPassedSeq = Math.max(this.maxPassedSeq, t.passedSeq);
     }
@@ -2139,7 +2606,16 @@ export class QueenNode extends DurableObject<Env> {
 
 /** A work item as the train planner needs it. */
 function plannerItem(i: WorkItemRecord): PlannerItem {
-  return { itemId: i.itemId, traceId: i.traceId, priority: i.priority, paths: [...i.paths], bestOf: i.bestOf, conflicts: i.conflicts };
+  return {
+    itemId: i.itemId,
+    traceId: i.traceId,
+    priority: i.priority,
+    paths: [...i.paths],
+    bestOf: i.bestOf,
+    conflicts: i.conflicts,
+    status: i.status,
+    ...(i.inbox?.handoff ? { handoff: true } : {}),
+  };
 }
 
 function sameSettings(a: HiveSettingsRecord, b: HiveSettingsRecord): boolean {

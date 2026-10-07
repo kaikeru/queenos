@@ -44,6 +44,19 @@
  * drone instance id)); every visible phase change is an EventDraft in
  * `PlanResult.events`.
  *
+ * Human-push design rev 2 (T1): pushed code arrives in PRE-FORKED trains. The git proxy forks hive main
+ * itself and pushes the contributor's code to the fork's `main`, so a contributed train (origin
+ * human / agent) never forks or dispatches a builder: `intent()` creates it in BUILDING with
+ * `forkState: PENDING` (the intent's watchdog clock is `forkIssuedAt`; no `gitPushed` within
+ * `commandTimeoutMs` ejects it, no attempt charged); `pushed()` adopts the fork (READY, headSha,
+ * baseSha) and either deploys its preview at once (DEPLOYING, exactly like a drone's build-result) or
+ * PARKS it (BUILDING, fork READY) until its item is dispatched, where `submit()` resumes it instead of
+ * forking a builder. A rejected contributed train is not reworked: its prompt FAILS ("awaiting
+ * contributor") and its fork is KEPT (EJECTED with `forkState: READY`; `deleteIssuedAt` holds the
+ * delete-after deadline, KEEP_FORK_MS) so a handoff can fork from it. With a handoff (`Queen: rework`,
+ * or the `handoff` action) the item reworks as a drone item, and the REWORK forks FROM the kept fork
+ * (`FORK.from`) with the rendered v1 note as its brief.
+ *
  * Every method returns the changed rows (for the DO to persist) plus an
  * explicit list of effects for the DO to execute afterwards.
  */
@@ -66,10 +79,12 @@ import type {
   ProvisionResult,
   QueenServerMessage,
   RecalledMemory,
+  SubmissionOrigin,
   TraceContext,
   TrainPhase as QueenTrainPhase,
   TrainResult,
   TrainState,
+  WorkStatus,
 } from "@queenos/queen-types";
 import { MAX_RECALL_QUERY, RACE_GRACE_MS, memoryToRagSnippet, spanIdFor, traceIdFromUuid, traceparent } from "@queenos/queen-types";
 import { droneInstanceId } from "../drones";
@@ -130,6 +145,28 @@ export const DEFAULT_MAX_CONFLICT_REWORKS = 2;
  * suspect car ahead (carForkGuard). BUILD trains and race candidates keep MAX_INFRA_ATTEMPTS.
  */
 export const MAX_INFRA_ATTEMPTS = MAX_COMMAND_ATTEMPTS;
+/** A rejected contributed train's fork is kept this long for a handoff (or until its item leaves FAILED). */
+export const KEEP_FORK_MS = 24 * 3_600_000;
+
+/** Whose code a train carries: a contributed (human / agent) train came through the git proxy. Absent origin = drone. */
+export function isContributed(t: Pick<TrainRecord, "origin" | "lane">): boolean {
+  return !!t.origin && t.origin.kind !== "drone" && t.lane !== "QUEUE";
+}
+
+/** A pre-forked train still waiting for its push (`gitIntent` accepted, no `gitPushed` yet). */
+export function awaitingPush(t: TrainRecord): boolean {
+  return isActive(t) && isContributed(t) && t.phase === "BUILDING" && t.forkState === "PENDING";
+}
+
+/** A pushed train parked until its item is dispatched (paused, budget, capacity, dependencies). */
+export function isParked(t: TrainRecord): boolean {
+  return isActive(t) && isContributed(t) && t.phase === "BUILDING" && t.forkState === "READY";
+}
+
+/** A rejected contributed train whose fork is kept for a handoff; `deleteIssuedAt` is its delete-after deadline. */
+export function keptFork(t: TrainRecord): boolean {
+  return !isActive(t) && isContributed(t) && t.forkState === "READY";
+}
 export const INFRA_RETRY_BASE_MS = 30_000;
 export const INFRA_RETRY_MAX_MS = 5 * 60_000;
 
@@ -264,6 +301,10 @@ export interface PlannerItem {
   bestOf?: number | null;
   /** Conflict reworks so far (work_items.conflicts; D7). */
   conflicts?: number;
+  /** The item's status at the start of the decision (kept forks are released once it leaves FAILED). */
+  status?: WorkStatus;
+  /** The contributor handed the item to the swarm (`Queen: rework` or the `handoff` action). */
+  handoff?: boolean;
 }
 
 export interface HiveState {
@@ -349,6 +390,11 @@ export interface PlannerContext {
   queue?: QueueOptions;
   /** v2: item priority for car member order (default: HiveState.items, else 2). */
   priorityOf?: (promptId: string) => number;
+  /**
+   * T1: the rendered v1 verdict note of a commit (the `notesFor` projection), the brief of a REWORK seeded
+   * from a contributor's rejected head. A read-only ledger lookup; absent or null = no brief.
+   */
+  briefFor?: (sha: string) => string | null;
 }
 
 export type Effect =
@@ -392,6 +438,10 @@ export interface PlanResult {
   executorLost?: boolean;
   /** Prompts FAILED on infrastructure (infra retries / executor attempts spent): EXECUTOR_LOST on the item, not REWORK_EXHAUSTED. */
   infraFailed?: { promptId: string; summary: string }[];
+  /** T1: prompts of contributed code FAILED at the gate: the item waits for its contributor (no escalation, no rework). */
+  awaitingContributor?: { promptId: string; summary: string }[];
+  /** T1: push intents ended without a push (gitAborted, the intent watchdog, or a newer push): submissions `aborted:transient`. */
+  abortedIntents?: string[];
 }
 
 const TERMINAL: ReadonlySet<TrainPhase> = new Set(["MERGED", "EJECTED"]);
@@ -468,12 +518,12 @@ export const UNDISPATCHED_RETRY_MS = 15_000;
 
 /** Whether the train's current-phase drone should be out but is not confirmed dispatched (reconcile sends it). */
 function droneUndispatched(t: TrainRecord): boolean {
-  return isActive(t) && !t.dispatched && ((t.phase === "BUILDING" && t.forkState === "READY") || t.phase === "LANDING");
+  return isActive(t) && !t.dispatched && !isContributed(t) && ((t.phase === "BUILDING" && t.forkState === "READY") || t.phase === "LANDING");
 }
 
 /** Whether the train's current-phase drone is out (dispatched, not yet reported). */
 function droneOutstanding(t: TrainRecord): boolean {
-  return isActive(t) && t.dispatched && ((t.phase === "BUILDING" && t.forkState === "READY") || t.phase === "LANDING");
+  return isActive(t) && t.dispatched && !isContributed(t) && ((t.phase === "BUILDING" && t.forkState === "READY") || t.phase === "LANDING");
 }
 
 /**
@@ -544,6 +594,7 @@ export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: numb
     if (at !== null) all.push(at);
     if (droneUndispatched(t)) all.push(now + UNDISPATCHED_RETRY_MS);
     if (forkOverdue(t, trains)) all.push(now + UNDISPATCHED_RETRY_MS);
+    if (keptFork(t) && t.deleteIssuedAt !== null) all.push(t.deleteIssuedAt);
   }
   for (const r of races) if (r.state === "RACING" && r.deadlineAt !== null) all.push(r.deadlineAt);
   return all.length ? Math.min(...all) : null;
@@ -595,6 +646,7 @@ export function toMergeTrainV2(t: TrainRecord): MergeTrain {
   if (t.changedPaths) v2.changedPaths = [...t.changedPaths];
   if (t.waitForCarSeq !== null && t.waitForCarSeq !== undefined) v2.waitForCarSeq = t.waitForCarSeq;
   if (t.lane === "QUEUE") v2.carSeq = t.seq;
+  if (t.origin) v2.origin = { ...t.origin };
   return { ...toMergeTrain(t), ...v2 };
 }
 
@@ -662,6 +714,8 @@ export class TrainPlanner {
   /** Car repos a car forked from failed on infra in this plan (carForkGuard: do not stack on them). */
   private readonly suspectRepos = new Set<string>();
   private infraFailed: { promptId: string; summary: string }[] = [];
+  private awaitingContributor: { promptId: string; summary: string }[] = [];
+  private abortedIntents: string[] = [];
   private readonly hooks: QueueHooks;
   private readonly activeBuildsAtStart: number;
   private landing = false;
@@ -701,11 +755,19 @@ export class TrainPlanner {
    * (the caller applied race.raceWidth(); the planner narrows it to the
    * number of distinct models the router can offer).
    */
-  submit(input: { promptId: string; promptText: string; raceWidth?: number; difficulty?: "normal" | "hard"; item?: PlannerItem }): PlanResult {
+  submit(input: { promptId: string; promptText: string; raceWidth?: number; difficulty?: "normal" | "hard"; item?: PlannerItem; attempts?: number }): PlanResult {
     // An item filed in the same decision (not in HiveState.items): its trace, priority and paths.
     if (input.item) {
       this.items.set(input.item.itemId, { ...input.item });
       if (input.item.conflicts !== undefined) this.conflicts.set(input.item.itemId, input.item.conflicts);
+    }
+    // T1: pushed code parked for this item is its build: resume it (no fork, no builder).
+    const parked = this.active().filter((t) => t.promptId === input.promptId && isParked(t));
+    if (parked.length) {
+      const prompt = this.ensurePrompt(input.promptId, input.promptText, input.attempts ?? this.prompts.get(input.promptId)?.attempts ?? 0);
+      this.setPromptStatus(prompt.promptId, "QUEUED");
+      for (const t of parked) this.resumePushed(t);
+      return this.finish("applied");
     }
     // A retried item re-submits its existing prompt id (attempts reset; filing order kept).
     const prev = this.prompts.get(input.promptId);
@@ -725,6 +787,258 @@ export class TrainPlanner {
     this.markPrompt(prompt);
     this.enqueue(prompt, "BUILD", input.raceWidth ?? 1);
     return this.finish("applied");
+  }
+
+  // ── T1: pushed submissions (pre-forked trains) ─────────────────────────
+
+  /**
+   * `gitIntent` accepted a push: a pre-forked BUILD train in BUILDING with `forkState: PENDING`. The proxy
+   * forks hive main under `artifactRepo` itself; nothing is dispatched. `promptId` is the targeted item, or
+   * the id intake will file the new item under. `forkIssuedAt` is the intent watchdog's clock.
+   */
+  intent(input: { trainId: string; promptId: string; origin: SubmissionOrigin; traceId?: string | null; promptText?: string }): PlanResult {
+    if (this.find(input.trainId)) return this.finish("ignored:duplicate");
+    // Every train row needs its prompt row (FK); `promptText` is passed when the item has none yet.
+    if (input.promptText !== undefined) this.ensurePrompt(input.promptId, input.promptText, this.prompts.get(input.promptId)?.attempts ?? 0);
+    const train: TrainRecord = {
+      ...this.blankTrain(input.trainId, input.promptId, "BUILD"),
+      phase: "BUILDING",
+      status: "BUILDING",
+      forkState: "PENDING",
+      forkSource: this.ctx.namespace,
+      forkCommandId: nextCommandId(input.trainId, "intent", null),
+      forkIssuedAt: this.ctx.now,
+      traceId: input.traceId ?? this.item(input.promptId)?.traceId ?? traceIdFromUuid(input.promptId),
+      origin: { ...input.origin },
+    };
+    this.trains.push(train);
+    this.markTrain(train);
+    this.event(train, {
+      type: "train.enqueued",
+      summary: clip500(`push intent: train ${train.trainId} (${train.artifactRepo}) for ${input.promptId} from ${input.origin.kind}:${input.origin.id}`),
+      data: { action: "BUILD", lane: "BUILD", origin: input.origin, preForked: true },
+    });
+    return this.finish("applied");
+  }
+
+  /**
+   * `gitPushed`: the push landed on the pre-forked train's `main`. The train becomes the item's submission:
+   * it adopts the fork (READY, head, base), joins or creates the item's race when correlated, and enters the
+   * pipeline exactly where a drone's build-result does (DEPLOYING → preview → gate), unless its item is not
+   * ACTIVE yet (`resume: false`): then it is parked until the item is dispatched (paused, budget, capacity).
+   */
+  pushed(input: {
+    trainId: string;
+    headSha: string;
+    baseSha: string;
+    origin: SubmissionOrigin;
+    promptId: string;
+    promptText: string;
+    attempts: number;
+    item: PlannerItem;
+    race: { join: string } | { create: true } | null;
+    resume: boolean;
+  }): PlanResult {
+    const t = this.find(input.trainId);
+    if (!t || !isContributed(t)) return this.finish("ignored:unknown");
+    if (!isActive(t)) return this.finish("ignored:stale");
+    if (!awaitingPush(t)) return this.finish("ignored:duplicate");
+    this.items.set(input.item.itemId, { ...input.item });
+    const prompt = this.ensurePrompt(input.promptId, input.promptText, input.attempts);
+    this.setTrain(t, {
+      promptId: input.promptId,
+      includedPrompts: [input.promptId],
+      traceId: input.item.traceId ?? traceIdFromUuid(input.promptId),
+      origin: { ...input.origin },
+      headSha: input.headSha,
+      baseSha: input.baseSha,
+      forkState: "READY",
+      artifactRepo: t.artifactRepo,
+    });
+    let race = input.race && "join" in input.race ? this.races.get(input.race.join) : undefined;
+    if (race && race.state !== "RACING") race = undefined;
+    if (race) {
+      this.setRace(race, { trainIds: [...race.trainIds, t.trainId] });
+      this.setTrain(t, { raceId: race.raceId, candidate: race.trainIds.length - 1, raceOutcome: "RACING" }, false);
+      this.event(t, {
+        type: "train.enqueued",
+        summary: clip500(`pushed train ${t.trainId} joined race ${race.raceId} as candidate ${race.trainIds.length} (${input.origin.kind})`),
+        data: { action: "BUILD", lane: "BUILD", raceId: race.raceId, candidate: race.trainIds.length - 1, origin: input.origin, joined: true },
+      });
+    } else if (input.race) {
+      const raceId = this.ctx.newId();
+      const created: RaceRecord = {
+        raceId,
+        itemId: input.promptId,
+        width: 1,
+        state: "RACING",
+        trainIds: [t.trainId],
+        winnerTrainId: null,
+        reason: null,
+        deadlineAt: null,
+        createdAt: this.ctx.now,
+        decidedAt: null,
+        entryClosesAt: null,
+      };
+      this.races.set(raceId, created);
+      this.dirtyRaces.add(raceId);
+      this.setTrain(t, { raceId, candidate: 0, raceOutcome: "RACING" }, false);
+      this.events.push({
+        type: "race.started",
+        actor: ACTOR,
+        traceId: traceOfTrain(t),
+        spanId: spanIdFor(raceId),
+        parentSpanId: spanIdFor(input.promptId),
+        itemId: input.promptId,
+        trainId: t.trainId,
+        summary: clip500(`race ${raceId}: opened for a ${input.origin.kind} submission (train ${t.trainId})`),
+        data: { raceId, width: 1, trainIds: [t.trainId], models: [], action: "BUILD", origin: input.origin },
+      });
+    }
+    if (input.resume) {
+      this.resumePushed(t);
+    } else {
+      this.setPromptStatus(prompt.promptId, "QUEUED");
+    }
+    return this.finish("applied");
+  }
+
+  /** A parked (or just pushed) contributed train enters the pipeline: preview deploy, then the gate. */
+  private resumePushed(t: TrainRecord): void {
+    if (!isParked(t)) return;
+    this.setTrain(t, { phase: "DEPLOYING" });
+    this.promptStatus(t, "IN_TRAIN");
+    this.deployPreview(t);
+  }
+
+  /**
+   * `gitAborted` (or a newer push of the same branch replacing a stale intent): the push never landed.
+   * The intent's train is EJECTED with no attempt charged and its fork, if the proxy made one, is deleted.
+   * A train that was already pushed is never aborted (ignored:stale).
+   */
+  abort(trainId: string, reason: string): PlanResult {
+    const t = this.find(trainId);
+    if (!t || !isContributed(t)) return this.finish("ignored:unknown");
+    if (!isActive(t)) return this.finish("ignored:duplicate");
+    if (!awaitingPush(t)) return this.finish("ignored:stale");
+    this.endIntent(t, `push aborted: ${reason}`);
+    return this.finish("applied");
+  }
+
+  private endIntent(t: TrainRecord, reason: string): void {
+    this.eject(t, clip500(reason));
+    this.abortedIntents.push(t.trainId);
+  }
+
+  /**
+   * A re-push of the same branch replaces the contributor's train while it is not yet in a car (§6.2):
+   * EJECTED ("superseded by push <sha>", race outcome LOST), no attempt charged, fork deleted, preview torn
+   * down. Call it AFTER the new train joined the race, so the race does not decide without it.
+   */
+  supersede(trainId: string, byHead: string): PlanResult {
+    const t = this.find(trainId);
+    if (!t || !isContributed(t)) return this.finish("ignored:unknown");
+    if (!isActive(t)) return this.finish("ignored:stale");
+    if (awaitingPush(t)) {
+      this.endIntent(t, `superseded by push ${byHead.slice(0, 7)} before it landed`);
+      return this.finish("applied");
+    }
+    if (t.carId || t.phase === "LANDING") return this.finish("ignored:stale");
+    const race = this.racingRaceOf(t);
+    this.eject(t, `superseded by push ${byHead.slice(0, 7)}`, race ? { raceOutcome: "LOST" } : {});
+    if (race) this.maybeDecide(race);
+    this.maybeLand();
+    return this.finish("applied");
+  }
+
+  /**
+   * The contributor hands a FAILED item to the swarm (§6.3, `workAction handoff`): a REWORK as for drones,
+   * under maxReworks, forked FROM the rejected submission's kept fork when it still exists. The item's
+   * prompt row is passed in (a FAILED prompt is not in the warm state).
+   */
+  handoff(input: { promptId: string; promptText: string; summary: string | null; attempts: number; item: PlannerItem }): PlanResult {
+    this.items.set(input.item.itemId, { ...input.item, handoff: true });
+    const p = this.ensurePrompt(input.promptId, input.promptText, input.attempts);
+    if (input.summary) this.setPromptSummary(p.promptId, input.summary);
+    this.rework(p.promptId);
+    this.maybeLand();
+    return this.finish("applied");
+  }
+
+  /** The prompt row of an item, created (or refreshed) for a pushed or handed-off submission. */
+  private ensurePrompt(promptId: string, promptText: string, attempts: number): PromptRecord {
+    const prev = this.prompts.get(promptId);
+    if (prev) {
+      if (prev.attempts !== attempts || prev.promptText !== promptText) {
+        prev.attempts = attempts;
+        prev.promptText = promptText;
+        this.markPrompt(prev, false);
+      }
+      return prev;
+    }
+    const prompt: PromptRecord = {
+      promptId,
+      namespace: this.ctx.namespace,
+      promptText,
+      status: "QUEUED",
+      createdAt: this.ctx.now,
+      seq: ++this.maxPromptSeq,
+      summary: null,
+      attempts,
+    };
+    this.prompts.set(promptId, prompt);
+    this.markPrompt(prompt);
+    return prompt;
+  }
+
+  /** The blank row every new BUILD / QUEUE train starts from. */
+  private blankTrain(trainId: string, promptId: string, action: TrainAction): TrainRecord {
+    return {
+      trainId,
+      baseSha: "",
+      includedPrompts: [promptId],
+      artifactRepo: trainRepoName(this.ctx.namespace, trainId),
+      status: "BUILDING",
+      createdAt: this.ctx.now,
+      seq: ++this.maxTrainSeq,
+      promptId,
+      phase: "WAITING_PARENT",
+      forkState: "NONE",
+      forkSource: null,
+      headSha: null,
+      landedSha: null,
+      summary: null,
+      reason: null,
+      action,
+      dispatched: false,
+      forkCommandId: null,
+      deleteCommandId: null,
+      deployState: "NONE",
+      deployCommandId: null,
+      teardownCommandId: null,
+      previewUrl: null,
+      forkIssuedAt: null,
+      deleteIssuedAt: null,
+      deployIssuedAt: null,
+      teardownIssuedAt: null,
+      droneIssuedAt: null,
+      droneAttempt: 1,
+      model: null,
+      modelReason: null,
+      modelChoice: null,
+      modelChoiceAttempt: null,
+      modelOutcome: null,
+      modelProbe: false,
+      memories: [],
+      traceId: null,
+      lane: "BUILD",
+      raceId: null,
+      candidate: null,
+      raceOutcome: null,
+      carId: null,
+      passedSeq: null,
+      waitForCarSeq: null,
+    };
   }
 
   /** The Provisioner reports a FORK or DELETE outcome (matched by command id). */
@@ -1007,8 +1321,12 @@ export class TrainPlanner {
         this.emitTeardown(t);
       }
     }
+    this.releaseKeptForks();
     for (const t of this.active()) {
-      if (t.phase === "WAITING_PARENT") {
+      if (isContributed(t) && (t.phase === "BUILDING" || t.phase === "WAITING_PARENT")) {
+        // Pre-forked: the proxy forks and pushes; nothing to (re-)send. The intent watchdog bounds it.
+        continue;
+      } else if (t.phase === "WAITING_PARENT") {
         this.scheduleFork(t);
       } else if (t.forkState === "PENDING") {
         const source = this.forkSourceFor(t);
@@ -1101,6 +1419,10 @@ export class TrainPlanner {
         else this.teardownFailed(t, late("Herald TEARDOWN", t.teardownCommandId));
       }
       if (!isActive(t)) continue;
+      if (awaitingPush(t)) {
+        if (expired(t.forkIssuedAt)) this.endIntent(t, `push intent expired: no gitPushed within ${Math.round(this.timeoutMs / 60_000)} min`);
+        continue;
+      }
       if (t.forkState === "PENDING" && expired(t.forkIssuedAt)) {
         this.forkFailed(t, late("Provisioner FORK", t.forkCommandId));
       } else if (t.phase === "DEPLOYING" && t.deployState === "PENDING" && expired(t.deployIssuedAt)) {
@@ -1284,6 +1606,7 @@ export class TrainPlanner {
         hive: this.ctx.namespace,
         trainId: t.trainId,
         sourceRepo: t.forkSource!,
+        ...seedFrom(this.seedOf(t)),
         forkName: t.artifactRepo,
         ...this.recallQuery(t),
         trace: traceFor(t, t.forkCommandId!),
@@ -1488,9 +1811,63 @@ export class TrainPlanner {
       this.raceCandidateFailed(t, race, summary);
       return;
     }
+    if (isContributed(t)) {
+      // Human / agent code (§6.2): its fork is kept for a handoff; no auto-rework unless handed off.
+      this.ejectKeepingFork(t, `failed: ${summary}`, opts.conflict ? { conflict: opts.conflict } : {});
+      if (this.handoffOf(t.promptId)) this.rework(t.promptId, opts);
+      else this.awaitContributor(t.promptId, summary);
+      this.maybeLand();
+      return;
+    }
     this.eject(t, `failed: ${summary}`, opts.conflict ? { conflict: opts.conflict } : {});
     this.rework(t.promptId, opts);
     this.maybeLand();
+  }
+
+  /** The contributor handed this item to the swarm. */
+  private handoffOf(promptId: string): boolean {
+    return this.item(promptId)?.handoff === true;
+  }
+
+  /** A contributed item's code was rejected: the prompt FAILS and the item waits for its contributor (no escalation). */
+  private awaitContributor(promptId: string, summary: string): void {
+    const p = this.prompts.get(promptId);
+    if (!p) return;
+    this.setPromptSummary(p.promptId, clip500(summary));
+    this.setPromptStatus(p.promptId, "FAILED");
+    this.awaitingContributor.push({ promptId: p.promptId, summary: clip500(summary) });
+  }
+
+  /** EJECTED like eject(), but the fork is kept until `now + KEEP_FORK_MS` (deleteIssuedAt) for a handoff. */
+  private ejectKeepingFork(t: TrainRecord, reason: string, extra: Partial<TrainRecord> = {}): void {
+    if (t.forkState !== "READY") {
+      this.eject(t, reason, extra);
+      return;
+    }
+    this.setTrain(t, { ...extra, phase: "EJECTED", reason, deleteIssuedAt: this.ctx.now + KEEP_FORK_MS });
+    if (PREVIEW_EXISTS.has(t.deployState)) this.teardownPreview(t);
+  }
+
+  /** The newest kept fork of a prompt (a REWORK's seed: the contributor's rejected head). */
+  private seedOf(t: TrainRecord): { repo: string; headSha: string } | null {
+    if (t.action !== "REWORK" || isCar(t) || !this.handoffOf(t.promptId)) return null;
+    const kept = this.trains.filter((x) => keptFork(x) && x.promptId === t.promptId && x.headSha).sort((a, b) => a.seq - b.seq).at(-1);
+    return kept ? { repo: kept.artifactRepo, headSha: kept.headSha! } : null;
+  }
+
+  /**
+   * Delete kept forks no longer needed for a handoff (alarm): past their delete-after deadline, or once the
+   * item left FAILED and no REWORK of it is active (a seeded REWORK forks from, and is briefed by, the newest one).
+   */
+  private releaseKeptForks(): void {
+    for (const t of this.trains) {
+      if (!keptFork(t)) continue;
+      const due = t.deleteIssuedAt === null || this.ctx.now >= t.deleteIssuedAt;
+      const newest = !this.trains.some((x) => keptFork(x) && x.promptId === t.promptId && x.seq > t.seq);
+      const reworking = this.trains.some((x) => isActive(x) && !isCar(x) && x.promptId === t.promptId && x.action === "REWORK");
+      const needed = newest && (this.item(t.promptId)?.status === "FAILED" || reworking);
+      if (due || !needed) this.deleteFork(t);
+    }
   }
 
   /** The prompt's train failed: EJECTED, then a REWORK (or FAILED past the cap). */
@@ -1747,7 +2124,10 @@ export class TrainPlanner {
 
   /** A candidate failed (gate, build, watchdog): eject it alone; no rework yet. */
   private raceCandidateFailed(t: TrainRecord, race: RaceRecord, summary: string): void {
-    this.eject(t, `failed in race: ${summary}`, { raceOutcome: "FAILED", summary: clip500(summary) });
+    const why = `failed in race: ${summary}`;
+    const patch: Partial<TrainRecord> = { raceOutcome: "FAILED", summary: clip500(summary) };
+    if (isContributed(t)) this.ejectKeepingFork(t, why, patch);
+    else this.eject(t, why, patch);
     this.maybeDecide(race);
   }
 
@@ -1787,7 +2167,9 @@ export class TrainPlanner {
     this.raceEvent(race, best ?? cands[0], `race ${race.raceId} abandoned: no candidate passed`, { outcome: "ABANDONED", best: best?.trainId ?? null }, "warn");
     if (prompt) {
       this.setPromptSummary(prompt.promptId, why);
-      this.rework(prompt.promptId);
+      // Only contributed candidates (a race a push opened): the item waits for its contributor, unless handed off.
+      if (cands.length && cands.every(isContributed) && !this.handoffOf(prompt.promptId)) this.awaitContributor(prompt.promptId, why);
+      else this.rework(prompt.promptId);
     }
     this.maybeLand();
   }
@@ -1849,8 +2231,17 @@ export class TrainPlanner {
       ragContext: t.memories.map(memoryToRagSnippet),
       ...(t.action === "REWORK" && p.summary ? { scribeSummary: p.summary } : {}),
       modelChoice,
+      ...this.seedTask(t),
     };
     this.pushDrone(t, task);
+  }
+
+  /** A seeded REWORK (handoff): where its code starts, and the rendered v1 note of the rejected head as its brief. */
+  private seedTask(t: TrainRecord): Pick<DroneTask, "seed" | "brief"> {
+    const seed = this.seedOf(t);
+    if (!seed) return {};
+    const brief = this.ctx.briefFor?.(seed.headSha) ?? null;
+    return { seed: { repo: seed.repo, ref: "refs/heads/main", headSha: seed.headSha }, ...(brief ? { brief } : {}) };
   }
 
   /** A car's "builder": the deterministic MERGE drone (no LLM, no model choice). */
@@ -2148,8 +2539,12 @@ export class TrainPlanner {
       ...(this.carInfraDirty ? { carInfraFailures: this.carInfraFailures } : {}),
       ...(this.executorLost ? { executorLost: true } : {}),
       ...(this.infraFailed.length ? { infraFailed: this.infraFailed } : {}),
+      ...(this.awaitingContributor.length ? { awaitingContributor: this.awaitingContributor } : {}),
+      ...(this.abortedIntents.length ? { abortedIntents: this.abortedIntents } : {}),
     };
     this.infraFailed = [];
+    this.awaitingContributor = [];
+    this.abortedIntents = [];
     this.modelDeltas = [];
     this.events = [];
     this.landed = null;
@@ -2165,6 +2560,11 @@ export class TrainPlanner {
     this.effects = [];
     return result;
   }
+}
+
+/** `FORK.from` for a seeded REWORK (absent: fork `sourceRepo`, hive main). */
+function seedFrom(seed: { repo: string } | null): { from?: string } {
+  return seed ? { from: seed.repo } : {};
 }
 
 function toCandidate(t: TrainRecord): RaceCandidate {
