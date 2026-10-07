@@ -1,0 +1,8 @@
+{
+  "name": "queenos",
+  "version": "0.1.0",
+  "description": "Contribute code to a QueenOS hive from Claude Code: push to your inbox, read verdict notes, rework rejected submissions.",
+  "author": { "name": "QueenOS" },
+  "license": "MIT",
+  "keywords": ["queenos", "git", "inbox", "agents"]
+}

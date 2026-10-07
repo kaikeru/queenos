@@ -156,16 +156,27 @@ git push queen tip-jar                # username: queen, password: <password>
 
 ```bash
 git fetch queen 'refs/notes/*:refs/notes/*'
-git log --notes=queen -1
+git log --notes=verdict --notes=review -1
 ```
 ```
-Notes (queen):
-    queen: REJECTED by SECURITY  (item 3c1e…  train 7a90…  2026-10-07 14:06Z)
-    error src/features/tip-jar.js:12 fetch to non-allowlisted host "tips.example.com"
-    next: push a fix to tip-jar, or hand off: https://queenos.kaikeru.com/p/demo/items/3c1e…
+Notes (verdict):
+    REJECTED by SECURITY: fetch to a non-allowlisted host. Push a fix to tip-jar, or hand off: https://queenos.kaikeru.com/p/demo/items/3c1e…
+
+    Queen-Note: v1
+    Queen-Kind: verdict
+    Queen-Verdict: REJECTED
+    Queen-Item: 3c1e…
+    Queen-Train: 7a90…
+    Queen-Origin: drone:gatekeeper
+Notes (review):
+    Queen-Note: v1
+    Queen-Kind: finding
+    Queen-Finding: error src/features/tip-jar.js:12 fetch to non-allowlisted host "tips.example.com"
 ```
 
-Later milestones are appended to the same note: `PASSED`, `QUEUED in car <id>`, `CONFLICT`, `LANDED main@<sha>`, `SHIPPED <release>` or `ROLLED BACK`. The dashboard shows the same item with a **human** (or **agent**) origin badge.
+This is the machine-readable note format v1 (§7.1). It is the same loop for a human, Claude Code, Codex or a script: fetch the notes, read the rejection, fix, push. See `docs/agent-protocol.md` and the Claude Code plugin at `plugins/queenos/`.
+
+Later milestones are appended as further verdict notes on the same commit: `PASSED`, `QUEUED in car <id>`, `CONFLICT`, `LANDED main@<sha>`, `SHIPPED <release>` or `ROLLED BACK`. The dashboard shows the same item with a **human** (or **agent**) origin badge.
 
 ### 3.4 Fix it yourself, or hand off to the swarm
 
@@ -191,7 +202,7 @@ Later milestones are appended to the same note: `PASSED`, `QUEUED in car <id>`, 
 | Component | New responsibility |
 |---|---|
 | **edge** (`apps/edge/src/app.ts`) | `POST` and `DELETE /api/hives/:hive/inbox` behind Access: Queen `registerInbox`, then `InboxKeys.open` or `revoke`. Never logs the token. |
-| **provisioner** (`apps/provisioner`) | `InboxKeys` entrypoint: `open` gets or forks `<hive>-in-<handle>`, fast-forwards inbox `main` to hive main (the lander's fetch-then-push pattern), mints a write token (24 h) and returns it. `revoke` revokes the inbox's tokens. New Workflow op **`NOTE`** appends a note on `repo@sha` under `refs/notes/queen`. **It mints tokens only for names that match `^<hive>-in-[a-z0-9]{1,24}$`.** |
+| **provisioner** (`apps/provisioner`) | `InboxKeys` entrypoint: `open` gets or forks `<hive>-in-<handle>`, fast-forwards inbox `main` to hive main (the lander's fetch-then-push pattern), mints a write token (24 h) and returns it. `revoke` revokes the inbox's tokens. New Workflow op **`NOTE`** appends a note on `repo@sha` under `ref` (default `refs/notes/verdict`). **It mints tokens only for names that match `^<hive>-in-[a-z0-9]{1,24}$`.** |
 | **gatekeepers** (`event.ts`, `orchestrate.ts`) | `classifyPush`: an inbox repo with `refs/heads/*` (not `main`) → `intake`, then one step: Queen `submit(Submission)`. Notes refs are already ignored (event.ts:119). Every BUILD gate scans `changedBetween(baseSha, head)`. A non-drone origin fails closed when the reviewer is unavailable. |
 | **Queen** (`work/inbox.ts` new, planner, queen-node) | `registerInbox`; `submit`: dedupe, contributor lookup, caps, file or reopen the item, supersede; PIN trains; NOTE effects at milestones; `handoff`. |
 | **drones** | `PIN` action (no LLM): fetch `inbox ref`, check `headSha`, push it to train fork `main` (force), report `BuildResult` with `changedPaths`. REWORK with `seed`: pin first, then build. Then write back to the inbox branch (fast-forward only, else `<branch>-queen`). |
@@ -217,7 +228,7 @@ human        Artifacts            gatekeepers          Queen (decide)           
   │           │                       │ scans, smoke, REVIEWER (always for BUILD lane)        │
   │           │                       │── train-result ────▶│ PASSED → car → … (unchanged)    │
   │           │                       │                     │ or FAILED: NOTE effect ────────▶│ provisioner NOTE → inbox
-  │           │◀───────────────── refs/notes/queen push (filtered: notes-ref) ────────────────│
+  │           │◀───────────────── refs/notes/verdict push (filtered: notes-ref) ────────────────│
 ```
 
 **Latency (estimate, UNVERIFIED end to end):**
@@ -362,31 +373,110 @@ There are no new phases.
 
 ### 6.3 Handoff: human and agent on one branch
 
-1. The REWORK drone is dispatched with `seed`. It runs the PIN body (train `main` = the human's head), then the builder with the Scribe summary (the reviewer and scan findings), and pushes the train fork.
-2. It reports `BuildResult`, which is a Submission with origin `drone` and the item linked.
+1. The REWORK drone is dispatched with `seed`. It runs the PIN body (train `main` = the human's head), then the builder, and pushes the train fork. **Its brief is the note(s) on the rejected commit** (`refs/notes/verdict` rework brief and verdict, `refs/notes/review` findings), fetched and read exactly as a human or external agent would read them (§7). The Queen still decides to rework, from its ledger; the notes are only the brief (§7.3).
+2. It reports `BuildResult`, which is a Submission with origin `drone` and the item linked. Its head commit's note carries `Queen-Replies-To: <rejected sha>`, so the rework chain can be followed in history.
 3. Then it writes back: it pushes the new head to `inbox refs/heads/<ref>` if that is a fast-forward (the human has not pushed since); otherwise it pushes to `<ref>-queen`.
 4. The resulting push event is `ignored:own-push`. The Queen recorded the head in step 2, before the write-back.
 
 ---
 
-## 7. Notes write-back
+## 7. Notes are the protocol, the ledger is the truth
+
+Decided by the user, 2026-10-07. This section both defines the notes protocol (7.1 to 7.9) and keeps the write-back mechanics (7.10).
+
+### 7.1 Principle
+
+Git notes are QueenOS's **outward feedback protocol for humans and agents**. Verdicts, review findings, rework briefs and provenance are attached to the exact commit they judge. They travel with `fetch` and `fork` and show up in `git log --notes=...`, with no SDK or API needed. Any agent that speaks git (Claude Code, Codex, a script) can close the loop: fetch the notes, read the rejection, fix, push. External agents: see `docs/agent-protocol.md` and the Claude Code plugin at `plugins/queenos/`.
+
+### 7.2 Rework reads notes
+
+The Queen still **decides** rework (from its SQLite ledger: attempts, `maxReworks`, origin, handoff) and dispatches the drone. The REWORK drone's **brief is the note(s) on the rejected commit**, read exactly as a human or external agent would read them. The rework commit's own note carries `Queen-Replies-To: <rejected sha>`, so the chain (reject, rework, reject, rework, pass) can be followed in plain `git log --notes`.
+
+### 7.3 Notes are never authority
+
+Inbox owners can write notes into their own fork, so a forged `Queen-Verdict: PASSED` is possible.
+- The Queen decides **only from its ledger**. Notes are a projection of it.
+- Drones treat notes as a **brief, not permission**. A note can tell a drone what to fix; it can never make code pass, land or skip a gate.
+- The lander carries forward **only Queen-written notes** (those the provisioner's `NOTE` op wrote into a train fork), never notes from an inbox fork (§2.4 row 10, §8).
+- Any note the Queen relies on (for example a rework brief) must be **re-derivable from the ledger**. If the fetched note is missing or does not match, the Queen regenerates the brief from its ledger and the drone uses that.
+
+### 7.4 Note format v1
+
+A human-readable summary line, an optional body, then trailer lines. Total at most `MAX_NOTE_TEXT` (2000 characters, `executors.ts`).
+
+```
+<summary line>
+
+<optional body>
+
+Queen-Note: v1
+Queen-Kind: verdict | finding | rework-brief | provenance | memory
+Queen-Verdict: PASSED | REJECTED | INFRA | LANDED | SUPERSEDED   (kind verdict)
+Queen-Item: <itemId>
+Queen-Train: <trainId>
+Queen-Trace: <traceId>
+Queen-Origin: drone:<id> | human:<email> | agent:<id>
+Queen-Model: <model id>                     (when a drone)
+Queen-Finding: <severity> <path>[:<line>] <message>   (repeatable)
+Queen-Replies-To: <sha>                     (a rework answering a rejection)
+Queen-Memory: <memoryId> used|ignored        (repeatable; kind memory)
+```
+
+- **Unknown keys are ignored** (forward compatible); `Queen-Note: v1` is the version gate.
+- **Contract (T0b):** a Zod schema plus a renderer and a parser in `packages/queen-types/src/notes.ts`. The renderer clips the body and findings to fit 2000 characters (findings dropped last-first, with a "+N more" line). The parser follows `parseSubmissionTrailers` (`inbox.ts`): case-insensitive keys, trailers on lines of their own, validated ids. Both ends (Queen, provisioner, drones, gatekeepers, the plugin) use these helpers; nobody hand-formats a note.
+- hive-kit already has the primitives (`addNote`, `readNote`, `pushNotes`, `NOTES_REF = refs/notes/queen` in `git.ts`). `refs/notes/queen` already holds the Cognitive Ledger `GitNotesPayload` JSON (`ledger.ts`) on hive-main commits, unchanged. The v1 note is a separate, text-first format for outward feedback and lives on **other refs** (§7.5), because git keeps one note per commit per ref and mixing formats would break both parsers.
+
+### 7.5 Refs per purpose and writer
+
+Separate refs reduce push contention and let a reader fetch only what it needs.
+
+| Ref | Holds | Written by |
+|---|---|---|
+| `refs/notes/verdict` | verdicts, rework briefs (v1) | provisioner `NOTE` op (the Queen's milestones) |
+| `refs/notes/review` | findings | gatekeeper (T4), through the `NOTE` op |
+| `refs/notes/provenance` | model, trace, memories (kinds `provenance`, `memory`) | drone (builder), through the `NOTE` op |
+| `refs/notes/queen` | **internal Cognitive Ledger JSON** (`GitNotesPayload`, hive-kit `NOTES_REF`); unchanged, already in hive history | drones and the lander (existing). **Never parse it as v1, never write v1 to it.** |
+
+**Collision rule: one format per ref, and parsers must ignore refs they do not own.** The v1 parser reads only `verdict`, `review` and `provenance`; the ledger code reads only `queen`. A note that lacks `Queen-Note: v1` is not v1.
+
+Fetch everything with `git fetch queen 'refs/notes/*:refs/notes/*'`, or one ref. `NOTE` takes a `ref` (one of the three v1 refs, default `refs/notes/verdict`) and `text`. The gatekeeper filter already ignores all `refs/notes/*` pushes (event.ts:119).
+
+### 7.6 Timing
+
+Notes are pushes, and pushes trigger the Artifacts per-repo 503 episodes (commit 1deb7ab). So:
+- Write verdict notes **after a gate finishes**, never immediately before something reads that repo (the PIN, MERGE, lander or next gate).
+- `NOTE` writes are **retried and non-blocking**. Failure after retries records a `note.failed` event; nothing waits on it or is ejected for it.
+
+### 7.7 Carry-forward
+
+Rework and merge commits reference prior notes through `Queen-Replies-To` (a rework points at the rejected sha). The lander copies **Queen-written** notes from the train fork into hive main, and copies nothing from an inbox fork (§7.3).
+
+### 7.8 Memory bonus
+
+A `Queen-Kind: memory` note on `refs/notes/provenance` records which hive memories the builder was given and which it cited (`Queen-Memory: <memoryId> used|ignored`, repeatable). This closes the HANDOFF gap "the dashboard shows recalled memories but not whether the builder used them": the dashboard reads the projection from the ledger, and the note makes it visible in git.
+
+### 7.9 External agents
+
+An outside agent needs only git: `docs/agent-protocol.md` is the agent-facing protocol (get an inbox, push, fetch notes, parse the trailers, fix, re-push) and `plugins/queenos/` is the Claude Code plugin that automates that loop.
+
+### 7.10 Write-back mechanics
 
 - **Writer:** the provisioner's `NOTE` op, dispatched by the Queen as a `provision` effect with `commandId <trainId>-note-<n>` at these milestones:
-  - gate verdict (pass or reject, with the summary and up to 8 findings);
+  - gate verdict (pass or reject, with the summary; up to 8 findings go to `refs/notes/review` as `Queen-Finding` trailers);
   - conflict;
   - integration failure;
   - LANDED;
   - SHIPPED or ROLLED BACK.
 - **Why the provisioner:** it already owns repo administration (fork, delete, create, tokens). This keeps drones on code. The gatekeeper does not write notes today (its verdicts are `appendAudits` to the Queen), and later milestones are the Queen's to announce anyway.
 - **Body:**
-  1. fetch the inbox's `refs/notes/queen` (depth 1);
+  1. fetch the inbox's notes ref (`ref`, default `refs/notes/verdict`; depth 1);
   2. read the existing note on `sha`;
-  3. **append** (a separator line, up to 8 KB per commit);
+  3. **append** (a separator line, up to 8 KB per commit; each appended entry is one v1 note of at most 2000 characters);
   4. `addNote` and push **without** force;
   5. on a non-fast-forward, re-fetch and retry (3×).
   - Day 1 pushed notes with `force: true`. Force here would lose concurrent milestones.
-- **Event loop:** a notes push fires `repo.pushed` (day1 row 8). `classifyPush` drops `refs/notes/*` before anything else (event.ts:119, verified in code). The inbox inherits the hive's `refs/notes/queen` at fork time (day1 row 1), so `git log --notes=queen` also shows the swarm's ledger on main's history.
-- **The hive ledger:** the same NOTE is also written to the train fork, so the lander's `carryNotes` brings the verdict to hive main. Notes the human writes in their own inbox are never read.
+- **Event loop:** a notes push fires `repo.pushed` (day1 row 8). `classifyPush` drops `refs/notes/*` before anything else (event.ts:119, verified in code). The inbox inherits the hive's `refs/notes/queen` (the internal ledger JSON) at fork time (day1 row 1), so `git log --notes=queen` shows the swarm's ledger on main's history; the outward verdicts are under `--notes=verdict`.
+- **The hive ledger:** the same NOTE is also written to the train fork, so the lander's `carryNotes` brings the (Queen-written) verdict to hive main. Notes the human writes in their own inbox are never read or carried (§7.3).
 - **Drone submissions:** no NOTE (nobody reads a train fork, and it adds Artifacts load). The verdict reaches the hive through the event log, as today.
 
 ---
@@ -403,7 +493,7 @@ There are no new phases.
 | Untrusted code | The same exposure as LLM code: Worker Preview per train, policy, security and allowlist scans, reviewer, integration gate, staging, Sentinel. **Fix required (T4):** scan `changedBetween(baseSha, head)` (§2.4 row 7), or modified files escape the in-diff scan. Also: changes to `.queen/**`, `wrangler.*` and `package.json` from a non-drone origin are a policy **error**, since the deploy config is not a contributor's to change. |
 | Reviewer fails open | For drones it fails open on infra (orchestrate.ts:406). For human or agent origin it **fails closed**: the train is reported as `cause: "infra"`, so it is re-gated and never passed unreviewed. |
 | Abuse | Per-contributor open-item and hourly push caps; `(repo, after)` dedupe; global `maxOpenItems` and budget. The PIN drone refuses a diff over 5 MB or 500 files (a NOTE explains). Artifacts limits: 32 MB per blob, 1 GB per repo. |
-| Forged notes | The owner can write any notes into their own inbox. These are never carried to the hive (§7). |
+| Forged notes | The owner can write any notes, including a forged `Queen-Verdict: PASSED`, into their own inbox. **Notes are never authority** (§7.3): the Queen decides only from its ledger, drones read notes as a brief and never as permission, the lander carries forward only Queen-written notes (never inbox notes), and any note the Queen relies on must be re-derivable from the ledger. |
 
 ---
 
@@ -419,6 +509,8 @@ There are no new phases.
 | Inbox `main` pushed by the human | Ignored (`ignored:inbox-main`), and overwritten on the next open. |
 | `InboxKeys.open` fails (fork or 503) | The edge returns 503 and the call can be retried; the fork is idempotent (`ALREADY_EXISTS` = success, day1 row 5b). The Queen's contributor row exists either way. |
 | NOTE fails after retries | Recorded (`note.failed` event). The dashboard is the source of truth; nothing is ejected. |
+| **Note push contention** (several notes on the same repo or ref; Artifacts per-repo 503 episodes, commit 1deb7ab) | Notes are split across `refs/notes/{verdict,review,provenance}` by writer; pushes are non-forced with a re-fetch and retry (3x) and back off on 503. Verdict notes are written after a gate finishes, never just before a reader touches that repo (§7.6). Non-blocking. |
+| **Late or missing notes** | The ledger and the dashboard still hold the verdict. A REWORK whose brief note is missing or does not match regenerates the brief from the ledger (§7.3). An external agent that finds no note yet waits and re-fetches; it never treats "no note" as a pass. |
 | Write-back is not a fast-forward | Pushed to `<ref>-queen` instead, and the note says so. |
 | **Deploy-order hazard (NOTE vs DELETE).** Before the guard, the provisioner treated any unknown op as DELETE, so a NOTE sent to it could delete an inbox (or any named repo). | The guard now lands: NOTE returns a non-destructive failure until T2 gives it real support. **Rule: the provisioner with real NOTE support (T2) must deploy before any Queen that sends NOTE.** |
 | Hive `paused` or budget exhausted | The item waits READY, with `waitReason` shown on the dashboard. A note "queued: hive paused" is sent once. |
@@ -583,11 +675,12 @@ The human path **ships without T1b**. If the drone adapter slips, cut it: drones
 | Task | Model | Owns (exclusive) | Depends | Effort |
 |---|---|---|---|---|
 | **T0 Contracts + migration** **DONE** | Opus | `packages/queen-types/src/{inbox.ts,drone.ts,executors.ts,work.ts,state.ts,queue.ts,train.ts,autonomy.ts,models.ts,observability.ts,index.ts,index.test.ts}` (inbox and race/pick/preference contracts, §5 and §10.7; new event types in `observability.ts`); `apps/queen/src/db.ts` (v14: inboxes, submissions, model_preference, race / work_item / merge_train / model_stats columns, mappers); `apps/queen/test/{migrations.test.ts,work-ledger.test.ts}`; rename `submissions` → `dispatches` (and `DispatchSubmission` → `ItemDispatch`) in `apps/queen/src/work/ledger.ts` + `queen-node.ts` + `test/work-ledger.test.ts` (mechanical); seams with `NotImplementedError` in `work/inbox.ts` | none | 0.5 d (Oct 7 AM) |
+| **T0b Note schema + helpers** | Haiku or Sonnet | `packages/queen-types/src/{notes.ts,index.ts,index.test.ts}`: the note format v1 Zod schema and a renderer and parser (§7.4), including clipping to `MAX_NOTE_TEXT`, unknown-key tolerance, a round-trip test, and the ref constants (`verdict`, `review`, `provenance`; the parser rejects `refs/notes/queen`) | T0 | 0.25 d, **before T2/T3** |
 | **T1 Queen intake + planner** | Opus | `apps/queen/src/work/inbox.ts`, `train/planner.ts`, `queen-node.ts`, `index.ts`, `executors.ts`; `apps/queen/test/{inbox.test.ts,planner.test.ts,v2-flow.test.ts}`; `apps/queen/README.md` | T0 | 1 d |
 | **T1b Drone adapter** | Opus (same agent, after T1) | `planner.ts` `buildResult` → `submission()`; `submissionFromBuildResult` in queen-types | T1 | 0.25 d, **cuttable** |
-| **T2 Provisioner** | Sonnet | `apps/provisioner/**` (`InboxKeys` entrypoint, real NOTE op replacing the interim non-destructive failure guard, wrangler entrypoint export). **Must deploy before any Queen that sends NOTE** (§9 deploy-order hazard). | T0 | 0.5 d |
-| **T3 Drones** | Sonnet | `apps/drones/**` (PIN, seeded REWORK, write-back) | T0 | 0.5 d |
-| **T4 Gatekeepers** | Sonnet | `apps/gatekeepers/**` (inbox classify → submit; `changedBetween` for BUILD; fail-closed reviewer; protected-path policy) | T0 | 0.5 d |
+| **T2 Provisioner** | Sonnet | `apps/provisioner/**` (`InboxKeys` entrypoint, real NOTE op replacing the interim non-destructive failure guard, wrangler entrypoint export). **The NOTE op takes `ref` and `text`** (`ref` one of `refs/notes/{verdict,review,provenance}`; `text` is a rendered v1 note). **Must deploy before any Queen that sends NOTE** (§9 deploy-order hazard). | T0, T0b | 0.5 d |
+| **T3 Drones** | Sonnet | `apps/drones/**` (PIN, seeded REWORK, write-back). **REWORK reads its brief from the notes on the rejected commit** (§7.2) and **its rework commit writes `Queen-Replies-To`**; the builder writes the provenance and memory notes. The lander copies **only Queen-written notes** (§7.3). | T0, T0b | 0.5 d |
+| **T4 Gatekeepers** | Sonnet | `apps/gatekeepers/**` (inbox classify → submit; `changedBetween` for BUILD; fail-closed reviewer; protected-path policy; **writes findings to `refs/notes/review`** (never to `refs/notes/queen`) as `Queen-Finding` trailers) | T0, T0b | 0.5 d |
 | **T5 Edge** | Haiku | `apps/edge/src/app.ts`, `apps/edge/wrangler.jsonc` (`PROVISIONER_KEYS` service, entrypoint `InboxKeys`), `apps/edge/test/**` | T0 | 0.25 d |
 | **T6 Sim** | Sonnet | `apps/queen/src/sim/{sim-ports.ts,sim-v2.ts,worker.ts}`, `apps/queen/test/sim-ports.test.ts` | T0 | 0.5 d |
 | **T7 Dashboard** | Sonnet | `apps/dashboard/src/{ItemView.tsx,homeLogic.ts,api.ts,components.tsx,SwarmFloor.tsx}` + a new `PushCode.tsx`, tests | T0 | 0.5 d |
@@ -602,7 +695,8 @@ The human path **ships without T1b**. If the drone adapter slips, cut it: drones
   - **T9a:** `effectiveSettings` (guardrails.ts) must add race `judge` / `pickWindowMs`; the `maxPickingRaces` min-1 clamp (the schema allows 0, and a 0 cap would auto-decide every race).
   - **T9c:** preference reads and writes on `model_preference` and `model_stats.picks`.
 - **Infra fixes landed** (alongside T0): provisioner forks may now be named `<hive>-train-<12hex>-rN`, the gatekeeper `TRAIN_REPO_RE` accepts that, and cars retire after one infra round. **Inbox-related parsing must accept `-rN` train names too** (`INBOX_REPO_RE` is anchored `-in-<handle>`, so it does not clash, but any train-name regex T1/T3/T4 add must allow the suffix).
-- **Schedule:** T0 on Oct 7 morning. T1–T7 run in parallel from Oct 7 afternoon to Oct 8. T1b runs Oct 8 if T1 is green. Live on Oct 9.
+- **Notes protocol (§7):** T0b is a small prerequisite for T2, T3 and T4 (they import the renderer and parser). The lander rule is fixed: copy only Queen-written notes. `docs/agent-protocol.md` and `plugins/queenos/` are written separately and only reference the T0b format.
+- **Schedule:** T0 on Oct 7 morning, T0b right after it. T1–T7 run in parallel from Oct 7 afternoon to Oct 8. T1b runs Oct 8 if T1 is green. Live on Oct 9.
 - **Races schedule:** T9a's pure `pick.ts` and T9d start Oct 7 afternoon. T9a's planner wiring and T9b follow T1 (Oct 8 afternoon to Oct 9). T9c runs Oct 9–10. Each one ships alone, and none blocks the inbox path.
 - **Deploy order:** provisioner (new entrypoint) → queen (v14; no active trains, R16) → drones, gatekeepers → edge (binds to the new entrypoint, so two passes are not needed). Check: `pnpm turbo run build typecheck lint test --force --continue`.
 - **Cut lines, in order:**
@@ -622,9 +716,9 @@ The human path **ships without T1b**. If the drone adapter slips, cut it: drones
 
 1. Split screen: the dashboard swarm floor (12 drone tiles) and a terminal. Voice-over: *"A PR says 'please review my branch.' QueenOS has an inbox: you push code, and the swarm vets it with the same gates and the same train as the agents. You don't open, shepherd or merge anything."*
 2. `git push queen tip-jar`. It returns at once. Within seconds a tile with a **human** badge joins the floor.
-3. The change deliberately calls a non-allowlisted host, a deterministic SECURITY reject (no reliance on an LLM REJECT). The tile goes red. `git fetch queen 'refs/notes/*:refs/notes/*' && git log --notes=queen -1` shows the REJECTED note with the finding.
+3. The change deliberately calls a non-allowlisted host, a deterministic SECURITY reject (no reliance on an LLM REJECT). The tile goes red. `git fetch queen 'refs/notes/*:refs/notes/*' && git log --notes=verdict --notes=review -1` shows the REJECTED note with the finding, in a plain terminal with no SDK. Then the **notes beat**: Claude Code with the QueenOS plugin (`plugins/queenos/`) reads the same rejection note, fixes the problem and re-pushes. That is the notes protocol working for an agent exactly as for a human (§7).
 4. Click **Let the swarm fix it**. A REWORK drone starts from the human's commit. Its tile passes and boards a car **next to drone members**, and the merge-train graph shows the human branch merging in the same car.
-5. `git pull queen tip-jar` shows the drone's fix on top of the human commit. Then `git log --notes=queen` on it: `LANDED main@…`, then `SHIPPED`.
+5. `git pull queen tip-jar` shows the drone's fix on top of the human commit. Then `git log --notes=verdict` on it: `LANDED main@…`, then `SHIPPED`.
 6. Optional tag: push again with `[review-fail]` in sim to show the LLM reviewer's rejection text.
 
 This closes HANDOFF §6.5's "no reliable live reviewer REJECT" by showing a reliable *gate* REJECT live. The reviewer REJECT stays sim-backed.

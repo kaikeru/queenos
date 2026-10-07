@@ -1,0 +1,12 @@
+{
+  "name": "queenos-plugins",
+  "description": "Plugins for working with QueenOS",
+  "owner": { "name": "QueenOS" },
+  "plugins": [
+    {
+      "name": "queenos",
+      "source": "./queenos",
+      "description": "Submit code to a QueenOS hive inbox and react to verdict notes"
+    }
+  ]
+}
