@@ -7,7 +7,8 @@ import { Link } from "./router";
 import { hrefFor } from "./route";
 import type { State } from "./reducer";
 import { isQueueTrain } from "./swarm";
-import { landedCount } from "./status";
+import { isPushed, originBadge } from "./origin";
+import { OriginChip } from "./shell";
 import "./swarm.css";
 
 const DAY = 24 * 3600_000;
@@ -36,7 +37,16 @@ function CarDetail({ car, state, hive }: { car: MergeTrain; state: State; hive: 
   return (
     <dl>
       <dt>merged order</dt>
-      <dd>{(car.members ?? []).map((id) => state.trains[id]?.trainId ?? id).join(" → ") || "-"}</dd>
+      <dd>
+        {(car.members ?? []).length === 0
+          ? "-"
+          : (car.members ?? []).map((id, i) => (
+              <Fragment key={id}>
+                {i > 0 && " → "}
+                {id} <OriginChip badge={originBadge(state.trains[id]?.origin)} />
+              </Fragment>
+            ))}
+      </dd>
       <dt>conflicts</dt>
       <dd>
         {car.conflict ? `${car.conflict.kind}: ${car.conflict.paths.join(", ")} (${car.conflict.summary})` : "none"}
@@ -72,8 +82,14 @@ export function QueuePage({ hive, state }: { hive: string; state: State }) {
     <div className="qpage">
         <Link to={hrefFor.status(hive)} className="mq__meta">◂ {hive} / merge queue</Link>
         <section className="mq" aria-label="Merge train graph">
-          <div className="mq__head"><h3 className="eyebrow">MERGE TRAIN · LAST 24H</h3><span className="mq__meta">{landedCount(state)} landed · tap a car for its payload</span></div>
-          <MergeGraph state={state} hive={hive} spanMs={DAY} density="full" highlight={highlight} />
+          <MergeGraph
+            state={state}
+            hive={hive}
+            spanMs={DAY}
+            density="full"
+            highlight={highlight}
+            head={(l) => <div className="mq__head"><h3 className="eyebrow">MERGE TRAIN · LAST 24H</h3><span className="mq__meta">{l.landedInWindow} landed in 24h · tap a car for its payload</span></div>}
+          />
         </section>
         <section className="mq" aria-label="Cars, last 24 hours">
           <div className="mq__head"><h3 className="eyebrow">CARS · LAST 24H</h3><span className="mq__meta">{recent.length} cars</span></div>
@@ -95,7 +111,10 @@ export function QueuePage({ hive, state }: { hive: string; state: State }) {
                           <td>
                             <button className="linkish" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : t.trainId)}>{isOpen ? "▾" : "▸"} {label}</button>
                           </td>
-                          <td>{(t.members ?? []).length}</td>
+                          <td>
+                            {(t.members ?? []).length}{" "}
+                            {(t.members ?? []).map((m) => state.trains[m]).filter(isPushed).map((m) => <OriginChip key={m!.trainId} badge={originBadge(m!.origin)} />)}
+                          </td>
                           <td>{short(t.baseSha)} → {short(t.headSha)}</td>
                           <td>{t.status}</td>
                           <td className={v.cls}>{v.text}</td>

@@ -72,6 +72,8 @@ export const GitTokenSchema = z.object({
   id: z.string(),
   email: z.string().email(),
   scopes: z.array(z.enum(["read", "push"])).min(1),
+  /** The minter's note (e.g. "laptop"); null when none was given. Optional: older edges omitted it. */
+  label: z.string().max(80).nullable().optional(),
   createdAt: z.number().int(),
   expiresAt: z.number().int(),
   lastUsedAt: z.number().int().nullable(),

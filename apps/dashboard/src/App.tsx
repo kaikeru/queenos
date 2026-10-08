@@ -8,6 +8,7 @@ import { QueuePage } from "./QueuePage";
 import { TraceView } from "./TraceView";
 import { EventLog } from "./EventLog";
 import { Metrics } from "./Metrics";
+import { PushCode } from "./PushCode";
 import { Link, useRoute } from "./router";
 import { hrefFor, type Route } from "./route";
 import { isSimulation } from "./homeLogic";
@@ -29,6 +30,7 @@ function HiveRoot({ route }: { route: HiveRoute }) {
     trace: [{ label: "trace" }, { label: id.slice(0, 8) }],
     events: [{ label: "events" }],
     metrics: [{ label: "metrics" }],
+    push: [{ label: "push code" }],
   };
   return (
     <div className="app hive-page">
@@ -44,6 +46,7 @@ function HiveRoot({ route }: { route: HiveRoute }) {
       {page === "trace" && <TraceView hive={hive} traceId={id} state={state} />}
       {page === "events" && <EventLog hive={hive} state={state} />}
       {page === "metrics" && <Metrics hive={hive} state={state} />}
+      {page === "push" && <PushCode hive={hive} />}
       <HiveFooter hive={hive} />
     </div>
   );

@@ -13,13 +13,13 @@ const mmss = (ms: number) => {
 };
 
 const tipOf = (t: SwarmTile, now: number) =>
-  [t.title, t.model, `${t.group} ${mmss(now - t.startedAt)}`, `forked from main@${t.baseSha.slice(0, 4)}`, t.candidate != null ? `candidate ${t.candidate}${t.outcome ? ` (${t.outcome})` : ""}` : null]
+  [t.title, t.origin?.text ?? t.model, `${t.group} ${mmss(now - t.startedAt)}`, `forked from main@${t.baseSha.slice(0, 4)}`, t.candidate != null ? `candidate ${t.candidate}${t.outcome ? ` (${t.outcome})` : ""}` : null]
     .filter(Boolean)
     .join(" · ");
 
 /** One tile. Memoised; keyed by trainId inside its phase group, so a phase change remounts it and replays the slide-in. */
 const Tile = memo(function Tile({ tile, hive, now }: { tile: SwarmTile; hive: string; now: number }) {
-  const cls = `tile tile--${tile.group}${tile.outcome === "WON" ? " tile--winner" : ""}${tile.outcome === "LOST" || tile.outcome === "FAILED" ? " tile--loser" : ""}`;
+  const cls = `tile tile--${tile.group}${tile.outcome === "WON" ? " tile--winner" : ""}${tile.outcome === "LOST" || tile.outcome === "FAILED" ? " tile--loser" : ""}${tile.origin ? " tile--pushed" : ""}`;
   const tip = tipOf(tile, now);
   return tile.itemId ? <Link to={hrefFor.item(hive, tile.itemId)} className={cls} title={tip} aria-label={tip} /> : <span className={cls} title={tip} />;
 });

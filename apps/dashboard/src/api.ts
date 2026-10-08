@@ -1,5 +1,7 @@
 import {
   EscalationSchema,
+  GitTokenMintResultSchema,
+  GitTokenSchema,
   HiveStatusSchema,
   HourlyMetricSchema,
   MergeTrainSchema,
@@ -15,6 +17,8 @@ import {
   type Escalation,
   type EventQueryInput,
   type FileWorkItemInput,
+  type GitToken,
+  type GitTokenMintResult,
   type HiveStatus,
   type HourlyMetric,
   type MergeTrain,
@@ -109,6 +113,7 @@ const UrlParser: Parser<{ url: string }> = {
 const ProjectsParser: Parser<Project[]> = { parse: (v) => ProjectSchema.array().parse(v) };
 
 const AnyParser: Parser<unknown> = { parse: (v) => v };
+const GitTokensParser: Parser<GitToken[]> = { parse: (v) => GitTokenSchema.array().parse(v) };
 
 // ── v2 REST: items, events, traces, metrics, queue (design §3.6) ──────────
 
@@ -228,4 +233,9 @@ export const api = {
   connectCloudflare: (hive: string, accountId: string, apiToken: string): Promise<VaultStatus> =>
     request("POST", `/api/vault/${enc(hive)}/cloudflare`, VaultStatusSchema, { accountId, apiToken }),
   launch: (hive: string) => request("POST", `/api/genesis/${enc(hive)}/launch`, WizardStateSchema),
+  // Git tokens (edge, behind Access). The mint response carries the secret once: never log or persist it.
+  gitTokens: (): Promise<GitToken[]> => request("GET", "/api/git-tokens", GitTokensParser),
+  mintGitToken: (label?: string): Promise<GitTokenMintResult> =>
+    request("POST", "/api/git-tokens", GitTokenMintResultSchema, label ? { label } : {}),
+  revokeGitToken: (id: string) => request("DELETE", `/api/git-tokens/${enc(id)}`, AnyParser),
 };

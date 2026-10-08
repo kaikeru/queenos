@@ -149,6 +149,10 @@ describe("git intake contracts", () => {
     expect(NotesProjectionSchema.safeParse({ ref: "refs/notes/review", version: 1, notes: [{ sha, text: "t" }] }).success).toBe(true);
     const tok = { id: "i", email: "a@b.co", scopes: ["push"], createdAt: 1, expiresAt: 2, lastUsedAt: null, revokedAt: null, token: "qgt_x" };
     expect(GitTokenMintResultSchema.parse(tok)).toEqual(tok);
+    // The edge lists the minter's label; it must survive parsing (zod strips unknown keys).
+    const labelled = { ...tok, label: "laptop" };
+    expect(GitTokenMintResultSchema.parse(labelled)).toEqual(labelled);
+    expect(GitTokenMintResultSchema.parse({ ...tok, label: null }).label).toBeNull();
   });
 });
 

@@ -4,6 +4,7 @@ import type { MergeTrain, QueenEvent, Race } from "@queenos/queen-types";
 import { buildSwarmFixture } from "../src/mockQueen";
 import { fit, mergeGraph, packLanes, type GraphSlice } from "../src/mergeGraph";
 import { initialState, reducer, type Action } from "../src/reducer";
+import { landedCount } from "../src/status";
 
 const T0 = 1_800_000_000_000;
 const MIN = 60_000;
@@ -377,4 +378,28 @@ test("main nodes follow landing time even when the landed list is in creation or
   const g = layoutOf(slice(trains, [l1, l2]));
   const x = (c: string) => g.nodes.find((n) => n.kind === "main" && n.sha === sha(c))!.x;
   expect(x("1")).toBeLessThan(x("2"));
+});
+
+test("landedInWindow counts only landings inside the window (the strip's 'N landed in 30 min')", () => {
+  // An old batched car of 2 (hours ago), a recent car of 3, and a direct (unqueued) recent landing.
+  const [old, oldLanded] = landedCar("old", sha("9"), T0 - 3 * 3_600_000, ["o1", "o2"]);
+  const [k, kLanded] = landedCar("k", sha("c"), T0 + 10 * MIN, ["a", "b", "c"]);
+  const merged = (id: string, s: string, over: Partial<MergeTrain> = {}) => build(id, { status: "MERGED", phase: "MERGED", landedSha: s, ...over });
+  const trains = [
+    old,
+    merged("o1", sha("9"), { carId: "old", createdAt: T0 - 4 * 3_600_000 }),
+    merged("o2", sha("9"), { carId: "old", createdAt: T0 - 4 * 3_600_000 }),
+    k,
+    merged("a", sha("c"), { carId: "k" }),
+    merged("b", sha("c"), { carId: "k" }),
+    merged("c", sha("c"), { carId: "k" }),
+    merged("d", sha("d"), { createdAt: T0 + 12 * MIN }),
+  ];
+  const events = [oldLanded, kLanded, ev("train.phase", T0 + 14 * MIN, { trainId: "d", data: { to: "MERGED" } })];
+  const s = slice(trains, events);
+  expect(landedCount(s)).toBe(6); // what the old label counted, window or not
+  expect(mergeGraph(s, { now: NOW, spanMs: 30 * MIN }).landedInWindow).toBe(4);
+  expect(mergeGraph(s, { now: NOW, spanMs: 24 * 3_600_000 }).landedInWindow).toBe(6);
+  // Nothing recent: a quiet hour later the 30-minute count is 0, not the session total.
+  expect(mergeGraph(s, { now: NOW + 2 * 3_600_000, spanMs: 30 * MIN }).landedInWindow).toBe(0);
 });

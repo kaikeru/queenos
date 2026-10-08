@@ -1,7 +1,7 @@
 /** Pure client-side route matching (no React, no DOM; unit-tested). */
 
 /** Hive-scoped pages (v2 design §5). */
-export type HivePage = "status" | "lanes" | "queue" | "item" | "trace" | "events" | "metrics";
+export type HivePage = "status" | "lanes" | "queue" | "item" | "trace" | "events" | "metrics" | "push";
 
 export type Route =
   | { name: "home" }
@@ -29,7 +29,7 @@ function seg(raw: string): string | null {
   return SEGMENT.test(s) ? s : null;
 }
 
-const SIMPLE_PAGES: Record<string, HivePage> = { lanes: "lanes", queue: "queue", events: "events", metrics: "metrics" };
+const SIMPLE_PAGES: Record<string, HivePage> = { lanes: "lanes", queue: "queue", events: "events", metrics: "metrics", push: "push" };
 
 /**
  * Match a location to a route. `/?hive=x` keeps working (it maps to the status
@@ -79,4 +79,6 @@ export const hrefFor = {
   trace: (hive: string, traceId: string) => `${hv(hive)}/traces/${encodeURIComponent(traceId)}`,
   events: (hive: string) => `${hv(hive)}/events`,
   metrics: (hive: string) => `${hv(hive)}/metrics`,
+  /** Git tokens and clone / push instructions. */
+  push: (hive: string) => `${hv(hive)}/push`,
 };

@@ -7,7 +7,7 @@ import { MergeTrainStrip } from "./MergeGraph.tsx";
 import { Link } from "./router";
 import { hrefFor } from "./route";
 import { ReleaseStripRow, GuardrailsPanel } from "./HomePanels";
-import { HiveFooter, HiveHeader, ItemChip } from "./shell";
+import { HiveFooter, HiveHeader, ItemChip, OriginChip } from "./shell";
 import { blockedOrFailed, goalTrees, headline, openEscalations, pipelineCounts, statusTiles, type GoalNode, type ItemRow } from "./status";
 import { SwarmFloor } from "./SwarmFloor";
 import type { Room } from "./WarRoom";
@@ -31,7 +31,7 @@ export function StatusHome({ hive, room }: { hive: string; room: Room }) {
           <button type="button" onClick={() => window.location.reload()}>Reload</button>
         </div>
       )}
-      <HiveHeader hive={hive} status={status} latencyMs={latencyMs} sim={isSimulation(state.hive)} actions={<AutonomySelect hive={hive} state={room.state} />} />
+      <HiveHeader hive={hive} status={status} latencyMs={latencyMs} sim={isSimulation(state.hive)} actions={<><Link to={hrefFor.push(hive)} className="sh-link">push code ▸</Link><AutonomySelect hive={hive} state={room.state} /></>} />
 
       <section className={`sh-head sh-head--${head.kind.toLowerCase()}`} aria-live="polite">
         <span className="sh-head__dot" aria-hidden="true" />
@@ -285,6 +285,7 @@ function Row({ hive, row, retry, bare }: { hive: string; row: ItemRow; retry?: b
       <span className={`sh-kind sh-kind--${row.item.kind}`}>{row.item.kind}</span>
       <Link className="sh-row__title" to={hrefFor.item(hive, row.item.itemId)}>{row.item.title}</Link>
       <ItemChip status={row.item.status} sub={row.subState} />
+      <OriginChip badge={row.origin} />
       {note && <span className="sh-row__note">{note}</span>}
       {retry && row.item.status === "FAILED" && (
         <button type="button" className="sh-link" disabled={busy} onClick={() => void act("retry")}>{busy ? "…" : "retry ▸"}</button>

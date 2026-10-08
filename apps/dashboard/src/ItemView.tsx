@@ -8,7 +8,8 @@ import { relativeTime } from "./lanes";
 import type { State } from "./reducer";
 import { hrefFor } from "./route";
 import { Link } from "./router";
-import { ErrorNotice, ItemChip } from "./shell";
+import { ErrorNotice, ItemChip, OriginChip } from "./shell";
+import { itemOrigin, originBadge } from "./origin";
 import { itemSubState } from "./swarm";
 
 const clock = (ms: number) => new Date(ms).toLocaleTimeString([], { hour12: false });
@@ -44,7 +45,7 @@ export function ItemView({ hive, itemId, state }: { hive: string; itemId: string
         <p className="sh-muted"><Link to={hrefFor.status(hive)}>◂ {hive}</Link> / {item.kind} #{item.itemId}</p>
         <h2>{item.title}</h2>
         <p className="item__badges">
-          <span className="chip">P{item.priority}</span> <ItemChip status={item.status} sub={sub} />
+          <span className="chip">P{item.priority}</span> <ItemChip status={item.status} sub={sub} /> <OriginChip badge={itemOrigin(item, trains)} />
           {item.difficulty === "hard" && <span className="chip">HARD</span>}
           {item.bestOf && <span className="chip">best-of-{item.bestOf}</span>}
           <Link className="sh-link" to={hrefFor.trace(hive, item.traceId)}>trace {item.traceId.slice(0, 8)}… ▸</Link>
@@ -179,7 +180,8 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
   return (
     <li className={`item__attempt${a.winner ? " item__attempt--winner" : ""}`}>
       <p>
-        <b>#{a.n} {a.kind}{a.kind === "RACE" ? ` c${(t.candidate ?? 0) + 1}` : ""}</b> <span className="sh-muted">{t.model ?? "model pending"}</span>{" "}
+        <b>#{a.n} {a.kind}{a.kind === "RACE" ? ` c${(t.candidate ?? 0) + 1}` : ""}</b> <OriginChip badge={originBadge(t.origin)} />{" "}
+        {(t.origin?.kind ?? "drone") === "drone" && <span className="sh-muted">{t.model ?? "model pending"} </span>}
         <span className={`chip chip--${t.status.toLowerCase()}`}>{t.phase ?? t.status}</span>
         {a.winner && <span className="item__star" title={a.race?.reason ?? "winner"}> ★ winner</span>}
         {verdict && !a.winner && <span className="sh-muted"> {verdict}</span>}

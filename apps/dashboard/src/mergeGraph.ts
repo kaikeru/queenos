@@ -172,6 +172,8 @@ export interface MergeGraphLayout {
   breaks: { x: number; ms: number }[];
   /** History collapsed into the "+N earlier" stub. */
   earlier: { branches: number; cars: number; landings: number };
+  /** Distinct BUILD trains (items' builds) that landed on main inside the window, as `landedCount` counts them. */
+  landedInWindow: number;
   /** Concurrent branches at the right edge (alive now). */
   liveBranches: number;
   /** Approximate label character width (px) the layout truncated to. */
@@ -563,6 +565,15 @@ export function mergeGraph(state: GraphSlice, win: GraphWindow): MergeGraphLayou
   const visibleCars = [...cars.values()].filter((c) => (c.end ?? now) >= wStart);
   const visibleShas = shas.filter((s) => s.at >= wStart);
   const earlier = { branches: builds.length - visibleBuilds.length, cars: cars.size - visibleCars.length, landings: shas.length - visibleShas.length };
+  // Landed in the window: a car counts its merged members (a batched car of 3 is 3), a direct landing counts itself.
+  const landedIds = new Set<string>();
+  for (const s of visibleShas) {
+    for (const id of s.trainIds) {
+      const car = cars.get(id);
+      if (!car) landedIds.add(id);
+      else for (const m of car.members) if (state.trains[m]?.status !== "EJECTED") landedIds.add(m);
+    }
+  }
 
   // Time axis knots.
   const knots: Knot[] = [];
@@ -950,6 +961,7 @@ export function mergeGraph(state: GraphSlice, win: GraphWindow): MergeGraphLayou
     ticks,
     breaks: axis.breaks,
     earlier,
+    landedInWindow: landedIds.size,
     liveBranches: branches.filter((b) => b.alive).length,
     charW: g.charW,
   };

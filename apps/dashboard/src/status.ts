@@ -6,7 +6,8 @@
 import type { Escalation, HiveStatus, WorkItem, WorkStatus } from "@queenos/queen-types";
 
 import type { State } from "./reducer";
-import { itemSubState, queueRail, raceViewForItem, swarmFloor, type RaceView, type SubState } from "./swarm";
+import { pushedItemOrigin, type OriginBadge } from "./origin";
+import { itemIdOf, itemSubState, queueRail, raceViewForItem, swarmFloor, type RaceView, type SubState } from "./swarm";
 
 type Slice = Pick<State, "trains" | "trainOrder" | "items" | "itemOrder" | "races" | "events" | "landed" | "escalations" | "escalationOrder" | "hive" | "releases">;
 
@@ -99,6 +100,8 @@ export interface ItemRow {
   /** Titles of dependencies that are not LANDED or SHIPPED yet. */
   blockedBy: string[];
   race: RaceView | null;
+  /** Whose code: a badge for pushed (human / agent) code; null for drone-only items. */
+  origin: OriginBadge | null;
 }
 
 export interface GoalNode extends ItemRow {
@@ -119,7 +122,7 @@ export function itemRow(state: Slice, item: WorkItem, now = Date.now()): ItemRow
     })
     .map((id) => state.items[id]?.title ?? id);
   const note = item.waitReason ?? item.blockedReason ?? (item.status === "BLOCKED" && blockedBy.length ? `needs: ${blockedBy.join(", ")}` : null);
-  return { item, subState: itemSubState(state, item), note, blockedBy, race: raceViewForItem(state, item.itemId, now) };
+  return { item, subState: itemSubState(state, item), note, blockedBy, race: raceViewForItem(state, item.itemId, now), origin: pushedItemOrigin(state, item, itemIdOf) };
 }
 
 function build(state: Slice, item: WorkItem, kids: Map<string, WorkItem[]>, now: number): GoalNode {

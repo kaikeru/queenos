@@ -81,3 +81,6 @@ a.mchip:hover { border-color: var(--cyan); }
   .tile, .bar__fill { transition: none; }
   .tile:hover, .tile:focus-visible { transform: none; }
 }
+/* A tile carrying pushed (human / agent) code: a white corner dot. */
+.tile--pushed { position: relative; }
+.tile--pushed::after { content: ""; position: absolute; top: 2px; right: 2px; width: 6px; height: 6px; border-radius: 50%; background: var(--text); box-shadow: 0 0 0 1px var(--bg); }

@@ -6,6 +6,7 @@
  */
 import type { MergeTrain, QueenEvent, Race, WorkItem } from "@queenos/queen-types";
 
+import { isPushed, originBadge, type OriginBadge } from "./origin";
 import { tailOf, type State } from "./reducer";
 
 type Slice = Pick<State, "trains" | "trainOrder" | "items" | "races" | "events" | "landed">;
@@ -41,6 +42,8 @@ export interface SwarmTile {
   /** A race candidate's standing, if any. */
   outcome: string | null;
   previewUrl: string | null;
+  /** Whose code: a badge for pushed (human / agent) code; null for drone code. */
+  origin: OriginBadge | null;
 }
 
 export interface SwarmGroup {
@@ -105,6 +108,7 @@ export function swarmTiles(state: Slice): SwarmTile[] {
       candidate: t.candidate ?? null,
       outcome: t.raceOutcome ?? null,
       previewUrl: t.previewUrl ?? null,
+      origin: isPushed(t) ? originBadge(t.origin) : null,
     });
   }
   return out;

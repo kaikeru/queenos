@@ -16,7 +16,8 @@ import type { State } from "./reducer";
 import { hrefFor } from "./route";
 import { Link } from "./router";
 import { itemIdOf } from "./swarm";
-import { landedCount } from "./status";
+import { isPushed, originBadge } from "./origin";
+import { OriginChip } from "./shell";
 import "./mergeGraph.css";
 
 export type GraphSelection = { kind: "car" | "branch"; id: string } | null;
@@ -233,6 +234,7 @@ function MemberRow({ state, hive, id, n, conflict }: { state: State; hive: strin
           {itemId ? <Link to={hrefFor.item(hive, itemId)}>{title}</Link> : <span>{title}</span>}
         </div>
         <div className="mg-member__meta">
+          {isPushed(t) && <OriginChip badge={originBadge(t.origin)} />}
           {t.model && <span>{modelLabel(t.model)}</span>}
           {t.score && <span>{kb(t.score.changedBytes)} · {t.score.changedFiles} file{t.score.changedFiles === 1 ? "" : "s"}</span>}
           <Score t={t} />
@@ -294,6 +296,7 @@ function BranchPanel({ b, layout, state, hive, onPick }: { b: BranchView; layout
         {b.itemId ? <Link to={hrefFor.item(hive, b.itemId)}>{b.title} ▸</Link> : b.title}
       </div>
       <dl className="mg-kv">
+        <dt>origin</dt><dd><OriginChip badge={originBadge(t?.origin)} /></dd>
         {b.model && (<><dt>model</dt><dd>{modelLabel(b.model)}</dd></>)}
         <dt>forked</dt>
         <dd>{b.clippedLeft ? "before this window" : b.forkSha ? <>from main@<code>{short(b.forkSha)}</code></> : <>from main{t?.baseSha ? <> (<code>{short(t.baseSha)}</code>)</> : null}</>}{t && <> · {clock(t.createdAt)}</>}</dd>
@@ -339,9 +342,11 @@ export interface MergeGraphProps {
   highlight?: string | null;
   /** Fixed clock (tests); live otherwise. */
   now?: number;
+  /** A header drawn from the layout (e.g. "N landed" counted over the same window as the graph). */
+  head?: (layout: MergeGraphLayout) => ReactNode;
 }
 
-export function MergeGraph({ state, hive, spanMs, density = "full", highlight = null, now: fixedNow }: MergeGraphProps) {
+export function MergeGraph({ state, hive, spanMs, density = "full", highlight = null, now: fixedNow, head }: MergeGraphProps) {
   const liveNow = useNow(density === "compact" ? 5000 : 10_000);
   const now = fixedNow ?? liveNow;
   const { trains, trainOrder, items, races, landed, trainTimes } = state;
@@ -409,6 +414,8 @@ export function MergeGraph({ state, hive, spanMs, density = "full", highlight = 
   const empty = layout.cars.length === 0 && layout.branches.length === 0;
 
   return (
+    <>
+    {head?.(layout)}
     <div className={`mg mg--${density}`}>
       <div className="mg-box" ref={box} onScroll={onScroll}>
         {empty ? <p className="floor__empty mg-empty">No branches or cars in this window yet.</p> : <Svg layout={layout} sel={sel} highlight={highlight} onPick={setSel} />}
@@ -417,6 +424,7 @@ export function MergeGraph({ state, hive, spanMs, density = "full", highlight = 
       {selCar && <Panel onClose={close}><CarPanel car={selCar} layout={layout} state={state} hive={hive} /></Panel>}
       {selBranch && <Panel onClose={close}><BranchPanel b={selBranch} layout={layout} state={state} hive={hive} onPick={setSel} /></Panel>}
     </div>
+    </>
   );
 }
 
@@ -436,15 +444,28 @@ function Legend({ layout }: { layout: MergeGraphLayout }) {
   );
 }
 
-/** The status home's merge-train strip: header, the last 30 minutes of the graph, and the way to the queue page. */
-export function MergeTrainStrip({ state, hive }: { state: State; hive: string }) {
+export const STRIP_SPAN_MS = 30 * 60_000;
+
+/**
+ * The status home's merge-train strip: header, the last 30 minutes of the graph, and the way to the queue page.
+ * "N landed" counts landings inside the same 30-minute window the graph draws (not the session's total).
+ */
+export function MergeTrainStrip({ state, hive, now }: { state: State; hive: string; now?: number }) {
   return (
     <section className="mq" aria-label="Merge train">
-      <div className="mq__head">
-        <h3 className="eyebrow">MERGE TRAIN · LAST 30 MIN</h3>
-        <Link to={hrefFor.queue(hive)} className="mq__meta">{landedCount(state)} landed · queue page ▸</Link>
-      </div>
-      <MergeGraph state={state} hive={hive} spanMs={30 * 60_000} density="compact" />
+      <MergeGraph
+        state={state}
+        hive={hive}
+        spanMs={STRIP_SPAN_MS}
+        density="compact"
+        now={now}
+        head={(l) => (
+          <div className="mq__head">
+            <h3 className="eyebrow">MERGE TRAIN · LAST 30 MIN</h3>
+            <Link to={hrefFor.queue(hive)} className="mq__meta">{l.landedInWindow} landed in 30 min · queue page ▸</Link>
+          </div>
+        )}
+      />
     </section>
   );
 }

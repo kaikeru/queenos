@@ -1,6 +1,7 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { api, errorMessage, isAuthError } from "./api";
 import { SIM_BADGE_TEXT } from "./homeLogic";
+import type { OriginBadge } from "./origin";
 import { useEscape, useResource } from "./hooks";
 import { Link } from "./router";
 import { hrefFor } from "./route";
@@ -87,6 +88,12 @@ export function ItemChip({ status, sub }: { status: string; sub?: string | null 
   return <span className={`chip chip--w-${status.toLowerCase()}`}>{sub ? `${status} · ${sub}` : status}</span>;
 }
 
+/** Whose code: drone, human:<email>, agent:<name>. */
+export function OriginChip({ badge }: { badge: OriginBadge | null }) {
+  if (!badge) return null;
+  return <span className={`chip chip--sm origin origin--${badge.kind}`} title={badge.title}>{badge.text}</span>;
+}
+
 /** Header for hive pages: brand, breadcrumbs, link state, page actions. */
 export function HiveHeader(props: { hive: string; crumbs?: { label: string; to?: string }[]; status: ConnStatus; latencyMs: number | null; actions?: ReactNode; sim?: boolean }) {
   const label = props.status === "open" ? `linked${props.latencyMs !== null ? ` ${props.latencyMs}ms` : ""}` : props.status;
@@ -126,6 +133,7 @@ export function HiveFooter({ hive }: { hive: string }) {
       <Link to={hrefFor.queue(hive)}>queue ▸</Link>
       <Link to={hrefFor.events(hive)}>events ▸</Link>
       <Link to={hrefFor.metrics(hive)}>metrics ▸</Link>
+      <Link to={hrefFor.push(hive)}>push code ▸</Link>
       <Link to={`${hrefFor.lanes(hive)}#models`}>models ▸</Link>
     </footer>
   );
