@@ -81,9 +81,9 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 ## 4. Deploy state (CRITICAL)
 
-**Last production deploys (UTC):** Oct 8: gatekeepers 16:33 (T4), **queenos-git 16:33 (T2n)**, edge 17:01 (T7 dashboard). Oct 7: queen 21:17, herald 21:18. provisioner/drones Oct 7 14:49-14:51.
+**Last production deploys (UTC):** Oct 8: queen 18:12 and edge 18:14 (T9a/T9d), gatekeepers 16:33 (T4), **queenos-git 16:33 (T2n)**, edge 17:01 (T7 dashboard). Oct 7: queen 21:17, herald 21:18. provisioner/drones Oct 7 14:49-14:51.
 
-**Nothing pending.** Gatekeepers (T4), queenos-git (T2n) and edge (T7) are deployed on current `main` (03609d9). Command for a future gatekeepers redeploy:
+**Nothing pending.** Gatekeepers (T4), queenos-git (T2n) and edge (T7) are deployed on `main` (T9 commit 0cd85a5 deployed for queen + edge). Command for a future gatekeepers redeploy:
 ```
 cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
 ./scripts/deploy.sh --only gatekeepers --force
@@ -119,15 +119,14 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 
 ## 6. Next steps (recommended order; ONE at a time, ask first)
 
-**Done Oct 8:** T2n notes pack (fa648e6 + 6e53603: bounded LRU cache, refresh TTL, SHA validation, 9 cache tests) and T7 dashboard (03609d9: Push code page, origin badges, landed-in-window count; user eyeballed it, looks good). Full gate 46/46.
+**Done Oct 8:** T9a/T9d you-pick races (0cd85a5, deployed: Queen PICKING state, pick route `POST /hives/:hive/races/:raceId/pick`, deadline auto-pick, `maxPickingRaces` cap, sim `[you-pick]`; dashboard Pick view + "you pick (3)" composer option; NOT yet seen live or in a browser; not built: re-pick after the winner boarded a car (409), a human push joining a PICKING race as a candidate). T2n notes pack (fa648e6 + 6e53603: bounded LRU cache, refresh TTL, SHA validation, 9 cache tests) and T7 dashboard (03609d9: Push code page, origin badges, landed-in-window count; user eyeballed it, looks good). Full gate 46/46.
 
-1. **T9a/T9d races and pick** (NEXT; maps to the challenge's "multi-change comparison and selection"). Ask the user before starting.
-   T9b manual reject is cheap; T9c preference weighting is cut to a "next" slide.
+1. **Live-check T9** (sim: `pnpm --filter @queenos/queen dev:sim`, file a prompt with `[you-pick]`; prod: "you pick (3)" in the composer), then **T9b manual reject** (cheap; design §10.4) if wanted. T9c preference weighting is cut to a "next" slide. Ask the user before starting.
 2. **T5 drones:** the REWORK brief comes from notes; the rework commit writes `Queen-Replies-To`.
 3. **T6 sim** (the sim already gates pushed code via GATE commands); the all-sim fallback recording needs inbox and pick in the sim.
 4. **T8:** add `git` to `deploy.sh`; update the plugin and agent-protocol for the proxy UX and the `---` note entry separator (from T0b); live rehearsal.
 5. **README / video reframe** (agent-native git, "Git, reimagined" table) and a `docs/demo-script.md` update (it predates the merge-train graph and the git proxy). Demo beat: push, `remote:` lines, a deliberate edit-only push with `eval(` that gets REJECTED, a note in the terminal, Claude Code with the plugin fixes it, it lands.
-6. **Optional / cut:** T1b drone adapter; an external-gate (verdict webhook) contract for "bring your CI"; the Queen reading `TrainResult.changedPaths` (from T4) to widen path claims; auto-correlation of uncorrelated pushes. Cut order if time runs out: T9c, T9b, T9a/T9d, T1b, `/t/<trainId>`.
+6. **Optional / cut:** T1b drone adapter; an external-gate (verdict webhook) contract for "bring your CI"; the Queen reading `TrainResult.changedPaths` (from T4) to widen path claims; auto-correlation of uncorrelated pushes. Cut order if time runs out: T9c, T9b, T1b, `/t/<trainId>`.
 7. **Also open:** demo prod cleanup of old internal feature slugs on the Toy box chips; no reliable live reviewer REJECT in the swarm path (the sim has `[review-fail]`); dashboard doesn't show whether the builder used recalled memories; 390 px layout only verified headless; mock mode (`VITE_MOCK_API=1`) has no POST actions (use `pnpm dev:sim`). Screenshots and video stay deferred until the user asks.
 
 **Roadmap:** Oct 12-13 rehearsal and recording (go/no-go for an all-sim cut by Oct 12 noon); Oct 14 submit. **Dropped or stubbed:** bisect + auto-revert on staging failure (a P0 bug is filed instead), real npm builds, custom domains for project sites.
