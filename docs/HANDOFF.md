@@ -1,6 +1,6 @@
 # QueenOS: session handoff
 
-Last updated **2026-10-07** by the coordinating Claude session. Read this, then `CLAUDE.md`, `README.md`, `docs/human-push-design.md` (rev 2; §13 is the plan) and `docs/agent-protocol.md`, before doing anything. `docs/v2-design.md` (§1 principles, §10 decisions) is the older swarm design.
+Last updated **2026-10-08** by the coordinating Claude session. Read this, then `CLAUDE.md`, `README.md`, `docs/human-push-design.md` (rev 2; §13 is the plan) and `docs/agent-protocol.md`, before doing anything. `docs/v2-design.md` (§1 principles, §10 decisions) is the older swarm design.
 
 ## 1. Read first: direction, memory, rules
 
@@ -81,9 +81,9 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 ## 4. Deploy state (CRITICAL)
 
-**Last production deploys (UTC Oct 7):** gatekeepers 21:17, queen 21:17, herald 21:18, **queenos-git 21:18 (new)**, edge 21:18. provisioner/drones 14:49-14:51.
+**Last production deploys (UTC):** Oct 8: gatekeepers 16:33 (T4), **queenos-git 16:33 (T2n)**, edge 17:01 (T7 dashboard). Oct 7: queen 21:17, herald 21:18. provisioner/drones Oct 7 14:49-14:51.
 
-**PENDING (user runs it): gatekeepers needs a redeploy for T4 (be2e6c1).**
+**Nothing pending.** Gatekeepers (T4), queenos-git (T2n) and edge (T7) are deployed on current `main` (03609d9). Command for a future gatekeepers redeploy:
 ```
 cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
 ./scripts/deploy.sh --only gatekeepers --force
@@ -100,7 +100,7 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 ## 5. How to push code, and how to run a swarm
 
 ### How to push code (human or agent)
-- **Mint a token** (no dashboard button until T7). In the dashboard tab's DevTools console (Cmd+Opt+J; type `allow pasting` first if Chrome asks):
+- **Mint a token:** use the dashboard page `/p/<hive>/push` (T7: mint once-shown token, list, revoke, copyable clone/push instructions). Old way, in the dashboard tab's DevTools console (Cmd+Opt+J; type `allow pasting` first if Chrome asks):
   ```js
   await fetch('/api/git-tokens',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({label:'first push'})}).then(r=>r.json())
   ```
@@ -108,7 +108,7 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 - **Clone:** `git -c credential.helper='cache --timeout=3600' clone https://queenos.kaikeru.com/git/demo ~/queen-demo`. Username is anything; password is the token.
 - **Add a feature:** `src/features/<slug>.js` exports `slug` and `handle(request)`; register it in `src/features/index.js` with an `import * as fX from "./x.js"` line and in the `features` array.
 - **Push a branch:** `git push origin HEAD`. Use `item/<id>` or `goal/<slug>` branch names to join an item's race. Pushing to `main` is refused.
-- **Verdict notes:** `git fetch origin '+refs/notes/*:refs/notes/*' && git log --notes=verdict -1` returns NOTHING until **T2n** ships (`apps/git/src/notes-pack.ts` is a stub). The dashboard shows the verdict meanwhile.
+- **Verdict notes:** `git fetch origin '+refs/notes/*:refs/notes/*' && git log --notes=verdict -1` works (T2n, verified live Oct 8: `git log --notes=verdict` shows PASSED/LANDED for the hello-human push; refs/notes/{verdict,review,provenance} fetched by a real git client).
 
 ### How to run and watch a live swarm
 - **Dashboard:** the user is signed in to Access in Chrome. Drive it with the Chrome tools (load via ToolSearch): `get_page_text` to read, `form_input` for the composer textarea. Clicks via `find` refs sometimes don't register; coordinates work.
@@ -119,15 +119,16 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 
 ## 6. Next steps (recommended order; ONE at a time, ask first)
 
-1. **T2n notes pack** (`apps/git/src/notes-pack.ts`; contract in its header comment): makes `git log --notes=verdict` work.
-2. **T7 dashboard:** "Push code" panel (mint/revoke tokens, clone instructions); submission origin badge; fix the merge-train strip's "N landed · last 30 min" label, which ignores the 30-min window (showed 44-45 with nothing recent).
-3. **T9a/T9d races and pick** (maps to "multi-change comparison and selection" in the challenge brief). T9b manual reject is cheap; T9c preference weighting is cut to a "next" slide.
-4. **T5 drones:** the REWORK brief comes from notes; the rework commit writes `Queen-Replies-To`.
-5. **T6 sim** (the sim already gates pushed code via GATE commands); the all-sim fallback recording needs inbox and pick in the sim.
-6. **T8:** add `git` to `deploy.sh`; update the plugin and agent-protocol for the proxy UX and the `---` note entry separator (from T0b); live rehearsal.
-7. **README / video reframe** (agent-native git, "Git, reimagined" table) and a `docs/demo-script.md` update (it predates the merge-train graph and the git proxy). Demo beat: push, `remote:` lines, a deliberate edit-only push with `eval(` that gets REJECTED, a note in the terminal, Claude Code with the plugin fixes it, it lands.
-8. **Optional / cut:** T1b drone adapter; an external-gate (verdict webhook) contract for "bring your CI"; the Queen reading `TrainResult.changedPaths` (from T4) to widen path claims; auto-correlation of uncorrelated pushes. Cut order if time runs out: T9c, T9b, T9a/T9d, T1b, `/t/<trainId>`.
-9. **Also open:** demo prod cleanup of old internal feature slugs on the Toy box chips; no reliable live reviewer REJECT in the swarm path (the sim has `[review-fail]`); dashboard doesn't show whether the builder used recalled memories; 390 px layout only verified headless; mock mode (`VITE_MOCK_API=1`) has no POST actions (use `pnpm dev:sim`). Screenshots and video stay deferred until the user asks.
+**Done Oct 8:** T2n notes pack (fa648e6 + 6e53603: bounded LRU cache, refresh TTL, SHA validation, 9 cache tests) and T7 dashboard (03609d9: Push code page, origin badges, landed-in-window count; user eyeballed it, looks good). Full gate 46/46.
+
+1. **T9a/T9d races and pick** (NEXT; maps to the challenge's "multi-change comparison and selection"). Ask the user before starting.
+   T9b manual reject is cheap; T9c preference weighting is cut to a "next" slide.
+2. **T5 drones:** the REWORK brief comes from notes; the rework commit writes `Queen-Replies-To`.
+3. **T6 sim** (the sim already gates pushed code via GATE commands); the all-sim fallback recording needs inbox and pick in the sim.
+4. **T8:** add `git` to `deploy.sh`; update the plugin and agent-protocol for the proxy UX and the `---` note entry separator (from T0b); live rehearsal.
+5. **README / video reframe** (agent-native git, "Git, reimagined" table) and a `docs/demo-script.md` update (it predates the merge-train graph and the git proxy). Demo beat: push, `remote:` lines, a deliberate edit-only push with `eval(` that gets REJECTED, a note in the terminal, Claude Code with the plugin fixes it, it lands.
+6. **Optional / cut:** T1b drone adapter; an external-gate (verdict webhook) contract for "bring your CI"; the Queen reading `TrainResult.changedPaths` (from T4) to widen path claims; auto-correlation of uncorrelated pushes. Cut order if time runs out: T9c, T9b, T9a/T9d, T1b, `/t/<trainId>`.
+7. **Also open:** demo prod cleanup of old internal feature slugs on the Toy box chips; no reliable live reviewer REJECT in the swarm path (the sim has `[review-fail]`); dashboard doesn't show whether the builder used recalled memories; 390 px layout only verified headless; mock mode (`VITE_MOCK_API=1`) has no POST actions (use `pnpm dev:sim`). Screenshots and video stay deferred until the user asks.
 
 **Roadmap:** Oct 12-13 rehearsal and recording (go/no-go for an all-sim cut by Oct 12 noon); Oct 14 submit. **Dropped or stubbed:** bisect + auto-revert on staging failure (a P0 bug is filed instead), real npm builds, custom domains for project sites.
 
@@ -137,7 +138,7 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 |---|---|
 | `queen` (apps/queen) | `QueenNode` DO per hive: SQLite state, work ledger, `decide()` pipeline, merge queue, races, autonomy and error budget, model router, watchdog, event log, coalesced WS room. Git intake RPCs (`gitIntent` / `gitPushed` / `gitAborted` / `notesFor`). Also hosts the **`SwarmGovernor` DO**. Reachable only through the edge. `sim` env = localhost-only fakes. |
 | `queenos-edge` (apps/edge) | `queenos.kaikeru.com` front door: Access JWT, dashboard assets, `/api/*` and `/hives/*` routing, `HiveRegistry` DO, `/api/metrics/:hive`. **`/git/*` route** (before Access middleware): `qgt_` token check (Basic/Bearer), 401 challenge, failure rate limit, forwards to the `GIT` service binding with `x-queen-user`; `/api/git-tokens` behind Access. `dev` env = auth bypass. |
-| `queenos-git` (apps/git) | **Agent-native git proxy.** Smart-HTTP front door over Artifacts: pre-receive rules, `gitIntent`, one fork per push (+ readiness probe, `-rN` re-fork), ref rewrite, `remote:` lines, `gitPushed`/`gitAborted`, filtered read advert, read-only `/t/<trainId>`. No routes of its own (reached via the edge); notes pack (`notes-pack.ts`) is a stub until T2n. NOT in `deploy.sh` yet. |
+| `queenos-git` (apps/git) | **Agent-native git proxy.** Smart-HTTP front door over Artifacts: pre-receive rules, `gitIntent`, one fork per push (+ readiness probe, `-rN` re-fork), ref rewrite, `remote:` lines, `gitPushed`/`gitAborted`, filtered read advert, read-only `/t/<trainId>`. No routes of its own (reached via the edge); notes pack (`notes-pack.ts`) synthesizes v1 notes from the Queen's `notesFor` (bounded per-hive LRU cache). NOT in `deploy.sh` yet. |
 | `queenos-oracle` | Workflow: DECOMPOSE goals, TRIAGE bugs. |
 | `queenos-provisioner` | Workflow: Artifacts fork/delete, CREATE_HIVE seeds from `templates/worker-starter`, recalls hive memories on FORK. |
 | `queenos-drones` | Workflow: BUILD/REWORK/MERGE/LAND. Builder is a Think tool-loop agent (`docs/harness-design.md`) verifying in a Dynamic Worker. |
@@ -169,7 +170,9 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 - **Artifacts per-repo 503 episodes** right after a push (a fresh fork works). Handled by retire, re-fork and retry. The "ask Cloudflare" message waits on cf-rays: herald, gatekeepers and drones now capture them in error messages.
 - **Workflows `createBatch` silently drops instances** on failure; never trust its result length (fixed in 34ac6aa).
 - **Queen-started gates now apply to drone builds too** (926f991). Run a 2-item drone smoke goal after the next deploy to confirm the drone path.
-- The `remote:` notes hint suggests a fetch that returns nothing until T2n.
+- Vitest in `apps/git` warns that `env.test` in `wrangler.jsonc` doesn't inherit `durable_objects`/`artifacts` (harmless; clean up eventually).
+- Oct 8 T2n commit (Antigravity) also added `AGENTS.md`/`GEMINI.md` and trimmed `CLAUDE.md`; review whether that was intended.
+- Claude's Chrome profile isn't signed in to Access (needs the user's one-time PIN), so the coordinator can't view the dashboard; the user checks UI visually.
 - `PIN` and the `inboxes` table (T0) are unused under rev 2 (kept for compatibility).
 - Usage limits kill running agents; resume with SendMessage.
 - Templates: the no-build template serves features at `/features/<slug>` unless a feature declares its own `path`.
