@@ -354,11 +354,13 @@ export function raceView(state: Slice, raceId: string, now = Date.now()): RaceVi
   };
 }
 
+const isOpenRace = (r: Race): boolean => r.state === "RACING" || r.state === "PICKING";
+
 /** The race for an item: the active one, else the newest. */
 export function raceViewForItem(state: Slice, itemId: string, now = Date.now()): RaceView | null {
   const races = Object.values(state.races)
     .filter((r) => r.itemId === itemId)
-    .sort((a, b) => (a.state === "RACING" ? -1 : 0) - (b.state === "RACING" ? -1 : 0) || b.createdAt - a.createdAt);
+    .sort((a, b) => Number(isOpenRace(b)) - Number(isOpenRace(a)) || b.createdAt - a.createdAt);
   return races[0] ? raceView(state, races[0].raceId, now) : null;
 }
 

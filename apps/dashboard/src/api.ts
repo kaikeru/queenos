@@ -22,6 +22,7 @@ import {
   type HiveStatus,
   type HourlyMetric,
   type MergeTrain,
+  type PickRace,
   type Project,
   type QueenEvent,
   type Race,
@@ -203,6 +204,12 @@ export function eventsQuery(q: EventQueryInput = {}): string {
   return s ? `?${s}` : "";
 }
 
+/** Request body for POST /hives/:hive/races/:raceId/pick; a blank reason is omitted. */
+export function pickBody(trainId: string, reason: string): PickRace {
+  const r = reason.trim().slice(0, 300);
+  return r ? { trainId, reason: r } : { trainId };
+}
+
 export const api = {
   /** The edge adds the signed-in user's identity; we only need to send the cookie. */
   tapRelease: (hive: string, releaseId: string) =>
@@ -219,6 +226,9 @@ export const api = {
   metrics: (hive: string, window: MetricsWindow = "24h"): Promise<MetricsView> =>
     request("GET", `/hives/${enc(hive)}/metrics?window=${window}`, MetricsParser),
   queue: (hive: string): Promise<QueueView> => request("GET", `/hives/${enc(hive)}/queue`, QueueParser),
+  /** Identity comes from Access via the edge. 409 = the race is no longer PICKING (see raceLogic.pickFailure). */
+  pickRace: (hive: string, raceId: string, trainId: string, reason?: string) =>
+    request("POST", `/hives/${enc(hive)}/races/${enc(raceId)}/pick`, AnyParser, pickBody(trainId, reason ?? ""), "include"),
   resolveEscalation: (hive: string, escalationId: string, body: ResolveEscalation) =>
     request("POST", `/hives/${enc(hive)}/escalations/${enc(escalationId)}/resolve`, AnyParser, body, "include"),
   updateSettings: (hive: string, body: UpdateHiveSettings) => request("PATCH", `/hives/${enc(hive)}/settings`, AnyParser, body, "include"),

@@ -54,6 +54,7 @@ import {
   NotesRefSchema,
   MergeResultSchema,
   OracleResultSchema,
+  PickRaceSchema,
   ProvisionResultSchema,
   QueenClientMessageSchema,
   ResolveEscalationSchema,
@@ -94,12 +95,15 @@ import {
   type MetricsView,
   type NotesProjection,
   type OracleResultInput,
+  type PickRace as PickRaceInput,
   type PromptRun,
   type ProvisionResult,
   type QueenEvent,
   type QueenServerMessage,
   type QueenServerUnitMessage,
   type QueueView,
+  type Race,
+  type RaceJudge,
   type Release,
   type ScribeSummary,
   type SentinelVerdict,
@@ -114,6 +118,7 @@ import {
 import {
   ESCALATION_SELECT,
   applyModelStatDelta,
+  applyPickDelta,
   appendAuditRow,
   deleteClaims,
   listModelStats,
@@ -178,6 +183,7 @@ import {
   type HiveState,
   type ModelStatDelta,
   type Outcome,
+  type PickDelta,
   type PlanResult,
   type PlannerItem,
   type PromptRecord,
@@ -198,6 +204,7 @@ import {
 import { WorkPlanner, toWorkItem, workWatchdogDeadline, type AbsorbFollowUps, type WorkEffect, type WorkPlanResult } from "./work/ledger";
 import { budgetExhausted, creditsFor, defaultSettingsRecord, effectiveSettings, rollBudgetDay, utcDay } from "./work/guardrails";
 import { raceWidth } from "./train/race";
+import { humanBy, keptLoser } from "./train/pick";
 import { EscalationPlanner, type EscalationIntent, type EscalationPlanResult } from "./autonomy/escalation";
 import { autonomyTransition, changeSuccessFromReleases, effectiveAutonomy, errorBudget, hiveHeadline, type EffectiveAutonomy, type SloStatus } from "./autonomy/policy";
 import { appendEvents, pruneEvents, queryEvents } from "./obs/events";
@@ -380,6 +387,8 @@ class Acc {
   events: EventDraft[] = [];
   effects: AnyEffect[] = [];
   modelStats: ModelStatDelta[] = [];
+  /** T9a: human picks to count (model_stats picks / picks_against_recommendation). */
+  picks: PickDelta[] = [];
   routerDispatches?: number;
   routerFloor?: FloorState;
   itemConflicts = new Map<string, number>();
@@ -409,6 +418,7 @@ class Acc {
     this.effects.push(...r.effects);
     this.events.push(...r.events);
     this.modelStats.push(...r.modelStats);
+    this.picks.push(...(r.picks ?? []));
     if (r.routerDispatches !== undefined) this.routerDispatches = r.routerDispatches;
     if (r.routerFloor !== undefined) this.routerFloor = r.routerFloor;
     for (const c of r.itemConflicts) this.itemConflicts.set(c.itemId, c.conflicts);
@@ -472,6 +482,8 @@ export interface Decision {
 interface DecideOptions {
   /** Train / item ids the call names (loaded even when terminal). */
   trains?: string[];
+  /** Race ids the call names (loaded even when DECIDED: a re-pick), with their candidates. */
+  races?: string[];
   items?: string[];
   releases?: string[];
   /** Change the settings row before the planners are built (PATCH settings, escalation intents, the lease). */
@@ -540,8 +552,8 @@ export class QueenNode extends DurableObject<Env> {
     };
   }
 
-  /** Seam for sim: filing hints from a prompt's text (the sim's `[race]` marker sets bestOf 3). */
-  protected filingHints(text: string): { bestOf?: number } {
+  /** Seam for sim: filing hints from a prompt's text (the sim's `[race]` marker sets bestOf 3, `[you-pick]` judge human). */
+  protected filingHints(text: string): { bestOf?: number; judge?: RaceJudge } {
     void text;
     return {};
   }
@@ -579,6 +591,7 @@ export class QueenNode extends DurableObject<Env> {
           decompose: prompt.decompose ?? false,
           ...(prompt.priority !== undefined ? { priority: prompt.priority } : {}),
           ...((prompt.bestOf ?? hints.bestOf) !== undefined ? { bestOf: prompt.bestOf ?? hints.bestOf } : {}),
+          ...((prompt.judge ?? hints.judge) !== undefined ? { judge: prompt.judge ?? hints.judge } : {}),
           actor,
         }),
       ),
@@ -598,7 +611,15 @@ export class QueenNode extends DurableObject<Env> {
     await this.maybeLease(hive, true);
     const { value: res, acc } = this.decide(
       hive,
-      (d) => d.acc.work(d.wp.fileItem({ ...spec, ...(spec.bestOf === undefined && hints.bestOf ? { bestOf: hints.bestOf } : {}), actor: `user:${input.user}` })),
+      (d) =>
+        d.acc.work(
+          d.wp.fileItem({
+            ...spec,
+            ...(spec.bestOf === undefined && hints.bestOf ? { bestOf: hints.bestOf } : {}),
+            ...(spec.judge === undefined && hints.judge ? { judge: hints.judge } : {}),
+            actor: `user:${input.user}`,
+          }),
+        ),
       { items: [...spec.dependsOn, ...(spec.parentId ? [spec.parentId] : [])] },
     );
     await this.commit(hive, acc);
@@ -638,6 +659,28 @@ export class QueenNode extends DurableObject<Env> {
     this.throwWorkError(res);
     const item = this.loadItem(input.itemId);
     return { outcome: res.outcome, item: item ? toWorkItem(item) : null };
+  }
+
+  /**
+   * `POST /hives/:hive/races/:raceId/pick` (user, T9a, human-push design §10.2): a human picks a PICKING race's
+   * winner (`by: human:<email>`), or re-picks a just-decided one whose winner has not boarded a car (§10.3).
+   * 404 for an unknown race; 409 unless the race is PICKING and `trainId` a live passed candidate (or a re-pick).
+   */
+  async pick(input: { hive: string; raceId: string; user: string; pick: PickRaceInput }): Promise<{ outcome: string; race: Race }> {
+    const pick = parseOrThrow(PickRaceSchema, input.pick, "pick");
+    const hive = this.hiveFor(input.hive);
+    const row = this.sql.exec("SELECT * FROM races WHERE race_id = ?", input.raceId).toArray()[0];
+    if (!row) throw new QueenError("NOT_FOUND", `race ${input.raceId} not found`);
+    const race = rowToRace(row);
+    const { value: res, acc } = this.decide(
+      hive,
+      (d) => d.acc.train(d.tp.pick({ raceId: race.raceId, trainId: pick.trainId, by: humanBy(input.user), reason: pick.reason ?? null })),
+      { races: [race.raceId], trains: race.trainIds, items: [race.itemId] },
+    );
+    if (res.refused) throw new QueenError(res.refused.status === 404 ? "NOT_FOUND" : "CONFLICT", res.refused.message);
+    await this.commit(hive, acc);
+    const after = this.sql.exec("SELECT * FROM races WHERE race_id = ?", race.raceId).toArray()[0];
+    return { outcome: res.outcome, race: after ? rowToRace(after) : race };
   }
 
   /** Open work items (the sim Oracle's TRIAGE dedupe). */
@@ -1417,7 +1460,7 @@ export class QueenNode extends DurableObject<Env> {
       .toArray()
       .map(rowToEscalation);
     const races = this.sql
-      .exec("SELECT * FROM races WHERE state = 'RACING' OR race_id IN (SELECT race_id FROM races ORDER BY created_at DESC LIMIT 20) ORDER BY created_at")
+      .exec("SELECT * FROM races WHERE state IN ('RACING', 'PICKING') OR race_id IN (SELECT race_id FROM races ORDER BY created_at DESC LIMIT 20) ORDER BY created_at")
       .toArray()
       .map(rowToRace);
     const recentEvents = this.sql
@@ -1429,7 +1472,17 @@ export class QueenNode extends DurableObject<Env> {
     return {
       type: "snapshot",
       promptRuns: desc(this.sql.exec("SELECT * FROM prompt_runs ORDER BY seq DESC LIMIT ?", SNAPSHOT_LIMIT).toArray().map(rowToPrompt)).map(toPromptRun),
-      trains: desc(this.sql.exec("SELECT * FROM merge_trains ORDER BY seq DESC LIMIT ?", SNAPSHOT_LIMIT).toArray().map(rowToTrain)).map(toMergeTrainV2),
+      // The newest trains, plus every candidate of a PICKING race (the Pick view needs them all, however old).
+      trains: desc(
+        this.sql
+          .exec(
+            `SELECT * FROM merge_trains WHERE seq IN (SELECT seq FROM merge_trains ORDER BY seq DESC LIMIT ?)
+             OR race_id IN (SELECT race_id FROM races WHERE state = 'PICKING') ORDER BY seq DESC`,
+            SNAPSHOT_LIMIT,
+          )
+          .toArray()
+          .map(rowToTrain),
+      ).map(toMergeTrainV2),
       recentAudit: listRecentAudit(this.sql, AUDIT_SNAPSHOT_LIMIT),
       deployments: this.listDeployments(),
       releases,
@@ -1714,7 +1767,7 @@ export class QueenNode extends DurableObject<Env> {
       this.sql
         .exec(
           `SELECT * FROM merge_trains WHERE phase IN ('MERGED', 'EJECTED')
-           AND (fork_state = 'DELETING' OR deploy_state = 'TEARING_DOWN' OR (fork_state = 'READY' AND origin_json IS NOT NULL))`,
+           AND (fork_state = 'DELETING' OR deploy_state = 'TEARING_DOWN' OR (fork_state = 'READY' AND (origin_json IS NOT NULL OR (race_outcome = 'LOST' AND lane = 'BUILD'))))`,
         )
         .toArray()
         .map((r) => {
@@ -1824,6 +1877,7 @@ export class QueenNode extends DurableObject<Env> {
         paused: queuePaused,
       },
       briefFor: (sha) => this.verdictNote(sha),
+      pick: { judge: hs.race.judge ?? "auto", pickWindowMs: hs.race.pickWindowMs, maxPickingRaces: g.maxPickingRaces },
     });
     const releaseIds = state.releases.map((r) => r.releaseId);
     const releaseEscalations = releaseIds.length
@@ -1977,9 +2031,20 @@ export class QueenNode extends DurableObject<Env> {
     addTrains([...this.cleanup.values()]);
     const missing = (opts.trains ?? []).filter((id) => !trains.has(id));
     if (missing.length) addTrains(this.loadTrains(missing));
-    const racing = state.races.map((r) => r.raceId);
-    if (racing.length) {
-      const ids = state.races.flatMap((r) => r.trainIds).filter((id) => !trains.has(id));
+    let races = state.races;
+    const wantRaces = (opts.races ?? []).filter((id) => !races.some((r) => r.raceId === id));
+    if (wantRaces.length) {
+      const extra = this.sql
+        .exec(`SELECT * FROM races WHERE race_id IN (${wantRaces.map(() => "?").join(",")})`, ...wantRaces)
+        .toArray()
+        .map(rowToRace);
+      if (extra.length) {
+        races = [...races, ...extra];
+        changed = true;
+      }
+    }
+    if (races.length) {
+      const ids = races.flatMap((r) => r.trainIds).filter((id) => !trains.has(id));
       if (ids.length) addTrains(this.loadTrains(ids));
     }
     const items = new Map(state.items.map((i) => [i.itemId, i]));
@@ -2019,7 +2084,7 @@ export class QueenNode extends DurableObject<Env> {
     }
     if (!changed) return state;
     const bySeq = <X extends { seq: number }>(a: X, b: X) => a.seq - b.seq;
-    return { ...state, trains: [...trains.values()].sort(bySeq), items: [...items.values()].sort(bySeq), releases: [...releases.values()].sort(bySeq) };
+    return { ...state, trains: [...trains.values()].sort(bySeq), items: [...items.values()].sort(bySeq), releases: [...releases.values()].sort(bySeq), races };
   }
 
   /**
@@ -2031,7 +2096,7 @@ export class QueenNode extends DurableObject<Env> {
     const drafts = [...acc.events, ...this.issuedEvents(acc)];
     const trains = [...acc.trains.values()];
     const verdicts = acc.effects.flatMap((e) => (e.type === "broadcast" && e.message.type === "sentinel.verdict" ? [e.message.verdict] : []));
-    const statsChanged = acc.modelStats.length > 0 || acc.routerFloor !== undefined;
+    const statsChanged = acc.modelStats.length > 0 || acc.routerFloor !== undefined || acc.picks.length > 0;
     const router = acc.routerDispatches !== undefined || acc.routerFloor !== undefined;
     const claims = [...acc.claims.values()];
     const releasedClaims = (this.cache.get()?.claims ?? []).filter((c) => acc.released.has(c.itemId));
@@ -2059,6 +2124,7 @@ export class QueenNode extends DurableObject<Env> {
         for (const e of acc.escalations.values()) upsertEscalation(this.sql, e);
         for (const v of verdicts) upsertVerdict(this.sql, v, now);
         for (const d of acc.modelStats) applyModelStatDelta(this.sql, d, now);
+        for (const d of acc.picks) applyPickDelta(this.sql, d, now);
         if (router) saveRouter(this.sql, { dispatches: acc.routerDispatches, floor: acc.routerFloor });
         for (const [itemId, n] of acc.itemConflicts) {
           if (!acc.items.has(itemId)) this.sql.exec("UPDATE work_items SET conflicts = ? WHERE item_id = ?", n, itemId);
@@ -2089,7 +2155,7 @@ export class QueenNode extends DurableObject<Env> {
       ...(acc.settings ? { settings: acc.settings } : {}),
     });
     for (const t of trains) {
-      if (!isActive(t) && (t.forkState === "DELETING" || t.deployState === "TEARING_DOWN" || keptFork(t))) this.cleanup.set(t.trainId, t);
+      if (!isActive(t) && (t.forkState === "DELETING" || t.deployState === "TEARING_DOWN" || keptFork(t) || keptLoser(t))) this.cleanup.set(t.trainId, t);
       else this.cleanup.delete(t.trainId);
       if (t.passedSeq) this.maxPassedSeq = Math.max(this.maxPassedSeq, t.passedSeq);
     }
@@ -2628,6 +2694,7 @@ function plannerItem(i: WorkItemRecord): PlannerItem {
     conflicts: i.conflicts,
     status: i.status,
     ...(i.inbox?.handoff ? { handoff: true } : {}),
+    ...(i.judge ? { judge: i.judge } : {}),
   };
 }
 

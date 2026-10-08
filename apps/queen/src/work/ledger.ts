@@ -54,6 +54,7 @@ import {
   type OracleResult,
   type PromptStatus,
   type QueenServerMessage,
+  type RaceJudge,
   type ReleasePhase,
   type SimilarItem,
   type WorkAction,
@@ -264,6 +265,8 @@ export interface FileGoalInput {
   promptText: string;
   priority?: number;
   bestOf?: number;
+  /** `human`: the goal's children race for a human pick (§10.2). */
+  judge?: RaceJudge;
   /** `user:<email>` (or `user` for the open v1 route). */
   actor: string;
   itemId?: string;
@@ -279,6 +282,8 @@ export interface FilePromptInput {
   decompose?: boolean;
   priority?: number;
   bestOf?: number;
+  /** `human` ("you pick", §10.2): the item's races wait for a human pick. */
+  judge?: RaceJudge;
   actor: string;
   itemId?: string;
 }
@@ -372,6 +377,8 @@ export function toWorkItem(r: WorkItemRecord): WorkItem {
     updatedAt: r.updatedAt,
     // T1: pushed code (dashboard origin badge, handoff). Absent for Queen-solicited work.
     ...(r.inbox ? { inbox: { ...r.inbox } } : {}),
+    // §10.2: "you pick" (absent = the hive's race judge).
+    ...(r.judge ? { judge: r.judge } : {}),
   };
 }
 
@@ -414,6 +421,8 @@ interface NewItemSpec {
   bestOf: number | null;
   paths: string[];
   duplicateOf?: string | null;
+  /** Race judge (§10.2); absent = the hive's `settings.race.judge`. */
+  judge?: RaceJudge;
 }
 
 // ── the planner ──────────────────────────────────────────────────────────
@@ -479,6 +488,7 @@ export class WorkPlanner {
       dependsOn: [],
       paths: [],
       ...(input.bestOf !== undefined ? { bestOf: input.bestOf } : {}),
+      ...(input.judge !== undefined ? { judge: input.judge } : {}),
       actor: input.actor,
       ...(input.itemId !== undefined ? { itemId: input.itemId } : {}),
     });
@@ -509,6 +519,7 @@ export class WorkPlanner {
       difficulty: "normal",
       bestOf: input.bestOf ?? null,
       paths: [],
+      ...(input.judge !== undefined ? { judge: input.judge } : {}),
     });
     this.event("item.filed", goal, `goal filed: ${goal.title}`, { kind: "goal", source: "user", status: goal.status }, input.actor);
     this.issueOracle(goal, "decompose", 1);
@@ -548,6 +559,7 @@ export class WorkPlanner {
       difficulty: input.difficulty ?? "normal",
       bestOf: input.bestOf ?? null,
       paths: normalizePaths(input.paths),
+      ...(input.judge !== undefined ? { judge: input.judge } : {}),
     });
     this.settleNew(item);
     this.event("item.filed", item, `${item.kind} filed: ${item.title}`, { kind: item.kind, source: "user", status: item.status }, input.actor);
@@ -684,6 +696,7 @@ export class WorkPlanner {
           traceId: goal.traceId,
           difficulty: c.difficulty,
           bestOf: goal.bestOf,
+          ...(goal.judge !== undefined ? { judge: goal.judge } : {}),
           paths: normalizePaths(c.paths),
           duplicateOf: dup,
         }),
@@ -1276,6 +1289,7 @@ export class WorkPlanner {
       normalizedTitle: normalizeTitle(spec.title),
       landedAt: null,
       shippedAt: null,
+      ...(spec.judge !== undefined ? { judge: spec.judge } : {}),
     };
     this.items.set(item.itemId, item);
     this.markItem(item);

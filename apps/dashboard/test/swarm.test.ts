@@ -100,7 +100,7 @@ test("swarm floor: 20+ builds grouped by phase, race candidates together", () =>
   const count = (g: string) => f.groups.find((x) => x.group === g)!.count;
   expect(count("building")).toBe(13);
   expect(count("deploying")).toBe(2);
-  expect(count("gating")).toBe(5);
+  expect(count("gating")).toBe(8); // 5 gating + the 3 held candidates of the "you pick" race
   expect(count("racing")).toBe(3);
   expect(f.races).toBe(1);
   expect(f.waitingOnPaths.map((i) => i.itemId)).toEqual(["g1-c3"]);

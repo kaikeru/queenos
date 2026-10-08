@@ -77,6 +77,7 @@ import type {
   PromptRun,
   PromptStatus,
   ProvisionCommand,
+  RaceJudge,
   ProvisionResult,
   QueenServerMessage,
   RecalledMemory,
@@ -104,6 +105,7 @@ import {
 } from "../models/router";
 import type { RaceRecord } from "../records";
 import * as queue from "./queue";
+import { LOSER_FORK_KEEP_MS, checkPick, decideMode, isHumanBy, judgeOf, keptLoser, pickDeadline, pickDue, recommend, releaseLoser } from "./pick";
 import { buildCredits, rankCandidates, raceWidth, type RaceCandidate } from "./race";
 
 /**
@@ -166,7 +168,7 @@ export function isParked(t: TrainRecord): boolean {
 
 /** A rejected contributed train whose fork is kept for a handoff; `deleteIssuedAt` is its delete-after deadline. */
 export function keptFork(t: TrainRecord): boolean {
-  return !isActive(t) && isContributed(t) && t.forkState === "READY";
+  return !isActive(t) && isContributed(t) && t.forkState === "READY" && t.raceOutcome !== "LOST";
 }
 export const INFRA_RETRY_BASE_MS = 30_000;
 export const INFRA_RETRY_MAX_MS = 5 * 60_000;
@@ -312,6 +314,8 @@ export interface PlannerItem {
   status?: WorkStatus;
   /** The contributor handed the item to the swarm (`Queen: rework` or the `handoff` action). */
   handoff?: boolean;
+  /** Race judge (§10.2): `human` holds a race with ≥ 2 passes for a pick. Absent: the hive's (`PlannerContext.pick.judge`). */
+  judge?: RaceJudge;
 }
 
 export interface HiveState {
@@ -402,6 +406,18 @@ export interface PlannerContext {
    * from a contributor's rejected head. A read-only ledger lookup; absent or null = no brief.
    */
   briefFor?: (sha: string) => string | null;
+  /**
+   * T9a human-judged races (§10.2): the hive's default judge (`settings.race.judge`, default auto), the pick
+   * window (`settings.race.pickWindowMs`, default 15 min) and `Guardrails.maxPickingRaces` (default 2, min 1).
+   */
+  pick?: { judge?: RaceJudge; pickWindowMs?: number; maxPickingRaces?: number };
+}
+
+/** A human pick (§10.3): +1 pick for the winner's (model, role), +1 against the recommendation when it differed (db.applyPickDelta). */
+export interface PickDelta {
+  model: string;
+  role: RouterRole;
+  againstRecommendation: boolean;
 }
 
 export type Effect =
@@ -450,6 +466,10 @@ export interface PlanResult {
   awaitingContributor?: { promptId: string; summary: string }[];
   /** T1: push intents ended without a push (gitAborted, the intent watchdog, or a newer push): submissions `aborted:transient`. */
   abortedIntents?: string[];
+  /** T9a: human picks to count in model_stats (picks / picksAgainstRecommendation). */
+  picks?: PickDelta[];
+  /** T9a: a pick the rules refused (`pick()`): the route answers this status. */
+  refused?: { status: 404 | 409; message: string };
 }
 
 const TERMINAL: ReadonlySet<TrainPhase> = new Set(["MERGED", "EJECTED"]);
@@ -639,8 +659,8 @@ export function forkOverdue(t: TrainRecord, trains: readonly TrainRecord[]): boo
 
 /**
  * When the DO alarm must next run: the earliest `issuedAt + timeout` over
- * every outstanding command, or the earliest RACING race deadline (v2; pass
- * `races`), or a WAITING_PARENT train whose wait is already over (forkOverdue,
+ * every outstanding command, or the earliest RACING race deadline or PICKING pick deadline (v2 / T9a; pass
+ * `races`), a kept fork's delete-after deadline, or a WAITING_PARENT train whose wait is already over (forkOverdue,
  * UNDISPATCHED_RETRY_MS out), or null if none.
  */
 export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: number, now: number, races: readonly RaceRecord[] = []): number | null {
@@ -650,12 +670,16 @@ export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: numb
     if (at !== null) all.push(at);
     if (droneUndispatched(t)) all.push(now + UNDISPATCHED_RETRY_MS);
     if (forkOverdue(t, trains)) all.push(now + UNDISPATCHED_RETRY_MS);
-    if (keptFork(t) && t.deleteIssuedAt !== null) all.push(t.deleteIssuedAt);
+    if ((keptFork(t) || keptLoser(t)) && t.deleteIssuedAt !== null) all.push(t.deleteIssuedAt);
     // BUILD gates (cars keep their retire watchdog, from the preview deploy: outstandingSince).
     if (gateOutstanding(t) && !isCar(t)) all.push((t.gateIssuedAt ?? now) + GATE_TIMEOUT_FACTOR * timeoutMs);
     if (ungated(t)) all.push(now + UNDISPATCHED_RETRY_MS);
   }
-  for (const r of races) if (r.state === "RACING" && r.deadlineAt !== null) all.push(r.deadlineAt);
+  for (const r of races) {
+    if (r.state === "RACING" && r.deadlineAt !== null) all.push(r.deadlineAt);
+    // T9a: a PICKING race auto-picks its recommendation at its pick deadline (queen:deadline).
+    if (r.state === "PICKING" && r.pickDeadlineAt !== null && r.pickDeadlineAt !== undefined) all.push(r.pickDeadlineAt);
+  }
   return all.length ? Math.min(...all) : null;
 }
 
@@ -775,6 +799,8 @@ export class TrainPlanner {
   private infraFailed: { promptId: string; summary: string }[] = [];
   private awaitingContributor: { promptId: string; summary: string }[] = [];
   private abortedIntents: string[] = [];
+  private picks: PickDelta[] = [];
+  private refused: { status: 404 | 409; message: string } | null = null;
   private readonly hooks: QueueHooks;
   private readonly activeBuildsAtStart: number;
   private landing = false;
@@ -1423,7 +1449,7 @@ export class TrainPlanner {
       }
     }
     for (const race of [...this.races.values()]) {
-      if (race.state === "RACING") this.maybeDecide(race);
+      if (race.state === "RACING" || race.state === "PICKING") this.maybeDecide(race);
     }
     this.maybeLand();
     return this.finish("applied");
@@ -1966,6 +1992,12 @@ export class TrainPlanner {
    */
   private releaseKeptForks(): void {
     for (const t of this.trains) {
+      // T9a: a picked race's loser keeps its fork until the winner is terminal or LOSER_FORK_KEEP_MS ran out.
+      if (keptLoser(t)) {
+        const winner = this.trains.find((x) => x.raceId === t.raceId && x.raceOutcome === "WON" && x.trainId !== t.trainId);
+        if (releaseLoser(t, winner, this.ctx.now)) this.deleteFork(t);
+        continue;
+      }
       if (!keptFork(t)) continue;
       const due = t.deleteIssuedAt === null || this.ctx.now >= t.deleteIssuedAt;
       const newest = !this.trains.some((x) => keptFork(x) && x.promptId === t.promptId && x.seq > t.seq);
@@ -2214,11 +2246,11 @@ export class TrainPlanner {
 
   // ── internals: races ──────────────────────────────────────────────────
 
-  /** The train's race, if it is a candidate still in a RACING race. */
+  /** The train's race, if it is a candidate still in a RACING race (or a passed candidate held in a PICKING race). */
   private racingRaceOf(t: TrainRecord): RaceRecord | undefined {
     if (!t.raceId || isCar(t)) return undefined;
     const race = this.races.get(t.raceId);
-    if (race?.state !== "RACING") return undefined;
+    if (race?.state !== "RACING" && race?.state !== "PICKING") return undefined;
     return t.raceOutcome === "RACING" || t.raceOutcome === "PASSED" ? race : undefined;
   }
 
@@ -2239,8 +2271,13 @@ export class TrainPlanner {
   /**
    * Decide the race once every candidate has reported, or at its deadline.
    * Candidates missing from the loaded state are terminal (reported, failed).
+   * T9a: a human-judged race with ≥ 2 passes is held in PICKING instead (pick.ts decideMode).
    */
   private maybeDecide(race: RaceRecord): void {
+    if (race.state === "PICKING") {
+      this.maybeDecidePicking(race);
+      return;
+    }
     if (race.state !== "RACING") return;
     const cands = race.trainIds.map((id) => this.find(id)).filter((t): t is TrainRecord => !!t);
     const live = cands.filter(isActive);
@@ -2249,22 +2286,31 @@ export class TrainPlanner {
     const due = race.deadlineAt !== null && this.ctx.now >= race.deadlineAt;
     if (pending.length && !(due && passed.length)) return;
     const predicted = this.item(race.itemId)?.paths ?? [];
-    const prompt = this.prompts.get(race.itemId);
     if (passed.length) {
+      const judge = judgeOf(this.item(race.itemId)?.judge, this.ctx.pick?.judge);
+      const picking = [...this.races.values()].filter((r) => r.state === "PICKING" && r.raceId !== race.raceId).length;
+      const mode = decideMode({ judge, passed: passed.length, picking, maxPicking: this.ctx.pick?.maxPickingRaces ?? Number.NaN });
+      if (mode === "pick") {
+        this.enterPicking(race, passed, pending, predicted);
+        return;
+      }
       const ranking = rankCandidates(passed.map(toCandidate), { predictedPaths: predicted });
       const winner = this.find(ranking.winner!.trainId)!;
-      this.pass(winner, { raceOutcome: "WON", reason: ranking.reason });
-      for (const l of [...passed, ...pending]) {
-        if (l === winner) continue;
-        const why = l.raceOutcome === "RACING" ? "still running at the race deadline" : (ranking.lostBecause[l.trainId] ?? "ranked lower");
-        this.eject(l, `lost race to ${winner.trainId}: ${why}`, { raceOutcome: "LOST" });
-      }
-      this.setRace(race, { state: "DECIDED", winnerTrainId: winner.trainId, reason: ranking.reason, decidedAt: this.ctx.now });
-      this.raceEvent(race, winner, `race ${race.raceId} decided: ${winner.trainId} ${ranking.reason}`, { winner: winner.trainId, winnerModel: winner.model, outcome: "DECIDED" });
-      this.maybeLand();
+      const losers = [...passed, ...pending]
+        .filter((l) => l !== winner)
+        .map((l) => ({ t: l, why: l.raceOutcome === "RACING" ? "still running at the race deadline" : (ranking.lostBecause[l.trainId] ?? "ranked lower") }));
+      // Auto races keep their pre-T9a shape (no decidedBy); a human-judged race records who decided it.
+      const by = judge === "human" ? `queen:${mode}` : null;
+      const reason = mode === "cap" ? clip(`${ranking.reason} (maxPickingRaces reached: decided without a pick)`, 300) : ranking.reason;
+      this.decideRace(race, winner, losers, { reason, by, summary: `${winner.trainId} ${reason}` });
       return;
     }
-    // Nobody passed: one failure for the item, with the best failure's Scribe summary.
+    this.abandonRace(race, cands, predicted);
+  }
+
+  /** Nobody passed: one failure for the item, with the best failure's Scribe summary (no human, even when judged by one). */
+  private abandonRace(race: RaceRecord, cands: TrainRecord[], predicted: readonly string[]): void {
+    const prompt = this.prompts.get(race.itemId);
     const failed = cands.filter((t) => t.raceOutcome === "FAILED");
     const best = failed.length ? this.find(rankCandidates(failed.map(toCandidate), { predictedPaths: predicted }).winner!.trainId) : undefined;
     const why = best?.summary ?? prompt?.summary ?? "every race candidate failed";
@@ -2277,6 +2323,161 @@ export class TrainPlanner {
       else this.rework(prompt.promptId);
     }
     this.maybeLand();
+  }
+
+  /**
+   * T9a (§10.2): hold a human-judged race for a pick. The passed candidates stay alive (TESTING, previews LIVE,
+   * forks kept); still-running ones lose as at any deadline. The race records the Queen's recommendation and
+   * `pickDeadlineAt`, when the Queen picks it itself (`queen:deadline`).
+   */
+  private enterPicking(race: RaceRecord, passed: TrainRecord[], pending: TrainRecord[], predicted: readonly string[]): void {
+    const rec = recommend(passed.map(toCandidate), predicted)!;
+    for (const l of pending) this.eject(l, `lost race ${race.raceId}: still running when it went to a human pick`, { raceOutcome: "LOST" });
+    const pickDeadlineAt = pickDeadline(this.ctx.now, this.ctx.pick?.pickWindowMs);
+    this.setRace(race, { state: "PICKING", recommendedTrainId: rec.trainId, recommendReason: rec.reason, pickDeadlineAt });
+    const recommended = this.find(rec.trainId);
+    this.events.push({
+      type: "race.picking",
+      actor: ACTOR,
+      traceId: recommended ? traceOfTrain(recommended) : traceIdFromUuid(race.itemId),
+      spanId: spanIdFor(race.raceId),
+      parentSpanId: spanIdFor(race.itemId),
+      itemId: race.itemId,
+      trainId: rec.trainId,
+      summary: clip500(`race ${race.raceId}: ${passed.length} candidates passed every gate; waiting for a human pick until ${new Date(pickDeadlineAt).toISOString()} (${rec.reason}: ${rec.trainId})`),
+      data: {
+        raceId: race.raceId,
+        candidates: passed.map((t) => ({ trainId: t.trainId, model: t.model, previewUrl: t.previewUrl })),
+        recommended: rec.trainId,
+        recommendReason: rec.reason,
+        pickDeadlineAt,
+      },
+    });
+  }
+
+  /**
+   * A PICKING race: a candidate left (superseded, failed) or its pick window ran out. No live pass left → the
+   * usual ABANDONED path; one left → `queen:single`; at `pickDeadlineAt` → the recommendation (or, if it is
+   * gone, the best live one), `queen:deadline`. Otherwise it keeps waiting (a paused hive included).
+   */
+  private maybeDecidePicking(race: RaceRecord): void {
+    const cands = race.trainIds.map((id) => this.find(id)).filter((t): t is TrainRecord => !!t);
+    const passed = cands.filter((t) => isActive(t) && t.raceOutcome === "PASSED");
+    const predicted = this.item(race.itemId)?.paths ?? [];
+    if (!passed.length) {
+      this.abandonRace(race, cands, predicted);
+      return;
+    }
+    const single = passed.length === 1;
+    if (!single && !pickDue(race, this.ctx.now)) return;
+    const ranking = rankCandidates(passed.map(toCandidate), { predictedPaths: predicted });
+    const winner = passed.find((t) => t.trainId === race.recommendedTrainId) ?? this.find(ranking.winner!.trainId)!;
+    const by = single ? "queen:single" : "queen:deadline";
+    const reason = single
+      ? clip(`only candidate left in the pick; ${race.recommendReason ?? ranking.reason}`, 300)
+      : clip(`no pick within the window: the Queen's recommendation; ${race.recommendReason ?? ranking.reason}`, 300);
+    const losers = passed.filter((l) => l !== winner).map((l) => ({ t: l, why: "not picked before the pick deadline" }));
+    this.decideRace(race, winner, losers, { reason, by, summary: `${winner.trainId} by ${by}`, keepLoserForks: true });
+  }
+
+  /**
+   * The winner passes (WON, a queue ticket), the losers are EJECTED (LOST). A race decided out of PICKING keeps
+   * its losers' forks for a re-pick (`keepLoserForks`, LOSER_FORK_KEEP_MS); their previews are torn down.
+   */
+  private decideRace(
+    race: RaceRecord,
+    winner: TrainRecord,
+    losers: { t: TrainRecord; why: string }[],
+    opts: { reason: string; by: string | null; summary: string; keepLoserForks?: boolean; humanReason?: string | null },
+  ): void {
+    this.pass(winner, { raceOutcome: "WON", reason: opts.reason });
+    for (const { t, why } of losers) {
+      if (opts.keepLoserForks) this.ejectKeepingLoserFork(t, `lost race to ${winner.trainId}: ${why}`);
+      else this.eject(t, `lost race to ${winner.trainId}: ${why}`, { raceOutcome: "LOST" });
+    }
+    this.setRace(race, { state: "DECIDED", winnerTrainId: winner.trainId, reason: opts.reason, decidedAt: this.ctx.now, ...(opts.by ? { decidedBy: opts.by } : {}) });
+    const picked = race.recommendedTrainId !== null && race.recommendedTrainId !== undefined;
+    this.raceEvent(race, winner, `race ${race.raceId} decided: ${opts.summary}`, {
+      winner: winner.trainId,
+      winnerModel: winner.model,
+      outcome: "DECIDED",
+      ...(opts.by ? { by: opts.by } : {}),
+      ...(picked ? { recommended: race.recommendedTrainId, agreed: winner.trainId === race.recommendedTrainId } : {}),
+      ...(opts.humanReason ? { reason: opts.humanReason } : {}),
+    });
+    if (isHumanBy(opts.by)) this.countPick(winner, winner.trainId !== race.recommendedTrainId);
+    this.maybeLand();
+  }
+
+  /** EJECTED (LOST) with its preview torn down, the fork kept until `now + LOSER_FORK_KEEP_MS` (deleteIssuedAt). */
+  private ejectKeepingLoserFork(t: TrainRecord, reason: string): void {
+    if (t.forkState !== "READY") {
+      this.eject(t, reason, { raceOutcome: "LOST" });
+      return;
+    }
+    this.setTrain(t, { raceOutcome: "LOST", phase: "EJECTED", reason, deleteIssuedAt: this.ctx.now + LOSER_FORK_KEEP_MS });
+    if (PREVIEW_EXISTS.has(t.deployState)) this.teardownPreview(t);
+  }
+
+  /** model_stats picks (§10.3), per (model, role); contributed candidates have no model. */
+  private countPick(winner: TrainRecord, againstRecommendation: boolean): void {
+    if (!winner.model || !isCatalogModel(winner.model)) return;
+    const role: RouterRole = winner.modelChoice?.role === "rework" || (!winner.modelChoice && winner.action === "REWORK") ? "rework" : "builder";
+    this.picks.push({ model: winner.model, role, againstRecommendation });
+  }
+
+  /**
+   * T9a `POST /hives/:hive/races/:raceId/pick` (§10.2, §10.3): a human picks `trainId`.
+   * - PICKING: `trainId` (a live passed candidate) wins, the others lose with their forks kept; `race.decided`
+   *   `by: human:<email>`, `agreed` = the pick was the Queen's recommendation; picks counted in model_stats.
+   * - DECIDED out of PICKING, the winner not yet in a car: a re-pick. The winner steps back (EJECTED, LOST, no
+   *   attempt, fork kept) and `trainId` is restored to PASSED with a new queue ticket.
+   * - Otherwise `refused` (409; 404 for an unknown race), nothing changes.
+   */
+  pick(input: { raceId: string; trainId: string; by: string; reason?: string | null }): PlanResult {
+    const race = this.races.get(input.raceId);
+    if (!race) {
+      this.refused = { status: 404, message: `race ${input.raceId} not found` };
+      return this.finish("ignored:unknown");
+    }
+    const cands = race.trainIds.map((id) => this.find(id)).filter((t): t is TrainRecord => !!t);
+    const check = checkPick(race, input.trainId, cands);
+    if (!check.ok) {
+      this.refused = { status: check.status, message: check.message };
+      return this.finish("ignored:stale");
+    }
+    const pickedBy = input.by.replace(/^human:/, "");
+    const why = input.reason?.trim() ? clip(input.reason.trim(), 300) : null;
+    const reason = clip(`picked by ${pickedBy}${why ? `: ${why}` : ""}`, 300);
+    const chosen = this.find(input.trainId)!;
+    if (check.mode === "pick") {
+      const losers = cands
+        .filter((t) => t !== chosen && isActive(t) && t.raceOutcome === "PASSED")
+        .map((t) => ({ t, why: `not picked (${pickedBy}${why ? `: ${clip(why, 120)}` : ""})` }));
+      this.decideRace(race, chosen, losers, { reason, by: input.by, summary: `${chosen.trainId} picked by ${pickedBy}`, keepLoserForks: true, humanReason: why });
+      return this.finish("applied");
+    }
+    // Re-pick before boarding: swap the winner.
+    const old = this.find(check.winnerTrainId)!;
+    // The old winner never boarded: no attempt is charged, and its fork is kept like any picked loser's.
+    this.ejectKeepingLoserFork(old, `lost race to ${chosen.trainId}: re-picked by ${pickedBy}`);
+    this.setTrain(chosen, { deleteIssuedAt: null }, false);
+    this.pass(chosen, { raceOutcome: "WON", reason });
+    this.setRace(race, { winnerTrainId: chosen.trainId, reason, decidedAt: this.ctx.now, decidedBy: input.by });
+    this.raceEvent(race, chosen, `race ${race.raceId} re-picked: ${chosen.trainId} instead of ${old.trainId} by ${pickedBy}`, {
+      winner: chosen.trainId,
+      winnerModel: chosen.model,
+      outcome: "DECIDED",
+      by: input.by,
+      recommended: race.recommendedTrainId ?? null,
+      agreed: chosen.trainId === race.recommendedTrainId,
+      repick: true,
+      previous: old.trainId,
+      ...(why ? { reason: why } : {}),
+    });
+    this.countPick(chosen, chosen.trainId !== race.recommendedTrainId);
+    this.maybeLand();
+    return this.finish("applied");
   }
 
   private raceEvent(race: RaceRecord, t: TrainRecord | undefined, summary: string, data: Record<string, unknown>, severity: EventDraft["severity"] = "info"): void {
@@ -2646,7 +2847,11 @@ export class TrainPlanner {
       ...(this.infraFailed.length ? { infraFailed: this.infraFailed } : {}),
       ...(this.awaitingContributor.length ? { awaitingContributor: this.awaitingContributor } : {}),
       ...(this.abortedIntents.length ? { abortedIntents: this.abortedIntents } : {}),
+      ...(this.picks.length ? { picks: this.picks } : {}),
+      ...(this.refused ? { refused: this.refused } : {}),
     };
+    this.picks = [];
+    this.refused = null;
     this.infraFailed = [];
     this.awaitingContributor = [];
     this.abortedIntents = [];

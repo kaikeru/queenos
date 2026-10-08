@@ -9,6 +9,7 @@ import { hrefFor } from "./route";
 import { ReleaseStripRow, GuardrailsPanel } from "./HomePanels";
 import { HiveFooter, HiveHeader, ItemChip, OriginChip } from "./shell";
 import { blockedOrFailed, goalTrees, headline, openEscalations, pipelineCounts, statusTiles, type GoalNode, type ItemRow } from "./status";
+import { composerRace, YOU_PICK_WIDTH, type BestOfChoice } from "./raceLogic";
 import { SwarmFloor } from "./SwarmFloor";
 import type { Room } from "./WarRoom";
 
@@ -327,21 +328,21 @@ function GoalTree({ hive, node, open }: { hive: string; node: GoalNode; open: bo
 function Composer({ hive, room }: { hive: string; room: Room }) {
   const [text, setText] = useState("");
   const [split, setSplit] = useState(true);
-  const [bestOf, setBestOf] = useState<"auto" | "1" | "2" | "3" | "4" | "5">("auto");
+  const [bestOf, setBestOf] = useState<BestOfChoice>("auto");
   const [note, setNote] = useState<string | null>(null);
   const disabled = room.status !== "open";
-  const send = (promptText: string, decompose: boolean, best: number | undefined): boolean =>
-    room.send({ type: "submit_prompt", prompt: { namespace: hive, promptText, decompose, ...(best ? { bestOf: best } : {}) } });
+  const send = (promptText: string, decompose: boolean, race: { bestOf?: number; judge?: "human" }): boolean =>
+    room.send({ type: "submit_prompt", prompt: { namespace: hive, promptText, decompose, ...race } });
   const submit = (e: FormEvent) => {
     e.preventDefault();
     const t = text.trim();
     if (!t) return;
-    const ok = send(t, split, bestOf === "auto" ? undefined : Number(bestOf));
+    const ok = send(t, split, composerRace(bestOf));
     setNote(ok ? (split ? "Sent. The Queen is splitting it into items." : "Sent.") : "Not linked to the Queen; nothing was sent.");
     if (ok) setText("");
   };
   const swarm = () => {
-    const ok = send(demoSwarmPrompt(SWARM_DEMO_SIZE), true, undefined);
+    const ok = send(demoSwarmPrompt(SWARM_DEMO_SIZE), true, {});
     setNote(ok ? `Swarm demo sent: ${SWARM_DEMO_SIZE} items.` : "Not linked to the Queen; nothing was sent.");
   };
   return (
@@ -364,6 +365,7 @@ function Composer({ hive, room }: { hive: string; room: Room }) {
           <select value={bestOf} onChange={(e) => setBestOf(e.target.value as typeof bestOf)}>
             <option value="auto">auto</option>
             {[1, 2, 3, 4, 5].map((n) => <option key={n} value={String(n)}>{n}</option>)}
+            <option value="pick">you pick ({YOU_PICK_WIDTH})</option>
           </select>
         </label>
         <span className="sh-spacer" />

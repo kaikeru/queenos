@@ -12,6 +12,7 @@ import {
   NotesRefSchema,
   MergeResultSchema,
   OracleResultSchema,
+  PickRaceSchema,
   ProvisionResultSchema,
   ScribeSummarySchema,
   SentinelVerdictSchema,
@@ -41,7 +42,7 @@ export { SwarmGovernor } from "./scale/governor";
  * - open: `POST /prompts`, the WebSocket room and every GET (the edge's Access
  *   check covers them in production);
  * - user (`x-queen-user`, set by the edge after Access): tap, items, item
- *   actions, settings, escalation resolve;
+ *   actions, settings, escalation resolve, race pick;
  * - internal (bearer token): `/internal/*`, `/trains/*`, `/audit`, `/scribe`.
  *
  * The git proxy (apps/git) calls `gitIntent` / `gitPushed` / `gitAborted` / `notesFor` over DO RPC; the
@@ -169,6 +170,14 @@ hive.patch("/settings", async (c) => {
   const user = userOf(c);
   const patch = (await body(c)) as UpdateHiveSettings;
   return c.json(await stub(c, hiveOf(c)).updateSettings({ hive: hiveOf(c), user, patch }));
+});
+
+// T9a "you pick" (human-push design §10.2): pick a PICKING race's winner. 409 unless the race is PICKING and
+// trainId a live passed candidate (or a re-pick before the winner boards a car); 404 for an unknown race.
+hive.post("/races/:raceId/pick", async (c) => {
+  const user = userOf(c);
+  const pick = parseOrThrow(PickRaceSchema, await body(c), "pick");
+  return c.json(await stub(c, hiveOf(c)).pick({ hive: hiveOf(c), raceId: c.req.param("raceId"), user, pick }));
 });
 
 hive.post("/escalations/:id/resolve", async (c) => {

@@ -9,7 +9,8 @@
  * bundle (src/index.ts) never imports it.
  */
 import { QueenNode as ProdQueenNode, type QueenPorts } from "../queen-node";
-import { RACE_MARKER, SimExecutors } from "./sim-ports";
+import { SimExecutors } from "./sim-ports";
+import { simFilingHints } from "./sim-v2";
 
 import app from "../index";
 
@@ -46,9 +47,9 @@ export class QueenNode extends ProdQueenNode {
     return true;
   }
 
-  /** `[race]` in a filed prompt or item makes it a best-of-3 race (§6). */
-  protected override filingHints(text: string): { bestOf?: number } {
-    return text.includes(RACE_MARKER) ? { bestOf: 3 } : {};
+  /** `[race]` in a filed prompt or item makes it a best-of-3 race (§6); `[you-pick]` also makes a human pick it (§10.8). */
+  protected override filingHints(text: string): ReturnType<typeof simFilingHints> {
+    return simFilingHints(text);
   }
 
   /** Simulated executors run off the DO alarm (hibernation-safe), inside alarm(); then normal reconcile. */

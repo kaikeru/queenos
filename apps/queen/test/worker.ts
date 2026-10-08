@@ -4,7 +4,8 @@
  * `SimQueenNode` (binding SIM_QUEEN, v2-flow.test.ts) runs the real sim ports instead.
  */
 import { QueenNode as ProdQueenNode, type QueenPorts } from "../src/queen-node";
-import { RACE_MARKER, SimExecutors, type SimDelays } from "../src/sim/sim-ports";
+import { SimExecutors, type SimDelays } from "../src/sim/sim-ports";
+import { simFilingHints } from "../src/sim/sim-v2";
 import { RecordingDispatcher, RecordingGatekeeper, RecordingHerald, RecordingOracle, RecordingProvisioner, RecordingSentinel } from "./fakes";
 
 export { default } from "../src/index";
@@ -112,8 +113,8 @@ export class SimQueenNode extends ProdQueenNode {
     return go.length;
   }
 
-  protected override filingHints(text: string): { bestOf?: number } {
-    return text.includes(RACE_MARKER) ? { bestOf: 3 } : {};
+  protected override filingHints(text: string): ReturnType<typeof simFilingHints> {
+    return simFilingHints(text);
   }
 
   /** Jobs due by now (the sim's job queue), for tests that step the alarm. */

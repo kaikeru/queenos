@@ -19,6 +19,12 @@ export const SPOT_BUG_MARKER = "[spot-bug]";
 export const GATE_SPOT_MARKER = "[gate-spot]";
 /** Staging gets `inconclusive: true` and ROLLBACK. */
 export const INCONCLUSIVE_MARKER = "[inconclusive]";
+/**
+ * "You pick" (human-push design §10.8): the filed item races best-of-3 with `judge: human`, so once its
+ * candidates pass (the marker rule) the race waits in PICKING for a human pick. `[you-pick] [fail]`: candidate
+ * 0 fails, 2 passed candidates are left to pick from.
+ */
+export const YOU_PICK_MARKER = "[you-pick]";
 const TOUCH_RE = /\[touch:([^\]\s]+)\]/g;
 
 /** Sim defaults (§6): the Queen's sim env must be configured with these (Phase 2). */
@@ -75,6 +81,18 @@ export function simChangedPaths(text: string, opts: { dropShared?: boolean } = {
 }
 
 export const isMergeConflictRework = (scribeSummary: string | undefined) => !!scribeSummary?.startsWith("Merge conflict");
+
+/**
+ * Filing hints from a prompt or item text (the sim Queen's `filingHints` seam): `[race]` races it best-of-3;
+ * `[you-pick]` races it best-of-3 too and sets `judge: human`.
+ */
+export function simFilingHints(text: string): { bestOf?: number; judge?: "human" } {
+  const youPick = text.includes(YOU_PICK_MARKER);
+  return {
+    ...(youPick || text.includes(RACE_MARKER) ? { bestOf: 3 } : {}),
+    ...(youPick ? { judge: "human" as const } : {}),
+  };
+}
 
 // ── Oracle fake ──────────────────────────────────────────────────────────
 

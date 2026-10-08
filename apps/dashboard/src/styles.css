@@ -785,3 +785,27 @@ input, textarea { font: inherit; color: var(--text); }
   .push__cmd { flex-direction: column; align-items: stretch; }
   .push__mint input { max-width: none; }
 }
+
+/* Pick view (human-judged races, design §10.6) */
+.rp { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.rp__count { font: 700 18px var(--mono); color: var(--yellow); margin: 0; }
+.rp__why { margin: 0; }
+.rp__decided { margin: 0; font-weight: 600; }
+.rp__cards { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.rp__card-li { min-width: 0; display: flex; }
+.rp__card { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel-2); }
+.rp__card--rec { border-color: rgba(53, 242, 160, 0.6); }
+.rp__card--winner { border-color: var(--green); box-shadow: 0 0 0 1px var(--green) inset; }
+.rp__card--out { opacity: 0.6; }
+.rp__head { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.rp__rec, .rp__won { color: var(--green); border-color: rgba(53, 242, 160, 0.5); }
+.rp__frame { display: none; width: 100%; height: 220px; border: 1px solid var(--line-2); border-radius: 8px; background: #fff; }
+@media (min-width: 900px) { .rp__frame { display: block; } }
+.rp__link { align-self: flex-start; }
+.rp__stats { margin: 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.rp__stats > div { display: flex; gap: 8px; }
+.rp__stats dt { flex: none; width: 90px; color: var(--dim); }
+.rp__stats dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.rp__notes { margin: 0; font-size: 13px; }
+.rp__confirm { display: flex; flex-wrap: wrap; gap: 6px; }
+.rp__confirm input { flex: 1 1 160px; min-width: 0; font: 14px var(--mono); color: var(--text); background: var(--panel); border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 10px; min-height: 40px; }

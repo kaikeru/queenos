@@ -188,6 +188,38 @@ export function buildSwarmFixture(hive: string, now: number): SwarmFixture {
   train("t-g1c2-1", `${G}-c2`, { raceId: "race-1", candidate: 1, raceOutcome: "PASSED", status: "TESTING", phase: "TESTING", model: GLM, score: { ...score, changedBytes: 3900 } });
   train("t-g1c2-2", `${G}-c2`, { raceId: "race-1", candidate: 2, raceOutcome: "RACING", model: DEEPSEEK_FLASH });
 
+  // Race R2 ("you pick"): three candidates passed every gate; the Queen holds for a human until pickDeadlineAt.
+  item({ itemId: "pk1", title: "Pricing page layout", judge: "human", bestOf: 3, source: { kind: "user", actor: USER }, traceId: traceOf(5), paths: ["src/pricing.js"] });
+  const racePick: Race = {
+    raceId: "race-pick",
+    itemId: "pk1",
+    width: 3,
+    state: "PICKING",
+    trainIds: ["t-pk1-0", "t-pk1-1", "t-pk1-2"],
+    winnerTrainId: null,
+    reason: null,
+    deadlineAt: null,
+    createdAt: now - 300_000,
+    decidedAt: null,
+    pickDeadlineAt: now + 11 * 60_000 + 3000,
+    recommendedTrainId: "t-pk1-1",
+    recommendReason: "t-pk1-1: smallest diff (1.9 KB) with every criterion satisfied",
+    rejections: [],
+  };
+  [[KIMI, 2600, 3], [GLM, 1900, 3], [DEEPSEEK_FLASH, 4200, 2]].forEach(([m, b, sat], i) =>
+    train(`t-pk1-${i}`, "pk1", {
+      raceId: "race-pick",
+      candidate: i,
+      raceOutcome: "PASSED",
+      status: "TESTING",
+      phase: "TESTING",
+      model: m as string,
+      previewUrl: `https://pk1-${i}-${hive}.kaikeru.workers.dev`,
+      summary: ["Adds a three-tier grid with a monthly/yearly toggle.", "Single-column cards, tier data in one array.", "Table layout with a sticky header; one criterion partly met."][i]!,
+      score: { review: "approved", satisfied: sat as number, missing: 3 - (sat as number), changedFiles: 2 + (i % 2), changedBytes: b as number, checks: 3 },
+    }),
+  );
+
   // The swarm: 30 independent items, each on its own trace.
   let k = 0;
   const swarm = (status: MergeTrain["status"], phase: MergeTrain["phase"], extra: Partial<MergeTrain> = {}, itemOver: Partial<WorkItem> = {}) => {
@@ -339,7 +371,7 @@ export function buildSwarmFixture(hive: string, now: number): SwarmFixture {
     },
   ];
 
-  return { items, trains, races: [race1], escalations: esc, hive: hiveStatus, events, steps };
+  return { items, trains, races: [race1, racePick], escalations: esc, hive: hiveStatus, events, steps };
 }
 
 /** Hourly rollups for the mock metrics endpoint: 24 buckets of plausible numbers. */

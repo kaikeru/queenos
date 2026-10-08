@@ -1,0 +1,150 @@
+/** T9d: the Pick view, its countdown / 409 / composer-judge logic, and the pick API call. */
+import { renderToString } from "react-dom/server";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import type { MergeTrain, Race, WorkItem } from "@queenos/queen-types";
+
+import { api, ApiError, pickBody } from "../src/api";
+import { RacePick } from "../src/RacePick";
+import { composerRace, countdownLine, countdownText, decidedSummary, pickCards, pickFailure, pickRemainingMs } from "../src/raceLogic";
+import { raceView, raceViewForItem } from "../src/swarm";
+
+const NOW = 1_800_000_000_000;
+const race = (over: Partial<Race> = {}): Race => ({
+  raceId: "r1", itemId: "i1", width: 3, state: "PICKING", trainIds: ["a", "b", "c"], winnerTrainId: null, reason: null, deadlineAt: null,
+  createdAt: NOW - 60_000, decidedAt: null, pickDeadlineAt: NOW + 723_000, recommendedTrainId: "b", recommendReason: "b: smallest diff", ...over,
+});
+const score = { review: "approved" as const, satisfied: 3, missing: 1, changedFiles: 2, changedBytes: 2048, checks: 4 };
+const train = (id: string, i: number, over: Partial<MergeTrain> = {}): MergeTrain =>
+  ({ trainId: id, baseSha: "0", includedPrompts: ["i1"], artifactRepo: "r", status: "TESTING", phase: "TESTING", lane: "BUILD", createdAt: NOW, raceId: "r1", candidate: i,
+    raceOutcome: "PASSED", model: `model-${id}`, previewUrl: `https://${id}.example.dev`, summary: `notes ${id}`, score, ...over }) as MergeTrain;
+const item = { itemId: "i1", title: "Pricing page", judge: "human" } as WorkItem;
+
+function state(r: Race, trains: MergeTrain[]) {
+  return { trains: Object.fromEntries(trains.map((t) => [t.trainId, t])), trainOrder: trains.map((t) => t.trainId), items: { i1: item }, races: { r1: r }, events: [], landed: [] } as unknown as Parameters<typeof raceView>[0];
+}
+const three = () => [train("a", 0), train("b", 1, { score: { ...score, changedBytes: 1024 } }), train("c", 2, { score: undefined, previewUrl: null })];
+
+describe("countdown", () => {
+  test("mm:ss, h:mm:ss, clamps at zero", () => {
+    expect(countdownText(723_000)).toBe("12:03");
+    expect(countdownText(5_000)).toBe("0:05");
+    expect(countdownText(3_725_000)).toBe("1:02:05");
+    expect(countdownText(-10)).toBe("0:00");
+  });
+  test("only a PICKING race with a deadline counts down", () => {
+    expect(pickRemainingMs(race(), NOW)).toBe(723_000);
+    expect(pickRemainingMs(race({ pickDeadlineAt: undefined }), NOW)).toBeNull();
+    expect(pickRemainingMs(race({ state: "DECIDED" }), NOW)).toBeNull();
+    expect(pickRemainingMs(race({ pickDeadlineAt: NOW - 5 }), NOW)).toBe(0);
+  });
+  test("names the recommended candidate", () => {
+    const v = raceView(state(race(), three()), "r1", NOW)!;
+    expect(countdownLine(v, NOW)).toBe("auto-picks model-b in 12:03");
+    expect(countdownLine(v, NOW + 800_000)).toBe("auto-picking model-b now");
+  });
+});
+
+describe("cards", () => {
+  test("derives diff, gate, reviewer, preview and falls back to n/a", () => {
+    const cards = pickCards(raceView(state(race(), three()), "r1", NOW)!);
+    expect(cards.map((c) => c.trainId)).toEqual(["a", "b", "c"]);
+    expect(cards[1]).toMatchObject({ recommended: true, pickable: true, changedBytes: 1024, satisfied: 3, missing: 1, previewUrl: "https://b.example.dev" });
+    expect(cards[2]).toMatchObject({ changedBytes: null, checks: null, previewUrl: null });
+  });
+  test("failed / lost candidates are not shown while picking; rejected ones are, unpickable", () => {
+    const ts = [...three(), train("d", 3, { raceOutcome: "FAILED", status: "EJECTED" })];
+    const r = race({ rejections: [{ trainId: "a", by: "human:x@y.z", reason: "ugly" }] });
+    const cards = pickCards(raceView(state(r, ts), "r1", NOW)!);
+    expect(cards.map((c) => c.trainId)).toEqual(["a", "b", "c"]);
+    expect(cards[0]).toMatchObject({ pickable: false, rejectedReason: "ugly" });
+  });
+  test("a non-http preview URL is never linked", () => {
+    const c = pickCards(raceView(state(race(), [train("a", 0, { previewUrl: "javascript:alert(1)" })]), "r1", NOW)!)[0]!;
+    expect(c.previewUrl).toBeNull();
+  });
+});
+
+describe("decided result", () => {
+  test("human pick against the recommendation", () => {
+    const d = decidedSummary(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "human:k@kaikeru.com" }))!;
+    expect(d).toMatchObject({ human: true, agreed: false, text: "picked by k@kaikeru.com" });
+  });
+  test("deadline fallback agrees with the recommendation", () => {
+    expect(decidedSummary(race({ state: "DECIDED", winnerTrainId: "b", decidedBy: "queen:deadline" }))).toMatchObject({ human: false, agreed: true });
+  });
+  test("not decided, or an older Queen without decidedBy", () => {
+    expect(decidedSummary(race())).toBeNull();
+    expect(decidedSummary(race({ state: "DECIDED", recommendedTrainId: undefined }))).toMatchObject({ by: null, agreed: null });
+  });
+});
+
+describe("409 handling and the API call", () => {
+  test("409 is a friendly refresh, other errors pass through", () => {
+    const f = pickFailure(new ApiError("race is not PICKING", 409));
+    expect(f.refresh).toBe(true);
+    expect(f.message).toContain("no longer open for picking");
+    expect(f.message).not.toContain("PICKING");
+    expect(pickFailure(new ApiError("boom", 500))).toEqual({ message: "boom", refresh: false });
+  });
+  test("body omits a blank reason and clips a long one", () => {
+    expect(pickBody("t1", "  ")).toEqual({ trainId: "t1" });
+    expect(pickBody("t1", " cleaner ")).toEqual({ trainId: "t1", reason: "cleaner" });
+    expect(pickBody("t1", "x".repeat(400)).reason).toHaveLength(300);
+  });
+  afterEach(() => vi.unstubAllGlobals());
+  test("pickRace POSTs {trainId, reason} to the pick route", async () => {
+    const f = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await api.pickRace("demo hive", "r/1", "t1", "nicer");
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("/hives/demo%20hive/races/r%2F1/pick");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ trainId: "t1", reason: "nicer" });
+  });
+  test("pickRace surfaces a 409 as ApiError", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "not picking" }), { status: 409 })));
+    await expect(api.pickRace("h", "r", "t")).rejects.toMatchObject({ status: 409 });
+  });
+});
+
+describe("composer judge option", () => {
+  test("you pick = best-of 3 with judge human; numbers and auto carry no judge", () => {
+    expect(composerRace("pick")).toEqual({ bestOf: 3, judge: "human" });
+    expect(composerRace("auto")).toEqual({});
+    expect(composerRace("2")).toEqual({ bestOf: 2 });
+  });
+});
+
+describe("render", () => {
+  const view = (r: Race, ts = three()) => raceView(state(r, ts), "r1", NOW)!;
+  test("PICKING: candidates, recommended badge and reason, countdown, pick buttons, preview link", () => {
+    const html = renderToString(<RacePick hive="demo" view={view(race())} now={NOW} />);
+    expect(html).toContain("YOUR PICK");
+    expect(html).toContain("auto-picks model-b in 12:03");
+    expect(html).toContain("smallest diff");
+    expect(html).toContain("recommended");
+    expect(html.match(/Pick this one/g)).toHaveLength(3);
+    expect(html).toContain("https://a.example.dev");
+    expect(html).toContain("<iframe");
+    expect(html).toContain("3 satisfied");
+    expect(html).toContain("2.0 KB");
+    expect(html).toContain("n/a");
+  });
+  test("DECIDED by a human: result shown, no pick buttons", () => {
+    const html = renderToString(<RacePick hive="demo" view={view(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "human:k@kaikeru.com" }))} now={NOW} />);
+    expect(html).toContain("picked by k@kaikeru.com");
+    expect(html).toContain("overrode the Queen");
+    expect(html).not.toContain("Pick this one");
+    expect(html).not.toContain("<iframe");
+  });
+  test("a plain auto race renders nothing", () => {
+    const v = raceView(state(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "queen:auto" }), three()), "r1", NOW)!;
+    v.item = { ...item, judge: undefined } as WorkItem;
+    expect(renderToString(<RacePick hive="demo" view={v} now={NOW} />)).toBe("");
+  });
+  test("raceViewForItem prefers a PICKING race over a newer decided one", () => {
+    const s = state(race(), three());
+    s.races = { r1: race(), r0: race({ raceId: "r0", state: "DECIDED", createdAt: NOW }) };
+    expect(raceViewForItem(s, "i1", NOW)?.race.raceId).toBe("r1");
+  });
+});

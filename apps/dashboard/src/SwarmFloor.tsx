@@ -4,7 +4,8 @@ import { useNow } from "./components";
 import type { State } from "./reducer";
 import { hrefFor } from "./route";
 import { Link } from "./router";
-import { floorSummary, swarmFloor, type SwarmGroup, type SwarmTile } from "./swarm";
+import { RacePick } from "./RacePick";
+import { floorSummary, raceView, swarmFloor, type SwarmGroup, type SwarmTile } from "./swarm";
 import "./swarm.css";
 
 const mmss = (ms: number) => {
@@ -48,6 +49,10 @@ export function SwarmFloor({ state, hive }: { state: State; hive: string }) {
   const { trains, trainOrder, items, races, events, landed } = state;
   const floor = useMemo(() => swarmFloor({ trains, trainOrder, items, races, events, landed }), [trains, trainOrder, items, races, events, landed]);
   const summary = floorSummary(floor);
+  const picking = useMemo(
+    () => Object.values(races).filter((r) => r.state === "PICKING").sort((a, b) => a.createdAt - b.createdAt).map((r) => raceView({ trains, trainOrder, items, races, events, landed }, r.raceId, now)).filter((v) => v != null),
+    [races, trains, trainOrder, items, events, landed, now],
+  );
   const peak = Math.max(1, ...floor.groups.map((g) => g.count));
   return (
     <section className="floor" aria-label="Swarm floor">
@@ -77,6 +82,7 @@ export function SwarmFloor({ state, hive }: { state: State; hive: string }) {
           ))}
         </div>
       )}
+      {picking.map((v) => <RacePick key={v.race.raceId} hive={hive} view={v} now={now} showItem />)}
     </section>
   );
 }

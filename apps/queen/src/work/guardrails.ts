@@ -8,6 +8,8 @@ import {
   GUARDRAIL_MAX,
   HIVE_SETTINGS_DEFAULTS,
   MODEL_CATALOG,
+  PICK_WINDOW_DEFAULT_MS,
+  PICK_WINDOW_MAX_MS,
   PathPatternSchema,
   isGeneratedPath,
   type BuildUsage,
@@ -22,6 +24,8 @@ import type { HiveSettingsRecord } from "../records";
 /** Max predicted paths per item (WorkItemSchema.paths). */
 export const MAX_ITEM_PATHS = 10;
 const HOUR_MS = 3_600_000;
+/** The shortest pick window (RaceSettingsSchema min; train/pick.ts PICK_WINDOW_MIN_MS). */
+const PICK_WINDOW_MIN_MS = 60_000;
 
 // ── settings ─────────────────────────────────────────────────────────────
 
@@ -30,7 +34,11 @@ function clampInt(v: number | undefined, min: number, max: number, fallback: num
   return Math.min(max, Math.max(min, Math.trunc(v)));
 }
 
-/** GUARDRAIL_DEFAULTS with per-hive overrides, each clamped to [1 (0 where allowed), GUARDRAIL_MAX]. */
+/**
+ * GUARDRAIL_DEFAULTS with per-hive overrides, each clamped to [1 (0 where allowed), GUARDRAIL_MAX].
+ * `maxPickingRaces` is clamped to at least 1 although its schema allows 0 (human-push design §13 seams):
+ * 0 would turn every human-judged race into a `queen:cap` decision.
+ */
 export function effectiveGuardrails(overrides: Partial<Guardrails> | undefined): Guardrails {
   const o = overrides ?? {};
   const out = { ...GUARDRAIL_DEFAULTS } as Guardrails;
@@ -60,6 +68,9 @@ export function effectiveSettings(record: Pick<HiveSettingsRecord, "autonomy" | 
     race: {
       reworkWidth: clampInt(o.race?.reworkWidth, 1, 5, d.race.reworkWidth),
       hardWidth: clampInt(o.race?.hardWidth, 1, 5, d.race.hardWidth),
+      // Human-judged races (§10.2): who decides a race, and how long a PICKING race waits for a human.
+      judge: o.race?.judge ?? d.race.judge ?? "auto",
+      pickWindowMs: clampInt(o.race?.pickWindowMs, PICK_WINDOW_MIN_MS, PICK_WINDOW_MAX_MS, d.race.pickWindowMs ?? PICK_WINDOW_DEFAULT_MS),
     },
   };
 }

@@ -12,6 +12,8 @@ Every RPC (`report*`, `git*`, `submitWork`, `fileWorkItem`, `workAction`, `resol
 
 The merge queue is always on (`ctx.queue` from the hive's `maxQueueBatch` / `maxQueueDepth`): a passed build boards a car, the MERGE drone 3-way merges it, and the LANDER fast-forwards main. The **alarm** runs the three reconciles (watchdogs, race deadlines, the queue, the Oracle watchdog, stale claims), prunes the event log (30 days / 100k rows) and renews the lease.
 
+**You pick (T9a, human-push design §10.1–10.3).** A race whose judge is `human` (`judge` on the item from `SubmitPrompt` / `FileWorkItem`, else `settings.race.judge`, default `auto`) with ≥ 2 passed candidates enters **PICKING** instead of auto-deciding: the passed candidates stay TESTING with previews LIVE and forks kept, the race records `recommendedTrainId` / `recommendReason` (the `rankCandidates` winner) and `pickDeadlineAt` (`settings.race.pickWindowMs`, default 15 min, max 2 h), event `race.picking`. A human pick decides it (`by: human:<email>`, counted in `model_stats.picks` / `picks_against_recommendation`); at `pickDeadlineAt` the Queen picks its recommendation (`queen:deadline`; the alarm covers it, paused or not). 1 pass → `queen:single`, 0 → the usual ABANDONED → REWORK. Past `maxPickingRaces` (default 2, clamped to 1..5) a race auto-decides at once (`queen:cap`). Losers of a picked race are EJECTED (LOST) with previews torn down, but their forks are kept 30 min (or until the winner is terminal) so a re-pick before the winner boards a car swaps the winner.
+
 **Snapshot and broadcasts** use `toMergeTrainV2` (trace, race, lane, members, carId, passedSeq, ...) and carry `items`, `escalations`, `races`, `hive` (HiveStatus) and `recentEvents`; new messages are `item.updated`, `race.updated`, `escalation.updated`, `hive.updated`, `event.appended` and `batch`.
 
 **New hives** start `autonomous` (existing hives migrated `supervised`, D2). `HIVE_DEFAULT_GUARDRAILS` (JSON) seeds a new hive's guardrails; the sim sets `maxActiveTrains` 64 and `maxChildrenPerItem` 24.
@@ -36,6 +38,7 @@ There is **one `QueenNode` per hive**, addressed by `idFromName(namespace)`. A h
 | GET | `/metrics?window=24h\|7d` | `getMetrics(window)` | `MetricsView`: hourly rollups + `HiveStatus`, `source: "queen-rollups"` |
 | GET | `/queue` | `getQueue()` | `QueueView`: active cars, passed builds waiting to board, last 20 conflicts and bisects |
 | PATCH | `/settings` | `updateSettings({hive, user, patch})` | **User route.** `UpdateHiveSettings`; returns `HiveStatus`; event `hive.settings` |
+| POST | `/races/:raceId/pick` | `pick({hive, raceId, user, pick})` | **User route** (T9a, human-push design §10). `PickRace {trainId, reason?}`. 409 unless the race is PICKING and `trainId` a live passed candidate (or a re-pick of a kept loser before the human-picked winner boards a car); 404 unknown race. Returns `{outcome, race}`; event `race.decided` `{by: "human:<email>", recommended, agreed, reason}` |
 | POST | `/escalations/:id/resolve` | `resolveEscalation({hive, escalationId, user, action})` | **User route.** `ResolveEscalation`; ship → tap, retry/cancel → the item, resume_autonomy → streak reset, raise_budget → today's limits ×1.5, retry on EXECUTOR_LOST → queue resumes. 409 when not allowed, 404 unknown |
 | POST | `/internal/webhook/oracle-result` | `reportOracleResult(OracleResult)` | `{outcome}`; idempotent by `commandId`; 404 for an unknown item |
 | POST | `/internal/webhook/merge-result` | `reportMergeResult(MergeResult)` | `{outcome, train}`; the MERGE drone's report for a car |
@@ -203,7 +206,7 @@ The planner lives in `src/release/planner.ts` (pure, like the train planner) and
 - Vars: `SENTINEL_WINDOW_SECONDS` (default 60) and `SENTINEL_MIN_REQUESTS` (default 100).
 - Broadcasts `release.updated` (updatedAt strictly increases), `deployment.updated`, `sentinel.verdict`; the snapshot has `releases` (newest first, 20).
 - Sim: a new hive is `autonomous`, so a staging PROMOTE auto-ships (`tappedBy: queen:autonomous`). To tap by hand, make it supervised first: `curl -XPATCH localhost:8787/hives/<hive>/settings -H 'content-type: application/json' -d '{"autonomy":"supervised"}'` (the localhost sim defaults the user), then `curl -XPOST localhost:8787/hives/<hive>/releases/<id>/tap -H 'x-queen-user: you@example.com'`. A prompt containing `[canary-fail]` makes the sim Sentinel roll back at 10%; two rollbacks in a row degrade the hive to supervised (ROLLBACK_STREAK).
-- Sim markers (v2): `[race]` (best-of-3), `[hard]`, `[touch:<path>]`, `[collide]`, `[batch-fail]`, `[spot-bug]`, `[gate-spot]`, `[inconclusive]`, `[decompose-fail]`; `POST /prompts` with `"decompose": true` splits bullets into items (see `src/sim/sim-v2.ts`).
+- Sim markers (v2): `[race]` (best-of-3), `[you-pick]` (best-of-3 with `judge: human`: the race waits in PICKING for `POST /races/:raceId/pick`; `[you-pick] [fail]` leaves 2 to pick from), `[hard]`, `[touch:<path>]`, `[collide]`, `[batch-fail]`, `[spot-bug]`, `[gate-spot]`, `[inconclusive]`, `[decompose-fail]`; `POST /prompts` with `"decompose": true` splits bullets into items (see `src/sim/sim-v2.ts`).
 
 ## Model router
 

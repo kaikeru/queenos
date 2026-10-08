@@ -33,7 +33,7 @@ export interface ActiveState {
   items: WorkItemRecord[];
   /** Claims of ACTIVE items. */
   claims: PathClaim[];
-  /** RACING races. */
+  /** Open races: RACING, and PICKING (held for a human pick, T9a). */
   races: RaceRecord[];
   /** In-flight releases plus the newest one. */
   releases: ReleaseRecord[];
@@ -135,7 +135,7 @@ export class StateCache {
       const c = rowToClaim(r);
       this.claims.set(claimKey(c), c);
     }
-    for (const r of q("SELECT * FROM races WHERE state = 'RACING'")) {
+    for (const r of q("SELECT * FROM races WHERE state IN ('RACING', 'PICKING')")) {
       const race = rowToRace(r);
       this.races.set(race.raceId, race);
     }
@@ -199,7 +199,7 @@ export class StateCache {
     }
 
     for (const r of rows.races ?? []) {
-      if (r.state === "RACING") this.races.set(r.raceId, r);
+      if (r.state === "RACING" || r.state === "PICKING") this.races.set(r.raceId, r);
       else this.races.delete(r.raceId);
     }
     if (rows.releases?.length) {

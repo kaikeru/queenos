@@ -10,7 +10,8 @@ import { hrefFor } from "./route";
 import { Link } from "./router";
 import { ErrorNotice, ItemChip, OriginChip } from "./shell";
 import { itemOrigin, originBadge } from "./origin";
-import { itemSubState } from "./swarm";
+import { itemSubState, raceViewForItem } from "./swarm";
+import { RacePick } from "./RacePick";
 
 const clock = (ms: number) => new Date(ms).toLocaleTimeString([], { hour12: false });
 
@@ -37,6 +38,8 @@ export function ItemView({ hive, itemId, state }: { hive: string; itemId: string
   const escs = (d?.escalations ?? Object.values(state.escalations).filter((e) => e.subject.id === item.itemId)).filter((e) => e.status === "OPEN");
   const memories = [...trains].reverse().find((t) => t.memories?.length)?.memories ?? [];
   const claims = trains.filter((t) => t.status !== "EJECTED" && t.status !== "MERGED").flatMap((t) => t.changedPaths ?? []);
+  // The item's newest race with a human in it (PICKING or decided by a pick); RacePick renders nothing otherwise.
+  const pickView = raceViewForItem(state, item.itemId);
   const conflictPaths = new Set(trains.flatMap((t) => (t.conflict ? t.conflict.paths : [])));
 
   return (
@@ -48,6 +51,7 @@ export function ItemView({ hive, itemId, state }: { hive: string; itemId: string
           <span className="chip">P{item.priority}</span> <ItemChip status={item.status} sub={sub} /> <OriginChip badge={itemOrigin(item, trains)} />
           {item.difficulty === "hard" && <span className="chip">HARD</span>}
           {item.bestOf && <span className="chip">best-of-{item.bestOf}</span>}
+          {item.judge === "human" && <span className="chip" title="A human picks the winner">you pick</span>}
           <Link className="sh-link" to={hrefFor.trace(hive, item.traceId)}>trace {item.traceId.slice(0, 8)}… ▸</Link>
         </p>
         {item.body && <p className="item__body">{item.body}</p>}
@@ -106,6 +110,8 @@ export function ItemView({ hive, itemId, state }: { hive: string; itemId: string
           </ul>
         </section>
       )}
+
+      {pickView && <RacePick hive={hive} view={pickView} onChanged={() => detail.reload()} />}
 
       <section className="panel">
         <p className="eyebrow">ATTEMPTS ({attempts.length})</p>
