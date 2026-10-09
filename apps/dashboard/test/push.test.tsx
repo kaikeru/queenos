@@ -24,7 +24,7 @@ describe("push instructions", () => {
   test("steps: cached-credential clone, race branch names, push HEAD, verdict notes; never a token", () => {
     const all = pushSteps("https://q.example", "demo").map((s) => s.cmd).join("\n");
     expect(all).toContain("git -c credential.helper='cache --timeout=3600' clone https://q.example/git/demo demo");
-    expect(all).toContain("item/<id>");
+    expect(all).toContain("item/<id>/<agent>");
     expect(all).toContain("goal/<slug>");
     expect(all).toContain("git push origin HEAD");
     expect(all).toContain("git fetch origin '+refs/notes/*:refs/notes/*' && git log --notes=verdict");

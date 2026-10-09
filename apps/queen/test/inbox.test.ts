@@ -8,10 +8,14 @@ import type { SubmissionRecord } from "../src/db";
 import {
   decideIntake,
   decideIntent,
+  entryWindowLine,
   handleFor,
   itemFromMessage,
   lateReason,
+  NOTES_HINT,
   originOf,
+  pushedMessages,
+  raceClosedToEntries,
   remoteLines,
   resolveTarget,
   slugify,
@@ -170,6 +174,89 @@ describe("decideIntake (what a landed push becomes, §6.2)", () => {
       expect(plan.messages[0]).toMatch(/filed follow-up item NEW$/);
     }
     expect(lateReason(item("I1", { status: "READY" }), 0)).toBeNull();
+  });
+
+  it("per-agent branches item/<id>/<agent>: each correlates to the item and races; re-pushing one's own branch supersedes only that train; late after the close → follow-up", () => {
+    const racing = lookup([item("I1", { status: "ACTIVE", racing: { raceId: "R1", entryClosesAt: 5_000 } })]);
+    for (const ref of ["refs/heads/item/I1/haiku", "refs/heads/item/I1/claude-opus_4.1"]) {
+      expect(decideIntake(pushed(ref), { now: 1000, lookup: racing, previousOnRef: null })).toMatchObject({ disposition: "joined-race", itemId: "I1", race: { join: "R1" } });
+    }
+    // The supersede key is (user, ref): haiku's re-push replaces haiku's train (the caller looks up the prior on that exact ref).
+    const sup = decideIntake(pushed("refs/heads/item/I1/haiku"), {
+      now: 1000,
+      lookup: racing,
+      previousOnRef: prior({ ref: "refs/heads/item/I1/haiku", target: { kind: "item", itemId: "I1" }, trainId: "haiku-train" }),
+    });
+    expect(sup).toMatchObject({ disposition: "superseded", supersedeTrainId: "haiku-train", race: { join: "R1" } });
+    // After the close the same push files a follow-up (the existing late-entry behaviour).
+    expect(decideIntake(pushed("refs/heads/item/I1/opus"), { now: 5_000, lookup: racing, previousOnRef: null })).toMatchObject({ disposition: "late-new-item", itemId: "NEW" });
+    const goal = item("G", { kind: "goal", title: "Dark mode", status: "ACTIVE" });
+    expect(decideIntake(pushed("refs/heads/goal/dark-mode/haiku"), { now: 0, lookup: lookup([goal, item("C1", { parentId: "G" })]), previousOnRef: null })).toMatchObject({ itemId: "C1", disposition: "joined-race" });
+  });
+
+  it("a re-push after the race's entries closed (still RACING) files a follow-up and does NOT supersede the earlier candidate; before the close it supersedes", () => {
+    const ref = "refs/heads/item/I1/haiku";
+    const mine = prior({ ref, target: { kind: "item", itemId: "I1" }, trainId: "haiku-train" });
+    const closed = lookup([item("I1", { status: "ACTIVE", racing: { raceId: "R1", entryClosesAt: 5_000 } })]);
+    const plan = decideIntake(pushed(ref), { now: 5_000, lookup: closed, previousOnRef: mine });
+    expect(plan).toMatchObject({ disposition: "late-new-item", itemId: "NEW", race: null });
+    expect(plan.supersedeTrainId).toBeUndefined();
+    expect(plan.messages[0]).toBe("item I1's race is closed to entries; filed follow-up item NEW");
+    expect(decideIntake(pushed(ref), { now: 4_999, lookup: closed, previousOnRef: mine })).toMatchObject({ disposition: "superseded", supersedeTrainId: "haiku-train", race: { join: "R1" } });
+    // No window (null): the existing behaviour.
+    const noWindow = lookup([item("I1", { status: "ACTIVE", racing: { raceId: "R1", entryClosesAt: null } })]);
+    expect(decideIntake(pushed(ref), { now: 9e12, lookup: noWindow, previousOnRef: mine })).toMatchObject({ disposition: "superseded" });
+    expect(raceClosedToEntries(item("I1"), 0)).toBe(false);
+    expect(raceClosedToEntries(item("I1", { racing: { raceId: "R", entryClosesAt: 5 } }), 5)).toBe(true);
+  });
+
+  it("a candidate that failed while the window is open: the contributor's re-push joins the same race as a new candidate", () => {
+    const ref = "refs/heads/item/I1/haiku";
+    const open = lookup([item("I1", { status: "ACTIVE", racing: { raceId: "R1", entryClosesAt: 5_000 } })]);
+    const failed = prior({ ref, target: { kind: "item", itemId: "I1" }, trainId: "haiku-train" }, { trainActive: false });
+    expect(decideIntake(pushed(ref), { now: 1000, lookup: open, previousOnRef: failed })).toMatchObject({ disposition: "joined-race", itemId: "I1", race: { join: "R1" } });
+    // After the close it is a follow-up instead.
+    expect(decideIntake(pushed(ref), { now: 5_000, lookup: open, previousOnRef: failed })).toMatchObject({ disposition: "late-new-item" });
+  });
+
+  it("decideIntent: a re-push into a closed race counts as filing a new item for the open-item caps", () => {
+    const ref = "refs/heads/item/I1/haiku";
+    const mine = prior({ ref, target: { kind: "item", itemId: "I1" } });
+    const capped = { openItems: GUARDRAIL_DEFAULTS.maxInboxOpenPerContributor, previousOnRef: mine };
+    const racing = (entryClosesAt: number | null) => lookup([item("I1", { status: "ACTIVE", racing: { raceId: "R1", entryClosesAt } })]);
+    expect(decideIntent(intent(ref), intentCtx({ ...capped, lookup: racing(null) }))).toMatchObject({ verdict: "accept" });
+    expect(decideIntent(intent(ref), intentCtx({ ...capped, lookup: racing(500) }))).toMatchObject({ verdict: "refuse", outcome: "refused:over-cap" });
+  });
+
+  it("pushedMessages: the notes hint is always kept and last; the entry-window line is dropped first", () => {
+    const base = { plan: ["replaces your earlier push bbbbbbb (train old)", 'submission received → item I1 "Item I1"'], entries: "race open to entries until 14:05 UTC (2 candidates)", status: "train T · verdict in ~2 min", rework: null };
+    // 2 + entries + status + hint = 5: fits.
+    expect(pushedMessages(base)).toEqual([...base.plan, base.entries, base.status, NOTES_HINT]);
+    // With a rework line it would be 6: the entry line goes, the hint stays.
+    const withRework = pushedMessages({ ...base, rework: "Queen: rework — the swarm takes over if the gate rejects it" });
+    expect(withRework).toHaveLength(5);
+    expect(withRework.at(-1)).toBe(NOTES_HINT);
+    expect(withRework).not.toContain(base.entries);
+    expect(withRework).toContain("Queen: rework — the swarm takes over if the gate rejects it");
+    // Even without an entry line and too many lines, the hint survives.
+    const flood = pushedMessages({ plan: ["a", "b", "c", "d"], entries: null, status: "s", rework: "r" });
+    expect(flood).toHaveLength(5);
+    expect(flood.at(-1)).toBe(NOTES_HINT);
+    expect(pushedMessages({ plan: ["a"], entries: null, status: "s", rework: null })).toEqual(["a", "s", NOTES_HINT]);
+  });
+
+  it("decideIntent resolves the suffix branch's target (unknown item refused, known item accepted)", () => {
+    expect(decideIntent(intent("refs/heads/item/nope/haiku"), intentCtx())).toMatchObject({ outcome: "refused:unknown-item", reason: "no item nope in this hive" });
+    expect(decideIntent(intent("refs/heads/item/I1/haiku"), intentCtx({ lookup: lookup([item("I1")]) }))).toMatchObject({ verdict: "accept", itemId: "I1" });
+  });
+
+  it("entryWindowLine: names the close (UTC) and the candidates while open; nothing once closed or without a window", () => {
+    const at = Date.UTC(2026, 9, 9, 14, 5, 30);
+    expect(entryWindowLine({ entryClosesAt: at, trainIds: ["a"] }, at - 1)).toBe("race open to entries until 14:05 UTC (1 candidate)");
+    expect(entryWindowLine({ entryClosesAt: at, trainIds: ["a", "b", "c"] }, 0)).toBe("race open to entries until 14:05 UTC (3 candidates)");
+    expect(entryWindowLine({ entryClosesAt: at, trainIds: ["a"] }, at)).toBeNull();
+    expect(entryWindowLine({ entryClosesAt: null, trainIds: ["a"] }, 0)).toBeNull();
+    expect(entryWindowLine({ trainIds: ["a"] }, 0)).toBeNull();
   });
 
   it("goal/<slug>: its single child, else a new item under the goal; Queen-Item addresses an item from any branch", () => {

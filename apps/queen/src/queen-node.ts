@@ -45,6 +45,7 @@ import {
   AppendAuditsSchema,
   BuildResultSchema,
   DeployResultSchema,
+  ENTRY_WINDOW_DEFAULT_MS,
   EventQuerySchema,
   FileWorkItemSchema,
   GitAbortedSchema,
@@ -209,7 +210,8 @@ import { EscalationPlanner, type EscalationIntent, type EscalationPlanResult } f
 import { autonomyTransition, changeSuccessFromReleases, effectiveAutonomy, errorBudget, hiveHeadline, type EffectiveAutonomy, type SloStatus } from "./autonomy/policy";
 import { appendEvents, pruneEvents, queryEvents } from "./obs/events";
 import {
-  NOTES_HINT,
+  entryWindowLine,
+  pushedMessages,
   decideIntake,
   decideIntent,
   handleFor,
@@ -683,6 +685,27 @@ export class QueenNode extends DurableObject<Env> {
     return { outcome: res.outcome, race: after ? rowToRace(after) : race };
   }
 
+  /**
+   * `POST /hives/:hive/races/:raceId/close-entries` (user, external hives, human-push design §2.5): a human ends a
+   * race's entry window now, so it can be decided. 404 for an unknown race; 409 unless the race is RACING and its
+   * entries are still open.
+   */
+  async closeRaceEntries(input: { hive: string; raceId: string; user: string }): Promise<{ outcome: string; race: Race }> {
+    const hive = this.hiveFor(input.hive);
+    const row = this.sql.exec("SELECT * FROM races WHERE race_id = ?", input.raceId).toArray()[0];
+    if (!row) throw new QueenError("NOT_FOUND", `race ${input.raceId} not found`);
+    const race = rowToRace(row);
+    const { value: res, acc } = this.decide(hive, (d) => d.acc.train(d.tp.closeEntries({ raceId: race.raceId, by: humanBy(input.user) })), {
+      races: [race.raceId],
+      trains: race.trainIds,
+      items: [race.itemId],
+    });
+    if (res.refused) throw new QueenError(res.refused.status === 404 ? "NOT_FOUND" : "CONFLICT", res.refused.message);
+    await this.commit(hive, acc);
+    const after = this.sql.exec("SELECT * FROM races WHERE race_id = ?", race.raceId).toArray()[0];
+    return { outcome: res.outcome, race: after ? rowToRace(after) : race };
+  }
+
   /** Open work items (the sim Oracle's TRIAGE dedupe). */
   listOpenItems(): { itemId: string; title: string; status: string }[] {
     return this.sql
@@ -871,15 +894,20 @@ export class QueenNode extends DurableObject<Env> {
     await this.commit(hive, acc);
     const item = this.loadItem(plan.itemId);
     const waiting = item && item.status !== "ACTIVE" ? (item.waitReason ?? item.blockedReason ?? item.status.toLowerCase()) : null;
+    // External hives: a race with an open entry window says so (a push after the close files a follow-up instead).
+    const raceId = this.loadTrain(p.trainId)?.raceId;
+    const raceRow = raceId ? this.sql.exec("SELECT * FROM races WHERE race_id = ?", raceId).toArray()[0] : undefined;
+    const raceRec = raceRow ? rowToRace(raceRow) : null;
+    const entries = raceRec && raceRec.state === "RACING" ? entryWindowLine(raceRec, now) : null;
     return {
       disposition: plan.disposition,
       itemId: plan.itemId,
-      messages: remoteLines([
-        ...plan.messages,
-        waiting ? `queued: ${waiting}` : `train ${p.trainId} · verdict in ~2 min`,
-        rework ? "Queen: rework — the swarm takes over if the gate rejects it" : null,
-        NOTES_HINT,
-      ]),
+      messages: pushedMessages({
+        plan: plan.messages,
+        entries,
+        status: waiting ? `queued: ${waiting}` : `train ${p.trainId} · verdict in ~2 min`,
+        rework: rework ? "Queen: rework — the swarm takes over if the gate rejects it" : null,
+      }),
     };
   }
 
@@ -1884,6 +1912,7 @@ export class QueenNode extends DurableObject<Env> {
       briefFor: (sha) => this.verdictNote(sha),
       pick: { judge: hs.race.judge ?? "auto", pickWindowMs: hs.race.pickWindowMs, maxPickingRaces: g.maxPickingRaces },
       external: hs.executors === "external",
+      entryWindowMs: hs.executors === "external" ? (hs.race.entryWindowMs ?? ENTRY_WINDOW_DEFAULT_MS) : 0,
     });
     const releaseIds = state.releases.map((r) => r.releaseId);
     const releaseEscalations = releaseIds.length

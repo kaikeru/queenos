@@ -49,6 +49,13 @@ describe("pre-receive refusals (§4.3)", () => {
     ["a notes ref", [[ZERO, NEW_SHA, "refs/notes/verdict"]], REFUSALS.branchesOnly],
     ["a bad item target", [[ZERO, NEW_SHA, "refs/heads/item/has.dot"]], REFUSALS.badItem],
     ["a bad goal target", [[ZERO, NEW_SHA, "refs/heads/goal/"]], REFUSALS.badGoal],
+    ["a bad agent suffix", [[ZERO, NEW_SHA, "refs/heads/item/14/bad!"]], REFUSALS.badItem],
+    ["a dot-leading agent suffix", [[ZERO, NEW_SHA, "refs/heads/item/14/.hidden"]], REFUSALS.badItem],
+    ["an agent suffix with '..'", [[ZERO, NEW_SHA, "refs/heads/goal/tip-jar/a..b"]], REFUSALS.badGoal],
+    ["an agent suffix ending in .lock", [[ZERO, NEW_SHA, "refs/heads/item/14/opus.lock"]], REFUSALS.badItem],
+    ["an empty agent suffix", [[ZERO, NEW_SHA, "refs/heads/item/14/"]], REFUSALS.badItem],
+    ["a bad id before an agent suffix", [[ZERO, NEW_SHA, "refs/heads/item/has.dot/haiku"]], REFUSALS.badItem],
+    ["a nested ref under the agent suffix", [[ZERO, NEW_SHA, "refs/heads/goal/tip-jar/haiku/extra"]], REFUSALS.badGoal],
   ] as [string, [string, string, string][], string][])("refuses %s", async (_, cmds, reason) => {
     const r = await readReport(await push(cmds));
     expect(r.lines).toEqual(["unpack ok", `ng ${cmds[0]![2]} ${reason}`]);
@@ -94,6 +101,15 @@ describe("pre-receive refusals (§4.3)", () => {
     expect(world.calls.intent).toEqual([{ hive: HIVE, user: USER, ref: "refs/heads/item/99", oldSha: ZERO, newSha: NEW_SHA }]);
     expect(world.forks).toHaveLength(0);
     expect(world.calls.aborted).toHaveLength(0);
+  });
+});
+
+describe("per-agent branches (item/<id>/<agent>)", () => {
+  it.each(["refs/heads/item/14/haiku", "refs/heads/item/14/claude-opus_4.1", "refs/heads/goal/tip-jar/codex"])("passes %s to the Queen unchanged", async (ref) => {
+    world.intent = { verdict: "refuse", reason: "stop here", messages: [] };
+    const r = await readReport(await push([[ZERO, NEW_SHA, ref]]));
+    expect(r.lines).toEqual(["unpack ok", `ng ${ref} stop here`]);
+    expect(world.calls.intent).toEqual([{ hive: HIVE, user: USER, ref, oldSha: ZERO, newSha: NEW_SHA }]);
   });
 });
 

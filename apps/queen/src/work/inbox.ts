@@ -56,6 +56,30 @@ export function remoteLines(lines: readonly (string | null | undefined | false)[
 }
 
 /**
+ * The intake line for a push that joined or created a race still open to entries (external hives):
+ * `race open to entries until 14:05 UTC (2 candidates)`. Null once the window is closed or when there is none.
+ */
+export function entryWindowLine(race: { entryClosesAt?: number | null; trainIds: readonly string[] }, now: number): string | null {
+  const closes = race.entryClosesAt;
+  if (closes === null || closes === undefined || closes <= now) return null;
+  const hhmm = new Date(closes).toISOString().slice(11, 16);
+  const n = race.trainIds.length;
+  return `race open to entries until ${hhmm} UTC (${n} candidate${n === 1 ? "" : "s"})`;
+}
+
+/**
+ * The `remote:` lines of a landed push, with the notes hint always last and always kept: when the lines do not
+ * fit (5 max), the entry-window line is dropped first, then the others from the end.
+ */
+export function pushedMessages(parts: { plan: readonly string[]; entries: string | null; status: string; rework: string | null }): string[] {
+  const keep = (l: string | null): l is string => typeof l === "string" && l.trim() !== "";
+  const body = (entries: string | null) => [...parts.plan, entries, parts.status, parts.rework].filter(keep);
+  let lines = body(parts.entries);
+  if (lines.length > MAX_MESSAGES - 1) lines = body(null);
+  return remoteLines([...lines.slice(0, MAX_MESSAGES - 1), NOTES_HINT]);
+}
+
+/**
  * The WorkItemInbox `handle` for `email` (§15 Q5): the local part stripped to `[a-z0-9]`, at most 24 chars;
  * when `taken`, 4 hex chars of a hash replace the tail. Rev 2 has no inbox repos: the handle is display only.
  */
@@ -175,12 +199,17 @@ function resolveGoal(g: { goal: IntakeItem; children: IntakeItem[] } | null): Re
 
 const LATE_STATUSES: ReadonlySet<WorkStatus> = new Set(["LANDED", "SHIPPED", "CANCELLED", "DUPLICATE"]);
 
+/** The item's race has an entry window that has closed (the race may still be RACING, "closed · deciding"). */
+export function raceClosedToEntries(item: Pick<IntakeItem, "racing">, now: number): boolean {
+  return !!item.racing && item.racing.entryClosesAt !== null && now >= item.racing.entryClosesAt;
+}
+
 /** Why a correlated submission to `item` cannot enter it (late entry, §2.5), or null when it can. */
 export function lateReason(item: IntakeItem, now: number): string | null {
   if (LATE_STATUSES.has(item.status)) return `item ${item.itemId} is ${item.status.toLowerCase()}`;
   if (item.decided) return `item ${item.itemId} already decided`;
   if (item.racing) {
-    if (item.racing.entryClosesAt !== null && now >= item.racing.entryClosesAt) return `item ${item.itemId}'s race is closed to entries`;
+    if (raceClosedToEntries(item, now)) return `item ${item.itemId}'s race is closed to entries`;
     return null;
   }
   if (item.status === "ACTIVE" || item.activeNonRace) return `item ${item.itemId} is already being built`;
@@ -279,7 +308,8 @@ export function decideIntent(input: IntentInput, ctx: IntentContext): IntentDeci
     const item = ctx.lookup.item(prev.submission.itemId);
     if (item && !prev.trainBoarded && !LATE_STATUSES.has(item.status)) {
       itemId = item.itemId;
-      filesNew = false;
+      // A re-push into a race whose entries closed files a follow-up (it does not replace the earlier candidate).
+      filesNew = raceClosedToEntries(item, ctx.now);
     } else {
       filesNew = true;
     }
@@ -376,6 +406,9 @@ function fileNew(input: IntakeInput, parentId: string | null, note?: string): In
 function enter(item: IntakeItem, input: IntakeInput, now: number, correlated: boolean, previous?: PriorSubmission): IntakePlan {
   const supersede = previous && previous.trainActive && previous.submission.trainId ? previous.submission.trainId : undefined;
   if (supersede) {
+    // After the race's entries closed (still RACING, "closed · deciding") the re-push must not evict the earlier,
+    // possibly passed, candidate: it files a follow-up and the earlier code stays in the race.
+    if (raceClosedToEntries(item, now)) return followUp(item, input, `item ${item.itemId}'s race is closed to entries`);
     // The contributor's own train is the item's active build: it is replaced, not raced (no attempt charged).
     return {
       disposition: "superseded",

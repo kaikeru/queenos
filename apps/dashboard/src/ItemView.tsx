@@ -12,6 +12,7 @@ import { Link } from "./router";
 import { ErrorNotice, ItemChip, OriginChip } from "./shell";
 import { itemOrigin, originBadge } from "./origin";
 import { itemSubState, raceViewForItem } from "./swarm";
+import { RaceEntries } from "./RaceEntries";
 import { RacePick } from "./RacePick";
 
 const clock = (ms: number) => new Date(ms).toLocaleTimeString([], { hour12: false });
@@ -121,6 +122,7 @@ export function ItemView({ hive, itemId, state }: { hive: string; itemId: string
         </section>
       )}
 
+      {pickView && <RaceEntries hive={hive} view={pickView} onChanged={() => detail.reload()} />}
       {pickView && <RacePick hive={hive} view={pickView} onChanged={() => detail.reload()} />}
 
       <section className="panel">

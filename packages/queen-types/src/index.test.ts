@@ -90,6 +90,9 @@ import {
   SubmitOutcomeSchema,
   EventTypeSchema,
   inboxRepoName,
+  AGENT_HANDLE_RE,
+  ENTRY_WINDOW_DEFAULT_MS,
+  handleFromRef,
   itemIdFromRef,
   parseInboxRepo,
   parseSubmissionTrailers,
@@ -795,6 +798,15 @@ describe("human-push design T0 contracts (inbox, Submission, races)", () => {
     expect(UpdateHiveSettingsSchema.parse({ guardrails: { maxPickingRaces: 0 } })).toEqual({ guardrails: { maxPickingRaces: 0 } });
     expect(HiveSettingsSchema.parse({ ...HIVE_SETTINGS_DEFAULTS, race: { reworkWidth: 2, hardWidth: 3, judge: "human", pickWindowMs: 900_000 } }).race.judge).toBe("human");
     expect(HiveSettingsSchema.safeParse({ ...HIVE_SETTINGS_DEFAULTS, race: { reworkWidth: 2, hardWidth: 3, pickWindowMs: 3 * 3_600_000 } }).success).toBe(false);
+    // External hives: the entry window (0 = none, max 1 h); the update and overrides schemas take it too.
+    const withWindow = (entryWindowMs: number) => ({ ...HIVE_SETTINGS_DEFAULTS, race: { reworkWidth: 2, hardWidth: 3, entryWindowMs } });
+    expect(ENTRY_WINDOW_DEFAULT_MS).toBe(15 * 60_000);
+    for (const ok of [0, 1, ENTRY_WINDOW_DEFAULT_MS, 3_600_000]) expect(HiveSettingsSchema.parse(withWindow(ok)).race.entryWindowMs).toBe(ok);
+    for (const bad of [-1, 3_600_001, 1.5]) expect(HiveSettingsSchema.safeParse(withWindow(bad)).success).toBe(false);
+    expect(UpdateHiveSettingsSchema.parse({ race: { entryWindowMs: 0 } }).race?.entryWindowMs).toBe(0);
+    expect(UpdateHiveSettingsSchema.safeParse({ race: { entryWindowMs: 3_600_001 } }).success).toBe(false);
+    expect(HiveSettingsOverridesSchema.parse({ race: { entryWindowMs: 60_000 } }).race?.entryWindowMs).toBe(60_000);
+    expect(EventTypeSchema.options).toContain("race.entries-closed");
   });
 
   it("executors mode: swarm | external, optional everywhere, default swarm", () => {
@@ -832,6 +844,24 @@ describe("human-push design T0 contracts (inbox, Submission, races)", () => {
     expect(targetFromRef("refs/heads/item/3c1e")).toEqual({ kind: "item", itemId: "3c1e" });
     expect(targetFromRef("refs/heads/goal/tip-jar")).toEqual({ kind: "goal", goal: "tip-jar" });
     expect(targetFromRef("refs/heads/tip-jar")).toBeNull();
+    // An optional per-agent suffix (agents sharing a git token); it is not part of the target.
+    expect(targetFromRef("refs/heads/item/abc/haiku")).toEqual({ kind: "item", itemId: "abc" });
+    expect(targetFromRef("refs/heads/goal/tip-jar/claude-opus_4.1")).toEqual({ kind: "goal", goal: "tip-jar" });
+    expect(itemIdFromRef("refs/heads/item/abc/haiku")).toBe("abc");
+    expect(itemIdFromRef("refs/heads/goal/abc/haiku")).toBeNull();
+    expect(handleFromRef("refs/heads/item/abc/haiku")).toBe("haiku");
+    expect(handleFromRef("refs/heads/item/abc")).toBeNull();
+    // Git ref-name rules for the suffix: no leading '.', no '..', not ending in '.lock'.
+    for (const ok of ["a", "a.b", "v1.2", "x.lockx", "lock", "-x", "_x"]) expect(AGENT_HANDLE_RE.test(ok)).toBe(true);
+    for (const bad of [".hidden", "a..b", "..", "agent.lock", ".lock", "a b", "", "x".repeat(65)]) expect(AGENT_HANDLE_RE.test(bad)).toBe(false);
+    for (const bad of ["refs/heads/item/abc/.hidden", "refs/heads/item/abc/a..b", "refs/heads/item/abc/opus.lock", "refs/heads/goal/abc/.."]) {
+      expect(targetFromRef(bad)).toBeNull();
+      expect(handleFromRef(bad)).toBeNull();
+    }
+    for (const bad of ["refs/heads/item/abc/", "refs/heads/item/abc/a b", "refs/heads/item/abc/haiku/deeper", "refs/heads/item/a.b/haiku", `refs/heads/item/abc/${"x".repeat(65)}`]) {
+      expect(targetFromRef(bad)).toBeNull();
+      expect(handleFromRef(bad)).toBeNull();
+    }
     const targeted = { ...sub, ref: "refs/heads/goal/tip-jar", target: { kind: "goal", goal: "tip-jar" } };
     expect(roundTrip(SubmissionSchema, targeted)).toEqual({ ...targeted, provenance: {} });
     expect(SubmissionSchema.safeParse({ ...sub, target: { kind: "goal", goal: "a b" } }).success).toBe(false);

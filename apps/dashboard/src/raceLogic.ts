@@ -22,6 +22,34 @@ export function pickRemainingMs(race: Pick<Race, "state" | "pickDeadlineAt">, no
   return Math.max(0, race.pickDeadlineAt - now);
 }
 
+export type EntryState =
+  | { kind: "open"; remainingMs: number }
+  /** The window has passed but the Queen has not decided yet. */
+  | { kind: "closed" };
+
+/** The entry window of a RACING race (external hives); null when the race is not RACING or has no window (swarm hives, older Queens). */
+export function entryState(race: Pick<Race, "state" | "entryClosesAt">, now: number): EntryState | null {
+  if (race.state !== "RACING" || race.entryClosesAt == null) return null;
+  return race.entryClosesAt > now ? { kind: "open", remainingMs: race.entryClosesAt - now } : { kind: "closed" };
+}
+
+const plural = (n: number, one: string, many = `${one}s`): string => `${n} ${n === 1 ? one : many}`;
+
+/** "Entries open · closes in 12:03 (2 candidates)" / "Entries closed · deciding…"; null when there is no window. */
+export function entriesLine(race: Pick<Race, "state" | "entryClosesAt">, candidates: number, now: number): string | null {
+  const e = entryState(race, now);
+  if (!e) return null;
+  return e.kind === "open" ? `Entries open · closes in ${countdownText(e.remainingMs)} (${plural(candidates, "candidate")})` : "Entries closed · deciding…";
+}
+
+/** 409 means the race is no longer RACING or its entries already closed: refetch rather than retry. */
+export function closeEntriesFailure(e: unknown): PickFailure {
+  if (e instanceof ApiError && e.status === 409) {
+    return { message: "Entries are already closed for this race (it was decided, or the window ended). Refreshing…", refresh: true };
+  }
+  return { message: e instanceof Error ? e.message : String(e), refresh: false };
+}
+
 export interface PickCard {
   trainId: string;
   /** "c2" */

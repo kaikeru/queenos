@@ -98,7 +98,7 @@ describe("executors mode", () => {
     expect("bestOf" in pick).toBe(false);
   });
   it("push hint: external, non-goal, not finished", () => {
-    expect(itemPushCommand("abc")).toBe("git push origin HEAD:item/abc");
+    expect(itemPushCommand("abc")).toBe("git push origin HEAD:item/abc/<your-agent-name>");
     const ext = hive("external");
     expect(showPushHint(ext, { kind: "feature", status: "READY" })).toBe(true);
     expect(showPushHint(ext, { kind: "goal", status: "READY" })).toBe(false);

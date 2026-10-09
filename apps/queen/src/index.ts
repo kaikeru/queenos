@@ -180,6 +180,13 @@ hive.post("/races/:raceId/pick", async (c) => {
   return c.json(await stub(c, hiveOf(c)).pick({ hive: hiveOf(c), raceId: c.req.param("raceId"), user, pick }));
 });
 
+// External hives: a human ends a race's entry window now (the dashboard's "End entries now"). 409 unless the race
+// is RACING with entries still open; 404 for an unknown race. No body.
+hive.post("/races/:raceId/close-entries", async (c) => {
+  const user = userOf(c);
+  return c.json(await stub(c, hiveOf(c)).closeRaceEntries({ hive: hiveOf(c), raceId: c.req.param("raceId"), user }));
+});
+
 hive.post("/escalations/:id/resolve", async (c) => {
   const user = userOf(c);
   const action = await body(c);

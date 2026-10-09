@@ -229,6 +229,9 @@ export const api = {
   /** Identity comes from Access via the edge. 409 = the race is no longer PICKING (see raceLogic.pickFailure). */
   pickRace: (hive: string, raceId: string, trainId: string, reason?: string) =>
     request("POST", `/hives/${enc(hive)}/races/${enc(raceId)}/pick`, AnyParser, pickBody(trainId, reason ?? ""), "include"),
+  /** External hives: ends the race's entry window now (409 = not RACING, or entries already closed; see raceLogic.closeEntriesFailure). */
+  closeRaceEntries: (hive: string, raceId: string) =>
+    request("POST", `/hives/${enc(hive)}/races/${enc(raceId)}/close-entries`, AnyParser, {}, "include"),
   resolveEscalation: (hive: string, escalationId: string, body: ResolveEscalation) =>
     request("POST", `/hives/${enc(hive)}/escalations/${enc(escalationId)}/resolve`, AnyParser, body, "include"),
   updateSettings: (hive: string, body: UpdateHiveSettings) => request("PATCH", `/hives/${enc(hive)}/settings`, AnyParser, body, "include"),

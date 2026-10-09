@@ -4,6 +4,8 @@
  * `now`), no randomness.
  */
 import {
+  ENTRY_WINDOW_DEFAULT_MS,
+  ENTRY_WINDOW_MAX_MS,
   GUARDRAIL_DEFAULTS,
   GUARDRAIL_MAX,
   HIVE_SETTINGS_DEFAULTS,
@@ -71,6 +73,8 @@ export function effectiveSettings(record: Pick<HiveSettingsRecord, "autonomy" | 
       // Human-judged races (§10.2): who decides a race, and how long a PICKING race waits for a human.
       judge: o.race?.judge ?? d.race.judge ?? "auto",
       pickWindowMs: clampInt(o.race?.pickWindowMs, PICK_WINDOW_MIN_MS, PICK_WINDOW_MAX_MS, d.race.pickWindowMs ?? PICK_WINDOW_DEFAULT_MS),
+      // External hives: how long a race a push opened stays open to entries (0 = no window).
+      entryWindowMs: clampInt(o.race?.entryWindowMs, 0, ENTRY_WINDOW_MAX_MS, d.race.entryWindowMs ?? ENTRY_WINDOW_DEFAULT_MS),
     },
     executors: o.executors ?? d.executors ?? "swarm",
   };

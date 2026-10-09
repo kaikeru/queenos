@@ -26,7 +26,7 @@ export function pushSteps(origin: string, hive: string): Step[] {
     },
     {
       title: "Branch",
-      cmd: "git switch -c item/<id>      # join that item's race\n# or: git switch -c goal/<slug>   (a goal with one item)\n# any other branch name files a new item",
+      cmd: "git switch -c item/<id>/<agent>   # join that item's race (item/<id> works too; agents sharing a token use <agent>)\n# or: git switch -c goal/<slug>   (a goal with one item)\n# any other branch name files a new item",
       note: "Pushing to main is refused: every push is a Submission the swarm vets.",
     },
     { title: "Push", cmd: "git push origin HEAD", note: "The remote: lines report the gate, the queue and the landing." },

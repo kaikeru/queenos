@@ -270,6 +270,13 @@ export const PICK_WINDOW_DEFAULT_MS = 15 * 60_000;
 export const PICK_WINDOW_MAX_MS = 2 * 3_600_000;
 
 /**
+ * External hives: a race opened by a push stays open to new entries for this long from its creation (the first
+ * push), and is not decided before it closes. Swarm hives never set an entry window (`entryClosesAt` stays null).
+ */
+export const ENTRY_WINDOW_DEFAULT_MS = 15 * 60_000;
+export const ENTRY_WINDOW_MAX_MS = 3_600_000;
+
+/**
  * Who decided a race (`Race.decidedBy`, `race.decided` event `data.by`): `human:<email>`, or the Queen:
  * `queen:auto` (ranking), `queen:single` (one passed), `queen:deadline` (pick window ran out),
  * `queen:cap` (over `maxPickingRaces`). Only `human:*` decisions move preference ratings (§10.5).
@@ -303,7 +310,11 @@ export const RaceSchema = z.object({
   deadlineAt: z.number().int().nullable(),
   createdAt: z.number().int(),
   decidedAt: z.number().int().nullable(),
-  /** Submissions targeting the item join as candidates until this time (null: until decided). Inert until T1. */
+  /**
+   * Submissions targeting the item join as candidates until this time (null: until decided). Set in external
+   * hives (`settings.race.entryWindowMs`, default ENTRY_WINDOW_DEFAULT_MS from the first push); the race is not
+   * decided before it passes unless a human closes entries early (`race.entries-closed`).
+   */
   entryClosesAt: z.number().int().nullable().optional(),
   // Human-judged races (§10.7; all optional, absent on older Queens; inert until T9a).
   /** PICKING: when the Queen auto-picks its recommendation (`queen:deadline`). */

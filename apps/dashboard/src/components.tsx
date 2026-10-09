@@ -519,7 +519,7 @@ export function Composer(props: { disabled: boolean; onSubmit: (text: string) =>
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
-        placeholder={props.external ? "Describe the work for your coding agents…  (they push to item/<id> or goal/<slug>)" : "Describe a change for the swarm…  (sim only: add [fail] to make it fail once)"}
+        placeholder={props.external ? "Describe the work for your coding agents…  (they push to item/<id>/<agent> or goal/<slug>)" : "Describe a change for the swarm…  (sim only: add [fail] to make it fail once)"}
         rows={3}
         onKeyDown={(e) => {
           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(e);

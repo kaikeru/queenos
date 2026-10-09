@@ -188,7 +188,7 @@ export function externalPrompt(hive: string, promptText: string, judge: External
 }
 
 /** The branch an external agent pushes to for a given item. */
-export const itemPushCommand = (itemId: string): string => `git push origin HEAD:item/${itemId}`;
+export const itemPushCommand = (itemId: string): string => `git push origin HEAD:item/${itemId}/<your-agent-name>`;
 
 /** Show the push hint on non-goal items that still wait for code (not landed or finished) in an external hive. */
 export function showPushHint(hive: Parameters<typeof executorsMode>[0], item: Pick<WorkItem, "kind" | "status">): boolean {

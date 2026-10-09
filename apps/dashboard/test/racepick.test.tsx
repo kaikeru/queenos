@@ -4,8 +4,9 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { MergeTrain, Race, WorkItem } from "@queenos/queen-types";
 
 import { api, ApiError, pickBody } from "../src/api";
+import { RaceEntries } from "../src/RaceEntries";
 import { RacePick } from "../src/RacePick";
-import { composerRace, countdownLine, countdownText, decidedSummary, pickCards, pickFailure, pickRemainingMs } from "../src/raceLogic";
+import { closeEntriesFailure, composerRace, countdownLine, countdownText, decidedSummary, entriesLine, entryState, pickCards, pickFailure, pickRemainingMs } from "../src/raceLogic";
 import { raceView, raceViewForItem } from "../src/swarm";
 
 const NOW = 1_800_000_000_000;
@@ -146,5 +147,63 @@ describe("render", () => {
     const s = state(race(), three());
     s.races = { r1: race(), r0: race({ raceId: "r0", state: "DECIDED", createdAt: NOW }) };
     expect(raceViewForItem(s, "i1", NOW)?.race.raceId).toBe("r1");
+  });
+});
+
+describe("race entries (external hives)", () => {
+  const racing = (over: Partial<Race> = {}) => race({ state: "RACING", pickDeadlineAt: undefined, recommendedTrainId: undefined, recommendReason: undefined, entryClosesAt: NOW + 723_000, ...over });
+  const view = (r: Race, ts = three()) => raceView(state(r, ts), "r1", NOW)!;
+
+  test("entryState: open while the window is in the future, closed after, null without a window or past RACING", () => {
+    expect(entryState(racing(), NOW)).toEqual({ kind: "open", remainingMs: 723_000 });
+    expect(entryState(racing({ entryClosesAt: NOW }), NOW)).toEqual({ kind: "closed" });
+    expect(entryState(racing({ entryClosesAt: NOW - 1 }), NOW)).toEqual({ kind: "closed" });
+    expect(entryState(racing({ entryClosesAt: null }), NOW)).toBeNull();
+    expect(entryState(racing({ entryClosesAt: undefined }), NOW)).toBeNull();
+    expect(entryState(racing({ state: "PICKING" }), NOW)).toBeNull();
+    expect(entryState(racing({ state: "DECIDED" }), NOW)).toBeNull();
+  });
+  test("entriesLine formats the countdown and pluralises candidates", () => {
+    expect(entriesLine(racing(), 2, NOW)).toBe("Entries open · closes in 12:03 (2 candidates)");
+    expect(entriesLine(racing(), 1, NOW)).toBe("Entries open · closes in 12:03 (1 candidate)");
+    expect(entriesLine(racing(), 0, NOW + 720_000)).toBe("Entries open · closes in 0:03 (0 candidates)");
+    expect(entriesLine(racing({ entryClosesAt: NOW - 5 }), 2, NOW)).toBe("Entries closed · deciding…");
+    expect(entriesLine(racing({ entryClosesAt: null }), 2, NOW)).toBeNull();
+  });
+  test("409 is a friendly refresh, other errors pass through", () => {
+    expect(closeEntriesFailure(new ApiError("race is not RACING", 409))).toMatchObject({ refresh: true, message: expect.stringContaining("already closed") });
+    expect(closeEntriesFailure(new ApiError("boom", 500))).toEqual({ message: "boom", refresh: false });
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+  test("closeRaceEntries POSTs to the close-entries route", async () => {
+    const f = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await api.closeRaceEntries("demo hive", "r/1");
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("/hives/demo%20hive/races/r%2F1/close-entries");
+    expect(init.method).toBe("POST");
+    expect(init.credentials).toBe("include");
+  });
+  test("closeRaceEntries surfaces a 409 as ApiError", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "entries closed" }), { status: 409 })));
+    await expect(api.closeRaceEntries("h", "r")).rejects.toMatchObject({ status: 409 });
+  });
+
+  test("open window: countdown, candidate count and the End entries now button", () => {
+    const html = renderToString(<RaceEntries hive="demo" view={view(racing())} now={NOW} />);
+    expect(html).toContain("Entries open · closes in 12:03 (3 candidates)");
+    expect(html).toContain("End entries now");
+    expect(html).not.toContain("disabled");
+  });
+  test("closed window: deciding message, no button", () => {
+    const html = renderToString(<RaceEntries hive="demo" view={view(racing({ entryClosesAt: NOW - 1000 }))} now={NOW} />);
+    expect(html).toContain("Entries closed · deciding…");
+    expect(html).not.toContain("End entries now");
+  });
+  test("hidden for swarm races (no window) and non-RACING races", () => {
+    expect(renderToString(<RaceEntries hive="demo" view={view(racing({ entryClosesAt: null }))} now={NOW} />)).toBe("");
+    expect(renderToString(<RaceEntries hive="demo" view={view(racing({ state: "PICKING" }))} now={NOW} />)).toBe("");
+    expect(renderToString(<RaceEntries hive="demo" view={view(racing({ state: "DECIDED" }))} now={NOW} />)).toBe("");
   });
 });

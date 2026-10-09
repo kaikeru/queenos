@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { TraceIdSchema } from "./trace.js";
-import { GUARDRAIL_DEFAULTS, GuardrailOverridesSchema, GuardrailsSchema, PICK_WINDOW_MAX_MS, RaceJudgeSchema } from "./work.js";
+import { ENTRY_WINDOW_MAX_MS, GUARDRAIL_DEFAULTS, GuardrailOverridesSchema, GuardrailsSchema, PICK_WINDOW_MAX_MS, RaceJudgeSchema } from "./work.js";
 
 /**
  * Autonomy, escalations and hive settings (v2 design §2.4, §2.5, §2.8, §2.9).
@@ -130,6 +130,12 @@ export const RaceSettingsSchema = z.object({
   hardWidth: z.number().int().min(1).max(5),
   judge: RaceJudgeSchema.optional(),
   pickWindowMs: z.number().int().min(60_000).max(PICK_WINDOW_MAX_MS).optional(),
+  /**
+   * External hives only: how long a race opened by a push stays open to new entries, from its creation
+   * (default ENTRY_WINDOW_DEFAULT_MS, max 1 h). The race is not decided before it closes (a human can close
+   * it early). 0 = no window: decide as soon as every candidate has reported. Swarm hives ignore it.
+   */
+  entryWindowMs: z.number().int().min(0).max(ENTRY_WINDOW_MAX_MS).optional(),
 });
 export type RaceSettings = z.infer<typeof RaceSettingsSchema>;
 

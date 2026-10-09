@@ -30,7 +30,7 @@ Helper scripts live in `scripts/` beside this file (the skill directory, also `$
 2. Commit with a clear subject. **The subject is the item title and intent**, so write it as the goal ("Add a tip jar at /features/tip-jar"). Add a body for detail and an optional `Acceptance:` list of `- ` lines.
 3. Add the trailer `Queen-Origin: agent:claude-code` to the commit (**required** for agents). Optionally `Queen: rework` (hand a reject to the swarm) or `Queen-Item: <id>`.
 4. Choose the branch name:
-   - `item/<id>`: compete in that item's race;
+   - `item/<id>`: compete in that item's race. If other agents share your git token, push `item/<id>/<your-agent-name>` instead (your own ref: re-pushes supersede only your own submission). The race may stay open to entries for ~15 min in an external hive; a push after it closes files a follow-up item;
    - `goal/<slug>`: join the goal's single item or file a new one under the goal;
    - anything else: a new item (it counts as having won a race, but is still fully gated).
 5. `git push queen <branch>`. It always succeeds; that says nothing about the verdict.

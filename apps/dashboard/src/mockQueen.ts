@@ -182,6 +182,7 @@ export function buildSwarmFixture(hive: string, now: number): SwarmFixture {
     deadlineAt: now + 41_000,
     createdAt: now - 130_000,
     decidedAt: null,
+    entryClosesAt: now + 600_000,
   };
   const score = { review: "approved" as const, satisfied: 3, missing: 0, changedFiles: 2, changedBytes: 2400, checks: 3 };
   train("t-g1c2-0", `${G}-c2`, { raceId: "race-1", candidate: 0, raceOutcome: "PASSED", status: "TESTING", phase: "TESTING", model: KIMI, score });

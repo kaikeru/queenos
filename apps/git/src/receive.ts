@@ -11,7 +11,7 @@
  * git prints our reason instead of a transport error.
  */
 import type { GitAborted, GitIntakeDecision, GitPushed, GitPushedResult, GitPushIntent, GateTarget, NotesProjection } from "@queenos/queen-types";
-import { parseSubmissionTrailers } from "@queenos/queen-types";
+import { AGENT_HANDLE_RE, parseSubmissionTrailers } from "@queenos/queen-types";
 import { band, concat, demuxSideband, drain, FLUSH, parsePkts, pkt, pktText, PktReader, remoteLine, ZERO_SHA } from "./pktline.js";
 import { RepoNotFoundError } from "./tokens.js";
 import { deleteRepoQuietly, forkTrain, httpEvidence, readHeadCommit, upstreamFetch, type ForkOptions, type UpstreamDeps } from "./upstream.js";
@@ -37,8 +37,8 @@ export const REFUSALS = {
   branchesOnly: "only branches can be pushed",
   main: "pushes to main are refused (the lander owns main)",
   deletion: "branch deletion is refused",
-  badItem: "bad target: item/<id> takes [A-Za-z0-9_-]{1,64}",
-  badGoal: "bad target: goal/<slug> takes [A-Za-z0-9_-]{1,64}",
+  badItem: "bad target: item/<id>[/<agent>] takes [A-Za-z0-9_-]{1,64}, then an optional /[A-Za-z0-9._-]{1,64} (no leading '.', no '..', not ending in '.lock')",
+  badGoal: "bad target: goal/<slug>[/<agent>] takes [A-Za-z0-9_-]{1,64}, then an optional /[A-Za-z0-9._-]{1,64} (no leading '.', no '..', not ending in '.lock')",
   scope: "this token cannot push",
   tooLarge: "push too large (50 MB cap)",
   transient: "transient error, retry the push",
@@ -129,7 +129,13 @@ export function preReceive(cmds: RefCommand[], branch: string): (string | null)[
     if (c.ref === "refs/heads/main" || c.ref === `refs/heads/${branch}`) return REFUSALS.main;
     if (c.nu === ZERO_SHA) return REFUSALS.deletion;
     const target = /^refs\/heads\/(item|goal)\/(.*)$/.exec(c.ref);
-    if (target && !TARGET_RE.test(target[2]!)) return target[1] === "item" ? REFUSALS.badItem : REFUSALS.badGoal;
+    if (target) {
+      // `<id>` or `<id>/<agent>`: the optional agent suffix gives each agent sharing a token its own ref.
+      const [id, handle, ...deeper] = target[2]!.split("/");
+      if (!TARGET_RE.test(id!) || (handle !== undefined && !AGENT_HANDLE_RE.test(handle)) || deeper.length) {
+        return target[1] === "item" ? REFUSALS.badItem : REFUSALS.badGoal;
+      }
+    }
     if (cmds.length > 1) return REFUSALS.oneBranch;
     return null;
   });

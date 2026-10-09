@@ -75,9 +75,12 @@ describe("pick.ts: pure rules", () => {
   });
 
   it("effectiveSettings: race judge (default auto) and pickWindowMs (default 15 min, max 2 h)", () => {
-    expect(effectiveSettings(null).race).toEqual({ reworkWidth: 2, hardWidth: 3, judge: "auto", pickWindowMs: 15 * 60_000 });
+    expect(effectiveSettings(null).race).toEqual({ reworkWidth: 2, hardWidth: 3, judge: "auto", pickWindowMs: 15 * 60_000, entryWindowMs: 15 * 60_000 });
     const s = effectiveSettings({ autonomy: "autonomous", overrides: { race: { judge: "human", pickWindowMs: 99 * 3_600_000 } }, budgetBoost: null });
     expect(s.race).toMatchObject({ judge: "human", pickWindowMs: PICK_WINDOW_MAX_MS });
+    // The entry window (external hives): 0 (none) is kept, an absurd value is clamped to 1 h.
+    const win = (entryWindowMs: number) => effectiveSettings({ autonomy: "autonomous", overrides: { race: { entryWindowMs } }, budgetBoost: null }).race.entryWindowMs;
+    expect([win(0), win(60_000), win(99 * 3_600_000)]).toEqual([0, 60_000, 3_600_000]);
   });
 
   it("decideMode: auto races rank; human races pick with ≥ 2 passes, single with 1, cap past maxPickingRaces", () => {

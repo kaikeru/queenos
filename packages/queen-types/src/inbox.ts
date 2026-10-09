@@ -215,15 +215,40 @@ export function parseSubmissionTrailers(message: string): SubmissionTrailers {
   return out;
 }
 
-/** The target a branch name expresses (`item/<itemId>` or `goal/<goal>`), or null (unsolicited). */
-export function targetFromRef(ref: string): SubmissionTarget | null {
-  const m = /^refs\/heads\/(item|goal)\/([A-Za-z0-9_-]{1,64})$/.exec(ref);
+/**
+ * The per-agent suffix of `item/<id>/<agent>` and `goal/<slug>/<agent>` (agents sharing one git token): 1..64 of
+ * `[A-Za-z0-9._-]`, no leading `.`, no `..`, not ending in `.lock` (git ref-name rules). apps/git shares this check.
+ */
+export const AGENT_HANDLE_RE = /^(?!\.)(?!.*\.\.)(?!.*\.lock$)[A-Za-z0-9._-]{1,64}$/;
+
+/**
+ * `refs/heads/(item|goal)/<target>[/<handle>]`: the optional trailing `<handle>` names one agent among several
+ * that share a git token, so each gets its own ref (and its own supersede chain). It is not part of the target.
+ */
+const TARGET_REF_RE = /^refs\/heads\/(item|goal)\/([A-Za-z0-9_-]{1,64})(?:\/([^/]+))?$/;
+
+function parseTargetRef(ref: string): { kind: "item" | "goal"; id: string; handle: string | null } | null {
+  const m = TARGET_REF_RE.exec(ref);
   if (!m) return null;
-  return m[1] === "item" ? { kind: "item", itemId: m[2]! } : { kind: "goal", goal: m[2]! };
+  const handle = m[3] ?? null;
+  if (handle !== null && !AGENT_HANDLE_RE.test(handle)) return null;
+  return { kind: m[1] as "item" | "goal", id: m[2]!, handle };
 }
 
-/** The item a branch named `item/<itemId>` targets, or null. */
+/** The target a branch name expresses (`item/<itemId>[/<handle>]` or `goal/<goal>[/<handle>]`), or null (unsolicited). */
+export function targetFromRef(ref: string): SubmissionTarget | null {
+  const m = parseTargetRef(ref);
+  if (!m) return null;
+  return m.kind === "item" ? { kind: "item", itemId: m.id } : { kind: "goal", goal: m.id };
+}
+
+/** The per-agent suffix of a branch named `item/<id>/<handle>` or `goal/<slug>/<handle>`, or null. */
+export function handleFromRef(ref: string): string | null {
+  return parseTargetRef(ref)?.handle ?? null;
+}
+
+/** The item a branch named `item/<itemId>[/<handle>]` targets, or null. */
 export function itemIdFromRef(ref: string): string | null {
-  const m = /^refs\/heads\/item\/([A-Za-z0-9_-]{1,64})$/.exec(ref);
-  return m ? m[1]! : null;
+  const t = targetFromRef(ref);
+  return t?.kind === "item" ? t.itemId : null;
 }

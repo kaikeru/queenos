@@ -412,10 +412,17 @@ export interface PlannerContext {
    */
   pick?: { judge?: RaceJudge; pickWindowMs?: number; maxPickingRaces?: number };
   /**
-   * `settings.executors === "external"`: the hive has no swarm. A failed non-handed-off item never gets a
-   * drone REWORK (it awaits its contributor), and `submit` never forks a builder. Default false.
+   * `settings.executors === "external"`: the hive has no swarm. No item ever gets a drone REWORK (a failed
+   * item awaits its contributor), and `submit` never forks a builder. Default false.
    */
   external?: boolean;
+  /**
+   * External hives: how long a race a push opens stays open to new entries, from its creation (the first push;
+   * `settings.race.entryWindowMs`, default ENTRY_WINDOW_DEFAULT_MS). Until `entryClosesAt` the race is not decided
+   * (passes and all-failed are held) unless a human closes entries early. 0 or absent: no window (`entryClosesAt`
+   * stays null: decided as soon as every candidate reported, or at the grace deadline). Swarm hives leave it 0.
+   */
+  entryWindowMs?: number;
 }
 
 /** A human pick (§10.3): +1 pick for the winner's (model, role), +1 against the recommendation when it differed (db.applyPickDelta). */
@@ -681,7 +688,11 @@ export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: numb
     if (ungated(t)) all.push(now + UNDISPATCHED_RETRY_MS);
   }
   for (const r of races) {
-    if (r.state === "RACING" && r.deadlineAt !== null) all.push(r.deadlineAt);
+    // Only a future deadline: a past one (no live pass left, candidates pending) would re-arm the alarm at once, forever.
+    if (r.state === "RACING" && r.deadlineAt !== null && r.deadlineAt > now) all.push(r.deadlineAt);
+    // External hives: the race is decided no earlier than its entry window closing. Only a future close counts: once
+    // it passed, a still-RACING race waits on candidates (own watchdogs), and a past time would spin the alarm.
+    if (r.state === "RACING" && r.entryClosesAt != null && r.entryClosesAt > now) all.push(r.entryClosesAt);
     // T9a: a PICKING race auto-picks its recommendation at its pick deadline (queen:deadline).
     if (r.state === "PICKING" && r.pickDeadlineAt !== null && r.pickDeadlineAt !== undefined) all.push(r.pickDeadlineAt);
   }
@@ -965,7 +976,9 @@ export class TrainPlanner {
       artifactRepo: input.repo ?? t.artifactRepo,
     });
     let race = input.race && "join" in input.race ? this.races.get(input.race.join) : undefined;
-    if (race && race.state !== "RACING") race = undefined;
+    // Defensive (intake already files a follow-up): never join a race whose entry window has closed.
+    const closedJoin = !!race && race.state === "RACING" && race.entryClosesAt != null && this.ctx.now >= race.entryClosesAt;
+    if (race && (race.state !== "RACING" || closedJoin)) race = undefined;
     if (race) {
       this.setRace(race, { trainIds: [...race.trainIds, t.trainId] });
       this.setTrain(t, { raceId: race.raceId, candidate: race.trainIds.length - 1, raceOutcome: "RACING" }, false);
@@ -974,8 +987,9 @@ export class TrainPlanner {
         summary: clip500(`pushed train ${t.trainId} joined race ${race.raceId} as candidate ${race.trainIds.length} (${input.origin.kind})`),
         data: { action: "BUILD", lane: "BUILD", raceId: race.raceId, candidate: race.trainIds.length - 1, origin: input.origin, joined: true },
       });
-    } else if (input.race) {
+    } else if (input.race && !closedJoin) {
       const raceId = this.ctx.newId();
+      const window = this.ctx.entryWindowMs ?? 0;
       const created: RaceRecord = {
         raceId,
         itemId: input.promptId,
@@ -987,7 +1001,7 @@ export class TrainPlanner {
         deadlineAt: null,
         createdAt: this.ctx.now,
         decidedAt: null,
-        entryClosesAt: null,
+        entryClosesAt: window > 0 ? this.ctx.now + window : null,
       };
       this.races.set(raceId, created);
       this.dirtyRaces.add(raceId);
@@ -1352,7 +1366,9 @@ export class TrainPlanner {
     if (race) {
       // A candidate stays in TESTING until the race is decided.
       this.setTrain(t, { raceOutcome: "PASSED", summary: r.summary, headSha: r.commitSha ?? t.headSha, score: r.score ?? null });
-      if (race.deadlineAt === null) this.setRace(race, { deadlineAt: this.ctx.now + (this.ctx.raceGraceMs ?? RACE_GRACE_MS) });
+      // The others get the grace after the first pass, or after the entry window closes when that is later
+      // (a candidate that entered just before the close still gets its grace).
+      if (race.deadlineAt === null) this.setRace(race, { deadlineAt: Math.max(this.ctx.now, race.entryClosesAt ?? 0) + (this.ctx.raceGraceMs ?? RACE_GRACE_MS) });
       this.maybeDecide(race);
       return this.finish("applied");
     }
@@ -2311,6 +2327,10 @@ export class TrainPlanner {
     const live = cands.filter(isActive);
     const pending = live.filter((t) => t.raceOutcome === "RACING");
     const passed = live.filter((t) => t.raceOutcome === "PASSED");
+    // The grace clock belongs to a live pass: once the last one left (superseded, failed), the next pass restarts it.
+    if (!passed.length && race.deadlineAt !== null) this.setRace(race, { deadlineAt: null });
+    // An open entry window holds everything (passes and all-failed alike): another agent may still enter.
+    if (race.entryClosesAt != null && this.ctx.now < race.entryClosesAt) return;
     const due = race.deadlineAt !== null && this.ctx.now >= race.deadlineAt;
     if (pending.length && !(due && passed.length)) return;
     const predicted = this.item(race.itemId)?.paths ?? [];
@@ -2505,6 +2525,57 @@ export class TrainPlanner {
     });
     this.countPick(chosen, chosen.trainId !== race.recommendedTrainId);
     this.maybeLand();
+    return this.finish("applied");
+  }
+
+  /**
+   * `POST /hives/:hive/races/:raceId/close-entries` (external hives, human-push design §2.5): a human ends the
+   * entry window now. Only a RACING race with an entry window still open (`entryClosesAt` in the future) can be
+   * closed; else `refused` (404 unknown race; 409 not RACING, no window, or already closed), nothing changes.
+   * Closing sets `entryClosesAt = now`; a candidate that already passed has started the grace clock, and the
+   * others now get at most `raceGraceMs` more from the close (`deadlineAt = min(existing, now + grace)`; the
+   * existing one was measured from the old close). With no pass yet the first pass sets it from the close.
+   * Then the race is evaluated at once: decided (auto judge), held in PICKING (judge human, ≥ 2 passes), or
+   * ABANDONED when everything already failed.
+   */
+  closeEntries(input: { raceId: string; by: string }): PlanResult {
+    const race = this.races.get(input.raceId);
+    if (!race) {
+      this.refused = { status: 404, message: `race ${input.raceId} not found` };
+      return this.finish("ignored:unknown");
+    }
+    if (race.state !== "RACING") {
+      this.refused = { status: 409, message: `race ${race.raceId} is ${race.state}: only a RACING race takes entries` };
+      return this.finish("ignored:stale");
+    }
+    const now = this.ctx.now;
+    if (race.entryClosesAt == null) {
+      this.refused = { status: 409, message: `race ${race.raceId} has no entry window to close` };
+      return this.finish("ignored:stale");
+    }
+    if (race.entryClosesAt <= now) {
+      this.refused = { status: 409, message: `race ${race.raceId} is already closed to entries` };
+      return this.finish("ignored:stale");
+    }
+    const grace = this.ctx.raceGraceMs ?? RACE_GRACE_MS;
+    this.setRace(race, {
+      entryClosesAt: now,
+      ...(race.deadlineAt !== null ? { deadlineAt: Math.min(race.deadlineAt, now + grace) } : {}),
+    });
+    const who = input.by.replace(/^human:/, "");
+    const first = this.find(race.trainIds[0] ?? "");
+    this.events.push({
+      type: "race.entries-closed",
+      actor: `user:${who}`,
+      traceId: first ? traceOfTrain(first) : traceIdFromUuid(race.itemId),
+      spanId: spanIdFor(race.raceId),
+      parentSpanId: spanIdFor(race.itemId),
+      itemId: race.itemId,
+      trainId: null,
+      summary: clip500(`race ${race.raceId}: entries closed by ${who} (${race.trainIds.length} candidates)`),
+      data: { raceId: race.raceId, by: input.by, candidates: race.trainIds.length },
+    });
+    this.maybeDecide(race);
     return this.finish("applied");
   }
 

@@ -61,7 +61,7 @@ export function StatusHome({ hive, room }: { hive: string; room: Room }) {
       <section className="panel" aria-label="Goals">
         <p className="eyebrow">GOALS{trees.goals.length ? ` (${trees.goals.length})` : ""}</p>
         {trees.goals.length === 0 && trees.loose.length === 0 ? (
-          <p className="sh-muted">{external ? "Nothing filed yet. File an item below, or have your agents push to goal/<slug> or item/<id>." : "Nothing filed yet. Describe goals below and the Queen splits them into items."}</p>
+          <p className="sh-muted">{external ? "Nothing filed yet. File an item below, or have your agents push to goal/<slug> or item/<id>/<agent>." : "Nothing filed yet. Describe goals below and the Queen splits them into items."}</p>
         ) : (
           <div className="sh-goals">
             {trees.goals.map((g, i) => <GoalTree key={g.item.itemId} hive={hive} node={g} open={i < 3} />)}
@@ -437,7 +437,7 @@ function ExternalComposer({ hive, room }: { hive: string; room: Room }) {
           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(e);
         }}
       />
-      <p className="sh-muted">Agents push to <code>item/&lt;id&gt;</code> (join this item) or <code>goal/&lt;slug&gt;</code> (a goal with one item). No Queen swarm builds it.</p>
+      <p className="sh-muted">Agents push to <code>item/&lt;id&gt;/&lt;agent&gt;</code> (join this item&apos;s race; <code>item/&lt;id&gt;</code> also works for one agent per token) or <code>goal/&lt;slug&gt;</code> (a goal with one item). No Queen swarm builds it.</p>
       <div className="sh-composer__row">
         <label className="sh-check">
           judge{" "}

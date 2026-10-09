@@ -62,6 +62,8 @@ class Sim {
   maxPassedSeq = 0;
   /** `settings.executors === "external"` (no swarm). */
   external = false;
+  /** External hives: the entry window of races a push opens (0 = none). */
+  entryWindowMs = 0;
   private ids = 0;
   private maxTrainSeq = 0;
   private maxPromptSeq = 0;
@@ -96,6 +98,7 @@ class Sim {
         ...(this.queue ? { queue: this.queue } : {}),
         ...(this.briefFor ? { briefFor: this.briefFor } : {}),
         ...(this.external ? { external: true } : {}),
+        ...(this.entryWindowMs ? { entryWindowMs: this.entryWindowMs } : {}),
       },
     );
     const rs = fn(planner);
@@ -1931,6 +1934,225 @@ describe("planner: pushed submissions (pre-forked trains)", () => {
     expect(s.races.get(s.trains.get("p1")!.raceId!)!.state).toBe("ABANDONED");
     expect([...s.trains.values()].filter((t) => t.promptId === "I1")).toHaveLength(1);
     expect(s.trains.get("p1")!.forkState).toBe("READY");
+  });
+
+  // ── external hives: the entry window (human-push design §2.5) ──────────────────────────────────────
+  describe("entry window", () => {
+    const WINDOW = 15 * 60_000;
+    const GRACE = 90_000;
+    const GREEN = { review: "approved" as const, satisfied: 1, missing: 0, changedFiles: 1, changedBytes: 10, checks: 3 };
+    const open = (s: Sim, ...ids: string[]) => {
+      ids.forEach((id, i) => {
+        intent(s, id, "I1");
+        push(s, id, "I1", { race: i === 0 ? { create: true } : { join: [...s.races.keys()][0]! }, head: id.padEnd(40, "0") });
+      });
+      s.completeDeploys();
+    };
+    const pass = (s: Sim, id: string) => s.run((p) => p.trainResult({ trainId: id, passed: true, summary: "ok", score: GREEN }));
+    const fail = (s: Sim, id: string) => s.run((p) => p.trainResult({ trainId: id, passed: false, summary: "bad" }));
+    const race = (s: Sim) => [...s.races.values()][0]!;
+    const tick = (s: Sim, ms: number) => {
+      s.now += ms;
+      s.run((p) => p.reconcile());
+    };
+
+    it("an external push opens the race with entryClosesAt = creation + window; a swarm hive (no window) keeps it null; the joiner does not move it", () => {
+      const s = new Sim();
+      s.entryWindowMs = WINDOW;
+      open(s, "p1");
+      expect(race(s)).toMatchObject({ state: "RACING", entryClosesAt: 1000 + WINDOW });
+      s.now += 60_000;
+      intent(s, "p2", "I1");
+      push(s, "p2", "I1", { race: { join: race(s).raceId }, head: "c".repeat(40) });
+      expect(race(s)).toMatchObject({ trainIds: ["p1", "p2"], entryClosesAt: 1000 + WINDOW });
+
+      const swarm = new Sim();
+      intent(swarm, "p1", "I1");
+      push(swarm, "p1", "I1", { race: { create: true } });
+      expect(race(swarm).entryClosesAt).toBeNull();
+    });
+
+    it("a lone candidate that passes before the close leaves the race RACING; at the close (deadline + tick) it decides", () => {
+      const s = new Sim();
+      s.entryWindowMs = WINDOW;
+      open(s, "p1");
+      s.now += 120_000;
+      pass(s, "p1");
+      expect(race(s)).toMatchObject({ state: "RACING", deadlineAt: 1000 + WINDOW + GRACE });
+      expect(s.trains.get("p1")).toMatchObject({ phase: "TESTING", raceOutcome: "PASSED" });
+      tick(s, 10 * 60_000); // still inside the window
+      expect(race(s).state).toBe("RACING");
+      tick(s, 5 * 60_000 - 120_000 + 1); // window closed; nobody pending
+      expect(race(s)).toMatchObject({ state: "DECIDED", winnerTrainId: "p1" });
+    });
+
+    it("an all-failed race is held until the close, then ABANDONED (the item awaits its contributor)", () => {
+      const s = new Sim();
+      s.entryWindowMs = WINDOW;
+      open(s, "p1");
+      const r = fail(s, "p1");
+      expect(race(s).state).toBe("RACING");
+      expect(r.awaitingContributor).toBeUndefined();
+      tick(s, WINDOW - 1);
+      expect(race(s).state).toBe("RACING");
+      s.now += 1;
+      const done = s.run((p) => p.reconcile());
+      expect(race(s).state).toBe("ABANDONED");
+      expect(done.awaitingContributor?.[0]?.promptId).toBe("I1");
+    });
+
+    it("a late entrant that joins just before the close still gets the grace: the first pass sets deadlineAt from the close", () => {
+      const s = new Sim();
+      s.entryWindowMs = WINDOW;
+      open(s, "p1");
+      s.now = 1000 + WINDOW - 1_000;
+      intent(s, "p2", "I1");
+      push(s, "p2", "I1", { race: { join: race(s).raceId }, head: "c".repeat(40) });
+      s.completeDeploys();
+      pass(s, "p1");
+      expect(race(s).deadlineAt).toBe(1000 + WINDOW + GRACE);
+      tick(s, 2_000); // closed; p2 pending and inside the grace
+      expect(race(s).state).toBe("RACING");
+      tick(s, GRACE);
+      expect(race(s)).toMatchObject({ state: "DECIDED", winnerTrainId: "p1" });
+      expect(s.trains.get("p2")).toMatchObject({ raceOutcome: "LOST" });
+    });
+
+    it("watchdogDeadline includes a future entryClosesAt of a RACING race only", () => {
+      const s = new Sim();
+      s.entryWindowMs = WINDOW;
+      open(s, "p1");
+      const trains = [...s.trains.values()];
+      const races = [...s.races.values()];
+      const at = (now: number) => watchdogDeadline([], DEFAULT_COMMAND_TIMEOUT_MS, now, races);
+      expect(at(s.now)).toBe(1000 + WINDOW);
+      expect(at(1000 + WINDOW)).toBeNull(); // past (or at) the close: no hot alarm loop
+      expect(at(1000 + WINDOW + 1)).toBeNull();
+      expect(watchdogDeadline([], DEFAULT_COMMAND_TIMEOUT_MS, s.now, races.map((r) => ({ ...r, state: "DECIDED" as const })))).toBeNull();
+      expect(trains.length).toBeGreaterThan(0);
+    });
+
+    it("pushed() never joins a race whose entry window has closed: no race for the train (and no new race)", () => {
+      const s = new Sim();
+      s.entryWindowMs = WINDOW;
+      open(s, "p1");
+      const raceId = race(s).raceId;
+      s.now = 1000 + WINDOW; // closed, the race still RACING
+      intent(s, "p2", "I1");
+      push(s, "p2", "I1", { race: { join: raceId }, head: "c".repeat(40) });
+      expect(s.races.size).toBe(1);
+      expect(race(s).trainIds).toEqual(["p1"]);
+      expect(s.trains.get("p2")).toMatchObject({ raceId: null });
+    });
+
+    it("the grace clock belongs to a live pass: superseding the only pass resets deadlineAt (next pass restarts grace); watchdogDeadline ignores a past deadline", () => {
+      const s = new Sim();
+      s.entryWindowMs = WINDOW;
+      open(s, "p1", "p2");
+      pass(s, "p1");
+      expect(race(s).deadlineAt).toBe(1000 + WINDOW + GRACE);
+      s.run((p) => p.supersede("p1", "d".repeat(40)));
+      expect(s.trains.get("p1")).toMatchObject({ phase: "EJECTED" });
+      expect(race(s)).toMatchObject({ state: "RACING", deadlineAt: null });
+      // A stale deadline left on a RACING race with only pending candidates must not arm the alarm in the past.
+      const stale = { ...race(s), deadlineAt: 5_000, entryClosesAt: null };
+      s.now = 100_000;
+      expect(watchdogDeadline([], DEFAULT_COMMAND_TIMEOUT_MS, s.now, [stale])).toBeNull();
+      expect(watchdogDeadline([], DEFAULT_COMMAND_TIMEOUT_MS, 4_000, [stale])).toBe(5_000);
+      // The next pass restarts the grace from the close (or now, when later).
+      s.now = 1000 + WINDOW + 10_000;
+      pass(s, "p2");
+      expect(race(s).deadlineAt).toBe(s.now + GRACE);
+    });
+
+    it("a failed pass (the last live one) also resets deadlineAt via the reconcile tick", () => {
+      const s = new Sim();
+      s.entryWindowMs = WINDOW;
+      open(s, "p1", "p2");
+      pass(s, "p1");
+      // The passed candidate is lost some other way (here: ejected directly), without a maybeDecide hook.
+      s.trains.set("p1", { ...s.trains.get("p1")!, phase: "EJECTED" });
+      s.run((p) => p.reconcile());
+      expect(race(s).deadlineAt).toBeNull();
+    });
+
+    describe("closeEntries", () => {
+      it("refuses a race with no entry window (swarm or entryWindowMs 0): 409, nothing changes", () => {
+        const s = new Sim();
+        open(s, "p1");
+        expect(race(s).entryClosesAt).toBeNull();
+        const r = s.run((p) => p.closeEntries({ raceId: race(s).raceId, by: "human:kyle@example.com" }));
+        expect(r.refused).toMatchObject({ status: 409, message: expect.stringContaining("no entry window") });
+        expect(r.races).toEqual([]);
+        expect(r.events).toEqual([]);
+      });
+
+      it("closes now and decides a passed lone candidate at once (auto judge); emits race.entries-closed by user:<email>", () => {
+        const s = new Sim();
+        s.entryWindowMs = WINDOW;
+        open(s, "p1");
+        pass(s, "p1");
+        s.now += 5_000;
+        const r = s.run((p) => p.closeEntries({ raceId: race(s).raceId, by: "human:kyle@example.com" }));
+        expect(r.outcome).toBe("applied");
+        expect(race(s)).toMatchObject({ state: "DECIDED", winnerTrainId: "p1", entryClosesAt: s.now });
+        const ev = r.events.find((e) => e.type === "race.entries-closed")!;
+        expect(ev).toMatchObject({ actor: "user:kyle@example.com", itemId: "I1", data: { raceId: race(s).raceId, by: "human:kyle@example.com", candidates: 1 } });
+      });
+
+      it("pending candidates get at most the grace from the close: deadlineAt = min(existing, now + grace)", () => {
+        const s = new Sim();
+        s.entryWindowMs = WINDOW;
+        open(s, "p1", "p2");
+        pass(s, "p1");
+        expect(race(s).deadlineAt).toBe(1000 + WINDOW + GRACE);
+        s.now += 30_000;
+        s.run((p) => p.closeEntries({ raceId: race(s).raceId, by: "human:kyle@example.com" }));
+        expect(race(s)).toMatchObject({ state: "RACING", entryClosesAt: s.now, deadlineAt: s.now + GRACE });
+        tick(s, GRACE);
+        expect(race(s)).toMatchObject({ state: "DECIDED", winnerTrainId: "p1" });
+      });
+
+      it("with no pass yet the deadline stays unset; the first pass after the close sets it from now", () => {
+        const s = new Sim();
+        s.entryWindowMs = WINDOW;
+        open(s, "p1", "p2");
+        s.run((p) => p.closeEntries({ raceId: race(s).raceId, by: "human:kyle@example.com" }));
+        expect(race(s)).toMatchObject({ state: "RACING", deadlineAt: null, entryClosesAt: s.now });
+        s.now += 10_000;
+        pass(s, "p1");
+        expect(race(s).deadlineAt).toBe(s.now + GRACE);
+        fail(s, "p2");
+        expect(race(s)).toMatchObject({ state: "DECIDED", winnerTrainId: "p1" });
+      });
+
+      it("an all-failed race abandons on close", () => {
+        const s = new Sim();
+        s.entryWindowMs = WINDOW;
+        open(s, "p1");
+        fail(s, "p1");
+        expect(race(s).state).toBe("RACING");
+        const r = s.run((p) => p.closeEntries({ raceId: race(s).raceId, by: "human:kyle@example.com" }));
+        expect(race(s).state).toBe("ABANDONED");
+        expect(r.awaitingContributor?.[0]?.promptId).toBe("I1");
+      });
+
+      it("refuses an unknown race (404), a decided race (409) and one already closed (409); nothing changes", () => {
+        const s = new Sim();
+        s.entryWindowMs = WINDOW;
+        open(s, "p1", "p2");
+        const by = "human:kyle@example.com";
+        expect(s.run((p) => p.closeEntries({ raceId: "nope", by })).refused).toMatchObject({ status: 404 });
+        s.run((p) => p.closeEntries({ raceId: race(s).raceId, by }));
+        const again = s.run((p) => p.closeEntries({ raceId: race(s).raceId, by }));
+        expect(again.refused).toMatchObject({ status: 409, message: expect.stringContaining("already closed") });
+        expect(again.races).toEqual([]);
+        pass(s, "p1");
+        tick(s, GRACE);
+        expect(race(s).state).toBe("DECIDED");
+        expect(s.run((p) => p.closeEntries({ raceId: race(s).raceId, by })).refused).toMatchObject({ status: 409, message: expect.stringContaining("DECIDED") });
+      });
+    });
   });
 });
 
