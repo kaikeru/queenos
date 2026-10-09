@@ -1,6 +1,6 @@
 # QueenOS: session handoff
 
-Last updated **2026-10-08** by the coordinating Claude session. Read this, then `CLAUDE.md`, `README.md`, `docs/human-push-design.md` (rev 2; §13 is the plan) and `docs/agent-protocol.md`, before doing anything. `docs/v2-design.md` (§1 principles, §10 decisions) is the older swarm design.
+Last updated **2026-10-09** (OpenCode session: planner agent + coder/reviewer subagents; earlier sessions were the coordinating Claude session). Read this, then `CLAUDE.md`, `README.md`, `docs/human-push-design.md` (rev 2; §13 is the plan) and `docs/agent-protocol.md`, before doing anything. `docs/v2-design.md` (§1 principles, §10 decisions) is the older swarm design.
 
 ## 1. Read first: direction, memory, rules
 
@@ -50,7 +50,7 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 ## 2. State of the system
 
-`main` is green (46/46 turbo tasks). v2 swarm (Phases 0-3) is complete; the git proxy path (T0-T4) is built and live. Swarm internals: `docs/v2-design.md` §8, `apps/queen/README.md`.
+`main` is green (46/46 turbo tasks; Queen 707 tests). v2 swarm (Phases 0-3) is complete; the git proxy path (T0-T4) is built and live. Swarm internals: `docs/v2-design.md` §8, `apps/queen/README.md`.
 
 **v2 backend (built, tested):** work ledger (items, deps, state machine, path affinity, caps/dedupe); Oracle fan-out (one item per bullet); parallel builds with races; merge queue (cars, batching, 3-way merge, integration gate, LANDER fast-forward, bisect, conflict -> REWORK); autonomy and error budget; self-filed bugs; one trace id end to end, event log, rollups, Analytics Engine; scale plumbing (sim load test 500/500). **Dashboard:** status home, swarm floor, merge-train graph, item page, trace waterfall, event log, metrics, Model Board, SIM badge, release strip, guardrails panel. **Sim:** `pnpm dev:sim` runs the real Queen with fake executors.
 
@@ -70,6 +70,12 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 | 926f991 | Queen follow-ups, schema v15: `-rN` adoption; **Queen-started gates for every train reaching TESTING (applies to drone builds too)**; per-train findings |
 | be2e6c1 T4 | Gate uses a real tree diff against the base (closes a blind spot for human modify-only commits); reviewer fails closed for non-drone origin; protected paths |
 
+**Built and committed on Oct 9 (on `main`, pushed to origin):**
+
+| Commit | What |
+|---|---|
+| efcccea | **Step (a) of the external-agents direction: per-hive `executors: "swarm" \| "external"`** (details below, §6). NOT deployed |
+
 ## 3. Proven live (queenos.kaikeru.com, hive `demo`)
 
 **Oct 7:**
@@ -83,11 +89,13 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 **Last production deploys (UTC):** Oct 8: queen 18:12 and edge 18:14 (T9a/T9d), gatekeepers 16:33 (T4), **queenos-git 16:33 (T2n)**, edge 17:01 (T7 dashboard). Oct 7: queen 21:17, herald 21:18. provisioner/drones Oct 7 14:49-14:51.
 
-**Nothing pending.** Gatekeepers (T4), queenos-git (T2n) and edge (T7) are deployed on `main` (T9 commit 0cd85a5 deployed for queen + edge). Command for a future gatekeepers redeploy:
+**Pending (user runs these): queen + edge for efcccea** (the edge serves the dashboard, so it needs the new "workers" select). Gatekeepers (T4), queenos-git (T2n) and the T9 commit 0cd85a5 are already deployed. Same env setup as before; queen first, then edge:
 ```
 cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
-./scripts/deploy.sh --only gatekeepers --force
+./scripts/deploy.sh --only queen
+./scripts/deploy.sh --only edge
 ```
+Same pattern for a gatekeepers redeploy (`--only gatekeepers --force`). After deploying, switch hive `demo` (or a new hive) to external with the dashboard "workers" select, or `PATCH /hives/<hive>/settings {"executors":"external"}`. Not yet seen in a browser or live.
 Verify with the Cloudflare deployments API before assuming it is or isn't done.
 
 - **Access:** the user created a second Access app "QueenOS git (edge checks tokens)" on `queenos.kaikeru.com/git` with a **Bypass** policy (the edge checks `qgt_` tokens itself). Verified: `/git` without creds gives 401 Basic; the dashboard still 302s to Access.
@@ -121,22 +129,31 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 
 **Done Oct 8:** T9a/T9d you-pick races (0cd85a5, deployed: Queen PICKING state, pick route `POST /hives/:hive/races/:raceId/pick`, deadline auto-pick, `maxPickingRaces` cap, sim `[you-pick]`; dashboard Pick view + "you pick (3)" composer option; NOT yet seen live or in a browser; not built: re-pick after the winner boarded a car (409), a human push joining a PICKING race as a candidate). T2n notes pack (fa648e6 + 6e53603: bounded LRU cache, refresh TTL, SHA validation, 9 cache tests) and T7 dashboard (03609d9: Push code page, origin badges, landed-in-window count; user eyeballed it, looks good). Full gate 46/46.
 
+**Done Oct 9: step (a), efcccea** (pushed, NOT deployed; Queen 707 tests, full gate 46/46). Per-hive `executors: "swarm" | "external"`, default `swarm` (no migration; lives in the settings overrides JSON).
+- **queen-types:** `ExecutorsModeSchema`; optional `executors` on HiveSettings, overrides and `UpdateHiveSettings` (`PATCH /hives/:hive/settings`).
+- **Queen ledger (external hives):** READY items wait with waitReason "awaiting submissions" unless a pushed train is parked for them (then dispatch at width 1, which resumes the parked train). Goals skip the Oracle and file exactly one child (the inbox), so `goal/<slug>` pushes resolve to it. Follow-ups skip TRIAGE. The `handoff` action returns 409. Reconcile settles items left DECOMPOSING/TRIAGE from before a switch (no escalation).
+- **Planner:** no drone REWORK in external hives (a failure awaits the contributor; handoffs and the `Queen: rework` trailer are ignored, no "swarm takes over" remote line). Parked trains don't count against capacity (external only). MERGE/LANDER drones unchanged. Swarm mode unchanged.
+- **Dashboard:** "workers" select (swarm / external agents) next to autonomy. In external mode the StatusHome composer becomes "FILE AN ITEM FOR AGENTS" (judge auto / you pick, `decompose:true`); the War Room composer is relabelled with no demo-swarm button (it still files a plain feature item, which is a valid inbox); SwarmFloor and Model Board are hidden; ItemView shows a copyable `git push origin HEAD:item/<id>`.
+- **Tests:** new `apps/queen/test/external-mode.test.ts` plus ledger/planner/queen-types/dashboard tests.
+
 **NEW DIRECTION (user, Oct 8): hide the Oracle/drone swarm (not stable enough) and make external coding agents the workers.** New demo script:
 1. Create a new project (hive); the template ships `AGENTS.md` + skills (extend the `plugins/queenos` queenos-inbox skill) so agents know the API and the notes protocol.
 2. A primary agent files a goal; Claude sessions of different models (Haiku/Sonnet/Opus) each register as a worker (agent identity + declared model, shown as "claims <model>": self-reported, unverified) and race on it by pushing `item/<id>`.
 3. We look at results and live previews (existing train fork + gates + Worker Preview).
 4. We pick a winner (T9) and it publishes (land + auto-ship).
 5. Several goals in flight show the merge train (give goals overlapping paths so cars batch/conflict).
-Build order (Opus for the planner part, Sonnet for UI/template): (a) per-hive `executors: "external"` mode: no Oracle/drone builds, items wait for submissions instead of a BUILD train, dashboard hides goal composer/swarm floor/Model Board; keep code + sim as the fallback recording; (b) agent identity on git tokens (`agent:<name>`, label, declared model) and show it in the origin badge; (b2) **QueenOS agent API keys**: non-human principals, minted by a human in the dashboard (the Push code page grows an "Agent keys" section), hive-scoped, shown once, stored hashed (extend the edge `HiveRegistry` `git_tokens` table with kind + scopes, or add a sibling table), revocable, with scopes like `goals:create`, `inbox:submit`, `worker:register`, `races:read`; an agent can never mint keys. Optional per-key rate/race caps so a runaway agent can't burn credits. Edge: new `/api/agent/*` (and reuse `/git/*`) routes authenticated by the key and forwarded with `x-queen-user: agent:<name>`; this needs another Access Bypass path, which the USER configures. A key may register itself as a worker (name + claimed model) and create goals/inboxes; all of it is audited in the event log and shown via the origin badge. (b3) **Notes/trailers for the inbox target**: the item is the inbox; correlation today is branch `item/<id>` or commit trailer `Queen-Item` (docs/agent-protocol.md), and Queen's synthesized notes already carry `Queen-Item/Train/Trace/Model`. Add: `Queen-Goal: <goalId|slug>` commit trailer so a registered worker can push to a goal without knowing the item id (proxy resolves it); agents also set `Queen-Model` (claimed) next to `Queen-Origin`; proxy refuses a push whose branch item and `Queen-Item` trailer disagree (verify what it does today); agents never write verdict/review notes (synthesized, trusted), an optional untrusted `refs/notes/agent` self-report is shown as such. Update `docs/agent-protocol.md`, the plugin skill and the template `AGENTS.md`. (c) route that files an item/race without the Oracle (`FileWorkItem` already has bestOf/judge); (d) dynamic race entry so pushes by distinct agents to a RACING item become candidates (design 2.5, `entryClosesAt`); (e) hive template with AGENTS.md + skills; (f) SSE/long-poll "picked or landed" endpoint for `queen-wait.sh`; (g) rehearse with 3 real Claude Code sessions. Target before the Oct 12 recording cutoff, else cut.
+Build order (Opus for the planner part, Sonnet for UI/template): (a) **DONE Oct 9 (efcccea, see above)**: per-hive `executors: "external"` mode; code + sim stay as the fallback recording; **next is (d)**; then (b)-(g); (b) agent identity on git tokens (`agent:<name>`, label, declared model) and show it in the origin badge; (b2) **QueenOS agent API keys**: non-human principals, minted by a human in the dashboard (the Push code page grows an "Agent keys" section), hive-scoped, shown once, stored hashed (extend the edge `HiveRegistry` `git_tokens` table with kind + scopes, or add a sibling table), revocable, with scopes like `goals:create`, `inbox:submit`, `worker:register`, `races:read`; an agent can never mint keys. Optional per-key rate/race caps so a runaway agent can't burn credits. Edge: new `/api/agent/*` (and reuse `/git/*`) routes authenticated by the key and forwarded with `x-queen-user: agent:<name>`; this needs another Access Bypass path, which the USER configures. A key may register itself as a worker (name + claimed model) and create goals/inboxes; all of it is audited in the event log and shown via the origin badge. (b3) **Notes/trailers for the inbox target**: the item is the inbox; correlation today is branch `item/<id>` or commit trailer `Queen-Item` (docs/agent-protocol.md), and Queen's synthesized notes already carry `Queen-Item/Train/Trace/Model`. Add: `Queen-Goal: <goalId|slug>` commit trailer so a registered worker can push to a goal without knowing the item id (proxy resolves it); agents also set `Queen-Model` (claimed) next to `Queen-Origin`; proxy refuses a push whose branch item and `Queen-Item` trailer disagree (verify what it does today); agents never write verdict/review notes (synthesized, trusted), an optional untrusted `refs/notes/agent` self-report is shown as such. Update `docs/agent-protocol.md`, the plugin skill and the template `AGENTS.md`. (c) route that files an item/race without the Oracle (`FileWorkItem` already has bestOf/judge; mostly covered by (a): external goals file one inbox child and the dashboard composer files an item); (d) dynamic race entry so pushes by distinct agents to a RACING item become candidates (design 2.5, `entryClosesAt`; **the next step, see item 1 below**); (e) hive template with AGENTS.md + skills; (f) SSE/long-poll "picked or landed" endpoint for `queen-wait.sh`; (g) rehearse with 3 real Claude Code sessions. Target before the Oct 12 recording cutoff, else cut.
 **Dogfooding QueenOS on itself** (post Oct 14): needs an external gate (verdict webhook, "bring your CI") because gatekeepers can't run pnpm/turbo; a release-off hive mode (job ends at landed on main); a history import path (the proxy refuses main); a GitHub mirror; a separate hive on the prod Queen so a bad Queen deploy can't strand the train.
 
-1. **Live-check T9** (sim: `pnpm --filter @queenos/queen dev:sim`, file a prompt with `[you-pick]`; prod: "you pick (3)" in the composer), then **T9b manual reject** (cheap; design §10.4) if wanted. T9c preference weighting is cut to a "next" slide. Ask the user before starting.
-2. **T5 drones:** the REWORK brief comes from notes; the rework commit writes `Queen-Replies-To`.
-3. **T6 sim** (the sim already gates pushed code via GATE commands); the all-sim fallback recording needs inbox and pick in the sim.
-4. **T8:** add `git` to `deploy.sh`; update the plugin and agent-protocol for the proxy UX and the `---` note entry separator (from T0b); live rehearsal.
-5. **README / video reframe** (agent-native git, "Git, reimagined" table) and a `docs/demo-script.md` update (it predates the merge-train graph and the git proxy). Demo beat: push, `remote:` lines, a deliberate edit-only push with `eval(` that gets REJECTED, a note in the terminal, Claude Code with the plugin fixes it, it lands.
-6. **Optional / cut:** T1b drone adapter; an external-gate (verdict webhook) contract for "bring your CI"; the Queen reading `TrainResult.changedPaths` (from T4) to widen path claims; auto-correlation of uncorrelated pushes. Cut order if time runs out: T9c, T9b, T1b, `/t/<trainId>`.
-7. **Also open:** demo prod cleanup of old internal feature slugs on the Toy box chips; no reliable live reviewer REJECT in the swarm path (the sim has `[review-fail]`); dashboard doesn't show whether the builder used recalled memories; 390 px layout only verified headless; mock mode (`VITE_MOCK_API=1`) has no POST actions (use `pnpm dev:sim`). Screenshots and video stay deferred until the user asks.
+1. **Step (d): dynamic race entry (recommended next).** Today a push-created race has `entryClosesAt: null` and decides as soon as all current candidates have reported, and `lateReason` in `apps/queen/src/inbox.ts` treats an item as "decided" once any candidate passed. So a second agent pushing after the first agent's gate passes (~2 min) becomes a follow-up item instead of a race candidate. Needed: an entry window (e.g. race `entryClosesAt` = created + N min in external hives), decide-not-before-close, then PICKING for judge "human". Then (b)/(b2)/(b3) agent identity + agent API keys + `Queen-Goal` trailer, (e) template `AGENTS.md` + skills, (f) wait endpoint, (g) rehearsal with 3 Claude sessions. **Oct 12 noon go/no-go for the recording.** Ask the user before starting.
+2. **Deploy efcccea** (user: queen then edge, §4) and look at external mode in a browser/live.
+3. **Live-check T9** (sim: `pnpm --filter @queenos/queen dev:sim`, file a prompt with `[you-pick]`; prod: "you pick (3)" in the composer), then **T9b manual reject** (cheap; design §10.4) if wanted. T9c preference weighting is cut to a "next" slide. Ask the user before starting.
+4. **T5 drones:** the REWORK brief comes from notes; the rework commit writes `Queen-Replies-To`.
+5. **T6 sim** (the sim already gates pushed code via GATE commands); the all-sim fallback recording needs inbox and pick in the sim. Known: the sim has no git push, so an external hive in `dev:sim` just waits.
+6. **T8:** add `git` to `deploy.sh`; update the plugin and agent-protocol for the proxy UX and the `---` note entry separator (from T0b); live rehearsal.
+7. **README / video reframe** (agent-native git, "Git, reimagined" table) and a `docs/demo-script.md` update (it predates the merge-train graph and the git proxy). Demo beat: push, `remote:` lines, a deliberate edit-only push with `eval(` that gets REJECTED, a note in the terminal, Claude Code with the plugin fixes it, it lands.
+8. **Optional / cut:** T1b drone adapter; an external-gate (verdict webhook) contract for "bring your CI"; the Queen reading `TrainResult.changedPaths` (from T4) to widen path claims; auto-correlation of uncorrelated pushes. Cut order if time runs out: T9c, T9b, T1b, `/t/<trainId>`.
+9. **Also open:** demo prod cleanup of old internal feature slugs on the Toy box chips; no reliable live reviewer REJECT in the swarm path (the sim has `[review-fail]`); dashboard doesn't show whether the builder used recalled memories; 390 px layout only verified headless; mock mode (`VITE_MOCK_API=1`) has no POST actions (use `pnpm dev:sim`). Screenshots and video stay deferred until the user asks.
 
 **Roadmap:** Oct 12-13 rehearsal and recording (go/no-go for an all-sim cut by Oct 12 noon); Oct 14 submit. **Dropped or stubbed:** bisect + auto-revert on staging failure (a P0 bug is filed instead), real npm builds, custom domains for project sites.
 
@@ -183,6 +200,9 @@ Build order (Opus for the planner part, Sonnet for UI/template): (a) per-hive `e
 - Claude's Chrome profile isn't signed in to Access (needs the user's one-time PIN), so the coordinator can't view the dashboard; the user checks UI visually.
 - `PIN` and the `inboxes` table (T0) are unused under rev 2 (kept for compatibility).
 - Usage limits kill running agents; resume with SendMessage.
+- **External mode gaps (efcccea):** default for new hives is still `swarm` (a New Project option belongs with step (e)); the comment on `PlannerContext.external` in `apps/queen/src/train/planner.ts` still says "a failed non-handed-off item" and should say no item gets a drone REWORK.
+- **Stale worktrees:** `.claude/worktrees/integration` (branch `dashboard-ux-batch`) and four `.claude/worktrees/agent-*` are fully merged into main and safe to remove; the integration one holds the old Oct 5 `docs/HANDOFF.md`.
+- `AGENTS.md` has an uncommitted repo-graph block added by a tool; left uncommitted on purpose.
 - Templates: the no-build template serves features at `/features/<slug>` unless a feature declares its own `path`.
 - Sentinel uses synthetic probes only (little traffic on demo apps).
 - Pinned preview URLs (`<8hex>-<worker>...`) outlive teardown; Herald reports alias URLs.
