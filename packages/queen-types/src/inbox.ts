@@ -16,6 +16,22 @@ const BranchRef = z.string().regex(/^refs\/heads\/.+/);
 /** An inbox handle: the owner's email local part, stripped to `[a-z0-9]`, ≤ 24 chars (§15 Q5). */
 export const InboxHandleSchema = z.string().regex(/^[a-z0-9]{1,24}$/);
 
+/**
+ * The per-agent suffix of `item/<id>/<agent>` and `goal/<slug>/<agent>` (agents sharing one git token): 1..64 of
+ * `[A-Za-z0-9._-]`, no leading `.`, no `..`, not ending in `.lock` (git ref-name rules). apps/git shares this check.
+ */
+export const AGENT_HANDLE_RE = /^(?!\.)(?!.*\.\.)(?!.*\.lock$)[A-Za-z0-9._-]{1,64}$/;
+
+export const AgentHandleSchema = z.string().regex(AGENT_HANDLE_RE);
+export type AgentHandle = z.infer<typeof AgentHandleSchema>;
+
+/**
+ * A model name an agent's minter declared for a git token (e.g. "claude-opus-4-5", "anthropic/claude-opus-5-5").
+ * Self-reported and unverified: display/attribution only, never fed to the model router.
+ */
+export const ClaimedModelSchema = z.string().regex(/^[A-Za-z0-9._:/@-]{1,64}$/);
+export type ClaimedModel = z.infer<typeof ClaimedModelSchema>;
+
 export const SubmissionOriginKindSchema = z.enum(["drone", "human", "agent"]);
 export type SubmissionOriginKind = z.infer<typeof SubmissionOriginKindSchema>;
 
@@ -23,6 +39,8 @@ export const SubmissionOriginSchema = z.object({
   kind: SubmissionOriginKindSchema,
   /** drone: drone Workflow instance id; human: Access email; agent: "<name>@<owner email>". */
   id: z.string().min(1).max(320),
+  /** agent only: the model the token's minter declared; self-reported, unverified, display only. */
+  model: ClaimedModelSchema.optional(),
 });
 export type SubmissionOrigin = z.infer<typeof SubmissionOriginSchema>;
 
@@ -214,12 +232,6 @@ export function parseSubmissionTrailers(message: string): SubmissionTrailers {
   if (agent) out.agent = agent[1]!;
   return out;
 }
-
-/**
- * The per-agent suffix of `item/<id>/<agent>` and `goal/<slug>/<agent>` (agents sharing one git token): 1..64 of
- * `[A-Za-z0-9._-]`, no leading `.`, no `..`, not ending in `.lock` (git ref-name rules). apps/git shares this check.
- */
-export const AGENT_HANDLE_RE = /^(?!\.)(?!.*\.\.)(?!.*\.lock$)[A-Za-z0-9._-]{1,64}$/;
 
 /**
  * `refs/heads/(item|goal)/<target>[/<handle>]`: the optional trailing `<handle>` names one agent among several

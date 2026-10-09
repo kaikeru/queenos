@@ -757,6 +757,8 @@ input, textarea { font: inherit; color: var(--text); }
 
 /* submission origin badges (whose code: drone / human / agent) */
 .origin { letter-spacing: 0.04em; text-transform: none; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+.origin--agent { max-width: 56ch; }
+.origin__claim { font-size: 0.85em; opacity: 0.8; letter-spacing: 0; }
 .origin--human { color: var(--green); border-color: rgba(53, 242, 160, 0.5); background: rgba(53, 242, 160, 0.08); }
 .origin--agent { color: var(--violet); border-color: rgba(167, 139, 250, 0.55); background: rgba(167, 139, 250, 0.1); }
 
@@ -771,6 +773,7 @@ input, textarea { font: inherit; color: var(--text); }
 .push__mint { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 12px; }
 .push__mint input, .push__secret { flex: 1; min-width: 0; font: 14px var(--mono); color: var(--text); background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 8px; padding: 9px 10px; min-height: 40px; }
 .push__mint input { max-width: 340px; }
+.push__mint p { flex-basis: 100%; margin: 0; }
 .push__new { border: 1px solid rgba(255, 210, 63, 0.5); background: rgba(255, 210, 63, 0.06); border-radius: 10px; padding: 12px 14px; margin: 8px 0 12px; display: flex; flex-direction: column; gap: 8px; }
 .push__warn { color: var(--yellow); font-size: 14px; }
 .push__secret { border-color: rgba(255, 210, 63, 0.5); }

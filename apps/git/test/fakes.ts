@@ -301,17 +301,19 @@ export function chunked(bytes: Uint8Array, size = 7): ReadableStream<Uint8Array>
   });
 }
 
-export function gitRequest(path: string, init: RequestInit & { scopes?: string; user?: string | null } = {}): Request {
+export function gitRequest(path: string, init: RequestInit & { scopes?: string; user?: string | null; agent?: string; model?: string } = {}): Request {
   const headers = new Headers(init.headers);
+  if (init.agent !== undefined) headers.set("x-queen-agent", init.agent);
+  if (init.model !== undefined) headers.set("x-queen-agent-model", init.model);
   if (init.user !== null) headers.set("x-queen-user", init.user ?? USER);
   headers.set("x-queen-scopes", init.scopes ?? "read,push");
   return new Request(`https://git.internal${path}`, { ...init, headers });
 }
 
-export function pushRequest(body: Uint8Array, opts: { chunkedBody?: boolean; scopes?: string } = {}): Request {
+export function pushRequest(body: Uint8Array, opts: { chunkedBody?: boolean; scopes?: string; agent?: string; model?: string } = {}): Request {
   const headers: Record<string, string> = { "content-type": "application/x-git-receive-pack-request" };
   if (!opts.chunkedBody) headers["content-length"] = String(body.length);
-  return gitRequest(`/git/${HIVE}/git-receive-pack`, { method: "POST", body: opts.chunkedBody ? chunked(body) : body, headers, scopes: opts.scopes });
+  return gitRequest(`/git/${HIVE}/git-receive-pack`, { method: "POST", body: opts.chunkedBody ? chunked(body) : body, headers, scopes: opts.scopes, agent: opts.agent, model: opts.model });
 }
 
 /** A receive-pack response decoded the way git reads it. */

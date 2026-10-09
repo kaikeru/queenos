@@ -70,10 +70,10 @@ const columns = (sql: SqlStorage, table: string) =>
 const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v FROM _migrations").one().v);
 
 describe("migrations", () => {
-  it("a fresh DO migrates to v15", async () => {
-    expect(SCHEMA_VERSION).toBe(15);
+  it("a fresh DO migrates to v16", async () => {
+    expect(SCHEMA_VERSION).toBe(16);
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
-      expect(version(q.sql)).toBe(15);
+      expect(version(q.sql)).toBe(16);
       const t = tables(q.sql);
       for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims", "inboxes", "submissions", "model_preference"]) {
         expect(t.has(name), name).toBe(true);
@@ -82,6 +82,7 @@ describe("migrations", () => {
         expect(columns(q.sql, "merge_trains").has(c), c).toBe(true);
       }
       for (const c of ["entry_closes_at", "pick_deadline_at", "recommended_train_id", "recommend_reason", "decided_by", "rejections"]) expect(columns(q.sql, "races").has(c), c).toBe(true);
+      expect(columns(q.sql, "submissions").has("agent")).toBe(true);
       for (const c of ["picks", "picks_against_recommendation"]) expect(columns(q.sql, "model_stats").has(c), c).toBe(true);
       for (const c of ["paths", "wait_reason", "conflicts", "inbox_json", "judge"]) expect(columns(q.sql, "work_items").has(c), c).toBe(true);
       for (const c of ["leased_slots", "lease_expires_at", "car_infra_failures", "budget_boost"]) expect(columns(q.sql, "hive_settings").has(c), c).toBe(true);
@@ -90,8 +91,8 @@ describe("migrations", () => {
       // A new hive has no settings row yet (it gets one, autonomous, at its first v2 filing).
       expect(loadHiveSettings(q.sql)).toBeNull();
       // Idempotent: re-running is a no-op.
-      expect(migrate(state.storage)).toBe(15);
-      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(15);
+      expect(migrate(state.storage)).toBe(16);
+      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(16);
     });
   });
 
@@ -463,7 +464,7 @@ describe("v14: inbox, submissions, races, preference", () => {
 
       const A = "a".repeat(40), B = "b".repeat(40);
       const sub = { repo: "demo-in-kyle", headSha: A, ref: "refs/heads/tip-jar", originKind: "human" as const, originId: "kyle@example.com",
-        itemId: null, trainId: null, outcome: "applied" as const, disposition: "filed" as const, target: null, createdAt: 100 };
+        itemId: null, trainId: null, outcome: "applied" as const, disposition: "filed" as const, target: null, agent: null, createdAt: 100 };
       expect(insertSubmission(sql, sub)).toBe(true);
       expect(insertSubmission(sql, { ...sub, ref: "refs/heads/other" })).toBe(false); // same SHA, second branch: duplicate
       updateSubmission(sql, { repo: sub.repo, headSha: A }, { itemId: "i1", trainId: "t1" });
@@ -522,6 +523,24 @@ describe("v14: inbox, submissions, races, preference", () => {
       upsertModelPreference(sql, { model: "m", kind: "feature", rating: 1512, n: 1, updatedAt: 1 });
       upsertModelPreference(sql, { model: "m", kind: "feature", rating: 1530.5, n: 2, updatedAt: 2 });
       expect(listModelPreference(sql)).toEqual([{ model: "m", kind: "feature", rating: 1530.5, n: 2, updatedAt: 2 }]);
+    });
+  });
+});
+
+describe("v16: agent identity on submissions", () => {
+  it("adds a nullable agent column: older rows read agent = null, new rows round-trip it", async () => {
+    await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
+      const sql = q.sql;
+      const A = "a".repeat(40), B = "b".repeat(40);
+      const base = { repo: "demo-in-kyle", ref: "refs/heads/x", originKind: "human" as const, originId: "kyle@example.com", itemId: null, trainId: null, outcome: "applied" as const, disposition: "filed" as const, target: null, createdAt: 1 };
+      // Back to v15: no agent column, a row written by an older Queen.
+      sql.exec("ALTER TABLE submissions DROP COLUMN agent; DELETE FROM _migrations WHERE version = 16;");
+      expect(columns(sql, "submissions").has("agent")).toBe(false);
+      sql.exec("INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, outcome, disposition, created_at) VALUES ('demo-in-kyle', ?, 'refs/heads/x', 'human', 'kyle@example.com', 'applied', 'filed', 1)", A);
+      expect(migrate(state.storage)).toBe(16);
+      expect(getSubmission(sql, base.repo, A)).toEqual({ ...base, headSha: A, agent: null });
+      expect(insertSubmission(sql, { ...base, headSha: B, originKind: "agent", agent: "opus" })).toBe(true);
+      expect(getSubmission(sql, base.repo, B)).toMatchObject({ originKind: "agent", originId: "kyle@example.com", agent: "opus" });
     });
   });
 });

@@ -727,16 +727,21 @@ export class QueenNode extends DurableObject<Env> {
     const intent = parseOrThrow(GitPushIntentSchema, input, "push intent");
     const hive = this.hiveFor(intent.hive);
     const user = intent.user.toLowerCase();
+    // A token bound to an agent: its identity is authoritative (edge-derived). `model` is the minter's claim,
+    // display only: it rides on the origin, never into the router or model_stats.
+    const agent = intent.agent?.name ?? null;
+    const agentModel = intent.agent?.model;
+    const intentActor = agent ? `agent:${clip(`${agent}@${user}`, 320)}` : `user:${user}`;
     const trainId = crypto.randomUUID();
     const repo = trainRepoName(hive, trainId);
     const placeholder = crypto.randomUUID();
     const target = targetFromRef(intent.ref);
     const { value: decision, acc } = this.decide(hive, (d): GitIntakeDecision => {
       const now = d.now;
-      const prev = this.priorOnRef(user, intent.ref, null);
+      const prev = this.priorOnRef(user, intent.ref, null, undefined, agent);
       const settings = d.acc.settings ?? d.state.settings;
       const dec = decideIntent(
-        { ref: intent.ref, newSha: intent.newSha, user },
+        { ref: intent.ref, newSha: intent.newSha, user, agent },
         {
           now,
           guardrails: d.hs.guardrails,
@@ -762,21 +767,33 @@ export class QueenNode extends DurableObject<Env> {
           repo: hive,
           headSha: intent.newSha,
           ref: intent.ref,
-          originKind: "human",
+          originKind: agent ? "agent" : "human",
           originId: user,
           itemId: null,
           trainId: null,
           outcome: dec.outcome,
           disposition: null,
           target,
+          agent,
           createdAt: now,
         });
-        d.acc.events.push(this.submissionEvent(null, null, `push refused: ${dec.reason}`, { outcome: dec.outcome, ref: intent.ref, headSha: intent.newSha, user }, `user:${user}`, "warn"));
+        d.acc.events.push(
+          this.submissionEvent(
+            null,
+            null,
+            `push refused: ${dec.reason}`,
+            { outcome: dec.outcome, ref: intent.ref, headSha: intent.newSha, user, ...(agent ? { agent, ...(agentModel ? { model: agentModel } : {}) } : {}) },
+            intentActor,
+            "warn",
+          ),
+        );
         return { verdict: "refuse", reason: dec.reason, messages: dec.messages };
       }
       for (const stale of dec.supersedeIntents) d.acc.train(d.tp.abort(stale, `replaced by a newer push of ${intent.ref}`));
       const promptId = dec.itemId ?? placeholder;
-      const origin: SubmissionOrigin = { kind: "human", id: user };
+      const origin: SubmissionOrigin = agent
+        ? { kind: "agent", id: clip(`${agent}@${user}`, 320), ...(agentModel ? { model: agentModel } : {}) }
+        : { kind: "human", id: user };
       d.acc.train(
         d.tp.intent({
           trainId,
@@ -790,17 +807,24 @@ export class QueenNode extends DurableObject<Env> {
         repo,
         headSha: intent.newSha,
         ref: intent.ref,
-        originKind: "human",
+        originKind: agent ? "agent" : "human",
         originId: user,
         itemId: promptId,
         trainId,
         outcome: "pending",
         disposition: null,
         target,
+        agent,
         createdAt: now,
       });
       d.acc.events.push(
-        this.submissionEvent(dec.itemId, trainId, `push intent accepted: ${intent.ref} ${short(intent.newSha)} → train ${trainId} (${repo})`, { outcome: "pending", ref: intent.ref, headSha: intent.newSha, user, repo }, `user:${user}`),
+        this.submissionEvent(
+          dec.itemId,
+          trainId,
+          `push intent accepted: ${intent.ref} ${short(intent.newSha)} → train ${trainId} (${repo})`,
+          { outcome: "pending", ref: intent.ref, headSha: intent.newSha, user, repo, ...(agent ? { agent, ...(agentModel ? { model: agentModel } : {}) } : {}) },
+          intentActor,
+        ),
       );
       return { verdict: "accept", trainId, repo, messages: dec.messages };
     });
@@ -836,9 +860,11 @@ export class QueenNode extends DurableObject<Env> {
     }
     const user = sub.originId;
     const trailers = trailersOf(p.message, p.trailers);
-    const origin = originOf(user, trailers);
+    // A token bound to an agent set the train's origin at intent: that identity is authoritative and the
+    // `Queen-Origin` trailer is ignored. A human token's trailer is a claim within the owner's accountability.
+    const origin: SubmissionOrigin = train.origin?.kind === "agent" ? { ...train.origin } : originOf(user, trailers);
     const now = this.now();
-    const prev = this.priorOnRef(user, p.ref, p.trainId, "applied");
+    const prev = this.priorOnRef(user, p.ref, p.trainId, "applied", sub.agent);
     const lookupState = this.activeState();
     const newItemId = this.loadItem(train.promptId) ? crypto.randomUUID() : train.promptId;
     const plan = decideIntake(
@@ -877,7 +903,7 @@ export class QueenNode extends DurableObject<Env> {
         if (plan.supersedeTrainId) d.acc.train(d.tp.supersede(plan.supersedeTrainId, p.headSha));
         d.acc.submissionUpdates.push({ key: { repo: sub.repo, headSha: p.headSha }, patch: { outcome: "applied", disposition: plan.disposition, itemId: item.itemId, trainId: p.trainId } });
         d.acc.events.push(
-          this.submissionEvent(item.itemId, p.trainId, `submission received (${plan.disposition}) from ${origin.kind}:${origin.id}: ${p.title}`, {
+          this.submissionEvent(item.itemId, p.trainId, `submission received (${plan.disposition}) from ${origin.kind}:${origin.id}${origin.model ? ` (claims ${origin.model})` : ""}: ${p.title}`, {
             outcome: "applied",
             disposition: plan.disposition,
             ref: p.ref,
@@ -1003,15 +1029,17 @@ export class QueenNode extends DurableObject<Env> {
 
   // ── git intake: reads ─────────────────────────────────────────────────
 
-  /** The contributor's latest submission on `ref` (applied, or also pending), other than `exceptTrain`, with its train's state. */
-  private priorOnRef(user: string, ref: string, exceptTrain: string | null, only?: "applied"): PriorSubmission | null {
+  /** The contributor's latest submission on `ref` (applied, or also pending), other than `exceptTrain`, with its train's state.
+   *  Keyed on the owner AND the agent (NULL-safe `IS`): two agent tokens of one owner are separate chains, so their pushes race. */
+  private priorOnRef(user: string, ref: string, exceptTrain: string | null, only: "applied" | undefined, agent: string | null): PriorSubmission | null {
     const row = this.sql
       .exec(
         `SELECT * FROM submissions WHERE origin_id = ? AND ref = ? AND outcome IN (${only ? "'applied'" : "'applied', 'pending'"})
-         AND (train_id IS NULL OR train_id != ?) ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+         AND (train_id IS NULL OR train_id != ?) AND agent IS ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
         user,
         ref,
         exceptTrain ?? "",
+        agent,
       )
       .toArray()[0];
     if (!row) return null;

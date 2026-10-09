@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   GitIntakeDecisionSchema,
   GitPushIntentSchema,
+  GIT_TOKEN_MAX_TTL_DAYS,
+  GitTokenAgentSchema,
+  GitTokenMintRequestSchema,
   GitTokenMintResultSchema,
+  GitTokenSchema,
+  ClaimedModelSchema,
+  SubmissionOriginSchema,
   MAX_NOTE_TEXT,
   NotesProjectionSchema,
   currentVerdict,
@@ -153,6 +159,82 @@ describe("git intake contracts", () => {
     const labelled = { ...tok, label: "laptop" };
     expect(GitTokenMintResultSchema.parse(labelled)).toEqual(labelled);
     expect(GitTokenMintResultSchema.parse({ ...tok, label: null }).label).toBeNull();
+  });
+});
+
+describe("agent identity on git tokens", () => {
+  const tok = { id: "i", email: "a@b.co", scopes: ["push"], createdAt: 1, expiresAt: 2, lastUsedAt: null, revokedAt: null };
+  const intent = { hive: "demo", user: "a@b.co", ref: "refs/heads/item/14", oldSha: sha, newSha: sha };
+
+  it("validates claimed models", () => {
+    for (const ok of ["claude-opus-4-5", "anthropic/claude-opus-5-5", "gpt-5:high", "m@v1.2", "x".repeat(64)]) {
+      expect(ClaimedModelSchema.safeParse(ok).success).toBe(true);
+    }
+    for (const bad of ["", "has space", "x".repeat(65), "semi;colon", "new\nline"]) {
+      expect(ClaimedModelSchema.safeParse(bad).success).toBe(false);
+    }
+  });
+
+  it("parses GitToken with and without agent (backward compat)", () => {
+    expect(GitTokenSchema.parse(tok).agent).toBeUndefined();
+    expect(GitTokenSchema.parse({ ...tok, agent: null }).agent).toBeNull();
+    const bound = { ...tok, agent: { name: "haiku", model: "claude-haiku-4-5" } };
+    expect(GitTokenSchema.parse(bound)).toEqual(bound);
+    expect(GitTokenSchema.parse({ ...tok, agent: { name: "haiku", model: null } }).agent).toEqual({ name: "haiku", model: null });
+    expect(GitTokenMintResultSchema.parse({ ...bound, token: "qgt_x" })).toEqual({ ...bound, token: "qgt_x" });
+    expect(GitTokenAgentSchema.safeParse({ name: "haiku" }).success).toBe(false); // model is nullable, not optional
+    for (const name of [".hidden", "a..b", "x.lock", "a b", ""]) {
+      expect(GitTokenSchema.safeParse({ ...tok, agent: { name, model: null } }).success).toBe(false);
+    }
+    expect(GitTokenSchema.safeParse({ ...tok, agent: { name: "ok", model: "bad model" } }).success).toBe(false);
+  });
+
+  it("parses mint requests", () => {
+    expect(GitTokenMintRequestSchema.parse({})).toEqual({});
+    expect(GitTokenMintRequestSchema.parse({ scopes: ["read", "push"], label: "  laptop ", ttlDays: 30 })).toEqual({
+      scopes: ["read", "push"],
+      label: "laptop",
+      ttlDays: 30,
+    });
+    expect(GitTokenMintRequestSchema.parse({ agent: { name: "haiku" } }).agent).toEqual({ name: "haiku" });
+    expect(GitTokenMintRequestSchema.parse({ agent: { name: "haiku", model: "claude-haiku-4-5" } }).agent).toEqual({
+      name: "haiku",
+      model: "claude-haiku-4-5",
+    });
+    expect(GIT_TOKEN_MAX_TTL_DAYS).toBe(90);
+    expect(GitTokenMintRequestSchema.safeParse({ ttlDays: GIT_TOKEN_MAX_TTL_DAYS }).success).toBe(true);
+    for (const bad of [
+      { scopes: [] },
+      { scopes: ["admin"] },
+      { label: "   " },
+      { label: "x".repeat(81) },
+      { ttlDays: 0 },
+      { ttlDays: GIT_TOKEN_MAX_TTL_DAYS + 1 },
+      { ttlDays: 1.5 },
+      { agent: { name: ".bad" } },
+      { agent: { name: "ok", model: "no spaces" } },
+      { agent: { model: "m" } },
+    ]) {
+      expect(GitTokenMintRequestSchema.safeParse(bad).success).toBe(false);
+    }
+  });
+
+  it("parses push intents with and without agent", () => {
+    expect(GitPushIntentSchema.parse(intent).agent).toBeUndefined();
+    expect(GitPushIntentSchema.parse({ ...intent, agent: { name: "haiku" } }).agent).toEqual({ name: "haiku" });
+    expect(GitPushIntentSchema.parse({ ...intent, agent: { name: "haiku", model: "claude-haiku-4-5" } }).agent).toEqual({
+      name: "haiku",
+      model: "claude-haiku-4-5",
+    });
+    expect(GitPushIntentSchema.safeParse({ ...intent, agent: { name: "a..b" } }).success).toBe(false);
+    expect(GitPushIntentSchema.safeParse({ ...intent, agent: { name: "ok", model: "x y" } }).success).toBe(false);
+  });
+
+  it("parses SubmissionOrigin with and without model", () => {
+    expect(SubmissionOriginSchema.parse({ kind: "agent", id: "haiku@a@b.co" })).toEqual({ kind: "agent", id: "haiku@a@b.co" });
+    expect(SubmissionOriginSchema.parse({ kind: "agent", id: "haiku@a@b.co", model: "claude-haiku-4-5" }).model).toBe("claude-haiku-4-5");
+    expect(SubmissionOriginSchema.parse({ kind: "human", id: "a@b.co" }).model).toBeUndefined();
+    expect(SubmissionOriginSchema.safeParse({ kind: "agent", id: "x", model: "bad model" }).success).toBe(false);
   });
 });
 

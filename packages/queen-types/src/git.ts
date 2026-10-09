@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { HiveSlugSchema } from "./onboarding.js";
-import { SubmitDispositionSchema } from "./inbox.js";
+import { AgentHandleSchema, ClaimedModelSchema, SubmitDispositionSchema } from "./inbox.js";
 import { NotesRefSchema } from "./notes.js";
 
 /**
@@ -18,6 +18,8 @@ export const GitPushIntentSchema = z.object({
   ref: z.string().regex(/^refs\/heads\/.+/),
   oldSha: Sha40,
   newSha: Sha40,
+  /** Set when the git token is bound to an agent (edge-derived, never client-supplied). `model` is self-reported. */
+  agent: z.object({ name: AgentHandleSchema, model: ClaimedModelSchema.optional() }).optional(),
 });
 export type GitPushIntent = z.infer<typeof GitPushIntentSchema>;
 
@@ -67,6 +69,25 @@ export const GitAbortedSchema = z.object({
 });
 export type GitAborted = z.infer<typeof GitAbortedSchema>;
 
+/** The agent a git token is bound to: `name` is a ref-safe handle; `model` is self-reported and unverified. */
+export const GitTokenAgentSchema = z.object({
+  name: AgentHandleSchema,
+  model: ClaimedModelSchema.nullable(),
+});
+export type GitTokenAgent = z.infer<typeof GitTokenAgentSchema>;
+
+/** Longest git token lifetime, in days (the edge enforces the same cap). */
+export const GIT_TOKEN_MAX_TTL_DAYS = 90;
+
+/** Body of `POST` mint-a-git-token. */
+export const GitTokenMintRequestSchema = z.object({
+  scopes: z.array(z.enum(["read", "push"])).min(1).optional(),
+  label: z.string().trim().min(1).max(80).optional(),
+  ttlDays: z.number().int().min(1).max(GIT_TOKEN_MAX_TTL_DAYS).optional(),
+  agent: z.object({ name: AgentHandleSchema, model: ClaimedModelSchema.optional() }).optional(),
+});
+export type GitTokenMintRequest = z.infer<typeof GitTokenMintRequestSchema>;
+
 /** A git token as listed (never carries the secret). */
 export const GitTokenSchema = z.object({
   id: z.string(),
@@ -74,6 +95,8 @@ export const GitTokenSchema = z.object({
   scopes: z.array(z.enum(["read", "push"])).min(1),
   /** The minter's note (e.g. "laptop"); null when none was given. Optional: older edges omitted it. */
   label: z.string().max(80).nullable().optional(),
+  /** The agent the token is bound to; null/absent for a plain human token. Optional: older edges omitted it. */
+  agent: GitTokenAgentSchema.nullable().optional(),
   createdAt: z.number().int(),
   expiresAt: z.number().int(),
   lastUsedAt: z.number().int().nullable(),

@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { HiveSlugSchema, type Project } from "@queenos/queen-types";
+import { HiveSlugSchema, type GitTokenAgent, type Project } from "@queenos/queen-types";
 
 type Patch = { status?: Project["status"]; name?: string; description?: string; urls?: Partial<Project["urls"]> };
 
@@ -36,6 +36,8 @@ export interface GitTokenInfo {
   expiresAt: number;
   lastUsedAt: number | null;
   revokedAt: number | null;
+  /** The agent the token is bound to (name + self-reported model); null for a plain human token. */
+  agent: GitTokenAgent | null;
 }
 
 interface TokenRow extends Record<string, SqlStorageValue> {
@@ -47,6 +49,8 @@ interface TokenRow extends Record<string, SqlStorageValue> {
   expires_at: number;
   last_used_at: number | null;
   revoked_at: number | null;
+  agent_name: string | null;
+  agent_model: string | null;
 }
 
 function toToken(r: TokenRow): GitTokenInfo {
@@ -59,7 +63,15 @@ function toToken(r: TokenRow): GitTokenInfo {
     expiresAt: r.expires_at,
     lastUsedAt: r.last_used_at,
     revokedAt: r.revoked_at,
+    agent: r.agent_name ? { name: r.agent_name, model: r.agent_model ?? null } : null,
   };
+}
+
+/** Adds the agent columns to a `git_tokens` table created before agent identity existed. Idempotent. */
+export function migrateGitTokens(sql: SqlStorage): void {
+  const cols = new Set(sql.exec<{ name: string }>("PRAGMA table_info(git_tokens)").toArray().map((c) => c.name));
+  if (!cols.has("agent_name")) sql.exec("ALTER TABLE git_tokens ADD COLUMN agent_name TEXT");
+  if (!cols.has("agent_model")) sql.exec("ALTER TABLE git_tokens ADD COLUMN agent_model TEXT");
 }
 
 /** Failed git auth: at most this many per key per window. */
@@ -80,6 +92,7 @@ export class HiveRegistry extends DurableObject {
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS git_tokens (
       id TEXT PRIMARY KEY, email TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL, label TEXT,
       created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER)`);
+    migrateGitTokens(ctx.storage.sql);
     ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS git_tokens_email ON git_tokens (email)`);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS git_auth_fails (
       key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL)`);
@@ -147,10 +160,12 @@ export class HiveRegistry extends DurableObject {
     scopes: ("read" | "push")[];
     label: string | null;
     ttlMs: number;
+    /** Optional: tokens minted without an agent are plain human tokens. */
+    agent?: GitTokenAgent | null;
   }): Promise<GitTokenInfo> {
     const t = Date.now();
     this.ctx.storage.sql.exec(
-      "INSERT INTO git_tokens (id, email, hash, scopes, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO git_tokens (id, email, hash, scopes, label, created_at, expires_at, agent_name, agent_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       input.id,
       input.email,
       input.hash,
@@ -158,6 +173,8 @@ export class HiveRegistry extends DurableObject {
       input.label,
       t,
       t + input.ttlMs,
+      input.agent?.name ?? null,
+      input.agent ? (input.agent.model ?? null) : null,
     );
     return toToken(this.ctx.storage.sql.exec<TokenRow>("SELECT * FROM git_tokens WHERE id = ?", input.id).one());
   }
@@ -184,7 +201,11 @@ export class HiveRegistry extends DurableObject {
   }
 
   /** Checked on every git request: revocation and expiry take effect immediately. */
-  async authGitToken(hash: string): Promise<{ email: string; scopes: ("read" | "push")[] } | null> {
+  async authGitToken(hash: string): Promise<{
+    email: string;
+    scopes: ("read" | "push")[];
+    agent: GitTokenAgent | null;
+  } | null> {
     const r = this.ctx.storage.sql.exec<TokenRow>("SELECT * FROM git_tokens WHERE hash = ?", hash).toArray()[0];
     if (!r || r.revoked_at !== null) return null;
     const t = Date.now();
@@ -192,7 +213,11 @@ export class HiveRegistry extends DurableObject {
     if (r.last_used_at === null || t - r.last_used_at >= LAST_USED_GRANULARITY_MS) {
       this.ctx.storage.sql.exec("UPDATE git_tokens SET last_used_at = ? WHERE id = ?", t, r.id);
     }
-    return { email: r.email, scopes: r.scopes.split(",") as ("read" | "push")[] };
+    return {
+      email: r.email,
+      scopes: r.scopes.split(",") as ("read" | "push")[],
+      agent: r.agent_name ? { name: r.agent_name, model: r.agent_model ?? null } : null,
+    };
   }
 
   // ---- Failed git auth rate limit (fixed window per key) ----

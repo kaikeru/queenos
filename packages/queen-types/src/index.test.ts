@@ -91,6 +91,7 @@ import {
   EventTypeSchema,
   inboxRepoName,
   AGENT_HANDLE_RE,
+  AgentHandleSchema,
   ENTRY_WINDOW_DEFAULT_MS,
   handleFromRef,
   itemIdFromRef,
@@ -854,6 +855,8 @@ describe("human-push design T0 contracts (inbox, Submission, races)", () => {
     // Git ref-name rules for the suffix: no leading '.', no '..', not ending in '.lock'.
     for (const ok of ["a", "a.b", "v1.2", "x.lockx", "lock", "-x", "_x"]) expect(AGENT_HANDLE_RE.test(ok)).toBe(true);
     for (const bad of [".hidden", "a..b", "..", "agent.lock", ".lock", "a b", "", "x".repeat(65)]) expect(AGENT_HANDLE_RE.test(bad)).toBe(false);
+    for (const ok of ["a", "v1.2", "claude-opus_4.1"]) expect(AgentHandleSchema.safeParse(ok).success).toBe(true);
+    for (const bad of [".hidden", "a..b", "agent.lock", "a b", "", "x".repeat(65)]) expect(AgentHandleSchema.safeParse(bad).success).toBe(false);
     for (const bad of ["refs/heads/item/abc/.hidden", "refs/heads/item/abc/a..b", "refs/heads/item/abc/opus.lock", "refs/heads/goal/abc/.."]) {
       expect(targetFromRef(bad)).toBeNull();
       expect(handleFromRef(bad)).toBeNull();

@@ -23,7 +23,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const push = (cmds: [string, string, string][], packBytes = 2048, opts: { chunkedBody?: boolean; scopes?: string; caps?: string } = {}) =>
+const push = (cmds: [string, string, string][], packBytes = 2048, opts: { chunkedBody?: boolean; scopes?: string; caps?: string; agent?: string; model?: string } = {}) =>
   handleGit(pushRequest(pushBody(cmds, fakePack(packBytes), opts.caps), opts), world.deps());
 
 describe("pre-receive refusals (§4.3)", () => {
@@ -110,6 +110,93 @@ describe("per-agent branches (item/<id>/<agent>)", () => {
     const r = await readReport(await push([[ZERO, NEW_SHA, ref]]));
     expect(r.lines).toEqual(["unpack ok", `ng ${ref} stop here`]);
     expect(world.calls.intent).toEqual([{ hive: HIVE, user: USER, ref, oldSha: ZERO, newSha: NEW_SHA }]);
+  });
+});
+
+describe("agent identity (edge x-queen-agent*)", () => {
+  const REF = "refs/heads/item/14";
+  const intent = { hive: HIVE, user: USER, ref: REF, oldSha: ZERO, newSha: NEW_SHA };
+  beforeEach(() => {
+    world.intent = { verdict: "refuse", reason: "stop here", messages: [] };
+  });
+
+  it("passes agent and model to gitIntent", async () => {
+    await push([[ZERO, NEW_SHA, REF]], 2048, { agent: "claude-code", model: "claude-opus-4-5" });
+    expect(world.calls.intent).toEqual([{ ...intent, agent: { name: "claude-code", model: "claude-opus-4-5" } }]);
+  });
+
+  it("passes an agent without a model, with no model key", async () => {
+    await push([[ZERO, NEW_SHA, REF]], 2048, { agent: "codex" });
+    expect(world.calls.intent).toEqual([{ ...intent, agent: { name: "codex" } }]);
+    expect(world.calls.intent[0]!.agent).not.toHaveProperty("model");
+  });
+
+  it("leaves the call unchanged when there are no agent headers (or empty ones)", async () => {
+    await push([[ZERO, NEW_SHA, REF]]);
+    await push([[ZERO, NEW_SHA, REF]], 2048, { agent: "", model: "" });
+    expect(world.calls.intent).toEqual([intent, intent]);
+    expect(world.calls.intent[0]).not.toHaveProperty("agent");
+  });
+
+  it("logs the agent name", async () => {
+    await push([[ZERO, NEW_SHA, REF]], 2048, { agent: "codex", model: "gpt-5" });
+    expect(logs.join("\n")).toMatch(/user=ada@kaikeru\.com agent=codex /);
+  });
+
+  it.each([
+    ["bad name", { agent: "bad!" }],
+    ["leading dot", { agent: ".x" }],
+    ["name with a slash", { agent: "a/b" }],
+    ["too long name", { agent: "a".repeat(65) }],
+    ["bad model", { agent: "codex", model: "bad model!" }],
+    ["too long model", { agent: "codex", model: "m".repeat(65) }],
+    ["model without agent", { model: "claude-opus-4-5" }],
+    ["model with empty agent", { agent: "", model: "claude-opus-4-5" }],
+  ])("401s %s and never reaches the Queen", async (_, opts) => {
+    const res = await push([[ZERO, NEW_SHA, REF]], 2048, opts);
+    expect(res.status).toBe(401);
+    expect(await res.text()).toMatch(/bad agent identity from the edge/);
+    expect(world.calls.intent).toHaveLength(0);
+    expect(world.forks).toHaveLength(0);
+  });
+});
+
+describe("agent tokens and branch handles", () => {
+  beforeEach(() => {
+    world.intent = { verdict: "refuse", reason: "stop here", messages: [] };
+  });
+
+  it.each([
+    ["refs/heads/item/14/haiku", "item/14", "haiku"],
+    ["refs/heads/goal/tip-jar/haiku", "goal/tip-jar", "haiku"],
+  ])("refuses %s for a token bound to another agent, before the Queen", async (ref, target) => {
+    const r = await readReport(await push([[ZERO, NEW_SHA, ref]], 2048, { agent: "codex", model: "gpt-5" }));
+    const reason = `branch handle haiku does not match this token's agent codex; push ${target} or ${target}/codex`;
+    expect(r.lines).toEqual(["unpack ok", `ng ${ref} ${reason}`]);
+    expect(r.remote).toContain(`QueenOS:   ${ref}: ${reason}`);
+    expect(world.calls.intent).toHaveLength(0);
+    expect(world.forks).toHaveLength(0);
+  });
+
+  it.each(["refs/heads/item/14/codex", "refs/heads/goal/tip-jar/codex", "refs/heads/item/14", "refs/heads/goal/tip-jar"])(
+    "lets an agent token push %s (own handle or no suffix) through to the Queen",
+    async (ref) => {
+      const r = await readReport(await push([[ZERO, NEW_SHA, ref]], 2048, { agent: "codex" }));
+      expect(r.lines).toEqual(["unpack ok", `ng ${ref} stop here`]);
+      expect(world.calls.intent).toEqual([{ hive: HIVE, user: USER, ref, oldSha: ZERO, newSha: NEW_SHA, agent: { name: "codex" } }]);
+    },
+  );
+
+  it("leaves a human token free to use any handle", async () => {
+    const ref = "refs/heads/item/14/haiku";
+    const r = await readReport(await push([[ZERO, NEW_SHA, ref]]));
+    expect(r.lines).toEqual(["unpack ok", `ng ${ref} stop here`]);
+    expect(world.calls.intent).toHaveLength(1);
+  });
+
+  it("keeps the bad-target refusal when the suffix is malformed, agent token or not", async () => {
+    const r = await readReport(await push([[ZERO, NEW_SHA, "refs/heads/item/14/.x"]], 2048, { agent: "codex" }));
+    expect(r.lines).toEqual(["unpack ok", `ng refs/heads/item/14/.x ${REFUSALS.badItem}`]);
   });
 });
 

@@ -18,6 +18,7 @@ import {
   type EventQueryInput,
   type FileWorkItemInput,
   type GitToken,
+  type GitTokenMintRequest,
   type GitTokenMintResult,
   type HiveStatus,
   type HourlyMetric,
@@ -248,7 +249,7 @@ export const api = {
   launch: (hive: string) => request("POST", `/api/genesis/${enc(hive)}/launch`, WizardStateSchema),
   // Git tokens (edge, behind Access). The mint response carries the secret once: never log or persist it.
   gitTokens: (): Promise<GitToken[]> => request("GET", "/api/git-tokens", GitTokensParser),
-  mintGitToken: (label?: string): Promise<GitTokenMintResult> =>
-    request("POST", "/api/git-tokens", GitTokenMintResultSchema, label ? { label } : {}),
+  mintGitToken: (req: GitTokenMintRequest | string = {}): Promise<GitTokenMintResult> =>
+    request("POST", "/api/git-tokens", GitTokenMintResultSchema, typeof req === "string" ? (req ? { label: req } : {}) : req),
   revokeGitToken: (id: string) => request("DELETE", `/api/git-tokens/${enc(id)}`, AnyParser),
 };

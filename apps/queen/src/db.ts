@@ -488,6 +488,11 @@ const MIGRATIONS: readonly Migration[] = [
   ALTER TABLE merge_trains ADD COLUMN gate_command_id TEXT;
   ALTER TABLE merge_trains ADD COLUMN gate_issued_at INTEGER;
   `,
+  `
+  -- v16: agent identity on git tokens. The agent a push's token is bound to (its name); NULL = a plain human
+  -- token (and every older row). origin_id stays the owner's email so per-owner caps span all their agents.
+  ALTER TABLE submissions ADD COLUMN agent TEXT;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -1571,6 +1576,8 @@ export interface SubmissionRecord {
   outcome: SubmitOutcomeKind;
   disposition: SubmitDisposition | null;
   target: SubmissionTarget | null;
+  /** The agent the push's git token is bound to (its name); null = a human token. originId stays the owner. */
+  agent: string | null;
   createdAt: number;
 }
 
@@ -1587,6 +1594,7 @@ export function rowToSubmission(r: Row): SubmissionRecord {
     outcome: SubmitOutcomeKindSchema.parse(r.outcome),
     disposition: SubmitDispositionSchema.safeParse(r.disposition ?? null).data ?? null,
     target: parseJson(r.target ?? null, schemaCheck<SubmissionTarget>(SubmissionTargetSchema)),
+    agent: str(r.agent),
     createdAt: Number(r.created_at),
   };
 }
@@ -1595,8 +1603,8 @@ export function rowToSubmission(r: Row): SubmissionRecord {
 export function insertSubmission(sql: SqlStorage, s: SubmissionRecord): boolean {
   const row = sql
     .exec(
-      `INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, disposition, target, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, disposition, target, agent, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(repo, head_sha) DO NOTHING RETURNING head_sha`,
       s.repo,
       s.headSha,
@@ -1608,6 +1616,7 @@ export function insertSubmission(sql: SqlStorage, s: SubmissionRecord): boolean 
       s.outcome,
       s.disposition,
       json(s.target),
+      s.agent,
       s.createdAt,
     )
     .toArray()[0];

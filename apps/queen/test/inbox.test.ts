@@ -57,6 +57,7 @@ function sub(extra: Partial<SubmissionRecord> = {}): SubmissionRecord {
     outcome: "applied",
     disposition: "filed",
     target: null,
+    agent: null,
     createdAt: 0,
     ...extra,
   };
@@ -82,7 +83,7 @@ function intentCtx(extra: Partial<IntentContext> = {}): IntentContext {
   };
 }
 
-const intent = (ref: string) => ({ ref, newSha: SHA, user: USER });
+const intent = (ref: string, agent: string | null = null) => ({ ref, newSha: SHA, user: USER, agent });
 
 function pushed(ref: string, extra: Partial<IntakeInput> = {}): IntakeInput {
   const message = extra.message ?? "Add a tip jar\n\nA jar.\n\nAcceptance:\n- shows a jar\n- takes tips\n\nQueen-Origin: agent:claude";
@@ -103,6 +104,11 @@ describe("decideIntent (pre-receive state rules, §4.3)", () => {
     const pending = sub({ headSha: SHA, outcome: "pending", trainId: "stale", ref: "refs/heads/x" });
     expect(decideIntent(intent("refs/heads/x"), intentCtx({ sameHead: [pending] }))).toMatchObject({ verdict: "accept", supersedeIntents: ["stale"] });
     expect(decideIntent(intent("refs/heads/y"), intentCtx({ sameHead: [pending] }))).toMatchObject({ verdict: "refuse", outcome: "refused:duplicate" });
+    // The same owner's other agent pushing the same head to the same branch is not a retry: a duplicate.
+    expect(decideIntent(intent("refs/heads/x", "b"), intentCtx({ sameHead: [{ ...pending, agent: "a" }] }))).toMatchObject({ verdict: "refuse", outcome: "refused:duplicate" });
+    expect(decideIntent(intent("refs/heads/x", "b"), intentCtx({ sameHead: [pending] }))).toMatchObject({ verdict: "refuse", outcome: "refused:duplicate" });
+    expect(decideIntent(intent("refs/heads/x"), intentCtx({ sameHead: [{ ...pending, agent: "a" }] }))).toMatchObject({ verdict: "refuse", outcome: "refused:duplicate" });
+    expect(decideIntent(intent("refs/heads/x", "a"), intentCtx({ sameHead: [{ ...pending, agent: "a" }] }))).toMatchObject({ verdict: "accept", supersedeIntents: ["stale"] });
     // A pending intent of another head on the same branch is replaced too.
     const other = prior({ outcome: "pending", trainId: "older", ref: "refs/heads/x" });
     expect(decideIntent(intent("refs/heads/x"), intentCtx({ previousOnRef: other }))).toMatchObject({ verdict: "accept", supersedeIntents: ["older"] });

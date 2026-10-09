@@ -2,7 +2,6 @@
 
 export const TOKEN_PREFIX = "qgt_";
 export const DEFAULT_TTL_DAYS = 30;
-export const MAX_TTL_DAYS = 90;
 export type GitScope = "read" | "push";
 export const ALL_SCOPES: GitScope[] = ["read", "push"];
 

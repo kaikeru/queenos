@@ -14,6 +14,19 @@ describe("routing and identity", () => {
     expect(w.tokens.size).toBe(0);
   });
 
+  it("refuses malformed agent identity headers on reads too (fail closed)", async () => {
+    const w = new World();
+    const refs = `/git/${HIVE}/info/refs?service=git-upload-pack`;
+    for (const opts of [{ agent: "bad!" }, { agent: ".x" }, { agent: "ok", model: "bad model" }, { model: "claude-opus-4-5" }]) {
+      const res = await handleGit(gitRequest(refs, opts), w.deps());
+      expect(res.status, JSON.stringify(opts)).toBe(401);
+      expect(await res.text()).toMatch(/bad agent identity from the edge/);
+    }
+    expect(w.tokens.size).toBe(0);
+    expect((await handleGit(gitRequest(refs, { agent: "claude-code", model: "claude-opus-4-5" }), w.deps())).status).toBe(200);
+    expect((await handleGit(gitRequest(refs, { agent: "codex" }), w.deps())).status).toBe(200);
+  });
+
   it("404s non-git paths and bad hive slugs; 403s dumb HTTP; 405s wrong methods", async () => {
     const w = new World();
     expect((await handleGit(gitRequest("/hives/demo"), w.deps())).status).toBe(404);

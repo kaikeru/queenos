@@ -6,7 +6,7 @@ import type { GitToken, MergeTrain } from "@queenos/queen-types";
 import { ApiError } from "../src/api";
 import { itemOrigin, originBadge, pushedItemOrigin } from "../src/origin";
 import { PushCode } from "../src/PushCode";
-import { gitRemote, pushSteps, sortTokens, tokenApiUnavailable, tokenState } from "../src/pushLogic";
+import { agentTokenSteps, checkAgentInput, gitRemote, pushSteps, tokenAgentText, sortTokens, tokenApiUnavailable, tokenState } from "../src/pushLogic";
 import { OriginChip } from "../src/shell";
 import { itemIdOf } from "../src/swarm";
 
@@ -29,6 +29,51 @@ describe("push instructions", () => {
     expect(all).toContain("git push origin HEAD");
     expect(all).toContain("git fetch origin '+refs/notes/*:refs/notes/*' && git log --notes=verdict");
     expect(all).not.toContain("qgt_");
+  });
+});
+
+describe("agent tokens", () => {
+  test("both blank = a plain token; a name alone or with a model builds the agent body", () => {
+    expect(checkAgentInput("", "  ")).toEqual({ agent: undefined, errors: {} });
+    expect(checkAgentInput(" haiku ", "")).toEqual({ agent: { name: "haiku" }, errors: {} });
+    expect(checkAgentInput("haiku", " claude-haiku-4-5 ")).toEqual({ agent: { name: "haiku", model: "claude-haiku-4-5" }, errors: {} });
+    expect(checkAgentInput("a", "anthropic/claude-opus-5-5").agent).toEqual({ name: "a", model: "anthropic/claude-opus-5-5" });
+  });
+
+  test("a model without a name is invalid; bad handles and models carry inline errors", () => {
+    const m = checkAgentInput("", "claude-opus-4-5");
+    expect(m.agent).toBeNull();
+    expect(m.errors.name).toBeTruthy();
+    for (const bad of [".hidden", "a..b", "x.lock", "a b", "x".repeat(65)]) {
+      const r = checkAgentInput(bad, "");
+      expect(r.agent).toBeNull();
+      expect(r.errors.name).toBeTruthy();
+    }
+    const bm = checkAgentInput("ok", "bad model!");
+    expect(bm.agent).toBeNull();
+    expect(bm.errors.model).toBeTruthy();
+    expect(bm.errors.name).toBeUndefined();
+  });
+
+  test("token list text: agent:<name> · claims <model>, or just agent:<name>, null for plain tokens", () => {
+    expect(tokenAgentText(tok("a"))).toBeNull();
+    expect(tokenAgentText(tok("a", { agent: null }))).toBeNull();
+    expect(tokenAgentText(tok("a", { agent: { name: "haiku", model: null } }))).toBe("agent:haiku");
+    expect(tokenAgentText(tok("a", { agent: { name: "haiku", model: "claude-haiku-4-5" } }))).toBe("agent:haiku · claims claude-haiku-4-5");
+  });
+
+  test("agent instructions: push to item/<id> with no suffix; identity comes from the token", () => {
+    const [push] = agentTokenSteps({ name: "haiku", model: "claude-haiku-4-5" });
+    expect(push?.cmd).toContain("git push origin HEAD:item/<id>");
+    expect(push?.cmd).not.toContain("<agent>");
+    expect(push?.note).toContain("agent:haiku");
+    expect(push?.note).toContain("claims claude-haiku-4-5, unverified");
+    expect(push?.note).toContain("Identity comes from the token");
+    expect(agentTokenSteps({ name: "haiku", model: null })[0]?.note).not.toContain("claims");
+  });
+
+  test("human-token instructions are unchanged", () => {
+    expect(pushSteps("https://q.example", "demo")[1]?.cmd).toContain("item/<id>/<agent>");
   });
 });
 
@@ -73,6 +118,26 @@ describe("origin badges", () => {
     const a = originBadge({ kind: "agent", id: "claude-code@kyle@kaikeru.com" });
     expect(a).toMatchObject({ kind: "agent", text: "agent:claude-code" });
     expect(a.title).toContain("kyle@kaikeru.com");
+    expect(a.claim).toBeNull();
+    expect(a.title).not.toContain("claims");
+  });
+
+  test("an agent's claimed model rides on the badge (self-reported tooltip); human and drone have none", () => {
+    const a = originBadge({ kind: "agent", id: "claude-code@kyle@kaikeru.com", model: "claude-opus-4-5" });
+    expect(a.claim).toBe("claude-opus-4-5");
+    expect(a.title).toContain("claims claude-opus-4-5 (self-reported)");
+    expect(originBadge({ kind: "human", id: "kyle@kaikeru.com" }).claim).toBeNull();
+    expect(originBadge({ kind: "drone", id: "wf-1" }).claim).toBeNull();
+    expect(originBadge(null).claim).toBeNull();
+    const inbox = { repo: "r", ref: "refs/heads/x", handle: "kyle", headSha: "a".repeat(40), handoff: false };
+    expect(itemOrigin({ inbox }, []).claim).toBeNull();
+  });
+
+  test("the chip shows a muted claim next to an agent badge only", () => {
+    const html = renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@kaikeru.com", model: "claude-opus-4-5" })} />);
+    expect(html).toContain("agent:bot");
+    expect(html).toContain("claims claude-opus-4-5");
+    expect(renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@kaikeru.com" })} />)).not.toContain("claims");
   });
 
   test("an item takes its newest pushed train's origin, else its inbox handle, else drone", () => {

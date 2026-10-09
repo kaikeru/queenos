@@ -223,6 +223,8 @@ export interface IntentInput {
   newSha: string;
   /** The token owner (from the edge): the contributor caps and the supersede key are per email. */
   user: string;
+  /** The agent the token is bound to (null = a human token): a retry is the same owner AND the same agent. */
+  agent: string | null;
 }
 
 /** A recorded submission plus what became of its train. */
@@ -278,8 +280,9 @@ export function decideIntent(input: IntentInput, ctx: IntentContext): IntentDeci
   for (const s of ctx.sameHead) {
     if (s.outcome === "applied") return refuse("refused:duplicate", `already submitted as item ${s.itemId ?? "?"} (train ${s.trainId ?? "?"})`);
     if (s.outcome !== "pending") continue;
-    // A retry of the same push (the proxy died after gitIntent): replace the stale intent.
-    if (s.originId === input.user && s.ref === input.ref && s.trainId) supersedeIntents.push(s.trainId);
+    // A retry of the same push (the proxy died after gitIntent): replace the stale intent. Another agent of
+    // the same owner pushing the same head is not a retry: it is a duplicate, like across owners.
+    if (s.originId === input.user && (s.agent ?? null) === input.agent && s.ref === input.ref && s.trainId) supersedeIntents.push(s.trainId);
     else return refuse("refused:duplicate", `${short(input.newSha)} is already being submitted (train ${s.trainId ?? "?"})`);
   }
   const prev = ctx.previousOnRef;

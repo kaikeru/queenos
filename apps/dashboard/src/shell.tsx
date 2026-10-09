@@ -91,7 +91,12 @@ export function ItemChip({ status, sub }: { status: string; sub?: string | null 
 /** Whose code: drone, human:<email>, agent:<name>. */
 export function OriginChip({ badge }: { badge: OriginBadge | null }) {
   if (!badge) return null;
-  return <span className={`chip chip--sm origin origin--${badge.kind}`} title={badge.title}>{badge.text}</span>;
+  return (
+    <span className={`chip chip--sm origin origin--${badge.kind}`} title={badge.title}>
+      {badge.text}
+      {badge.claim && <span className="origin__claim sh-muted"> claims {badge.claim}</span>}
+    </span>
+  );
 }
 
 /** Header for hive pages: brand, breadcrumbs, link state, page actions. */

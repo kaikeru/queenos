@@ -1,8 +1,9 @@
-import { env as testEnv } from "cloudflare:test";
+import { env as testEnv, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { Bindings } from "../src/app";
 import { createApp } from "../src/app";
 import { hashToken } from "../src/gittokens";
+import { migrateGitTokens } from "../src/registry";
 import { fakeBindings, freshVerifier, goodClaims, makeKey, sign } from "./helpers";
 
 const HOST = "https://queenos.kaikeru.com";
@@ -185,7 +186,6 @@ describe("git tokens API", () => {
     const token = "qgt_storagechecktoken";
     const hash = await hashToken(token);
     await stub.mintGitToken({ id: "s1", hash, email: "a@kaikeru.com", scopes: ["read"], label: null, ttlMs: 1000 });
-    const { runInDurableObject } = await import("cloudflare:test");
     await runInDurableObject(stub, (_i, state) => {
       const rows = state.storage.sql.exec("SELECT * FROM git_tokens").toArray();
       expect(JSON.stringify(rows)).not.toContain(token);
@@ -214,6 +214,147 @@ describe("git tokens API", () => {
       const r = await app.request(`${HOST}${path}`, { method, headers: { authorization: `Bearer ${json.token}` } }, env);
       expect(r.status, path).toBe(401);
     }
+  });
+});
+
+describe("agent identity on git tokens", () => {
+  const AGENT = { name: "claude-code", model: "claude-opus-4" };
+
+  it("mints with an agent and lists it; without an agent it is null", async () => {
+    const { mint, api } = await ctx();
+    const a = await mint({ label: "bot", agent: AGENT });
+    expect(a.status).toBe(201);
+    expect(a.json.agent).toEqual(AGENT);
+    const b = await mint({ agent: { name: "codex" } });
+    expect(b.json.agent).toEqual({ name: "codex", model: null });
+    const c = await mint({});
+    expect(c.json.agent).toBeNull();
+    const list = (await (await api("/api/git-tokens")).json()) as { id: string; agent: unknown }[];
+    const byId = new Map(list.map((t) => [t.id, t.agent]));
+    expect(byId.get(a.json.id)).toEqual(AGENT);
+    expect(byId.get(b.json.id)).toEqual({ name: "codex", model: null });
+    expect(byId.get(c.json.id)).toBeNull();
+  });
+
+  it("rejects bad agent names and models with 400", async () => {
+    const { mint } = await ctx();
+    for (const agent of [
+      { name: "bad!" },
+      { name: ".x" },
+      { name: "" },
+      { name: "a b" },
+      { name: "ok", model: "" },
+      { name: "ok", model: "x".repeat(500) },
+      { name: "ok", model: "bad\nmodel" },
+      { name: "ok", model: null },
+      { model: "claude" },
+      "claude-code",
+    ]) {
+      expect((await mint({ agent })).status, JSON.stringify(agent)).toBe(400);
+    }
+  });
+
+  it("forwards x-queen-agent and x-queen-agent-model for an agent token", async () => {
+    const { git, mint, seen } = await ctx();
+    const { json } = await mint({ agent: AGENT });
+    expect((await git(REFS, { headers: { authorization: basic(json.token) } })).status).toBe(200);
+    const h = seen.git[0]!.req.headers;
+    expect(h.get("x-queen-agent")).toBe("claude-code");
+    expect(h.get("x-queen-agent-model")).toBe("claude-opus-4");
+    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+  });
+
+  it("omits the model header when the agent token has no model", async () => {
+    const { git, mint, seen } = await ctx();
+    const { json } = await mint({ agent: { name: "codex" } });
+    await git(REFS, { headers: { authorization: basic(json.token) } });
+    const h = seen.git[0]!.req.headers;
+    expect(h.get("x-queen-agent")).toBe("codex");
+    expect(h.has("x-queen-agent-model")).toBe(false);
+  });
+
+  it("a human token never forwards agent headers, even if the client supplies them", async () => {
+    const { git, mint, seen } = await ctx();
+    const { json } = await mint();
+    await git(REFS, {
+      headers: { authorization: basic(json.token), "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" },
+    });
+    const h = seen.git[0]!.req.headers;
+    expect(h.has("x-queen-agent")).toBe(false);
+    expect(h.has("x-queen-agent-model")).toBe(false);
+  });
+
+  it("an agent token overrides client-supplied agent headers", async () => {
+    const { git, mint, seen } = await ctx();
+    const { json } = await mint({ agent: { name: "codex" } });
+    await git(REFS, {
+      headers: { authorization: basic(json.token), "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" },
+    });
+    const h = seen.git[0]!.req.headers;
+    expect(h.get("x-queen-agent")).toBe("codex");
+    expect(h.has("x-queen-agent-model")).toBe(false);
+  });
+
+  it("strips client-supplied agent headers on the Access JWT path", async () => {
+    const { git, access, seen } = await ctx();
+    await git(REFS, { headers: { "cf-access-token": access, "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" } });
+    const h = seen.git[0]!.req.headers;
+    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(h.has("x-queen-agent")).toBe(false);
+    expect(h.has("x-queen-agent-model")).toBe(false);
+  });
+
+  it("strips client-supplied agent headers in dev mode", async () => {
+    const { app, env, seen } = await ctx({ ACCESS_MODE: "dev", DEV_USER_EMAIL: "dev@kaikeru.com" });
+    await app.request("http://localhost:8787" + REFS, { headers: { "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" } }, env);
+    const h = seen.git[0]!.req.headers;
+    expect(h.has("x-queen-agent")).toBe(false);
+    expect(h.has("x-queen-agent-model")).toBe(false);
+  });
+
+  it("strips client-supplied agent headers on the /hives/* proxy", async () => {
+    const { api, seen } = await ctx();
+    await api("/hives/demo/items", { headers: { "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" } });
+    const h = seen.queen[0]!.headers;
+    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(h.has("x-queen-agent")).toBe(false);
+    expect(h.has("x-queen-agent-model")).toBe(false);
+  });
+
+  it("authGitToken returns the agent (or null) and rejects a revoked agent token", async () => {
+    const { reg, mint, api } = await ctx();
+    const a = await mint({ agent: AGENT });
+    const h = await hashToken(a.json.token);
+    expect(await reg.authGitToken(h)).toMatchObject({ email: "kyle@kaikeru.com", agent: AGENT });
+    await api(`/api/git-tokens/${a.json.id}`, { method: "DELETE" });
+    expect(await reg.authGitToken(h)).toBeNull();
+  });
+
+  it("migrates a git_tokens table created before agent columns existed", async () => {
+    const ns = (testEnv as unknown as Bindings).REGISTRY;
+    const stub = ns.get(ns.newUniqueId());
+    // First construction creates the current table; replace it with the OLD schema and a legacy row,
+    // then re-run the constructor's migration via a fresh instance.
+    await runInDurableObject(stub, (_i, state) => {
+      const sql = state.storage.sql;
+      sql.exec("DROP TABLE git_tokens");
+      sql.exec(`CREATE TABLE git_tokens (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL, label TEXT,
+        created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER)`);
+      sql.exec("INSERT INTO git_tokens (id, email, hash, scopes, label, created_at, expires_at) VALUES ('old1', 'a@kaikeru.com', 'oldhash', 'read', NULL, 1, ?)", Date.now() + 1e9);
+      expect(sql.exec("PRAGMA table_info(git_tokens)").toArray().map((c) => c.name)).not.toContain("agent_name");
+      migrateGitTokens(sql);
+      migrateGitTokens(sql); // idempotent
+      const cols = sql.exec("PRAGMA table_info(git_tokens)").toArray().map((c) => c.name);
+      expect(cols).toContain("agent_name");
+      expect(cols).toContain("agent_model");
+    });
+    const list = await stub.listGitTokens("a@kaikeru.com");
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({ id: "old1", agent: null });
+    expect(await stub.authGitToken("oldhash")).toMatchObject({ email: "a@kaikeru.com", agent: null });
+    const minted = await stub.mintGitToken({ id: "n1", hash: "h2", email: "a@kaikeru.com", scopes: ["push"], label: null, ttlMs: 1000, agent: { name: "codex", model: null } });
+    expect(minted.agent).toEqual({ name: "codex", model: null });
   });
 });
 

@@ -1,8 +1,9 @@
 import { Hono } from "hono";
-import { z } from "zod";
 import type { Context } from "hono";
 import {
   ConnectCloudflareSchema,
+  GitTokenMintRequestSchema,
+  type GitTokenAgent,
   HiveSlugSchema,
   type Project,
   type VaultStatus,
@@ -22,7 +23,6 @@ import type { HiveRegistry } from "./registry";
 import {
   ALL_SCOPES,
   DEFAULT_TTL_DAYS,
-  MAX_TTL_DAYS,
   TOKEN_PREFIX,
   extractGitCredential,
   generateToken,
@@ -97,7 +97,7 @@ export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher
         headers: { "www-authenticate": 'Basic realm="QueenOS"', "content-type": "text/plain" },
       });
 
-    let identity: { email: string; scopes: string[] } | null = null;
+    let identity: { email: string; scopes: string[]; agent?: GitTokenAgent | null } | null = null;
     if (env.ACCESS_MODE === "dev") {
       // Same localhost-only bypass as the Access middleware below; never reachable on a real host.
       if (!LOCAL_HOSTS.has(new URL(c.req.url).hostname)) return c.json({ error: "dev mode is localhost-only" }, 403);
@@ -145,11 +145,27 @@ export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher
     }
 
     const headers = new Headers(c.req.raw.headers);
-    for (const h of ["x-queen-user", "x-queen-scopes", "authorization", "cookie", "cf-access-token", "cf-access-jwt-assertion"]) {
+    // Client-supplied identity headers are removed on every path (token, Access JWT, dev mode);
+    // only what the edge itself authenticated is set below.
+    for (const h of [
+      "x-queen-user",
+      "x-queen-scopes",
+      "x-queen-agent",
+      "x-queen-agent-model",
+      "authorization",
+      "cookie",
+      "cf-access-token",
+      "cf-access-jwt-assertion",
+    ]) {
       headers.delete(h);
     }
     headers.set("x-queen-user", identity.email);
     headers.set("x-queen-scopes", identity.scopes.join(","));
+    // Only a token bound to an agent carries one; Access JWT and dev identities never do.
+    if (identity.agent) {
+      headers.set("x-queen-agent", identity.agent.name);
+      if (identity.agent.model) headers.set("x-queen-agent-model", identity.agent.model);
+    }
     // Method, path, query and the streamed body are forwarded unchanged; the response streams back as-is.
     return env.GIT.fetch(new Request(c.req.raw, { headers }));
   });
@@ -191,12 +207,6 @@ export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher
   app.get("/api/projects", async (c) => c.json((await registry(c).list()) satisfies Project[]));
 
   // ---- Git tokens (behind Access). The secret is returned once, at mint; only its hash is stored. ----
-  const MintBodySchema = z.object({
-    scopes: z.array(z.enum(["read", "push"])).min(1).optional(),
-    label: z.string().trim().min(1).max(80).optional(),
-    ttlDays: z.number().int().min(1).max(MAX_TTL_DAYS).optional(),
-  });
-
   app.post("/api/git-tokens", async (c) => {
     let body: unknown = {};
     const raw = await c.req.text();
@@ -207,7 +217,7 @@ export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher
         return c.json({ error: "invalid json" }, 400);
       }
     }
-    const parsed = MintBodySchema.safeParse(body);
+    const parsed = GitTokenMintRequestSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: "invalid body" }, 400);
     const token = generateToken();
     const info = await registry(c).mintGitToken({
@@ -217,6 +227,7 @@ export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher
       scopes: [...new Set(parsed.data.scopes ?? ALL_SCOPES)],
       label: parsed.data.label ?? null,
       ttlMs: (parsed.data.ttlDays ?? DEFAULT_TTL_DAYS) * 86_400_000,
+      agent: parsed.data.agent ? { name: parsed.data.agent.name, model: parsed.data.agent.model ?? null } : null,
     });
     return c.json({ ...info, token }, 201);
   });
@@ -302,6 +313,9 @@ export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher
   const forward = (target: "GENESIS" | "QUEEN") => (c: Ctx) => {
     const headers = new Headers(c.req.raw.headers);
     headers.delete("x-queen-user"); // never trust a client-supplied identity
+    headers.delete("x-queen-agent"); // agent identity is only ever set by the /git/* front door
+    headers.delete("x-queen-agent-model");
+    headers.delete("x-queen-scopes");
     headers.delete("cookie");
     headers.delete("cf-access-jwt-assertion");
     headers.set("x-queen-user", c.get("email"));

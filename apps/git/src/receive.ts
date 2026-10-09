@@ -50,6 +50,8 @@ export interface PushContext {
   hive: string;
   /** The token owner's email, from the edge (`x-queen-user`). */
   user: string;
+  /** The agent the token is bound to (edge `x-queen-agent*`); `model` is self-reported and unverified. */
+  agent?: { name: string; model?: string };
   /** The token has the `push` scope (edge `x-queen-scopes`). */
   canPush: boolean;
   queen: QueenRpc;
@@ -121,9 +123,10 @@ export function parseReport(body: Uint8Array, sideband: boolean): { unpack: stri
 
 /**
  * §4.3 local rules (no state), on the command list only. Returns one refusal reason per command (null =
- * fine), or null when the push passes. The default branch counts as `main`.
+ * fine), or null when the push passes. The default branch counts as `main`. With an `agent` (the token is bound
+ * to one), a branch handle suffix must be that agent's: a token can only push as its own agent.
  */
-export function preReceive(cmds: RefCommand[], branch: string): (string | null)[] | null {
+export function preReceive(cmds: RefCommand[], branch: string, agent?: string): (string | null)[] | null {
   const reasons = cmds.map((c): string | null => {
     if (!c.ref.startsWith("refs/heads/")) return REFUSALS.branchesOnly;
     if (c.ref === "refs/heads/main" || c.ref === `refs/heads/${branch}`) return REFUSALS.main;
@@ -134,6 +137,9 @@ export function preReceive(cmds: RefCommand[], branch: string): (string | null)[
       const [id, handle, ...deeper] = target[2]!.split("/");
       if (!TARGET_RE.test(id!) || (handle !== undefined && !AGENT_HANDLE_RE.test(handle)) || deeper.length) {
         return target[1] === "item" ? REFUSALS.badItem : REFUSALS.badGoal;
+      }
+      if (agent !== undefined && handle !== undefined && handle !== agent) {
+        return `branch handle ${handle} does not match this token's agent ${agent}; push ${target[1]}/${id} or ${target[1]}/${id}/${agent}`;
       }
     }
     if (cmds.length > 1) return REFUSALS.oneBranch;
@@ -237,7 +243,7 @@ export async function handleReceivePack(ctx: PushContext, req: Request): Promise
   }
   const declared = gzip ? null : req.headers.get("content-length");
   const packBytesDeclared = declared ? Number(declared) - headBytes : null;
-  const ruleReasons = preReceive(cmds, branch);
+  const ruleReasons = preReceive(cmds, branch, ctx.agent?.name);
   if (ruleReasons) {
     const hint = ruleReasons.some((r) => r === REFUSALS.main || r === REFUSALS.branchesOnly || r === REFUSALS.oneBranch);
     return refuseAll(ruleReasons, [
@@ -254,7 +260,14 @@ export async function handleReceivePack(ctx: PushContext, req: Request): Promise
   const cmd = cmds[0]!;
   let decision: GitIntakeDecision;
   try {
-    decision = await ctx.queen.gitIntent({ hive, user: ctx.user, ref: cmd.ref, oldSha: cmd.old, newSha: cmd.nu });
+    decision = await ctx.queen.gitIntent({
+      hive,
+      user: ctx.user,
+      ref: cmd.ref,
+      oldSha: cmd.old,
+      newSha: cmd.nu,
+      ...(ctx.agent ? { agent: ctx.agent } : {}),
+    });
   } catch (e) {
     log.push(`gitIntent failed: ${messageOf(e)}`);
     return refuseAll([REFUSALS.transient], [queenLine("push not received: the Queen is unavailable; retry the push")]);

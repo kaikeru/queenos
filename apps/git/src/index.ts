@@ -6,13 +6,16 @@
  * Reachable only through the edge's service binding (no routes, `workers_dev:false`, `preview_urls:false`).
  * The edge authenticates the QueenOS git token and forwards with:
  *   - `x-queen-user`: the token owner's email (required; the only identity this Worker trusts),
- *   - `x-queen-scopes`: comma-separated token scopes (`read`, `push`); without `push`, pushes are refused.
+ *   - `x-queen-scopes`: comma-separated token scopes (`read`, `push`); without `push`, pushes are refused,
+ *   - `x-queen-agent` / `x-queen-agent-model` (optional): set only when the token is bound to an agent. The name must
+ *     be a valid AgentHandle and the model (self-reported, unverified) a valid ClaimedModel, and a model without an
+ *     agent is refused; anything else is a 401 (fail closed). Pushes made with such a token carry the agent in gitIntent.
  * The URL path is kept as the client sent it:
  *   /git/<hive>[.git]/info/refs?service=git-upload-pack|git-receive-pack
  *   /git/<hive>[.git]/git-upload-pack | git-receive-pack
  *   /git/<hive>/t/<trainId>[.git]/info/refs?service=git-upload-pack | git-upload-pack   (read-only, §3.4)
  */
-import { HiveSlugSchema, type NotesRef } from "@queenos/queen-types";
+import { AgentHandleSchema, ClaimedModelSchema, HiveSlugSchema, type NotesRef } from "@queenos/queen-types";
 import { notesHandlers, type NotesHandlers } from "./notes-pack.js";
 import { DEFAULT_MAX_PACK_BYTES, handleReceivePack, type QueenRpc } from "./receive.js";
 import { RepoNotFoundError, TokenCache, type ArtifactsLike } from "./tokens.js";
@@ -43,6 +46,20 @@ function text(status: number, body: string, headers: Record<string, string> = {}
   return new Response(`${body}\n`, { status, headers: { "content-type": "text/plain; charset=utf-8", ...headers } });
 }
 
+/**
+ * The agent the edge bound to this token. `undefined` when there is none (empty headers count as absent);
+ * "invalid" for a malformed name or model, or a model without an agent.
+ */
+function agentFromHeaders(headers: Headers): { name: string; model?: string } | undefined | "invalid" {
+  const name = headers.get("x-queen-agent") ?? "";
+  const model = headers.get("x-queen-agent-model") ?? "";
+  if (!name) return model ? "invalid" : undefined;
+  if (!AgentHandleSchema.safeParse(name).success) return "invalid";
+  if (!model) return { name };
+  if (!ClaimedModelSchema.safeParse(model).success) return "invalid";
+  return { name, model };
+}
+
 /** The Queen's repo name for a train (apps/queen planner.ts `trainRepoName`); keep in sync. */
 export function trainRepoName(hive: string, trainId: string): string {
   return `${hive}-train-${trainId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12)}`;
@@ -70,6 +87,8 @@ export async function handleGit(req: Request, deps: GitDeps): Promise<Response> 
   if (!HiveSlugSchema.safeParse(hive).success) return text(404, `QueenOS: no hive ${hive}`);
   const user = (req.headers.get("x-queen-user") ?? "").trim().toLowerCase();
   if (!EMAIL_RE.test(user)) return text(401, "QueenOS: unauthenticated (the edge must forward x-queen-user)");
+  const agent = agentFromHeaders(req.headers);
+  if (agent === "invalid") return text(401, "QueenOS: bad agent identity from the edge");
   const scopes = (req.headers.get("x-queen-scopes") ?? "").split(",").map((s) => s.trim());
   const canPush = scopes.includes("push");
 
@@ -94,14 +113,14 @@ export async function handleGit(req: Request, deps: GitDeps): Promise<Response> 
       res = await handleUploadPack(target, req);
     } else {
       if (trainId) return text(403, "QueenOS: /t/<trainId> is read-only; push to the hive remote");
-      res = await handleReceivePack({ deps: deps.upstream, hive, user, canPush, queen, maxPackBytes: deps.maxPackBytes, fork: deps.fork, log }, req);
+      res = await handleReceivePack({ deps: deps.upstream, hive, user, ...(agent ? { agent } : {}), canPush, queen, maxPackBytes: deps.maxPackBytes, fork: deps.fork, log }, req);
     }
-    console.log(`git ${req.method} ${url.pathname} user=${user} ${res.status} ${deps.upstream.now() - started}ms | ${log.join(" | ")}`);
+    console.log(`git ${req.method} ${url.pathname} user=${user}${agent ? ` agent=${agent.name}` : ""} ${res.status} ${deps.upstream.now() - started}ms | ${log.join(" | ")}`);
     return res;
   } catch (e) {
     if (e instanceof RepoNotFoundError) return text(404, trainId ? `QueenOS: no train ${trainId} in ${hive}` : `QueenOS: no hive ${hive}`);
     const id = crypto.randomUUID().slice(0, 8);
-    console.error(`git ERROR ${id} ${req.method} ${url.pathname} user=${user}: ${e instanceof Error ? e.message : String(e)} | ${log.join(" | ")}`);
+    console.error(`git ERROR ${id} ${req.method} ${url.pathname} user=${user}${agent ? ` agent=${agent.name}` : ""}: ${e instanceof Error ? e.message : String(e)} | ${log.join(" | ")}`);
     return text(502, `QueenOS: proxy error ${id}; retry`);
   }
 }

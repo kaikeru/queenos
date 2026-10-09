@@ -1,10 +1,10 @@
 import { useMemo, useRef, useState, type FormEvent } from "react";
-import type { GitToken, GitTokenMintResult } from "@queenos/queen-types";
+import type { GitToken, GitTokenMintRequest, GitTokenMintResult } from "@queenos/queen-types";
 
 import { api, errorMessage, isAuthError } from "./api";
 import { useResource } from "./hooks";
 import { relativeTime } from "./lanes";
-import { pushSteps, sortTokens, tokenApiUnavailable, tokenState } from "./pushLogic";
+import { agentTokenSteps, checkAgentInput, pushSteps, sortTokens, tokenAgentText, tokenApiUnavailable, tokenState } from "./pushLogic";
 import { ErrorNotice } from "./shell";
 
 // Mock mode answers no git-token API (and has no POST actions): show the instructions only.
@@ -81,18 +81,29 @@ function Tokens() {
   // The secret lives only in this component's state: never logged, never persisted. Cleared on "Done" or unmount.
   const [minted, setMinted] = useState<GitTokenMintResult | null>(null);
   const [label, setLabel] = useState("");
+  const [agentName, setAgentName] = useState("");
+  const [agentModel, setAgentModel] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<unknown>(null);
   const now = Date.now();
   const tokens = useMemo(() => (list.data ? sortTokens(list.data, Date.now()) : []), [list.data]);
 
+  const check = useMemo(() => checkAgentInput(agentName, agentModel), [agentName, agentModel]);
+  const touched = agentName.trim() !== "" || agentModel.trim() !== "";
+
   const mint = async (e: FormEvent) => {
     e.preventDefault();
+    if (check.agent === null) return; // inline errors are showing
     setBusy(true);
     setErr(null);
     try {
-      setMinted(await api.mintGitToken(label.trim() || undefined));
+      const req: GitTokenMintRequest = {};
+      if (label.trim()) req.label = label.trim();
+      if (check.agent) req.agent = check.agent;
+      setMinted(await api.mintGitToken(req));
       setLabel("");
+      setAgentName("");
+      setAgentModel("");
       list.reload();
     } catch (x) {
       setErr(x);
@@ -125,7 +136,14 @@ function Tokens() {
       ) : (
         <form className="push__mint" onSubmit={(e) => void mint(e)}>
           <input type="text" value={label} maxLength={80} onChange={(e) => setLabel(e.target.value)} placeholder="label (optional), e.g. laptop" aria-label="Token label" />
-          <button type="submit" className="btn btn--primary" disabled={busy}>{busy ? "Minting…" : "Mint token"}</button>
+          <input type="text" value={agentName} maxLength={64} onChange={(e) => setAgentName(e.target.value)} placeholder="agent name (optional), e.g. claude-code" aria-label="Agent name" aria-invalid={Boolean(check.errors.name)} />
+          <input type="text" value={agentModel} maxLength={64} onChange={(e) => setAgentModel(e.target.value)} placeholder="model (claimed, optional), e.g. claude-opus-4-5" aria-label="Model (claimed)" aria-invalid={Boolean(check.errors.model)} />
+          <button type="submit" className="btn btn--primary" disabled={busy || check.agent === null}>{busy ? "Minting…" : "Mint token"}</button>
+          {touched && check.errors.name && <p className="sh-err" role="alert">{check.errors.name}</p>}
+          {touched && check.errors.model && <p className="sh-err" role="alert">{check.errors.model}</p>}
+          <p className="sh-muted">
+            Bind the token to an agent and every push with it is attributed to that agent. The model is a claim: self-reported, unverified, display only.
+          </p>
         </form>
       )}
       {Boolean(err) && <p className="sh-err" role="alert">{errorMessage(err)}</p>}
@@ -173,8 +191,22 @@ function NewToken({ minted, onDone }: { minted: GitTokenMintResult; onDone: () =
       </div>
       {manual && <p className="sh-muted">Clipboard unavailable: the token is selected, press Cmd/Ctrl+C.</p>}
       <p className="sh-muted">
-        {minted.label ? `"${minted.label}" · ` : ""}scopes {minted.scopes.join(", ")} · expires {date(minted.expiresAt)}
+        {minted.label ? `"${minted.label}" · ` : ""}{tokenAgentText(minted) ? `${tokenAgentText(minted)} · ` : ""}scopes {minted.scopes.join(", ")} · expires {date(minted.expiresAt)}
       </p>
+      {minted.agent && (
+        <ol className="push__steps">
+          {agentTokenSteps(minted.agent).map((s) => (
+            <li key={s.title}>
+              <b>{s.title} (agent token)</b>
+              <div className="push__cmd">
+                <pre><code>{s.cmd}</code></pre>
+                <CopyButton text={s.cmd} label={`Copy ${s.title.toLowerCase()} command`} />
+              </div>
+              {s.note && <p className="sh-muted">{s.note}</p>}
+            </li>
+          ))}
+        </ol>
+      )}
       <button type="button" className="btn" onClick={onDone}>Done, hide it</button>
     </div>
   );
@@ -202,6 +234,7 @@ function TokenRow({ t, now, onRevoked }: { t: GitToken; now: number; onRevoked: 
     <li className={`push__token push__token--${state}`}>
       <div className="push__token-main">
         <b>{t.label || <span className="sh-muted">no label</span>}</b>{" "}
+        {tokenAgentText(t) && <span className="chip chip--sm origin origin--agent">{tokenAgentText(t)}</span>}{" "}
         <span className={`chip chip--sm push__state--${state}`}>{state}</span>
         <p className="sh-muted">
           created {date(t.createdAt)} · last used {t.lastUsedAt ? relativeTime(t.lastUsedAt, now) : "never"} ·{" "}
