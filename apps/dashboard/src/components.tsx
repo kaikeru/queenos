@@ -503,7 +503,7 @@ export function LedgerPanel({ card, lane, onClose }: { card: AuditCard; lane: La
 
 // ── composer ──────────────────────────────────────────────────────────────
 
-export function Composer(props: { disabled: boolean; onSubmit: (text: string) => void; onSwarm: () => void; swarming: boolean }) {
+export function Composer(props: { disabled: boolean; onSubmit: (text: string) => void; onSwarm: () => void; swarming: boolean; external?: boolean }) {
   const [text, setText] = useState("");
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -514,12 +514,12 @@ export function Composer(props: { disabled: boolean; onSubmit: (text: string) =>
   };
   return (
     <form className="composer panel" onSubmit={submit}>
-      <p className="eyebrow">PROMPT COMPOSER</p>
+      <p className="eyebrow">{props.external ? "FILE AN ITEM FOR AGENTS" : "PROMPT COMPOSER"}</p>
       {props.disabled && <p className="composer__hint">Waiting for the Queen link. Prompts are disabled until it opens.</p>}
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
-        placeholder="Describe a change for the swarm…  (sim only: add [fail] to make it fail once)"
+        placeholder={props.external ? "Describe the work for your coding agents…  (they push to item/<id> or goal/<slug>)" : "Describe a change for the swarm…  (sim only: add [fail] to make it fail once)"}
         rows={3}
         onKeyDown={(e) => {
           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(e);
@@ -527,11 +527,11 @@ export function Composer(props: { disabled: boolean; onSubmit: (text: string) =>
       />
       <div className="composer__row">
         <button type="submit" className="btn btn--primary" disabled={props.disabled || !text.trim()} title={props.disabled ? "Waiting for the Queen link" : !text.trim() ? "Type a prompt first" : "Submit (Cmd/Ctrl+Enter)"}>
-          Submit prompt
+          {props.external ? "File item" : "Submit prompt"}
         </button>
-        <button type="button" className="btn btn--swarm" title={`Queues ${DEMO_PROMPTS.length} sample prompts at once so several agents share the merge train`} disabled={props.disabled || props.swarming} onClick={props.onSwarm}>
+        {!props.external && <button type="button" className="btn btn--swarm" title={`Queues ${DEMO_PROMPTS.length} sample prompts at once so several agents share the merge train`} disabled={props.disabled || props.swarming} onClick={props.onSwarm}>
           {props.swarming ? "Launching…" : `Launch demo swarm (${DEMO_PROMPTS.length})`}
-        </button>
+        </button>}
       </div>
     </form>
   );

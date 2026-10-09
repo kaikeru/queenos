@@ -152,6 +152,16 @@ The git proxy Worker (`apps/git`) is the intake executor: it asks before it fork
 
 **Notes** (`refs/notes/verdict`): PASSED / REJECTED by <ROLE> (with findings parsed from the REJECTED audits between the train's enqueue, or its previous verdict, and this verdict: only the train's own, and its head's, when the audit names them — gatekeepers send `trainId` / `commitSha` in `appendAudits`, stored as `event_log.train_id` / `data.commitSha` — else, for older rows, the item's) / INFRA from `gate.verdict`; SUPERSEDED, REJECTED (lost the race / CONFLICT) from EJECTED; `LANDED main@<sha>`; then `SHIPPED in release <id>` / `ROLLED BACK` without a `Queen-Verdict` (the last verdict stays LANDED, which is what agents wait for). `refs/notes/review`: the findings. `refs/notes/provenance`: `BUILT by <model>` or `PUSHED by human:<email>`. A seeded REWORK's entries carry `Queen-Replies-To: <rejected sha>`.
 
+## External executors mode
+
+`PATCH /hives/:hive/settings {"executors": "external"}` (default `"swarm"`; stored in the settings overrides JSON, no migration) turns a hive into an inbox for external coding agents. The Queen then runs **no Oracle and no drone BUILD / REWORK**; everything else (git intake, gates, previews, the merge queue's MERGE / LANDER drones, releases) is unchanged. Swarm hives behave exactly as before.
+
+- **Goals** (`decompose: true`): filed as today, but not sent to the Oracle; the goal is decomposed at once into exactly **one** `feature` child carrying the whole prompt (event: "external hive: goal filed as one inbox item"), so `goal/<slug>` pushes resolve to it. No `EXECUTOR_LOST`.
+- **Dispatch**: a READY item gets `waitReason: "awaiting submissions"` and is not dispatched. An item with **parked** pushed code (a push to a READY item) dispatches at width 1; `TrainPlanner.submit` resumes the parked train into preview → gate. Pause, budget, capacity, dependencies and affinity still apply, and `awaiting push` (a pending intent) still comes first.
+- **Auto-filed follow-ups** are filed READY (or BLOCKED on dependencies), skipping TRIAGE.
+- **Failures**: a rejected train awaits its contributor (item FAILED, no escalation), including drone trains still in flight when the hive was switched; no REWORK is enqueued. `POST /items/:id/actions {action:"handoff"}` is refused with 409 (no swarm).
+- **Switching** an existing hive: items parked in DECOMPOSING / TRIAGE settle at the next alarm (one-child fallback / skip dedupe) without escalating; in-flight drone trains finish or fail as above.
+
 ## Merge train
 
 The planner lives in `src/train/planner.ts`. It is pure and returns effects for the DO to execute.

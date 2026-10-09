@@ -60,6 +60,8 @@ class Sim {
   /** T1: the notes projection hook (a seeded REWORK's brief). */
   briefFor: ((sha: string) => string | null) | undefined;
   maxPassedSeq = 0;
+  /** `settings.executors === "external"` (no swarm). */
+  external = false;
   private ids = 0;
   private maxTrainSeq = 0;
   private maxPromptSeq = 0;
@@ -93,6 +95,7 @@ class Sim {
         ...(this.race ? { race: this.race } : {}),
         ...(this.queue ? { queue: this.queue } : {}),
         ...(this.briefFor ? { briefFor: this.briefFor } : {}),
+        ...(this.external ? { external: true } : {}),
       },
     );
     const rs = fn(planner);
@@ -1928,5 +1931,104 @@ describe("planner: pushed submissions (pre-forked trains)", () => {
     expect(s.races.get(s.trains.get("p1")!.raceId!)!.state).toBe("ABANDONED");
     expect([...s.trains.values()].filter((t) => t.promptId === "I1")).toHaveLength(1);
     expect(s.trains.get("p1")!.forkState).toBe("READY");
+  });
+});
+
+// ── external executors mode ─────────────────────────────────────────────────────────────────────────
+
+describe("planner: external executors", () => {
+  const HUMAN = { kind: "human" as const, id: "ada@example.com" };
+  const HEAD = "a".repeat(40);
+  const BASE = "b".repeat(40);
+
+  it("a failed drone train (hive switched while it was in flight): the item awaits a contributor; no REWORK, attempts untouched", () => {
+    const s = Sim.abc();
+    s.external = true;
+    const r = s.result("B", false, "B broke the build");
+    expect(r.awaitingContributor).toEqual([{ promptId: "B", summary: "B broke the build" }]);
+    expect(s.prompts.get("B")).toMatchObject({ status: "FAILED", attempts: 0 });
+    expect([...s.trains.values()].filter((t) => t.action === "REWORK")).toEqual([]);
+    expect(s.take("dispatchDrone")).toEqual([]);
+    expect(s.takeOp("FORK")).toEqual([]);
+    expect(s.trains.get("t2")).toMatchObject({ status: "EJECTED", reason: "failed: B broke the build" });
+  });
+
+  it("the same failure in a swarm hive still reworks (control)", () => {
+    const s = Sim.abc();
+    const r = s.result("B", false, "B broke the build");
+    expect(r.awaitingContributor).toBeUndefined();
+    expect(s.trainOf("B").action).toBe("REWORK");
+  });
+
+  it("submit() forks no builder: no train, no fork, a warn event", () => {
+    const s = new Sim();
+    s.external = true;
+    const r = s.run((p) => p.submit({ promptId: "A", promptText: "do A" }));
+    expect(s.trains.size).toBe(0);
+    expect(s.takeOp("FORK")).toEqual([]);
+    expect(r.events.some((e) => e.severity === "warn" && e.itemId === "A")).toBe(true);
+  });
+
+  it("submit() still resumes parked pushed code", () => {
+    const s = new Sim();
+    s.external = true;
+    s.run((p) => p.intent({ trainId: "p1", promptId: "I1", origin: HUMAN }));
+    s.run((p) =>
+      p.pushed({
+        trainId: "p1",
+        headSha: HEAD,
+        baseSha: BASE,
+        origin: HUMAN,
+        promptId: "I1",
+        promptText: "pushed I1",
+        attempts: 0,
+        item: { itemId: "I1", traceId: traceIdFromUuid("I1"), priority: 2, paths: [], bestOf: null },
+        race: { create: true },
+        resume: false,
+      }),
+    );
+    expect(s.trains.get("p1")!.phase).toBe("BUILDING");
+    s.run((p) => p.submit({ promptId: "I1", promptText: "pushed I1" }));
+    expect(s.trains.get("p1")!.phase).toBe("DEPLOYING");
+    expect(s.takeOp("FORK")).toEqual([]);
+  });
+
+  it("a handed-off contributed item (`Queen: rework`, or handed off before a switch) never gets a drone REWORK: it awaits its contributor", () => {
+    const s = new Sim();
+    s.external = true;
+    s.run((p) => p.intent({ trainId: "p1", promptId: "I1", origin: HUMAN }));
+    s.run((p) =>
+      p.pushed({
+        trainId: "p1",
+        headSha: HEAD,
+        baseSha: BASE,
+        origin: HUMAN,
+        promptId: "I1",
+        promptText: "pushed I1",
+        attempts: 0,
+        item: { itemId: "I1", traceId: traceIdFromUuid("I1"), priority: 2, paths: [], bestOf: null, handoff: true },
+        race: null,
+        resume: true,
+      }),
+    );
+    s.completeDeploys();
+    // The Queen rebuilds PlannerItems from the ledger each decision: the item carries its inbox handoff.
+    s.items = [{ itemId: "I1", traceId: traceIdFromUuid("I1"), priority: 2, paths: [], bestOf: null, handoff: true }];
+    const r = s.run((p) => p.trainResult({ trainId: "p1", passed: false, summary: "security: nope" }));
+    expect(r.awaitingContributor).toEqual([{ promptId: "I1", summary: "security: nope" }]);
+    expect(s.prompts.get("I1")).toMatchObject({ status: "FAILED", attempts: 0 });
+    expect([...s.trains.values()].filter((t) => t.promptId === "I1")).toHaveLength(1);
+    expect(s.take("dispatchDrone")).toEqual([]);
+    expect(s.takeOp("FORK")).toEqual([]);
+  });
+
+  it("a direct handoff() in an external hive does not enqueue a REWORK either", () => {
+    const s = new Sim();
+    s.external = true;
+    const r = s.run((p) =>
+      p.handoff({ promptId: "I1", promptText: "pushed I1", summary: "rejected", attempts: 0, item: { itemId: "I1", traceId: traceIdFromUuid("I1"), priority: 2, paths: [], bestOf: null } }),
+    );
+    expect(r.awaitingContributor).toEqual([{ promptId: "I1", summary: "rejected" }]);
+    expect(s.trains.size).toBe(0);
   });
 });

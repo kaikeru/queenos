@@ -1,6 +1,6 @@
 /** Pure helpers for the status home and item page (no React; unit-tested). */
-import type { Escalation, EscalationAction, EscalationReason, HiveStatus, MergeTrain, Race, WorkItem } from "@queenos/queen-types";
-import { GUARDRAIL_MAX } from "@queenos/queen-types";
+import type { Escalation, EscalationAction, EscalationReason, ExecutorsMode, HiveStatus, MergeTrain, Race, WorkItem } from "@queenos/queen-types";
+import { GUARDRAIL_MAX, TERMINAL_WORK_STATUSES } from "@queenos/queen-types";
 import { itemIdOf, isBuildTrain } from "./swarm";
 
 export const ACTION_LABEL: Record<EscalationAction, string> = {
@@ -168,4 +168,30 @@ export function guardrailPatch(current: Record<GuardrailKey, number>, draft: Rec
     if (p.value !== current[f.key]) guardrails[f.key] = p.value;
   }
   return Object.keys(guardrails).length ? { guardrails } : null;
+}
+
+// ── executors mode (swarm | external agents) ──────────────────────────────
+
+/** The hive's executors mode; `swarm` when the hive is unknown or its Queen predates the setting. */
+export function executorsMode(hive: { settings?: { executors?: ExecutorsMode } } | null | undefined): ExecutorsMode {
+  return hive?.settings?.executors ?? "swarm";
+}
+
+/** True when external coding agents (not the Queen's swarm) do the building. */
+export const isExternal = (hive: Parameters<typeof executorsMode>[0]): boolean => executorsMode(hive) === "external";
+
+export type ExternalJudgeChoice = "auto" | "pick";
+
+/** The prompt an external-mode composer sends: always one decomposed goal; "you pick" asks a human to judge, never a numeric best-of. */
+export function externalPrompt(hive: string, promptText: string, judge: ExternalJudgeChoice): { namespace: string; promptText: string; decompose: true; judge?: "human" } {
+  return { namespace: hive, promptText, decompose: true, ...(judge === "pick" ? { judge: "human" as const } : {}) };
+}
+
+/** The branch an external agent pushes to for a given item. */
+export const itemPushCommand = (itemId: string): string => `git push origin HEAD:item/${itemId}`;
+
+/** Show the push hint on non-goal items that still wait for code (not landed or finished) in an external hive. */
+export function showPushHint(hive: Parameters<typeof executorsMode>[0], item: Pick<WorkItem, "kind" | "status">): boolean {
+  if (!isExternal(hive) || item.kind === "goal") return false;
+  return item.status !== "LANDED" && !(TERMINAL_WORK_STATUSES as readonly string[]).includes(item.status);
 }

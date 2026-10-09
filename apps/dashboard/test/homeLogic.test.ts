@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MergeTrain, Race } from "@queenos/queen-types";
 import { demoSwarmPrompt } from "../src/demo";
-import { attemptsOf, autonomyLabel, compactNumber, durationText, escalationButtons, escalationSubjectLabel, gateText, meterFill, shortItemId, validItemActions } from "../src/homeLogic";
+import { attemptsOf, autonomyLabel, compactNumber, durationText, escalationButtons, escalationSubjectLabel, executorsMode, externalPrompt, gateText, isExternal, itemPushCommand, showPushHint, meterFill, shortItemId, validItemActions } from "../src/homeLogic";
 
 const train = (o: Partial<MergeTrain>): MergeTrain => ({ trainId: "t", baseSha: "a", includedPrompts: ["p"], artifactRepo: "r", status: "BUILDING", createdAt: 1, ...o }) as MergeTrain;
 
@@ -75,5 +75,35 @@ describe("escalation subject (one card per item, not per goal)", () => {
   it("prefers the item title", () => {
     expect(escalationSubjectLabel(esc(ids[3]!), { [ids[3]!]: { title: "Add /features/fib" } })).toBe("item “Add /features/fib”");
     expect(escalationSubjectLabel({ subject: { type: "hive", id: "demo" } }, {})).toBe("hive demo");
+  });
+});
+
+describe("executors mode", () => {
+  const hive = (executors?: "swarm" | "external") => ({ settings: executors ? { executors } : {} });
+  it("defaults to swarm when absent or the hive is unknown", () => {
+    expect(executorsMode(null)).toBe("swarm");
+    expect(executorsMode(undefined)).toBe("swarm");
+    expect(executorsMode(hive())).toBe("swarm");
+    expect(isExternal(hive())).toBe(false);
+    expect(isExternal(hive("swarm"))).toBe(false);
+  });
+  it("detects external", () => {
+    expect(executorsMode(hive("external"))).toBe("external");
+    expect(isExternal(hive("external"))).toBe(true);
+  });
+  it("composer payload: always decompose, human judge only for 'you pick', never bestOf", () => {
+    expect(externalPrompt("h", "do it", "auto")).toEqual({ namespace: "h", promptText: "do it", decompose: true });
+    const pick = externalPrompt("h", "do it", "pick");
+    expect(pick).toEqual({ namespace: "h", promptText: "do it", decompose: true, judge: "human" });
+    expect("bestOf" in pick).toBe(false);
+  });
+  it("push hint: external, non-goal, not finished", () => {
+    expect(itemPushCommand("abc")).toBe("git push origin HEAD:item/abc");
+    const ext = hive("external");
+    expect(showPushHint(ext, { kind: "feature", status: "READY" })).toBe(true);
+    expect(showPushHint(ext, { kind: "goal", status: "READY" })).toBe(false);
+    for (const status of ["LANDED", "SHIPPED", "CANCELLED", "DUPLICATE"] as const) expect(showPushHint(ext, { kind: "feature", status })).toBe(false);
+    expect(showPushHint(hive(), { kind: "feature", status: "READY" })).toBe(false);
+    expect(showPushHint(null, { kind: "feature", status: "READY" })).toBe(false);
   });
 });

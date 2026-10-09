@@ -641,6 +641,7 @@ input, textarea { font: inherit; color: var(--text); }
 .sh-auto { display: inline-flex; align-items: center; gap: 8px; font: 600 13px var(--mono); padding: 6px 12px; border: 1px solid var(--line-2); border-radius: 999px; background: var(--panel); flex-wrap: wrap; }
 .sh-auto--degraded { border-color: rgba(255, 210, 63, 0.6); color: var(--yellow); }
 .sh-auto select, .sh-composer select { font: 600 13px var(--mono); background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 6px; }
+.item__push { margin: 10px 0; }
 .sh-auto__err { font-style: normal; color: #ffb3bd; width: 100%; }
 
 .sh-head { display: flex; align-items: center; gap: 14px; padding: 16px 20px; border-radius: 12px; border: 1px solid; }

@@ -21,7 +21,7 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-function CopyButton({ text, label = "Copy", onFail }: { text: string; label?: string; onFail?: () => void }) {
+export function CopyButton({ text, label = "Copy", onFail }: { text: string; label?: string; onFail?: () => void }) {
   const [done, setDone] = useState(false);
   const copy = async () => {
     if (await copyText(text)) {

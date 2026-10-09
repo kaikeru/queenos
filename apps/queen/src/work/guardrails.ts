@@ -72,6 +72,7 @@ export function effectiveSettings(record: Pick<HiveSettingsRecord, "autonomy" | 
       judge: o.race?.judge ?? d.race.judge ?? "auto",
       pickWindowMs: clampInt(o.race?.pickWindowMs, PICK_WINDOW_MIN_MS, PICK_WINDOW_MAX_MS, d.race.pickWindowMs ?? PICK_WINDOW_DEFAULT_MS),
     },
+    executors: o.executors ?? d.executors ?? "swarm",
   };
 }
 

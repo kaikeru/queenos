@@ -245,6 +245,11 @@ export interface DispatchCapacity {
   leasedSlots?: number | null;
   /** T1: items a pending push intent targets: held READY ("awaiting push") so no drone races the push in. */
   held?: ReadonlySet<string>;
+  /**
+   * T1: items whose pushed code is parked (their train awaits a resume). In an `external` hive only these
+   * dispatch (at width 1: the push is the build); every other READY item waits for a submission.
+   */
+  parked?: ReadonlySet<string>;
 }
 
 /** T1: a new item a pushed submission files (human-push design §6.2): a `feature`, READY, skipping TRIAGE. */
@@ -468,6 +473,11 @@ export class WorkPlanner {
     }
   }
 
+  /** `settings.executors === "external"`: no Oracle, no drone BUILD/REWORK; items await git-pushed submissions. */
+  private get external(): boolean {
+    return this.hs.executors === "external";
+  }
+
   /** The effective autonomy dispatch obeys. */
   private get autonomy(): AutonomyLevel {
     return this.ctx.autonomy ?? this.settings.autonomy;
@@ -522,7 +532,13 @@ export class WorkPlanner {
       ...(input.judge !== undefined ? { judge: input.judge } : {}),
     });
     this.event("item.filed", goal, `goal filed: ${goal.title}`, { kind: "goal", source: "user", status: goal.status }, input.actor);
-    this.issueOracle(goal, "decompose", 1);
+    if (this.external) {
+      // No swarm, no Oracle: the goal is one inbox item (`goal/<slug>` pushes resolve to its only child).
+      this.decompose(goal, [], null, true);
+      this.settle();
+    } else {
+      this.issueOracle(goal, "decompose", 1);
+    }
     return this.finish("applied", { itemId });
   }
 
@@ -607,7 +623,7 @@ export class WorkPlanner {
    * maxChildrenPerItem dropped (GUARDRAIL_TRIPPED). No children (ok:false, an
    * empty answer, the watchdog) → one `feature` child with the whole prompt.
    */
-  private decompose(goal: WorkItemRecord, answer: readonly DecomposedChild[], commandId: string | null): void {
+  private decompose(goal: WorkItemRecord, answer: readonly DecomposedChild[], commandId: string | null, external = false): void {
     const max = this.hs.guardrails.maxChildrenPerItem;
     const seenKeys = new Set<string>();
     let children = answer.filter((c) => !seenKeys.has(c.key) && seenKeys.add(c.key));
@@ -710,12 +726,14 @@ export class WorkPlanner {
     goal.commandId = null;
     goal.commandIssuedAt = null;
     this.setStatus(goal, "ACTIVE", "queen");
-    this.event("item.decomposed", goal, fallback ? "decomposition fell back to one item" : `decomposed into ${created.length} items`, {
-      fallback,
+    const summary = external ? "external hive: goal filed as one inbox item" : fallback ? "decomposition fell back to one item" : `decomposed into ${created.length} items`;
+    this.event("item.decomposed", goal, summary, {
+      fallback: fallback && !external,
+      ...(external ? { external: true } : {}),
       children: created.map((c) => c.itemId),
       duplicates: created.filter((c) => c.duplicateOf).length,
       dropped: dropped.length,
-    }, "queen", fallback ? "warn" : "info");
+    }, "queen", fallback && !external ? "warn" : "info");
   }
 
   /** TRIAGE (§2.9): an auto-filed item scoring ≥ DEDUPE_THRESHOLD against a live item is a DUPLICATE; else READY / BLOCKED. */
@@ -910,7 +928,8 @@ export class WorkPlanner {
         body: clip(fu.body, MAX_BODY_CHARS),
         acceptance: [],
         priority: followUpPriority(f.source, fu),
-        status: "TRIAGE",
+        // External hive: no Oracle to triage (and dedupe) it; it is filed like a user item.
+        status: this.external ? "BLOCKED" : "TRIAGE",
         parentId: asChild ? parent.itemId : null,
         rootId: asChild ? parent.rootId : itemId,
         depth,
@@ -926,13 +945,14 @@ export class WorkPlanner {
         bestOf: null,
         paths: normalizePaths(fu.paths),
       });
-      this.event("item.filed", item, `${item.kind} filed by ${f.actor}: ${item.title}`, { kind: item.kind, source: f.source, status: "TRIAGE" }, f.actor);
+      if (this.external) this.settleNew(item);
+      this.event("item.filed", item, `${item.kind} filed by ${f.actor}: ${item.title}`, { kind: item.kind, source: f.source, status: item.status }, f.actor);
       this.event("followup.filed", item, `follow-up from ${f.actor}${f.itemId ? ` on ${f.itemId}` : ""}`, {
         origin: f.source,
         ...(f.itemId ? { onItem: f.itemId } : {}),
         ...(f.trainId ? { trainId: f.trainId } : {}),
       }, f.actor);
-      this.issueOracle(item, "triage", 1);
+      if (!this.external) this.issueOracle(item, "triage", 1);
     }
   }
 
@@ -967,10 +987,15 @@ export class WorkPlanner {
     let used = Math.max(0, cap.activeBuilds);
     const paused = this.autonomy === "paused";
     let budgetBlocked = false;
+    const external = this.external;
 
     for (const item of ready) {
       if (cap.held?.has(item.itemId)) {
         this.setWait(item, "awaiting push");
+        continue;
+      }
+      if (external && !cap.parked?.has(item.itemId)) {
+        this.setWait(item, "awaiting submissions");
         continue;
       }
       if (paused) {
@@ -1005,7 +1030,8 @@ export class WorkPlanner {
       }
       const slotsFree = slots - used;
       const left = dispatchesLeft(this.settings, this.hs.budget);
-      const asked = this.ctx.widthOf ? this.ctx.widthOf(item, slotsFree, this.hs) : this.defaultWidth(item);
+      // External: parked pushed code is the build; no drone races it.
+      const asked = external ? 1 : this.ctx.widthOf ? this.ctx.widthOf(item, slotsFree, this.hs) : this.defaultWidth(item);
       const width = Math.max(1, Math.min(Math.trunc(asked) || 1, slotsFree, Math.max(1, left)));
       this.dispatch(item, width);
       used += width;
@@ -1079,6 +1105,7 @@ export class WorkPlanner {
   handoff(itemId: string, actor = "queen", note?: string): WorkPlanResult {
     const item = this.items.get(itemId);
     if (!item) return this.notFound(itemId);
+    if (this.external) return this.invalid(item, "handoff", "this hive has no swarm: external agents only");
     if (item.status !== "FAILED" || !item.inbox || item.kind === "goal") {
       return this.invalid(item, "handoff", "only a FAILED item with pushed code can be handed off");
     }
@@ -1225,8 +1252,14 @@ export class WorkPlanner {
     const now = this.ctx.now;
     for (const item of [...this.items.values()].sort(dispatchOrder)) {
       if (!ORACLE_STATUSES.has(item.status) || !item.commandId) continue;
-      if ((item.commandIssuedAt ?? now) + this.timeoutMs > now) continue;
       const op = item.status === "DECOMPOSING" ? "decompose" : "triage";
+      if (this.external) {
+        // The hive switched to external while the Oracle was asked: no swarm will answer. Settle quietly.
+        if (op === "decompose") this.decompose(item, [], null, true);
+        else this.triage(item, []);
+        continue;
+      }
+      if ((item.commandIssuedAt ?? now) + this.timeoutMs > now) continue;
       const attempt = attemptOf(item.commandId);
       this.event("command.result", item, `oracle ${op} attempt ${attempt} timed out`, { op: op.toUpperCase(), ok: false, timeout: true }, "queen", "warn", item.commandId);
       if (attempt < MAX_ORACLE_ATTEMPTS) {

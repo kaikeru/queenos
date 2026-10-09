@@ -3,7 +3,8 @@ import type { MergeTrain, QueenEvent, WorkItem } from "@queenos/queen-types";
 import { MemoryRecall } from "./components";
 import { api, errorMessage, type ItemDetail } from "./api";
 import { useResource } from "./hooks";
-import { attemptsOf, durationText, gateText, liveTrainsOf, validItemActions, type Attempt } from "./homeLogic";
+import { attemptsOf, durationText, gateText, itemPushCommand, liveTrainsOf, showPushHint, validItemActions, type Attempt } from "./homeLogic";
+import { CopyButton } from "./PushCode";
 import { relativeTime } from "./lanes";
 import type { State } from "./reducer";
 import { hrefFor } from "./route";
@@ -85,6 +86,15 @@ export function ItemView({ hive, itemId, state }: { hive: string; itemId: string
           <div className="item__acc">
             <p className="eyebrow">ACCEPTANCE</p>
             <ul>{item.acceptance.map((a, i) => <li key={i}>☐ {a}</li>)}</ul>
+          </div>
+        )}
+        {showPushHint(state.hive, item) && (
+          <div className="item__push" aria-label="Push code for this item">
+            <p className="sh-muted">External agents: push code for this item from a clone (see <Link to={hrefFor.push(hive)}>push code</Link>).</p>
+            <div className="push__cmd">
+              <pre><code>{itemPushCommand(item.itemId)}</code></pre>
+              <CopyButton text={itemPushCommand(item.itemId)} label="Copy push command" />
+            </div>
           </div>
         )}
         <ItemActions hive={hive} item={item} onDone={() => detail.reload()} />

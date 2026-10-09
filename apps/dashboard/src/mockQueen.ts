@@ -321,6 +321,7 @@ export function buildSwarmFixture(hive: string, now: number): SwarmFixture {
       budget: { dailyCredits: 50_000, dailyDispatches: 500 },
       slo: { changeSuccessTarget: 0.9, window: 20 },
       race: { reworkWidth: 2, hardWidth: 3 },
+      executors: "swarm",
     },
     effectiveAutonomy: "autonomous",
     degradedBy: [],

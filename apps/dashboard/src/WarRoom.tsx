@@ -2,6 +2,7 @@ import { useCallback, useMemo, useReducer, useState } from "react";
 import { HiveFooter } from "./shell";
 import { DEMO_PROMPTS } from "./demo";
 import { Composer, Lanes, LedgerPanel, MainTrack, ModelBoard, ReleaseTimeline, Sites, Ticker, TopBar } from "./components";
+import { isExternal } from "./homeLogic";
 import { currentRelease, siteReleaseView } from "./releases";
 import { useMockQueen } from "./useMockQueen";
 import { buildLanes, buildSites, initialState, reducer, type AuditCard, type Lane } from "./reducer";
@@ -75,9 +76,9 @@ export function WarRoom({ hive, room, backTo }: { hive: string; room: Room; back
           <Lanes lanes={lanes} selected={selectedKey} onSelect={(card) => setSelectedKey(card.key)} />
         </main>
         <aside className="layout__side">
-          <Composer disabled={status !== "open"} onSubmit={submit} onSwarm={() => void swarm()} swarming={swarming} />
+          <Composer disabled={status !== "open"} onSubmit={submit} onSwarm={() => void swarm()} swarming={swarming} external={isExternal(state.hive)} />
           <Sites rows={sites} state={state} view={siteView} />
-          <ModelBoard stats={state.modelStats} floor={state.routerFloor} />
+          {!isExternal(state.hive) && <ModelBoard stats={state.modelStats} floor={state.routerFloor} />}
           <Ticker items={state.ticker} />
         </aside>
       </div>

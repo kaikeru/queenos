@@ -411,6 +411,11 @@ export interface PlannerContext {
    * window (`settings.race.pickWindowMs`, default 15 min) and `Guardrails.maxPickingRaces` (default 2, min 1).
    */
   pick?: { judge?: RaceJudge; pickWindowMs?: number; maxPickingRaces?: number };
+  /**
+   * `settings.executors === "external"`: the hive has no swarm. A failed non-handed-off item never gets a
+   * drone REWORK (it awaits its contributor), and `submit` never forks a builder. Default false.
+   */
+  external?: boolean;
 }
 
 /** A human pick (§10.3): +1 pick for the winner's (model, role), +1 against the recommendation when it differed (db.applyPickDelta). */
@@ -761,6 +766,8 @@ interface FailOptions {
   conflict?: MergeConflict | null;
   /** For a car: a gate verdict (bisect) or infrastructure. Default infra. */
   carCause?: queue.CarFailureCause;
+  /** The failure summary (external hives: shown while the item awaits a new submission). */
+  summary?: string;
 }
 
 export class TrainPlanner {
@@ -853,6 +860,21 @@ export class TrainPlanner {
       this.setPromptStatus(prompt.promptId, "QUEUED");
       for (const t of parked) this.resumePushed(t);
       return this.finish("applied");
+    }
+    // External hive: there is no swarm to build; the item waits for a git-pushed submission. Defensive only:
+    // the ledger dispatches an item in external mode solely when it has parked pushed code (handled above).
+    if (this.ctx.external) {
+      this.events.push({
+        type: "train.phase",
+        severity: "warn",
+        actor: ACTOR,
+        traceId: this.item(input.promptId)?.traceId ?? traceIdFromUuid(input.promptId),
+        spanId: spanIdFor(input.promptId),
+        itemId: input.promptId,
+        summary: clip500(`item ${input.promptId}: external hive, no builder forked (awaiting a git-pushed submission)`),
+        data: { external: true },
+      });
+      return this.finish("ignored:stale");
     }
     // A retried item re-submits its existing prompt id (attempts reset; filing order kept).
     const prev = this.prompts.get(input.promptId);
@@ -1951,13 +1973,14 @@ export class TrainPlanner {
       return;
     }
     this.eject(t, `failed: ${summary}`, opts.conflict ? { conflict: opts.conflict } : {});
-    this.rework(t.promptId, opts);
+    this.rework(t.promptId, { ...opts, summary });
     this.maybeLand();
   }
 
   /** The contributor handed this item to the swarm. */
   private handoffOf(promptId: string): boolean {
-    return this.item(promptId)?.handoff === true;
+    // An external hive has no swarm: a handoff (a `Queen: rework` trailer, or one made before a switch) never reworks.
+    return !this.ctx.external && this.item(promptId)?.handoff === true;
   }
 
   /** A contributed item's code was rejected: the prompt FAILS and the item waits for its contributor (no escalation). */
@@ -2011,6 +2034,11 @@ export class TrainPlanner {
   private rework(promptId: string, opts: FailOptions = {}): void {
     const failed = this.prompts.get(promptId);
     if (!failed) return;
+    // External hive: no drone REWORK, handed off or not; the item awaits a new submission.
+    if (this.ctx.external) {
+      this.awaitContributor(promptId, opts.summary ?? failed.summary ?? "failed; awaiting a new submission");
+      return;
+    }
     let exhausted: boolean;
     if (opts.cause === "conflict") {
       const n = (this.conflicts.get(promptId) ?? 0) + 1;

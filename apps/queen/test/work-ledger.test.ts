@@ -965,3 +965,125 @@ describe("guardrails and compose helpers", () => {
     expect(releaseBugText({ releaseId: "R", phase: "ROLLED_BACK", summary: "boom" }, ["x"]).title).toBe("Release R rolled back: boom");
   });
 });
+
+// ── external executors mode ──────────────────────────────────────────────
+
+describe("executors: external", () => {
+  /** A hive whose settings row carries `executors: "external"` (what PATCH /settings stores). */
+  function externalHive(): WSim {
+    const s = new WSim();
+    s.feature("seed"); // first filing creates the settings row
+    s.settings = { ...s.settings!, overrides: { ...s.settings!.overrides, executors: "external" } };
+    return s;
+  }
+
+  it("a READY item waits for a submission: no dispatch, waitReason, no budget spent", () => {
+    const s = externalHive();
+    const a = s.feature("a");
+    const before = s.settings!.dispatches;
+    const r = s.dispatch();
+    expect(r.dispatches).toEqual([]);
+    expect(s.item(a).waitReason).toBe("awaiting submissions");
+    expect(s.status(a)).toBe("READY");
+    expect(s.settings!.dispatches).toBe(before);
+  });
+
+  it("an item with parked pushed code dispatches at width 1, whatever the race settings", () => {
+    const s = externalHive();
+    const a = s.feature("a", { bestOf: 3, difficulty: "hard" });
+    const b = s.feature("b");
+    s.ctx = { widthOf: () => 3 };
+    const r = s.dispatch({ activeBuilds: 0, parked: new Set([a]) });
+    expect(r.dispatches).toEqual([expect.objectContaining({ itemId: a, width: 1 })]);
+    expect(s.status(a)).toBe("ACTIVE");
+    expect(s.item(b).waitReason).toBe("awaiting submissions");
+  });
+
+  it("a parked item is still subject to paused, budget and capacity", () => {
+    const s = externalHive();
+    const a = s.feature("a");
+    const parked = new Set([a]);
+    s.ctx = { autonomy: "paused" };
+    expect(s.dispatch({ activeBuilds: 0, parked }).dispatches).toEqual([]);
+    expect(s.item(a).waitReason).toBe("paused");
+    s.ctx = {};
+    s.settings = { ...s.settings!, overrides: { ...s.settings!.overrides, guardrails: { maxActiveTrains: 1 } } };
+    expect(s.dispatch({ activeBuilds: 1, parked }).dispatches).toEqual([]);
+    expect(s.item(a).waitReason).toMatch(/^capacity/);
+    s.settings = { ...s.settings!, overrides: { ...s.settings!.overrides, budget: { dailyDispatches: 1 } }, dispatches: 1 };
+    expect(s.dispatch({ activeBuilds: 0, parked }).dispatches).toEqual([]);
+    expect(s.item(a).waitReason).toBe("budget");
+  });
+
+  it("an item held for a pending push says awaiting push, not awaiting submissions", () => {
+    const s = externalHive();
+    const a = s.feature("a");
+    s.dispatch({ activeBuilds: 0, held: new Set([a]), parked: new Set([a]) });
+    expect(s.item(a).waitReason).toBe("awaiting push");
+  });
+
+  it("a goal is filed as exactly one inbox child: no Oracle command, no escalation", () => {
+    const s = externalHive();
+    const r = s.run((p) => p.fileGoal({ promptText: "Ship dark mode\n- toggle\n- persist", actor: "user:a@x" }));
+    expect(s.oracle(r)).toEqual([]);
+    const goal = s.item(r.itemId!);
+    expect(goal.status).toBe("ACTIVE");
+    const kids = [...s.items.values()].filter((i) => i.parentId === goal.itemId);
+    expect(kids).toHaveLength(1);
+    expect(kids[0]).toMatchObject({ kind: "feature", title: goal.title, status: "READY", body: goal.body });
+    const decomposed = r.events.find((e) => e.type === "item.decomposed")!;
+    expect(decomposed.summary).toBe("external hive: goal filed as one inbox item");
+    expect(decomposed.severity ?? "info").toBe("info");
+    expect(s.open("EXECUTOR_LOST")).toHaveLength(0);
+  });
+
+  it("follow-ups are filed READY (or BLOCKED on dependencies) with no TRIAGE or Oracle command", () => {
+    const s = externalHive();
+    const parent = s.feature("parent");
+    s.dispatch({ activeBuilds: 0, parked: new Set([parent]) });
+    const r = s.absorb({ followUps: [{ source: "drone", actor: "drone:BUILDER", itemId: parent, trainId: "t1", followUps: [fu("flaky test")] }] });
+    const bug = [...s.items.values()].find((i) => i.title === "flaky test")!;
+    expect(bug).toMatchObject({ status: "READY", depth: 1, parentId: parent });
+    expect(s.oracle(r)).toEqual([]);
+    expect(r.events.find((e) => e.type === "item.filed" && e.itemId === bug.itemId)?.data).toMatchObject({ status: "READY" });
+  });
+
+  it("handoff is refused with 409 even for a FAILED pushed item", () => {
+    const s = externalHive();
+    const a = s.feature("a");
+    s.dispatch({ activeBuilds: 0, parked: new Set([a]) });
+    s.item(a).inbox = { repo: "r", ref: "refs/heads/item/x", headSha: "abc", handoff: false } as never;
+    s.item(a).status = "FAILED";
+    const r = s.run((p) => p.handoff(a, "user:a@x"));
+    expect(r.outcome).toBe("conflict");
+    expect(r.error).toMatchObject({ status: 409, code: "invalid_handoff" });
+    expect(r.error!.message).toContain("no swarm");
+    expect(s.status(a)).toBe("FAILED");
+  });
+
+  it("an Oracle command in flight when the hive switches to external settles at reconcile, without an escalation", () => {
+    const s = new WSim();
+    const { goalId } = s.goal();
+    s.settings = { ...s.settings!, overrides: { ...s.settings!.overrides, executors: "external" } };
+    s.run((p) => p.reconcile());
+    expect(s.status(goalId)).toBe("ACTIVE");
+    expect([...s.items.values()].filter((i) => i.parentId === goalId)).toHaveLength(1);
+    expect(s.open("EXECUTOR_LOST")).toHaveLength(0);
+  });
+
+  it("swarm mode (default and explicit) is unchanged: Oracle DECOMPOSE, TRIAGE follow-ups, dispatch", () => {
+    for (const explicit of [false, true]) {
+      const s = new WSim();
+      const a = s.feature("a");
+      if (explicit) s.settings = { ...s.settings!, overrides: { ...s.settings!.overrides, executors: "swarm" } };
+      const r = s.dispatch();
+      expect(r.dispatches.map((d) => d.itemId)).toEqual([a]);
+      expect(s.item(a).waitReason).toBeNull();
+      const { goalId } = s.goal();
+      expect(s.status(goalId)).toBe("DECOMPOSING");
+      const fr = s.absorb({ followUps: [{ source: "drone", actor: "drone:BUILDER", itemId: a, trainId: "t1", followUps: [fu("x")] }] });
+      expect([...s.items.values()].find((i) => i.title === "x")!.status).toBe("TRIAGE");
+      expect(s.oracle(fr)).toEqual([expect.objectContaining({ op: "TRIAGE" })]);
+    }
+  });
+});

@@ -2,7 +2,7 @@ import { useMemo, useState, type FormEvent } from "react";
 import { RUNBOOK, type Escalation, type EscalationAction } from "@queenos/queen-types";
 import { api, errorMessage } from "./api";
 import { SWARM_DEMO_SIZE, demoSwarmPrompt } from "./demo";
-import { ACTION_LABEL, autonomyLabel, isSimulation, compactNumber, durationText, escalationButtons, escalationSubjectLabel, meterFill, reasonText } from "./homeLogic";
+import { ACTION_LABEL, autonomyLabel, executorsMode, externalPrompt, isExternal, isSimulation, type ExternalJudgeChoice, compactNumber, durationText, escalationButtons, escalationSubjectLabel, meterFill, reasonText } from "./homeLogic";
 import { MergeTrainStrip } from "./MergeGraph.tsx";
 import { Link } from "./router";
 import { hrefFor } from "./route";
@@ -23,6 +23,7 @@ export function StatusHome({ hive, room }: { hive: string; room: Room }) {
   const trees = useMemo(() => goalTrees(state), [state]);
   const blocked = useMemo(() => blockedOrFailed(state), [state]);
   const counts = useMemo(() => pipelineCounts(state), [state.items, state.hive]);
+  const external = isExternal(state.hive);
 
   return (
     <div className="app hive-page">
@@ -32,7 +33,7 @@ export function StatusHome({ hive, room }: { hive: string; room: Room }) {
           <button type="button" onClick={() => window.location.reload()}>Reload</button>
         </div>
       )}
-      <HiveHeader hive={hive} status={status} latencyMs={latencyMs} sim={isSimulation(state.hive)} actions={<><Link to={hrefFor.push(hive)} className="sh-link">push code ▸</Link><AutonomySelect hive={hive} state={room.state} /></>} />
+      <HiveHeader hive={hive} status={status} latencyMs={latencyMs} sim={isSimulation(state.hive)} actions={<><Link to={hrefFor.push(hive)} className="sh-link">push code ▸</Link><ExecutorsSelect hive={hive} state={room.state} /><AutonomySelect hive={hive} state={room.state} /></>} />
 
       <section className={`sh-head sh-head--${head.kind.toLowerCase()}`} aria-live="polite">
         <span className="sh-head__dot" aria-hidden="true" />
@@ -54,13 +55,13 @@ export function StatusHome({ hive, room }: { hive: string; room: Room }) {
         </section>
       )}
 
-      <SwarmFloor state={state} hive={hive} />
+      {!external && <SwarmFloor state={state} hive={hive} />}
       <MergeTrainStrip state={state} hive={hive} />
 
       <section className="panel" aria-label="Goals">
         <p className="eyebrow">GOALS{trees.goals.length ? ` (${trees.goals.length})` : ""}</p>
         {trees.goals.length === 0 && trees.loose.length === 0 ? (
-          <p className="sh-muted">Nothing filed yet. Describe goals below and the Queen splits them into items.</p>
+          <p className="sh-muted">{external ? "Nothing filed yet. File an item below, or have your agents push to goal/<slug> or item/<id>." : "Nothing filed yet. Describe goals below and the Queen splits them into items."}</p>
         ) : (
           <div className="sh-goals">
             {trees.goals.map((g, i) => <GoalTree key={g.item.itemId} hive={hive} node={g} open={i < 3} />)}
@@ -93,7 +94,7 @@ export function StatusHome({ hive, room }: { hive: string; room: Room }) {
         </section>
       </div>
 
-      <Composer hive={hive} room={room} />
+      {external ? <ExternalComposer hive={hive} room={room} /> : <Composer hive={hive} room={room} />}
       <HiveFooter hive={hive} />
     </div>
   );
@@ -125,6 +126,34 @@ function AutonomySelect({ hive, state }: { hive: string; state: Room["state"] })
         <option value="autonomous">autonomous</option>
         <option value="supervised">supervised</option>
         <option value="paused">paused</option>
+      </select>
+      {err && <i className="sh-auto__err">{err}</i>}
+    </label>
+  );
+}
+
+function ExecutorsSelect({ hive, state }: { hive: string; state: Room["state"] }) {
+  const h = state.hive;
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  if (!h) return null;
+  const set = async (executors: "swarm" | "external") => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.updateSettings(hive, { executors });
+    } catch (e) {
+      setErr(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <label className="sh-auto" title={err ?? "Who builds: the Queen's swarm, or your own coding agents pushing over git"}>
+      <span>workers</span>
+      <select value={executorsMode(h)} disabled={busy} onChange={(e) => void set(e.target.value as "swarm" | "external")} aria-label="Workers">
+        <option value="swarm">swarm</option>
+        <option value="external">external agents</option>
       </select>
       {err && <i className="sh-auto__err">{err}</i>}
     </label>
@@ -375,6 +404,50 @@ function Composer({ hive, room }: { hive: string; room: Room }) {
           </button>
         )}
         <button type="submit" className="btn btn--primary" disabled={disabled || !text.trim()}>Send to Queen</button>
+      </div>
+      {note && <p className="sh-muted" role="status">{note}</p>}
+    </form>
+  );
+}
+
+/** External-agents composer: files one item (a goal with a single inbox item) for coding agents that push over git. */
+function ExternalComposer({ hive, room }: { hive: string; room: Room }) {
+  const [text, setText] = useState("");
+  const [judge, setJudge] = useState<ExternalJudgeChoice>("auto");
+  const [note, setNote] = useState<string | null>(null);
+  const disabled = room.status !== "open";
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    const t = text.trim();
+    if (!t) return;
+    const ok = room.send({ type: "submit_prompt", prompt: externalPrompt(hive, t, judge) });
+    setNote(ok ? "Filed. Agents can now push to it." : "Not linked to the Queen; nothing was sent.");
+    if (ok) setText("");
+  };
+  return (
+    <form className="panel sh-composer" onSubmit={submit} aria-label="Composer">
+      <p className="eyebrow">FILE AN ITEM FOR AGENTS</p>
+      {disabled && <p className="composer__hint">Waiting for the Queen link. Sending is disabled until it opens.</p>}
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        placeholder="Describe the work for your coding agents…"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(e);
+        }}
+      />
+      <p className="sh-muted">Agents push to <code>item/&lt;id&gt;</code> (join this item) or <code>goal/&lt;slug&gt;</code> (a goal with one item). No Queen swarm builds it.</p>
+      <div className="sh-composer__row">
+        <label className="sh-check">
+          judge{" "}
+          <select value={judge} onChange={(e) => setJudge(e.target.value as ExternalJudgeChoice)} aria-label="Judge">
+            <option value="auto">auto</option>
+            <option value="pick">you pick</option>
+          </select>
+        </label>
+        <span className="sh-spacer" />
+        <button type="submit" className="btn btn--primary" disabled={disabled || !text.trim()}>File item</button>
       </div>
       {note && <p className="sh-muted" role="status">{note}</p>}
     </form>

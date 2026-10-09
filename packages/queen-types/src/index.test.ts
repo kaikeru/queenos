@@ -22,6 +22,7 @@ import {
   MAX_AUDIT_BATCH,
   GuardrailsSchema,
   HIVE_SETTINGS_DEFAULTS,
+  ExecutorsModeSchema,
   HiveSettingsSchema,
   HiveStatusSchema,
   HourlyMetricSchema,
@@ -794,6 +795,24 @@ describe("human-push design T0 contracts (inbox, Submission, races)", () => {
     expect(UpdateHiveSettingsSchema.parse({ guardrails: { maxPickingRaces: 0 } })).toEqual({ guardrails: { maxPickingRaces: 0 } });
     expect(HiveSettingsSchema.parse({ ...HIVE_SETTINGS_DEFAULTS, race: { reworkWidth: 2, hardWidth: 3, judge: "human", pickWindowMs: 900_000 } }).race.judge).toBe("human");
     expect(HiveSettingsSchema.safeParse({ ...HIVE_SETTINGS_DEFAULTS, race: { reworkWidth: 2, hardWidth: 3, pickWindowMs: 3 * 3_600_000 } }).success).toBe(false);
+  });
+
+  it("executors mode: swarm | external, optional everywhere, default swarm", () => {
+    expect(ExecutorsModeSchema.options).toEqual(["swarm", "external"]);
+    expect(HIVE_SETTINGS_DEFAULTS.executors).toBe("swarm");
+    // Optional: an older Queen's settings (no executors) still parse, and nothing is filled in.
+    const { executors: _omit, ...old } = HIVE_SETTINGS_DEFAULTS;
+    void _omit;
+    expect(HiveSettingsSchema.parse(old)).toEqual(old);
+    expect(HiveSettingsSchema.parse({ ...HIVE_SETTINGS_DEFAULTS, executors: "external" }).executors).toBe("external");
+    expect(HiveSettingsOverridesSchema.parse({ executors: "external" })).toEqual({ executors: "external" });
+    expect(HiveSettingsOverridesSchema.parse({})).toEqual({});
+    expect(UpdateHiveSettingsSchema.parse({ executors: "swarm" })).toEqual({ executors: "swarm" });
+    expect(UpdateHiveSettingsSchema.parse({})).toEqual({});
+    for (const schema of [HiveSettingsSchema, HiveSettingsOverridesSchema, UpdateHiveSettingsSchema]) {
+      const base = schema === HiveSettingsSchema ? HIVE_SETTINGS_DEFAULTS : {};
+      expect(schema.safeParse({ ...base, executors: "robots" }).success).toBe(false);
+    }
   });
 
   it("races: PICKING, pick/reject inputs, decidedBy and the new optional fields", () => {

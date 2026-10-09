@@ -822,13 +822,16 @@ export class QueenNode extends DurableObject<Env> {
       { ref: p.ref, headSha: p.headSha, title: p.title, message: p.message, trailers, newItemId },
       { now, lookup: this.intakeLookup({ state: lookupState }), previousOnRef: prev },
     );
-    const inbox = { repo: p.repo, ref: p.ref, handle: handleFor(user), headSha: p.headSha, handoff: trailers.rework };
+    // External hive: there is no swarm to hand off to, so a `Queen: rework` trailer is ignored.
+    let rework = false;
     const actor = origin.kind === "agent" ? `agent:${origin.id}` : `user:${user}`;
     const source = origin.kind === "agent" ? { kind: "agent" as const, actor } : { kind: "user" as const, actor };
     const parent = plan.file?.parentId ?? null;
     const { acc } = this.decide(
       hive,
       (d) => {
+        rework = trailers.rework && d.hs.executors !== "external";
+        const inbox = { repo: p.repo, ref: p.ref, handle: handleFor(user), headSha: p.headSha, handoff: rework };
         if (plan.file) d.acc.work(d.wp.fileSubmission({ ...plan.file, source, inbox, disposition: plan.disposition }));
         else d.acc.work(d.wp.adoptSubmission(plan.itemId, { inbox, reopen: plan.reopen, actor }));
         const item = d.acc.items.get(plan.itemId) ?? d.state.items.find((i) => i.itemId === plan.itemId) ?? this.loadItem(plan.itemId);
@@ -859,7 +862,7 @@ export class QueenNode extends DurableObject<Env> {
             repo: p.repo,
             origin,
             ...(plan.supersedeTrainId ? { superseded: plan.supersedeTrainId } : {}),
-            ...(trailers.rework ? { handoff: true } : {}),
+            ...(rework ? { handoff: true } : {}),
           }, actor),
         );
       },
@@ -874,7 +877,7 @@ export class QueenNode extends DurableObject<Env> {
       messages: remoteLines([
         ...plan.messages,
         waiting ? `queued: ${waiting}` : `train ${p.trainId} · verdict in ~2 min`,
-        trailers.rework ? "Queen: rework — the swarm takes over if the gate rejects it" : null,
+        rework ? "Queen: rework — the swarm takes over if the gate rejects it" : null,
         NOTES_HINT,
       ]),
     };
@@ -1352,6 +1355,7 @@ export class QueenNode extends DurableObject<Env> {
               ...(patch.guardrails ? { guardrails: { ...(o.guardrails ?? {}), ...patch.guardrails } } : {}),
               ...(patch.budget ? { budget: { ...(o.budget ?? {}), ...patch.budget } } : {}),
               ...(patch.race ? { race: { ...(o.race ?? {}), ...patch.race } } : {}),
+              ...(patch.executors ? { executors: patch.executors } : {}),
             },
             updatedBy: `user:${input.user}`,
             updatedAt: this.now(),
@@ -1838,6 +1842,7 @@ export class QueenNode extends DurableObject<Env> {
     const ep = new EscalationPlanner(state.escalations, { hive, now });
     if (opts.pre) settings = opts.pre(settings, { ep, state, hs: effectiveSettings(settings, now) });
     const hs = effectiveSettings(settings, now);
+    const external = hs.executors === "external";
     const open = ep.all().filter((e) => e.status === "OPEN");
     const { eff } = this.autonomy(settings, hs, open);
     const g = hs.guardrails;
@@ -1878,6 +1883,7 @@ export class QueenNode extends DurableObject<Env> {
       },
       briefFor: (sha) => this.verdictNote(sha),
       pick: { judge: hs.race.judge ?? "auto", pickWindowMs: hs.race.pickWindowMs, maxPickingRaces: g.maxPickingRaces },
+      external: hs.executors === "external",
     });
     const releaseIds = state.releases.map((r) => r.releaseId);
     const releaseEscalations = releaseIds.length
@@ -1975,11 +1981,12 @@ export class QueenNode extends DurableObject<Env> {
       // Dispatch READY items: one prompt run per item, all forked from main.
       const merged = new Map(trainsAtStart);
       for (const t of acc.trains.values()) merged.set(t.trainId, t);
-      const building = [...merged.values()].filter((t) => isActive(t) && !isCar(t)).length;
+      // External hive: a parked push is the build the item waits to dispatch; it must not eat the capacity it needs.
+      const building = [...merged.values()].filter((t) => isActive(t) && !isCar(t) && !(external && isParked(t))).length;
       // A pending push intent holds its targeted item READY; parked pushes resume at width 1.
       const held = new Set([...merged.values()].filter(awaitingPush).map((t) => t.promptId));
       parkedItems = new Set([...merged.values()].filter(isParked).map((t) => t.promptId));
-      const dispatch = acc.work(wp.dispatchReady({ activeBuilds: building, leasedSlots: leased, held }));
+      const dispatch = acc.work(wp.dispatchReady({ activeBuilds: building, leasedSlots: leased, held, parked: parkedItems }));
       for (const s of dispatch.dispatches) {
         const item = acc.items.get(s.itemId) ?? state.items.find((i) => i.itemId === s.itemId);
         acc.train(

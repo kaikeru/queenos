@@ -133,12 +133,22 @@ export const RaceSettingsSchema = z.object({
 });
 export type RaceSettings = z.infer<typeof RaceSettingsSchema>;
 
+/**
+ * Who executes work in a hive. `swarm` (default): the Queen's Oracle decomposes goals and drones build/rework.
+ * `external`: no Oracle and no drone BUILD/REWORK; items wait for git-pushed submissions from external coding
+ * agents (merge-queue MERGE/LANDER drones are unchanged).
+ */
+export const ExecutorsModeSchema = z.enum(["swarm", "external"]);
+export type ExecutorsMode = z.infer<typeof ExecutorsModeSchema>;
+
 export const HiveSettingsSchema = z.object({
   autonomy: AutonomyLevelSchema,
   guardrails: GuardrailsSchema,
   budget: z.object({ dailyCredits: z.number().int().min(0), dailyDispatches: z.number().int().min(0) }),
   slo: z.object({ changeSuccessTarget: z.number().min(0.5).max(1), window: z.number().int().min(5).max(100) }),
   race: RaceSettingsSchema,
+  /** Executors mode (optional: absent on older Queens, which are always `swarm`). */
+  executors: ExecutorsModeSchema.optional(),
 });
 export type HiveSettings = z.infer<typeof HiveSettingsSchema>;
 
@@ -149,6 +159,7 @@ export const HIVE_SETTINGS_DEFAULTS: HiveSettings = {
   budget: { dailyCredits: 50_000, dailyDispatches: 400 },
   slo: { changeSuccessTarget: 0.9, window: 20 },
   race: { reworkWidth: 2, hardWidth: 3 },
+  executors: "swarm",
 };
 
 /** Per-hive overrides of HIVE_SETTINGS_DEFAULTS, as stored (`hive_settings.settings`); autonomy has its own column. */
@@ -157,6 +168,7 @@ export const HiveSettingsOverridesSchema = z.object({
   budget: HiveSettingsSchema.shape.budget.partial().optional(),
   slo: HiveSettingsSchema.shape.slo.partial().optional(),
   race: HiveSettingsSchema.shape.race.partial().optional(),
+  executors: ExecutorsModeSchema.optional(),
 });
 export type HiveSettingsOverrides = z.infer<typeof HiveSettingsOverridesSchema>;
 
@@ -177,6 +189,7 @@ export const UpdateHiveSettingsSchema = z.object({
   guardrails: GuardrailOverridesSchema.optional(),
   budget: HiveSettingsSchema.shape.budget.partial().optional(),
   race: HiveSettingsSchema.shape.race.partial().optional(),
+  executors: ExecutorsModeSchema.optional(),
 });
 export type UpdateHiveSettings = z.infer<typeof UpdateHiveSettingsSchema>;
 
