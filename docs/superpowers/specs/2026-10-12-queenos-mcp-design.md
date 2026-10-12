@@ -8,7 +8,7 @@ Anything marked **PROBE** has not been checked against the real account or the i
 
 ## 1. Summary
 
-Agents (local Claude Code sessions, cloud sandboxes, later our drones) contribute to a hive through an MCP server at `https://queenos.kaikeru.com/mcp`. Each **attempt** (one agent on one item) gets its own Artifacts repo: a fork of hive `main`, plus a 2 h write token scoped to that fork only. The agent clones it, commits, pushes `main`, and waits for the verdict over MCP. The pushed event routes the fork into the item's race as a candidate; the Queen gates it, races it, picks, lands, and deletes the fork.
+Agents (local Claude Code sessions, cloud sandboxes, later our drones) contribute to a hive through an MCP server at `https://queenos.kaikeru.com/mcp`. Each **attempt** (one agent on one item) gets its own Artifacts repo: a fork of the item's frozen **race base repo** (itself a read-only fork of hive `main`, made once per item), plus a 2 h write token scoped to that fork only. Every candidate of a race therefore starts from the same commit. The agent clones it, commits, pushes `main`, and waits for the verdict over MCP. The pushed event routes the fork into the item's race as a candidate; the Queen gates it, races it, picks, lands, and deletes the fork.
 
 The agent needs exactly one credential: the human's existing `qgt_` git token, sent as a Bearer header in its MCP config. No shared git creds, volumes or checkouts.
 
@@ -27,7 +27,7 @@ The git proxy (`apps/git`) stays unchanged for humans. Agents use the MCP path.
 
 ## 3. Pitch: attempt = repo
 
-Git gives every contributor one shared repo and asks them to keep out of each other's way with branches. QueenOS gives every attempt its own repo. An agent asks for an attempt and gets a fresh fork of `main` and a key that opens that fork and nothing else. It pushes `main`, because in its own repo there is nothing to collide with. The push *is* the submission: the fork becomes a candidate in the item's race, the gates judge it, and the winner lands. When the attempt resolves, the repo and its key are gone. Artifacts is not a git host here; it is agent infrastructure: one disposable repo per attempt, thousands at a time.
+Git gives every contributor one shared repo and asks them to keep out of each other's way with branches. QueenOS gives every attempt its own repo. Every race starts from one frozen base repo, so every candidate has the identical base commit. An agent asks for an attempt and gets a fresh fork of that base and a key that opens that fork and nothing else. It pushes `main`, because in its own repo there is nothing to collide with. The push *is* the submission: the fork becomes a candidate in the item's race, the gates judge it, and the winner lands. When the attempt resolves, the repo and its key are gone. Artifacts is not a git host here; it is agent infrastructure: one disposable repo per attempt, thousands at a time.
 
 This extends the "Git, reimagined" table (HANDOFF §1): **Branch / worktree → Ephemeral fork** now holds for agents literally. Rev 2 of the human-push design said "no Artifacts token ever leaves our side". This design deliberately changes that for agents only: the token leaves, but it is scoped to one disposable fork and lives 2 h.
 
@@ -41,15 +41,18 @@ This extends the "Git, reimagined" table (HANDOFF §1): **Branch / worktree → 
    │  service binding MCP; trusted x-queen-user, x-queen-token-id; client copies stripped
    ▼
  queenos-mcp  (McpAgent, one DO per MCP session; AgentIdentity DO per agentId)
-   │  DO RPC: attemptIntent / attemptReady / attemptAborted / attemptRefresh / attemptEnd,
-   │          submitWork, getItemDetail, getSnapshot, getAttempt, closeRaceEntries, pick, notesFor
+   │  DO RPC: attemptIntent / attemptBaseReady / attemptBaseFailed / attemptReady / attemptAborted /
+   │          attemptRefresh / attemptEnd, submitWork, getItemDetail, getSnapshot, getAttempt, closeRaceEntries, pick, notesFor
    ▼
- QueenNode DO (per hive)  ── decides, records ──► Provisioner DELETE (fork cleanup)
+ QueenNode DO (per hive)  ── decides, records ──► Provisioner DELETE (attempt fork + base repo cleanup)
    ▲                                              Herald preview, gatekeepers gate, queue, land
    │ attemptPushed
  queenos-gatekeepers  ◄── cf.artifacts.repo.pushed (namespace "queenos")
    ▲
    │ event
+ Artifacts  <hive>-base-<12hex> (read-only, one per item; no agent token)
+   │ fork
+   ▼
  Artifacts  <hive>-att-<12hex>  ◄── git clone / git push main  (Bearer art_v1_…, this fork only)
    ▲
  agent (local clone in .queenos/attempts/<attemptId>)
@@ -58,10 +61,10 @@ This extends the "Git, reimagined" table (HANDOFF §1): **Branch / worktree → 
 | Component | Role on this path | Change |
 |---|---|---|
 | `queenos-edge` | `/mcp` front door, token auth, header injection | New route, `MCP` service binding |
-| `queenos-mcp` (new, `apps/mcp`) | MCP tools; Artifacts fork, token mint, token revoke | New Worker |
-| `queen` | Attempt ledger, race entry, gate start, watchdog, fork delete | New RPCs, migration v17 |
-| `queenos-gatekeepers` | Routes attempt-fork pushes to the Queen | `classifyPush` + `orchestrate.ts` |
-| `queenos-provisioner` | Deletes the fork (existing DELETE op) | None |
+| `queenos-mcp` (new, `apps/mcp`) | MCP tools; Artifacts base fork, attempt fork, token mint, token revoke | New Worker |
+| `queen` | Attempt ledger, item base ledger, race entry, gate start, watchdog, fork and base delete | New RPCs, migration v17 |
+| `queenos-gatekeepers` | Routes attempt-fork pushes to the Queen; ignores `-base-` repos | `classifyPush` + `orchestrate.ts` |
+| `queenos-provisioner` | Deletes attempt forks and base repos (existing DELETE op) | None |
 | `queenos-git` | Human git proxy | None (one pure move of `forkTrain`, §12) |
 | dashboard | Candidates show attempt and agent | Minimal |
 
@@ -134,8 +137,8 @@ All tools take and return JSON. "Own" means attempts whose `agentId` is the sess
 | `list_hives` | both | none | `[{hive, name, status}]` | `REGISTRY.list()` |
 | `create_goal` | orchestrator | `hive, title, description, judge?: "auto"\|"pick", entryWindowMs?` | `{goalId, itemId}` | Queen `submitWork` (= `POST /hives/:hive/prompts` with `decompose:true`), then `getItemDetail(goalId).children[0]` |
 | `list_items` | both | `hive, state?` | `[{itemId, title, kind, status, waitReason, parentId}]` | Queen `getSnapshot` (= `GET /snapshot`) |
-| `get_item` | both | `hive, itemId` | `{item, race: {raceId, state, entryClosesAt, candidates: [{attemptId, agent, claimedModel, verdict, previewUrl}]} \| null}` | Queen `getItemDetail` (= `GET /items/:id`) + attempts join |
-| `start_attempt` | both | `hive` + exactly one of `itemId`, `goalId` | `{attemptId, remote, token, expiresAt, baseSha, dir, cloneCommand, configCommand}` | Queen `attemptIntent` → fork + `createToken` → `attemptReady` |
+| `get_item` | both | `hive, itemId` | `{item, race: {raceId, state, baseSha, entryClosesAt, candidates: [{attemptId, agent, claimedModel, verdict, previewUrl}]} \| null}` | Queen `getItemDetail` (= `GET /items/:id`) + attempts join |
+| `start_attempt` | both | `hive` + exactly one of `itemId`, `goalId` | `{attemptId, remote, token, expiresAt, baseSha (the item's shared base), dir, cloneCommand, configCommand}` | Queen `attemptIntent` → (first attempt only: base fork → `attemptBaseReady`) → fork of the base + `createToken` → `attemptReady` |
 | `refresh_attempt` | both (own) | `attemptId` | `{token, expiresAt, configCommand}` | Queen `attemptRefresh` → `createToken` + revoke others |
 | `end_attempt` | both (own) | `attemptId` | `{state, cleanup: "remove <dir>"}` | Queen `attemptEnd` |
 | `get_attempt` | both (own) | `attemptId` | `Attempt` (§8) + current verdict summary | Queen `getAttempt` |
@@ -149,6 +152,7 @@ Tool notes:
 
 - **`create_goal`.** `POST /items` cannot file goals (`FileWorkItemSchema.kind` excludes `goal`). Goals go through `submitWork` with `decompose: true`; `promptText` = `title` + blank line + `description`. In an external hive the goal files exactly one inbox child synchronously (ledger `filePrompt` → `decompose(goal, [], null, true)`), returned as `itemId`. `judge: "pick"` maps to the Queen's `"human"`. `entryWindowMs` (0..1 h) is new: `SubmitPromptSchema` gains an optional `entryWindowMs`, stored on the inbox item; when its race opens, `entryClosesAt` uses it instead of `settings.race.entryWindowMs`. A hive whose `executors` is not `"external"` fails `HIVE_NOT_EXTERNAL`.
 - **`start_attempt` with `goalId`** resolves to the goal's single open child. None or several: `GOAL_AMBIGUOUS` with the children's `{itemId, title, status}`.
+- **`start_attempt` and `BASE_PENDING`.** If another first attempt is still creating the item's base, `attemptIntent` answers `BASE_PENDING`. The MCP Worker does not return that to the agent at once: it re-calls `attemptIntent` every 2 s for up to 30 s, then fails the tool with retryable `BASE_PENDING`. (Chosen over a bare retry error so two agents starting together both succeed in one call.)
 - **`cloneCommand`** = `git -c http.extraHeader="Authorization: Bearer <token>" clone <remote> <dir>`. **`configCommand`** = `git -C <dir> config --local --replace-all http.<remote>.extraHeader "Authorization: Bearer <token>"`. The response tells the agent to run both and never to set a global credential helper or global `http.extraHeader`.
 - **`wait`** never blocks longer than `timeoutMs` (max 50 000). On timeout it returns the current state with `changed:false`; the agent calls again. `verdict` = the attempt's current head has PASSED or REJECTED; `decided` = its race is DECIDED (WON or LOST); `landed` = LANDED, or any terminal state.
 - **`get_verdict`** returns the v1 verdict note text for the attempt's head (the same text `apps/git` serves on `refs/notes/verdict`) and the gate findings. No `remote:` lines on this path.
@@ -168,12 +172,15 @@ Tool notes:
                                                                              └─► PASSED ──race──► WON ──land──► LANDED
                                                                                          └─race─► LOST
  every terminal state (ABORTED, EXPIRED, ABANDONED, LOST, LANDED) ──► fork deleted (Provisioner DELETE)
+ item decided and all its attempts terminal, or item cancelled ──► base repo deleted (Provisioner DELETE)
 ```
+
+The first `start_attempt` for an item also runs the base step before INTENT → READY: item has no base → `attemptIntent` marks it base-pending and returns `{base:"create", baseRepo}` → `queenos-mcp` forks hive main read-only → `attemptBaseReady` pins `base_repo` + `base_sha`. Later attempts get `{base: existing}`.
 
 | Transition | Trigger | Who |
 |---|---|---|
-| → INTENT | `start_attempt`: caps checked, item accepts entries, `attemptId`, first `trainId` and repo name allocated | Queen `attemptIntent` (called by `queenos-mcp`) |
-| INTENT → READY | Fork exists, readiness probe passed, token minted | `queenos-mcp` → Queen `attemptReady` |
+| → INTENT | `start_attempt`: caps checked, item accepts entries, `attemptId`, first `trainId` and repo name allocated; returns the item's base (existing, or "create" with the base repo name) | Queen `attemptIntent` (called by `queenos-mcp`) |
+| INTENT → READY | Attempt fork of the base exists, readiness probe passed, token minted | `queenos-mcp` → Queen `attemptReady` |
 | INTENT → ABORTED | Fork or token failed; fork already deleted by `queenos-mcp` | `queenos-mcp` → Queen `attemptAborted` |
 | READY → PUSHED | `cf.artifacts.repo.pushed` on `refs/heads/main` of the fork | gatekeepers → Queen `attemptPushed` |
 | PUSHED → PUSHED | A re-push: the new train supersedes the attempt's previous train if it has not boarded a car | Queen `attemptPushed` |
@@ -185,9 +192,14 @@ Tool notes:
 | READY / REJECTED → EXPIRED | No live candidate and `expiresAt` passed | Queen watchdog (reconcile alarm) |
 | non-terminal → ABANDONED | `end_attempt`. A PASSED/WON attempt already in a car cannot be abandoned: returns its state unchanged | Queen `attemptEnd` |
 | terminal → fork deleted | Queen issues Provisioner DELETE for the attempt's current train | Queen → Provisioner |
+| item resolved → base deleted | Item reaches a terminal race outcome (race DECIDED and every attempt of the item terminal) or the item is cancelled. Exactly once: `base_repo` is cleared when the DELETE is issued | Queen (in the same `decide()` that makes the last attempt terminal, the race decision or the cancel) → Provisioner DELETE |
 
 Rules:
 
+- **One base per item.** The first `start_attempt` for an item with no base forks hive main into `<hive>-base-<12hex>` (`fork(name, { readOnly: true, defaultBranchOnly: true })`, readiness and `-rN` handling via `forkTrain`). The Queen records `base_repo` and `base_sha` on the item (§8.2). **Every** attempt of that item forks from the base repo, never from hive main, so all candidates share the identical base commit. Agents never get a token for the base repo.
+- **Concurrent first attempts.** `attemptIntent` is the lock. With no base and none pending it marks the item base-pending (`base_repo` set, `base_sha` null) and returns `{base:"create", baseRepo}` to that caller only. While pending, any other intent gets `BASE_PENDING` (retryable; the MCP Worker polls, §6). `attemptBaseReady` clears the pending state and pins `base_sha`. `attemptBaseFailed` (base fork failed after retries) clears `base_repo`, so the next intent may try again; the failing caller gets `ARTIFACTS_UNAVAILABLE`. A pending base older than 5 min is cleared by the watchdog.
+- **Follow-ups.** A late push after entry close files a follow-up item (a new item). It has no base; its own first attempt creates one.
+- **Main moves on.** Hive main may advance after the base is pinned. That is fine: the winner goes through the existing merge queue (3-way merge, integration gate) as today, and is not required to be a fast-forward of the base.
 - **One train per push.** The first push uses the `trainId` reserved at intent; each later push allocates a new one. Every train's `artifactRepo` is the attempt fork: no re-fork, no ref rewrite. `attemptPushed` does `tp.intent` + `tp.pushed` in one `decide()`, so no awaiting-push train is held for 2 h.
 - **Fork ownership.** A train with an `attempt_id` never deletes its fork on teardown. The attempt owns the fork and deletes it once, on its terminal transition, through the existing `deleteFork` / Provisioner `DELETE` path of its current train.
 - **Race entry** is the existing gitPushed intake: dynamic race entry, the entry window, held decisions before close, and a push after close files a follow-up item (the attempt's `itemId` moves to the follow-up). Supersede is keyed by `attemptId` (not by owner, ref and agent).
@@ -207,14 +219,16 @@ Rules:
 | `McpAgentIdentitySchema` | `agentId, name: AgentHandle, model: ClaimedModel, role, owner: email` |
 | `AttemptStateSchema` | `INTENT, READY, PUSHED, PASSED, REJECTED, WON, LOST, LANDED, ABANDONED, EXPIRED, ABORTED` |
 | `AttemptIntentSchema` | `hive, owner, agent: McpAgentIdentity, target: {itemId} \| {goalId}` |
-| `AttemptIntentDecisionSchema` | `accept {attemptId, trainId, repo, itemId, raceId?, expiresAt}` \| `refuse {code, message, items?}` |
-| `AttemptReadySchema` | `hive, attemptId, repo` (actual name, may be `-rN`), `baseSha: Sha40, expiresAt` |
+| `AttemptIntentDecisionSchema` | `accept {attemptId, trainId, repo, itemId, raceId?, expiresAt, base: {kind:"existing", baseRepo, baseSha} \| {kind:"create", baseRepo}}` \| `refuse {code, message, items?}` (`BASE_PENDING` is a refuse code) |
+| `AttemptBaseReadySchema` | `hive, itemId, baseRepo` (actual name, may be `-rN`), `baseSha: Sha40` |
+| `AttemptBaseFailedSchema` | `hive, itemId, baseRepo, reason ≤200` |
+| `AttemptReadySchema` | `hive, attemptId, repo` (actual name, may be `-rN`), `baseSha: Sha40` (must equal the item's `base_sha`), `expiresAt` |
 | `AttemptAbortedSchema` | `hive, attemptId, reason ≤200` |
 | `AttemptPushedSchema` | `hive, attemptId, repo, before?, after: Sha40, title ≤120, message ≤4000` |
 | `AttemptRefreshSchema` / `AttemptEndSchema` | `hive, attemptId, owner, agentId` |
 | `AttemptSchema` | the row below, camelCase |
 
-Helpers next to the train helpers: `attemptRepoName(hive, attemptId)` = `<hive>-att-<12hex>`, and `ATTEMPT_REPO_RE = /^(.+)-att-([0-9a-f]{12})(?:-r\d+)?$/` (the `-rN` suffix mirrors `TRAIN_REPO_RE` for the re-fork). Constants: `ATTEMPT_TOKEN_TTL_S = 7200`, `MAX_OPEN_ATTEMPTS_PER_AGENT = 3`, `WAIT_MAX_MS = 50_000`. `SubmitPromptSchema` gains `entryWindowMs?` (§6).
+Helpers next to the train helpers: `attemptRepoName(hive, attemptId)` = `<hive>-att-<12hex>`, and `ATTEMPT_REPO_RE = /^(.+)-att-([0-9a-f]{12})(?:-r\d+)?$/` (the `-rN` suffix mirrors `TRAIN_REPO_RE` for the re-fork). Likewise `baseRepoName(hive, baseId)` = `<hive>-base-<12hex>` (`baseId` = 12 hex allocated by the Queen at intent) and `BASE_REPO_RE = /^(.+)-base-([0-9a-f]{12})(?:-r\d+)?$/`. Constants: `ATTEMPT_TOKEN_TTL_S = 7200`, `MAX_OPEN_ATTEMPTS_PER_AGENT = 3`, `WAIT_MAX_MS = 50_000`. `SubmitPromptSchema` gains `entryWindowMs?` (§6).
 
 ### 8.2 Queen schema migration v17
 
@@ -228,7 +242,7 @@ CREATE TABLE attempts (
   race_id     TEXT,                       -- set when the first push enters a race
   train_id    TEXT NOT NULL,              -- current train (first one reserved at intent)
   repo        TEXT NOT NULL,              -- <hive>-att-<12hex>[-rN]
-  base_sha    TEXT,                       -- hive main at fork time
+  base_sha    TEXT,                       -- always equals the item's base_sha (shared by all attempts of the item)
   agent_id    TEXT NOT NULL,
   agent_name  TEXT NOT NULL,
   model       TEXT NOT NULL,              -- claimed, display only
@@ -244,7 +258,12 @@ CREATE INDEX attempts_owner ON attempts(owner, state);
 CREATE INDEX attempts_item  ON attempts(item_id);
 ALTER TABLE submissions  ADD COLUMN attempt_id TEXT;
 ALTER TABLE merge_trains ADD COLUMN attempt_id TEXT;
+-- race base (work_items is the items table): nullable; both NULL = no base yet
+ALTER TABLE work_items ADD COLUMN base_repo TEXT;        -- <hive>-base-<12hex>[-rN]; set at intent (pending), cleared on delete
+ALTER TABLE work_items ADD COLUMN base_sha  TEXT;        -- NULL while the base is pending; pinned by attemptBaseReady
 ```
+
+`base_repo` set with `base_sha` NULL means base-pending. Both set means ready. When the base is deleted at resolution, `base_repo` is cleared and `base_sha` stays (history, `get_item`).
 
 `submissions` rows from attempts use `origin_kind = "agent"`, `origin_id = owner` (so per-owner caps span all agents, as in v16), `agent = name`, `attempt_id`. `MergeTrain` gains optional `attemptId` (the dashboard candidate chip).
 
@@ -252,14 +271,16 @@ ALTER TABLE merge_trains ADD COLUMN attempt_id TEXT;
 
 | RPC | Does |
 |---|---|
-| `attemptIntent(AttemptIntent)` | Validates the hive is external, the item accepts entries, caps; inserts INTENT; event `attempt.intent` |
-| `attemptReady(AttemptReady)` | INTENT → READY; records repo, `base_sha`; event `attempt.ready` |
+| `attemptIntent(AttemptIntent)` | Validates the hive is external, the item accepts entries, caps; resolves the item's base (existing, create-and-mark-pending, or refuse `BASE_PENDING`); inserts INTENT; event `attempt.intent` |
+| `attemptBaseReady({hive,itemId,baseRepo,baseSha})` | Pins `base_repo` (actual name) and `base_sha` on the item, clears pending; event `attempt.base.ready` |
+| `attemptBaseFailed({hive,itemId,baseRepo,reason})` | Clears the pending `base_repo`; aborts the caller's INTENT; event (warn) |
+| `attemptReady(AttemptReady)` | INTENT → READY; records repo; rejects a `baseSha` that differs from the item's; event `attempt.ready` |
 | `attemptAborted(AttemptAborted)` | INTENT → ABORTED; event (warn) |
 | `attemptPushed(AttemptPushed)` | Idempotent on `(repo, after)`. Ignores a push whose `after` is the base (nothing to submit). Files the submission, creates the train, supersedes, enters the race; READY/REJECTED/PUSHED → PUSHED |
 | `attemptRefresh` | Owner and agent must match; non-terminal only; `expires_at = now + 2 h` |
 | `attemptEnd` | Owner and agent must match; → ABANDONED (or no-op when boarded) |
 | `getAttempt(attemptId)` | Row + current train phase, verdict, gate score, preview URL, race summary |
-| `attemptsForItem(itemId)` | For `get_item` candidates |
+| `attemptsForItem(itemId)` | For `get_item` candidates (and the item's `base_sha`) |
 
 "Accepts entries": item READY with wait reason "awaiting submissions", or an item whose race is RACING with `entryClosesAt` in the future (or not yet set). Anything else: `ITEM_NOT_ACCEPTING` with the item's status.
 
@@ -271,6 +292,7 @@ ALTER TABLE merge_trains ADD COLUMN attempt_id TEXT;
 |---|---|---|
 | `ATTEMPT_REPO_RE` match | `refs/heads/main` | `{action:"attempt", task:{hive, attemptId:"att_"+hex, repo, before, after, commits}}` |
 | `ATTEMPT_REPO_RE` match | any other ref | `ignore` (`attempt-non-main`) |
+| `BASE_REPO_RE` match | any | `ignore` (`base-repo`). Base repos are read-only so no push should arrive; `classifyPush` must still never route one as a train or attempt |
 | `TRAIN_REPO_RE` match | branch | `gate` (unchanged) |
 | other | | `ignore` (unchanged) |
 
@@ -302,11 +324,13 @@ Tool errors are MCP results with `isError: true` and a JSON body `{code, message
 | `ITEM_NOT_ACCEPTING` | Item not READY-awaiting-submissions and no open race entry window |
 | `GOAL_AMBIGUOUS` | `goalId` with zero or several open children (lists them) |
 | `CAP_EXCEEDED` | §10 |
-| `ARTIFACTS_UNAVAILABLE` | Fork, readiness or token mint failed after retries; includes `cf-ray` when Artifacts returned one. The attempt is ABORTED and its fork deleted |
+| `BASE_PENDING` | Another first attempt is still creating the item's base. Retryable. The MCP Worker polls `attemptIntent` every 2 s for up to 30 s before returning it |
+| `BASE_MOVED` | Fallback only (P5 failed): hive main moved past the item's `base_sha`, so no new attempt can share the base; the race closes entries early |
+| `ARTIFACTS_UNAVAILABLE` | Base fork, attempt fork, readiness or token mint failed after retries; includes `cf-ray` when Artifacts returned one. The attempt is ABORTED and its fork deleted |
 | `ATTEMPT_EXPIRED` | `refresh_attempt` / `end_attempt` / `pick` on a terminal attempt |
 | `CONFLICT` | Queen 409s passed through (`pick` outside PICKING, `close_entries` already closed) |
 
-Artifacts 503 handling reuses the existing code: `forkTrain` (fork with timeout, `get()` backoff on `FORK_IN_PROGRESS`, receive-pack readiness probe, up to 3 names `-r2`, `-r3`) and the read retry delays (2 / 4 / 6 s). `start_attempt` may take 5–40 s; the tool returns only when the fork is pushable or the attempt is aborted.
+Artifacts 503 handling reuses the existing code, for both the base fork and the attempt fork: `forkTrain` (fork with timeout, `get()` backoff on `FORK_IN_PROGRESS`, receive-pack readiness probe, up to 3 names `-r2`, `-r3`) and the read retry delays (2 / 4 / 6 s). `start_attempt` may take 5–40 s (first attempt of an item: two forks in sequence, up to ~80 s; a second concurrent caller waits on `BASE_PENDING`); the tool returns only when the fork is pushable or the attempt is aborted.
 
 ## 12. Security
 
@@ -314,6 +338,7 @@ Artifacts 503 handling reuses the existing code: `forkTrain` (fork with timeout,
 |---|---|
 | MCP credential | The `qgt_` token, Bearer header only. Never in a URL, never logged; the edge strips `authorization` before forwarding. Revoking it on the Push code page cuts off every session of that human. |
 | Artifacts token | Minted per fork with `createToken("write", 7200)`. Scoped to that one repo (PROBE P1, load-bearing). Returned in the tool result (it will appear in the agent's transcript; accepted: one fork, 2 h). `queenos-mcp` never logs tool results. `refresh_attempt` mints a new token, then revokes the fork's other tokens (`listTokens` / `revokeToken`). Deleting the fork deletes all its tokens. |
+| Base repo | `<hive>-base-<12hex>` is created `readOnly` and only `queenos-mcp` (server-side) and the Queen's Provisioner DELETE touch it. Agents never get a token for it; their attempt fork's token is scoped to the fork alone (P1, P5). |
 | Clone config | Token in `http.extraHeader` in the clone's local `.git/config`, never in the remote URL, never a global helper. |
 | agentId | A capability, but bound to its owner: useless without that owner's `qgt_` token. |
 | Session | Each request's edge-derived owner must equal the session identity's owner. |
@@ -322,14 +347,14 @@ Artifacts 503 handling reuses the existing code: `forkTrain` (fork with timeout,
 
 | An agent can | An agent cannot |
 |---|---|
-| Read hive list, items, races, verdicts | Read or write any repo but its own attempt forks (P1) |
+| Read hive list, items, races, verdicts | Read or write any repo but its own attempt forks (P1); never the base repo (P5) |
 | File goals (orchestrator) | Push to hive `main` or any train fork |
-| Fork hive main into its own attempt, push it, rework it | Skip gates: every candidate passes the Queen-started gate, tree diff and reviewer (fails closed for non-drone origin) |
+| Fork the item's frozen base into its own attempt, push it, rework it | Skip gates: every candidate passes the Queen-started gate, tree diff and reviewer (fails closed for non-drone origin) |
 | Close entries and pick winners (any role) | Write verdict or review notes (synthesized from the ledger) |
 | End its own attempts | Touch another agent's attempts, or another owner's agents |
 | | Exceed per-owner caps or 3 open attempts |
 
-The MCP Worker has the Artifacts binding for the whole `queenos` namespace; that power stays server-side, used only on `<hive>-att-*` names the Queen allocated.
+The MCP Worker has the Artifacts binding for the whole `queenos` namespace; that power stays server-side, used only on `<hive>-att-*` and `<hive>-base-*` names the Queen allocated.
 
 ## 13. Risks and probes (FIRST TASKS)
 
@@ -341,12 +366,13 @@ Run these before building on them. Each is a short scratch Worker or `wrangler d
 | P2 | A push to `<hive>-att-<12hex>` main fires `cf.artifacts.repo.pushed` to the gatekeepers Workflow (filter `namespace: "queenos"`, no `repo_name`) with `commits[].id/message`, `before`, `after` | Routing depends on it; the payload shape is still UNVERIFIED in event.ts | Read the head with `readCommit(after)` (already the fallback); if no event at all, add a `submit_attempt` tool that calls `attemptPushed` after reading the fork head |
 | P3 | `McpAgent.serve` over Streamable HTTP survives Claude Code's usage (initialize, session id header, reconnect, 50 s tool calls) and owner props from the edge reach the DO per request | Identity and `wait` depend on it | Pass owner via a forwarded header read in `onRequest`; shorten `wait` to 25 s |
 | P4 | Fork readiness and 503 behaviour for attempt forks (time to pushable, `-rN` frequency); a fork kept 2 h stays pushable | `start_attempt` latency and reliability | Raise the readiness budget; surface `ARTIFACTS_UNAVAILABLE` with `cf-ray` |
+| P5 | Forking from a fork works, including from a `readOnly` fork (`fork(name, { readOnly: true, defaultBranchOnly: true })` of hive main, then an attempt fork of that); the child's token cannot write the base repo (ties to P1); the child is writable and its base commit equals the base's head | Load-bearing for "every candidate starts from the same commit" | Fallback: record `base_sha` at the first attempt; later attempts fork hive main; `attemptIntent` refuses (`BASE_MOVED`) once hive main has moved past `base_sha`, so the race closes entries early. No base repo, no base cleanup |
 
 Other risks:
 
 - **Herald previews read the fork's head.** A re-push during a preview deploy may preview newer code under the older train; the older train is superseded anyway. Accepted.
-- **Fork cost.** Forks are probably full copies (discovery §1). One per attempt, deleted on resolution; per-agent and per-owner caps bound the count.
-- **Leaked attempt token** gives 2 h of write to one fork whose pushes all pass the gate. Same blast radius as a bad push.
+- **Fork cost.** Forks are probably full copies (discovery §1). One per attempt plus one base per item, deleted on resolution; per-agent and per-owner caps bound the count. The base adds one extra copy per active item.
+- **Leaked attempt token** gives 2 h of write to one fork whose pushes all still go through the gate. Same blast radius as a bad push.
 - **Late push after entry close** files a follow-up item, not a candidate. `get_item` returns `entryClosesAt` so agents can see it.
 
 ## 14. Agent onboarding
@@ -368,11 +394,11 @@ These docs, `docs/agent-protocol.md` (new "MCP path" section) and the README mus
 
 | Package | Tests |
 |---|---|
-| `apps/mcp` (vitest-pool-workers) | Every tool with a fake Artifacts binding and a fake Queen: init/resume/whoami, `NOT_INITIALIZED`, `FORBIDDEN_ROLE`, `FORBIDDEN_OWNER` (owner mismatch on resume and on a session), `GOAL_AMBIGUOUS`, fork failure → `attemptAborted` + delete, `ARTIFACTS_UNAVAILABLE` carries `cf-ray`, refresh revokes old tokens, `wait` timeout returns `changed:false`, clone/config commands never put the token in a URL |
-| `apps/queen` | Migration v17 from a v16 fixture; attempt ledger: intent caps (owner and agent), item-not-accepting, ready/aborted, pushed creates train with the fork as repo, re-push supersedes unboarded only, late push → follow-up, REJECTED → rework, watchdog EXPIRED, end on a boarded attempt is a no-op, terminal → exactly one fork DELETE, train teardown never deletes an attempt fork, idempotent `attemptPushed`, claimed model never reaches `model_stats`; `submitWork` `entryWindowMs` |
-| `apps/gatekeepers` | `classifyPush`: attempt main → `attempt`, attempt other ref → ignore, `-rN` suffix, train forks unchanged; orchestrate calls `attemptPushed` and the `readCommit` fallback |
+| `apps/mcp` (vitest-pool-workers) | Every tool with a fake Artifacts binding and a fake Queen: first attempt forks hive main into `-base-` (readOnly) then the attempt from the base; later attempts fork the base repo, never hive main; `BASE_PENDING` polled then surfaced; base fork failure → `attemptBaseFailed`; init/resume/whoami, `NOT_INITIALIZED`, `FORBIDDEN_ROLE`, `FORBIDDEN_OWNER` (owner mismatch on resume and on a session), `GOAL_AMBIGUOUS`, fork failure → `attemptAborted` + delete, `ARTIFACTS_UNAVAILABLE` carries `cf-ray`, refresh revokes old tokens, `wait` timeout returns `changed:false`, clone/config commands never put the token in a URL |
+| `apps/queen` | Migration v17 from a v16 fixture; attempt ledger: intent caps (owner and agent), item-not-accepting, ready/aborted, pushed creates train with the fork as repo, re-push supersedes unboarded only, late push → follow-up, REJECTED → rework, watchdog EXPIRED, end on a boarded attempt is a no-op, terminal → exactly one fork DELETE, train teardown never deletes an attempt fork, idempotent `attemptPushed`, claimed model never reaches `model_stats`; `submitWork` `entryWindowMs`; base: a single base under concurrent first intents (second gets `BASE_PENDING`), all attempts of an item share one `base_sha`, `attemptBaseFailed` frees the slot, base deleted exactly once at resolution (decided + all attempts terminal) and on cancel, a follow-up item gets a new base, main advancing after pinning does not affect attempts |
+| `apps/gatekeepers` | `classifyPush`: attempt main → `attempt`, attempt other ref → ignore, `-rN` suffix, train forks unchanged; pushes to `-base-` repos (incl. `-rN`) are ignored and never routed as train or attempt; orchestrate calls `attemptPushed` and the `readCommit` fallback |
 | `apps/edge` | `/mcp`: no token 401, bad token 401 + fail counter, 429 when blocked, read-only token 403, header stripping (client `x-queen-user`, `x-queen-token-id`, `x-queen-agent*`, `authorization`), agent binding ignored, route runs before Access |
-| `packages/queen-types` | New schemas, `attemptRepoName` ↔ `ATTEMPT_REPO_RE` round trip |
+| `packages/queen-types` | New schemas, `attemptRepoName` ↔ `ATTEMPT_REPO_RE` and `baseRepoName` ↔ `BASE_REPO_RE` round trips (the two regexes never match each other's names) |
 | dashboard | Candidate chip renders attempt id and "claims <model>" |
 
 Per package: its tests and `tsc -p test`. Then the full gate `pnpm turbo run build typecheck lint test --force --continue` (turbo concurrency 4). Then a live probe: one Claude Code session on hive `demo` (external) runs the §14 procedure end to end; a second session races it; the human picks.
@@ -383,7 +409,7 @@ The user's rule holds: **one task at a time**; finish (verify, full gate, commit
 
 | # | Task | Files | Agent |
 |---|---|---|---|
-| 0 | Probes P1–P4 (§13), record results here | scratch Workers only | Sonnet |
+| 0 | Probes P1–P5 (§13), record results here | scratch Workers only | Sonnet |
 | 1 | Contracts: `attempt.ts`, `SubmitPromptSchema.entryWindowMs`, `MergeTrain.attemptId`, constants, repo helpers | `packages/queen-types` | Sonnet |
 | 2 | Queen attempt RPCs, migration v17, watchdog, fork ownership, race entry and supersede by attempt, `entryWindowMs` | `apps/queen` | **Opus** |
 | 3 | Gatekeepers routing: `classifyPush` attempt branch, `orchestrate.ts` → `attemptPushed`, `readCommit` fallback | `apps/gatekeepers` | Sonnet |
