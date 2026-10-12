@@ -1078,6 +1078,34 @@ export class TrainPlanner {
     return this.finish("applied");
   }
 
+  /** v17: the attempt reached a terminal state: delete its fork once, through this (its current) train's Provisioner DELETE. */
+  deleteAttemptFork(trainId: string): PlanResult {
+    const t = this.find(trainId);
+    if (!t || !t.attemptId) return this.finish("ignored:unknown");
+    if (t.forkState === "DELETING" || t.forkState === "DELETED") return this.finish("ignored:duplicate");
+    this.setTrain(t, { forkState: "DELETING", deleteCommandId: nextCommandId(t.trainId, "delete", t.deleteCommandId) }, false);
+    this.emitDelete(t);
+    return this.finish("applied");
+  }
+
+  /**
+   * v17 `end_attempt`: the contributor withdraws a candidate that has not boarded a car: EJECTED (race outcome LOST
+   * while its race is RACING, which may decide it), no attempt charged. When it was the item's only live train the
+   * item awaits a contributor (FAILED, reopened by the next push) instead of staying ACTIVE with nothing to build.
+   */
+  withdraw(trainId: string, reason: string): PlanResult {
+    const t = this.find(trainId);
+    if (!t || !isContributed(t)) return this.finish("ignored:unknown");
+    if (!isActive(t)) return this.finish("ignored:stale");
+    if (t.carId || t.phase === "LANDING") return this.finish("ignored:stale");
+    const race = this.racingRaceOf(t);
+    this.eject(t, clip500(`withdrawn: ${reason}`), race ? { raceOutcome: "LOST" } : {});
+    if (race) this.maybeDecide(race);
+    if (!this.trains.some((x) => isActive(x) && !isCar(x) && x.promptId === t.promptId)) this.awaitContributor(t.promptId, `withdrawn: ${reason}`);
+    this.maybeLand();
+    return this.finish("applied");
+  }
+
   /**
    * The contributor hands a FAILED item to the swarm (§6.3, `workAction handoff`): a REWORK as for drones,
    * under maxReworks, forked FROM the rejected submission's kept fork when it still exists. The item's
@@ -2107,6 +2135,14 @@ export class TrainPlanner {
   }
 
   private deleteFork(t: TrainRecord): void {
+    // v17: an attempt's trains share one fork that the ATTEMPT owns. A train never deletes it on its own teardown
+    // (supersede, eject, landing, a kept fork's release): it only lets go of it (`NONE`). The Queen deletes the fork
+    // once, on the attempt's terminal transition, through deleteAttemptFork. A DELETE already in flight (DELETING:
+    // the watchdog re-sends it) goes on as before.
+    if (t.attemptId && t.forkState !== "DELETING") {
+      if (t.forkState === "PENDING" || t.forkState === "READY") this.setTrain(t, { forkState: "NONE" }, false);
+      return;
+    }
     this.setTrain(t, { forkState: "DELETING", deleteCommandId: nextCommandId(t.trainId, "delete", t.deleteCommandId) }, false);
     this.emitDelete(t);
   }

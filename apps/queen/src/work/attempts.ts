@@ -72,3 +72,16 @@ export function attemptVerdict(t: Pick<TrainRecord, "phase" | "raceOutcome"> | n
 export function randomHex(bytes: number): string {
   return [...crypto.getRandomValues(new Uint8Array(bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+/**
+ * An attempt follows its current train: PUSHED while it builds / deploys / is gated, PASSED once its gate passed, WON
+ * when its race picked it (or it boarded a car / is landing), LANDED when merged; EJECTED is LOST (its race picked
+ * another) or REJECTED (the gate, the integration gate or a car ejected it; the agent may push again).
+ */
+export function attemptStateOf(t: Pick<TrainRecord, "phase" | "raceOutcome" | "carId">): AttemptState {
+  if (t.phase === "MERGED") return "LANDED";
+  if (t.phase === "EJECTED") return t.raceOutcome === "LOST" ? "LOST" : "REJECTED";
+  if (t.raceOutcome === "WON" || t.carId || t.phase === "LANDING") return "WON";
+  if (t.phase === "PASSED" || t.raceOutcome === "PASSED") return "PASSED";
+  return "PUSHED";
+}

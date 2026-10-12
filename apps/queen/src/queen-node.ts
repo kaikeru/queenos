@@ -46,8 +46,13 @@ import {
   AttemptAbortedSchema,
   AttemptBaseFailedSchema,
   AttemptBaseReadySchema,
+  AttemptEndSchema,
   AttemptIntentSchema,
+  AttemptPushedSchema,
   AttemptReadySchema,
+  AttemptRefreshSchema,
+  isTerminalAttemptState,
+  traceparent,
   MAX_OPEN_ATTEMPTS_PER_AGENT,
   attemptRepoName,
   baseRepoName,
@@ -87,6 +92,9 @@ import {
   type AttemptBaseReady,
   type AttemptIntent,
   type AttemptIntentDecision,
+  type AttemptOwnerAction,
+  type AttemptPushed,
+  type AttemptPushedResult,
   type AttemptReady,
   type AttemptRefusalCode,
   type AttemptResult,
@@ -146,6 +154,7 @@ import {
   deleteClaims,
   getAttemptRow,
   getItemBase,
+  getSubmission,
   setItemBase,
   upsertAttempt,
   type ItemBase,
@@ -253,7 +262,7 @@ import {
 } from "./work/inbox";
 import { MAX_NOTES, projectNotes, type NotesInput, type NotesTrain } from "./work/notes";
 import { composePrompt } from "./work/compose";
-import { ATTEMPT_TTL_MS, OPEN_ATTEMPTS_SQL, acceptsEntries, attemptVerdict, checkAttemptCaps, randomHex } from "./work/attempts";
+import { ATTEMPT_TTL_MS, OPEN_ATTEMPTS_SQL, PUSHABLE_STATES, acceptsEntries, attemptStateOf, attemptVerdict, checkAttemptCaps, randomHex } from "./work/attempts";
 import { queryMetrics, recordMetrics } from "./obs/rollup";
 import { AnalyticsSink } from "./obs/metrics-sink";
 import { logEvents } from "./obs/log";
@@ -1110,7 +1119,9 @@ export class QueenNode extends DurableObject<Env> {
     const b = getItemBase(this.sql, r.itemId);
     if (!b) throw new QueenError("NOT_FOUND", `item ${r.itemId} not found`);
     const pending = !!b.baseRepo && !b.baseSha && isForkOf(b.baseRepo, r.baseRepo);
-    const caller = r.attemptId ? getAttemptRow(this.sql, r.attemptId) : null;
+    // Only the caller's own INTENT on this item: a wrong attemptId never aborts an INTENT on another item.
+    const found = r.attemptId ? getAttemptRow(this.sql, r.attemptId) : null;
+    const caller = found && found.itemId === r.itemId ? found : null;
     if (!pending && caller?.state !== "INTENT") return { outcome: "ignored:stale" };
     const { acc } = this.decide(hive, (d) => {
       if (pending) d.acc.itemBases.set(r.itemId, { itemId: r.itemId, baseRepo: null, baseSha: null, pendingAt: null });
@@ -1158,6 +1169,170 @@ export class QueenNode extends DurableObject<Env> {
     return { outcome: "applied" };
   }
 
+  /**
+   * Gatekeepers: a push landed on `main` of an attempt fork, and `after` is the fork's head (the gatekeeper checked).
+   * Idempotent on (repo, after). The push is the attempt's submission through the same intake as `gitPushed` (race
+   * entry, follow-up when late, a FAILED item reopened), keyed by the attempt instead of (owner, ref, agent): the
+   * attempt's previous train is superseded while it has not boarded a car. The first push creates the train reserved
+   * at intent (tp.intent + tp.pushed in one decide); later pushes allocate a new train. Every train's repo is the
+   * attempt fork (no re-fork, no ref rewrite). The claimed model rides on the origin only, never into the router.
+   */
+  async attemptPushed(input: AttemptPushed): Promise<AttemptPushedResult> {
+    const p = parseOrThrow(AttemptPushedSchema, input, "attempt push");
+    const hive = this.hiveFor(p.hive);
+    const a = getAttemptRow(this.sql, p.attemptId);
+    const res = (outcome: AttemptPushedResult["outcome"], extra: Partial<AttemptPushedResult> = {}): AttemptPushedResult => ({
+      outcome,
+      attemptId: p.attemptId,
+      state: a?.state ?? null,
+      itemId: a?.itemId ?? null,
+      trainId: null,
+      disposition: null,
+      ...extra,
+    });
+    if (!a || a.hive !== hive || a.repo !== p.repo) return res("ignored:unknown");
+    const dup = getSubmission(this.sql, a.repo, p.after);
+    if (dup) return res("duplicate", { itemId: dup.itemId, trainId: dup.trainId, disposition: dup.disposition });
+    if (!PUSHABLE_STATES.has(a.state)) return res("ignored:state");
+    if (p.after === a.baseSha) return res("ignored:base");
+    const ref = `refs/heads/item/${a.itemId}`;
+    const prevRow = this.sql.exec("SELECT * FROM submissions WHERE attempt_id = ? AND outcome = 'applied' ORDER BY created_at DESC, rowid DESC LIMIT 1", a.attemptId).toArray()[0];
+    const prevSub = prevRow ? rowToSubmission(prevRow) : null;
+    const prevTrain = prevSub?.trainId ? this.loadTrain(prevSub.trainId) : null;
+    const previous: PriorSubmission | null = prevSub
+      ? { submission: prevSub, trainActive: !!prevTrain && isActive(prevTrain), trainBoarded: !!prevTrain && (!!prevTrain.carId || prevTrain.phase === "LANDING" || prevTrain.phase === "MERGED") }
+      : null;
+    const trainId = a.state === "READY" && !this.trainExists(a.trainId) ? a.trainId : crypto.randomUUID();
+    const origin: SubmissionOrigin = { kind: "agent", id: clip(`${a.agentName}@${a.owner}`, 320), model: a.model };
+    const actor = `agent:${origin.id}`;
+    const now = this.now();
+    const plan = decideIntake(
+      { ref, headSha: p.after, title: p.title, message: p.message, trailers: trailersOf(p.message, {}), newItemId: crypto.randomUUID() },
+      { now, lookup: this.intakeLookup({ state: this.activeState() }), previousOnRef: previous },
+    );
+    const parent = plan.file?.parentId ?? null;
+    let entered: Attempt = a;
+    const { acc } = this.decide(
+      hive,
+      (d) => {
+        const inbox = { repo: a.repo, ref, handle: handleFor(a.owner), headSha: p.after, handoff: false };
+        if (plan.file) d.acc.work(d.wp.fileSubmission({ ...plan.file, source: { kind: "agent" as const, actor }, inbox, disposition: plan.disposition }));
+        else d.acc.work(d.wp.adoptSubmission(plan.itemId, { inbox, reopen: plan.reopen, actor }));
+        const item = d.acc.items.get(plan.itemId) ?? d.state.items.find((i) => i.itemId === plan.itemId) ?? this.loadItem(plan.itemId);
+        if (!item) throw new QueenError("NOT_FOUND", `item ${plan.itemId} not found`);
+        d.acc.train(d.tp.intent({ trainId, promptId: item.itemId, origin, traceId: item.traceId, promptText: composePrompt(item), attemptId: a.attemptId }));
+        d.acc.train(
+          d.tp.pushed({
+            trainId,
+            repo: a.repo,
+            headSha: p.after,
+            baseSha: a.baseSha ?? p.before ?? p.after,
+            origin,
+            promptId: item.itemId,
+            promptText: composePrompt(item),
+            attempts: item.attempts,
+            item: plannerItem(item),
+            race: plan.race,
+            resume: item.status === "ACTIVE",
+          }),
+        );
+        if (plan.supersedeTrainId) d.acc.train(d.tp.supersede(plan.supersedeTrainId, p.after));
+        d.acc.submissions.push({
+          repo: a.repo,
+          headSha: p.after,
+          ref,
+          originKind: "agent",
+          originId: a.owner,
+          itemId: item.itemId,
+          trainId,
+          outcome: "applied",
+          disposition: plan.disposition,
+          target: { kind: "item", itemId: a.itemId },
+          agent: a.agentName,
+          attemptId: a.attemptId,
+          createdAt: now,
+        });
+        entered = { ...a, state: "PUSHED", trainId, headSha: p.after, itemId: item.itemId, raceId: d.acc.trains.get(trainId)?.raceId ?? null };
+        d.acc.attempts.set(a.attemptId, entered);
+        d.acc.events.push(
+          this.attemptEvent("attempt.state", item.itemId, a.attemptId, `attempt ${a.attemptId}: ${a.state} → PUSHED ${short(p.after)} (${plan.disposition}; train ${trainId})`, {
+            from: a.state,
+            to: "PUSHED",
+            headSha: p.after,
+            trainId,
+            disposition: plan.disposition,
+            ...(plan.supersedeTrainId ? { superseded: plan.supersedeTrainId } : {}),
+          }, actor),
+        );
+        d.acc.events.push(
+          this.submissionEvent(item.itemId, trainId, `submission received (${plan.disposition}) from ${actor} (claims ${a.model}): ${p.title}`, {
+            outcome: "applied",
+            disposition: plan.disposition,
+            ref,
+            headSha: p.after,
+            repo: a.repo,
+            origin,
+            attemptId: a.attemptId,
+          }, actor),
+        );
+      },
+      { trains: [trainId, ...(plan.supersedeTrainId ? [plan.supersedeTrainId] : [])], items: [plan.itemId, ...(parent ? [parent] : [])] },
+    );
+    await this.commit(hive, acc);
+    const now2 = getAttemptRow(this.sql, a.attemptId) ?? entered;
+    return { outcome: "applied", attemptId: a.attemptId, state: now2.state, itemId: now2.itemId, trainId, disposition: plan.disposition };
+  }
+
+  /** `refresh_attempt`: the attempt's own owner and agent, a non-terminal attempt: expires_at = now + 2 h (queenos-mcp mints the token). */
+  async attemptRefresh(input: AttemptOwnerAction): Promise<AttemptResult> {
+    const r = parseOrThrow(AttemptRefreshSchema, input, "attempt refresh");
+    const hive = this.hiveFor(r.hive);
+    const a = getAttemptRow(this.sql, r.attemptId);
+    const refused = this.ownerRefusal(a, r);
+    if (refused) return refused;
+    const next: Attempt = { ...a!, expiresAt: this.now() + ATTEMPT_TTL_MS };
+    const { acc } = this.decide(hive, (d) => {
+      d.acc.attempts.set(next.attemptId, next);
+      d.acc.events.push(this.attemptEvent("attempt.state", next.itemId, next.attemptId, `attempt ${next.attemptId}: token refreshed`, { refreshed: true, expiresAt: next.expiresAt }, `agent:${next.agentName}@${next.owner}`, "debug"));
+    });
+    await this.commit(hive, acc);
+    return { ok: true, attempt: this.attemptView(next), changed: true };
+  }
+
+  /**
+   * `end_attempt`: → ABANDONED. A pushed candidate not yet in a car is withdrawn; a winner already in a car (or
+   * landing) cannot be abandoned and is returned unchanged. The fork is deleted once: through the current train, or
+   * by a repo DELETE when the attempt never pushed. An INTENT is only marked (queenos-mcp is still creating its fork;
+   * its attemptReady then fails ATTEMPT_EXPIRED and it deletes the fork itself).
+   */
+  async attemptEnd(input: AttemptOwnerAction): Promise<AttemptResult> {
+    const r = parseOrThrow(AttemptEndSchema, input, "attempt end");
+    const hive = this.hiveFor(r.hive);
+    const a = getAttemptRow(this.sql, r.attemptId);
+    const refused = this.ownerRefusal(a, r);
+    if (refused) return refused;
+    const att = a!;
+    const t = this.trainExists(att.trainId) ? this.loadTrain(att.trainId) : null;
+    if (t && isActive(t) && (t.carId || t.phase === "LANDING")) return { ok: true, attempt: this.attemptView(att), changed: false };
+    const next: Attempt = { ...att, state: "ABANDONED" };
+    const { acc } = this.decide(
+      hive,
+      (d) => {
+        d.acc.attempts.set(att.attemptId, next);
+        if (t) {
+          if (isActive(t)) d.acc.train(d.tp.withdraw(t.trainId, `${att.agentName} ended attempt ${att.attemptId}`));
+          d.acc.train(d.tp.deleteAttemptFork(t.trainId));
+        } else if (att.state !== "INTENT") {
+          d.acc.effects.push(this.repoDelete(hive, att.attemptId, att.repo, this.loadItem(att.itemId)?.traceId ?? null));
+        }
+        d.acc.events.push(this.attemptEvent("attempt.state", att.itemId, att.attemptId, `attempt ${att.attemptId}: ${att.state} → ABANDONED (end_attempt)`, { from: att.state, to: "ABANDONED" }, `agent:${att.agentName}@${att.owner}`));
+      },
+      { trains: t ? [t.trainId] : [], items: [att.itemId] },
+    );
+    await this.commit(hive, acc);
+    return { ok: true, attempt: this.attemptView(next), changed: true };
+  }
+
   /** `get_attempt` / `wait` / `get_verdict`: the row, its current train and race. Null: unknown. */
   getAttempt(attemptId: string): AttemptView | null {
     const a = getAttemptRow(this.sql, attemptId);
@@ -1176,6 +1351,47 @@ export class QueenNode extends DurableObject<Env> {
   /** An attempt as this decision sees it: its pending row in `acc`, else SQLite. */
   private attemptOf(attemptId: string, acc?: Acc): Attempt | null {
     return acc?.attempts.get(attemptId) ?? getAttemptRow(this.sql, attemptId);
+  }
+
+  /** refresh / end: the attempt must exist, belong to this owner and agent, and not be terminal. */
+  private ownerRefusal(a: Attempt | null, r: AttemptOwnerAction): AttemptResult | null {
+    if (!a) return { ok: false, code: "NOT_FOUND", message: `attempt ${r.attemptId} not found` };
+    if (a.owner !== r.owner.toLowerCase() || a.agentId !== r.agentId) return { ok: false, code: "FORBIDDEN_OWNER", message: `attempt ${a.attemptId} belongs to another agent` };
+    if (isTerminalAttemptState(a.state)) return { ok: false, code: "ATTEMPT_EXPIRED", message: `attempt ${a.attemptId} is ${a.state}` };
+    return null;
+  }
+
+  /**
+   * v17: a Provisioner DELETE for a repo no train holds: an attempt fork before its first push (key = the attempt id)
+   * or a race base (key = `base-<itemId>`). `reportProvisionResult` acknowledges its report. Command id `<key>-delete-1`.
+   */
+  private repoDelete(hive: string, key: string, repo: string, traceId: string | null): Dispatchable {
+    const commandId = `${key}-delete-1`;
+    return {
+      type: "provision",
+      trainId: key,
+      command: { op: "DELETE", commandId, hive, trainId: key, repo, ...(traceId ? { trace: { traceparent: traceparent(traceId, spanIdFor(commandId)) } } : {}) },
+    };
+  }
+
+  /**
+   * v17: after every decision, each attempt follows its current train (attemptStateOf). A terminal transition (LOST,
+   * LANDED) deletes the attempt's fork once, through its current train. Trains of earlier pushes (superseded) are skipped:
+   * the attempt no longer points at them.
+   */
+  private syncAttempts(d: Decision): void {
+    for (const t of [...d.acc.trains.values()]) {
+      if (!t.attemptId) continue;
+      const a = this.attemptOf(t.attemptId, d.acc);
+      if (!a || a.trainId !== t.trainId || a.state === "INTENT" || a.state === "READY" || isTerminalAttemptState(a.state)) continue;
+      const next = attemptStateOf(t);
+      const raceId = t.raceId ?? a.raceId;
+      if (next !== a.state || raceId !== a.raceId) d.acc.attempts.set(a.attemptId, { ...a, state: next, raceId });
+      if (next !== a.state) {
+        d.acc.events.push(this.attemptEvent("attempt.state", a.itemId, a.attemptId, `attempt ${a.attemptId}: ${a.state} → ${next}`, { from: a.state, to: next, trainId: t.trainId }, "queen"));
+      }
+      if (isTerminalAttemptState(next)) d.acc.train(d.tp.deleteAttemptFork(t.trainId));
+    }
   }
 
   /** An item's race base as this decision sees it. */
@@ -1323,7 +1539,7 @@ export class QueenNode extends DurableObject<Env> {
     const row = this.sql
       .exec(
         `SELECT * FROM submissions WHERE origin_id = ? AND ref = ? AND outcome IN (${only ? "'applied'" : "'applied', 'pending'"})
-         AND (train_id IS NULL OR train_id != ?) AND agent IS ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+         AND (train_id IS NULL OR train_id != ?) AND agent IS ? AND attempt_id IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1`,
         user,
         ref,
         exceptTrain ?? "",
@@ -1533,6 +1749,23 @@ export class QueenNode extends DurableObject<Env> {
   /** Provisioner outcome for a FORK or DELETE command (POST /internal/webhook/provision-result). */
   async reportProvisionResult(input: ProvisionResult): Promise<TrainUpdate> {
     const r = parseOrThrow(ProvisionResultSchema, input, "provision result");
+    // v17: a repo DELETE keyed by an attempt (`att_…`) or a race base (`base-<itemId>`) has no train: acknowledge it.
+    if (r.op === "DELETE" && (r.trainId.startsWith("att_") || r.trainId.startsWith("base-")) && !this.trainExists(r.trainId)) {
+      const hive = this.hiveNamespace();
+      if (hive !== null) {
+        const base = r.trainId.startsWith("base-");
+        const { acc } = this.decide(hive, (d) => {
+          d.acc.events.push(
+            this.attemptEvent(base ? "attempt.base" : "attempt.state", base ? r.trainId.slice(5) : null, base ? null : r.trainId, `repo delete ${r.ok ? "done" : "failed"} (${r.commandId})`, {
+              outcome: r.ok ? "deleted" : "delete-failed",
+              commandId: r.commandId,
+            }, "provisioner", r.ok ? "info" : "warn"),
+          );
+        });
+        await this.commit(hive, acc);
+      }
+      return { outcome: "applied", train: null };
+    }
     return this.trainTransition(r.trainId, (d, t) => {
       const res = d.acc.train(d.tp.provisionResult(r));
       d.acc.events.push(this.commandResult(t, r.commandId, `${r.op} ${r.ok ? "ok" : "failed"}`, { action: r.op, outcome: r.ok ? "ok" : "error", applied: res.outcome }, "provisioner"));
@@ -2357,6 +2590,7 @@ export class QueenNode extends DurableObject<Env> {
       for (const e of tr.escalations) acc.escalations.set(e.escalationId, e);
       acc.settings = { ...base, degradedBy: tr.degradedBy };
     }
+    this.syncAttempts(d);
     // Final settings row: the planners' counters plus streak, queue and lease.
     const s = acc.settings ?? settings;
     acc.settings = {

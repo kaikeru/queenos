@@ -62,6 +62,25 @@ describe("attemptIntent", () => {
     expect(s.events.filter((e) => e.type === "attempt.base").map((e) => JSON.parse(e.data).outcome)).toEqual(["failed"]);
   });
 
+  it("baseFailed never aborts an INTENT of another item (a wrong attemptId)", async () => {
+    const { ns, stub } = await externalHive();
+    const itemA = await fileItem(ns, "Tip jar A");
+    const itemB = await fileItem(ns, "Tip jar B");
+    const a = accepted(await intent(ns, agent(), { itemId: itemA }));
+    const b = accepted(await intent(ns, agent(), { itemId: itemB }));
+    if (a.base.kind !== "create") throw new Error("expected create");
+    // A's base is pending: the slot is freed, but B's INTENT is untouched.
+    expect(await stub.attemptBaseFailed({ hive: ns, itemId: itemA, baseRepo: a.base.baseRepo, reason: "fork 503", attemptId: b.attemptId })).toEqual({ outcome: "applied" });
+    let s = await look(ns);
+    expect(s.items.find((i) => i.item_id === itemA)).toMatchObject({ base_repo: null, base_pending_at: null });
+    expect(s.attempts.find((x) => x.attempt_id === b.attemptId)).toMatchObject({ state: "INTENT" });
+    expect(s.attempts.find((x) => x.attempt_id === a.attemptId)).toMatchObject({ state: "INTENT" });
+    // A's base is no longer pending: a report naming B's attempt on item A is stale.
+    expect(await stub.attemptBaseFailed({ hive: ns, itemId: itemA, baseRepo: a.base.baseRepo, reason: "fork 503", attemptId: b.attemptId })).toEqual({ outcome: "ignored:stale" });
+    s = await look(ns);
+    expect(s.attempts.find((x) => x.attempt_id === b.attemptId)).toMatchObject({ state: "INTENT" });
+  });
+
   it("ready: INTENT → READY with the actual -rN repo; a foreign repo is INVALID_INPUT; a head other than the base is BASE_MOVED; a repeat is a no-op", async () => {
     const { ns, stub } = await externalHive();
     const itemId = await fileItem(ns);
