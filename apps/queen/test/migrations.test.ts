@@ -75,7 +75,7 @@ const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v F
 /** Undo v17 (a test that rebuilds an older version first). */
 function dropV17(sql: SqlStorage): void {
   sql.exec(`DROP TABLE attempts; DROP INDEX submissions_attempt;
-    ALTER TABLE submissions DROP COLUMN attempt_id; ALTER TABLE merge_trains DROP COLUMN attempt_id;
+    ALTER TABLE submissions DROP COLUMN attempt_id; ALTER TABLE submissions DROP COLUMN before_sha; ALTER TABLE merge_trains DROP COLUMN attempt_id;
     ALTER TABLE work_items DROP COLUMN base_repo; ALTER TABLE work_items DROP COLUMN base_sha;
     ALTER TABLE work_items DROP COLUMN base_pending_at; ALTER TABLE work_items DROP COLUMN entry_window_ms;
     DELETE FROM _migrations WHERE version = 17;`);
@@ -96,6 +96,7 @@ describe("migrations", () => {
       for (const c of ["entry_closes_at", "pick_deadline_at", "recommended_train_id", "recommend_reason", "decided_by", "rejections"]) expect(columns(q.sql, "races").has(c), c).toBe(true);
       expect(columns(q.sql, "submissions").has("agent")).toBe(true);
       expect(columns(q.sql, "submissions").has("attempt_id")).toBe(true);
+      expect(columns(q.sql, "submissions").has("before_sha")).toBe(true);
       for (const c of ["picks", "picks_against_recommendation"]) expect(columns(q.sql, "model_stats").has(c), c).toBe(true);
       for (const c of ["paths", "wait_reason", "conflicts", "inbox_json", "judge", "base_repo", "base_sha", "base_pending_at", "entry_window_ms"]) expect(columns(q.sql, "work_items").has(c), c).toBe(true);
       for (const c of ["leased_slots", "lease_expires_at", "car_infra_failures", "budget_boost"]) expect(columns(q.sql, "hive_settings").has(c), c).toBe(true);
@@ -572,7 +573,9 @@ describe("v17: MCP attempts", () => {
       expect(tables(sql).has("attempts")).toBe(true);
       for (const c of ["base_repo", "base_sha", "base_pending_at", "entry_window_ms"]) expect(columns(sql, "work_items").has(c), c).toBe(true);
       expect(columns(sql, "merge_trains").has("attempt_id")).toBe(true);
+      expect(columns(sql, "submissions").has("before_sha")).toBe(true);
       expect(getSubmission(sql, "demo-in-kyle", A)).not.toHaveProperty("attemptId");
+      expect(getSubmission(sql, "demo-in-kyle", A)).not.toHaveProperty("beforeSha");
       const att = {
         attemptId: "att_0123456789ab", hive: "demo", itemId: "i1", raceId: null, trainId: "t1", repo: "demo-att-0123456789ab", baseSha: null,
         agentId: `ag_${"a".repeat(32)}`, agentName: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "kyle@example.com",

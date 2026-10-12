@@ -521,6 +521,8 @@ const MIGRATIONS: readonly Migration[] = [
   CREATE INDEX attempts_item ON attempts(item_id);
   ALTER TABLE submissions ADD COLUMN attempt_id TEXT;
   CREATE INDEX submissions_attempt ON submissions(attempt_id, created_at);
+  -- An attempt push before sha (the fork head it was built on): an older event arriving late is stale.
+  ALTER TABLE submissions ADD COLUMN before_sha TEXT;
   ALTER TABLE merge_trains ADD COLUMN attempt_id TEXT;
   -- The item's race base: both NULL = none; base_repo set with base_sha NULL = being created (base_pending_at = since).
   ALTER TABLE work_items ADD COLUMN base_repo TEXT;
@@ -1622,6 +1624,8 @@ export interface SubmissionRecord {
   agent: string | null;
   /** v17: the MCP attempt this push belongs to (absent: a git push). */
   attemptId?: string | null;
+  /** v17: an attempt push's `before` sha (absent: a git push, or not reported). */
+  beforeSha?: string | null;
   createdAt: number;
 }
 
@@ -1640,6 +1644,7 @@ export function rowToSubmission(r: Row): SubmissionRecord {
     target: parseJson(r.target ?? null, schemaCheck<SubmissionTarget>(SubmissionTargetSchema)),
     agent: str(r.agent),
     ...(r.attempt_id !== undefined && r.attempt_id !== null ? { attemptId: String(r.attempt_id) } : {}),
+    ...(r.before_sha !== undefined && r.before_sha !== null ? { beforeSha: String(r.before_sha) } : {}),
     createdAt: Number(r.created_at),
   };
 }
@@ -1648,8 +1653,8 @@ export function rowToSubmission(r: Row): SubmissionRecord {
 export function insertSubmission(sql: SqlStorage, s: SubmissionRecord): boolean {
   const row = sql
     .exec(
-      `INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, disposition, target, agent, attempt_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, disposition, target, agent, attempt_id, before_sha, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(repo, head_sha) DO NOTHING RETURNING head_sha`,
       s.repo,
       s.headSha,
@@ -1663,6 +1668,7 @@ export function insertSubmission(sql: SqlStorage, s: SubmissionRecord): boolean 
       json(s.target),
       s.agent,
       s.attemptId ?? null,
+      s.beforeSha ?? null,
       s.createdAt,
     )
     .toArray()[0];

@@ -1193,6 +1193,26 @@ export class QueenNode extends DurableObject<Env> {
     if (!a || a.hive !== hive || a.repo !== p.repo) return res("ignored:unknown");
     const dup = getSubmission(this.sql, a.repo, p.after);
     if (dup) return res("duplicate", { itemId: dup.itemId, trainId: dup.trainId, disposition: dup.disposition });
+    // Push events are at-least-once and unordered: an event whose `after` an applied push of this attempt was built
+    // on (its `before`) is older than that push. It is answered like a replay (that push already carries it).
+    const newerRow = this.sql
+      .exec("SELECT * FROM submissions WHERE attempt_id = ? AND outcome = 'applied' AND before_sha = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", a.attemptId, p.after)
+      .toArray()[0];
+    if (newerRow) {
+      const newer = rowToSubmission(newerRow);
+      const { acc } = this.decide(hive, (d) => {
+        d.acc.events.push(
+          this.attemptEvent("attempt.state", a.itemId, a.attemptId, `attempt ${a.attemptId}: stale push ${short(p.after)} ignored (already built on by ${short(newer.headSha)})`, {
+            outcome: "stale",
+            headSha: p.after,
+            newerHeadSha: newer.headSha,
+            trainId: newer.trainId,
+          }, `agent:${a.agentName}@${a.owner}`, "debug"),
+        );
+      });
+      await this.commit(hive, acc);
+      return res("duplicate", { itemId: newer.itemId, trainId: newer.trainId, disposition: newer.disposition });
+    }
     if (!PUSHABLE_STATES.has(a.state)) return res("ignored:state");
     if (p.after === a.baseSha) return res("ignored:base");
     const ref = `refs/heads/item/${a.itemId}`;
@@ -1250,6 +1270,7 @@ export class QueenNode extends DurableObject<Env> {
           target: { kind: "item", itemId: a.itemId },
           agent: a.agentName,
           attemptId: a.attemptId,
+          beforeSha: p.before ?? null,
           createdAt: now,
         });
         entered = { ...a, state: "PUSHED", trainId, headSha: p.after, itemId: item.itemId, raceId: d.acc.trains.get(trainId)?.raceId ?? null };

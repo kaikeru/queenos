@@ -206,3 +206,98 @@ describe("attemptRefresh / attemptEnd", () => {
     expect(deletesOf((await look(ns)).provisions, r.repo)).toEqual([]);
   });
 });
+
+/** Play the car executors for `memberId`'s car: its fork, the MERGE drone (fast-forward), the LANDER. */
+async function landCarOf(ns: string, memberId: string): Promise<string> {
+  const stub = stubFor(ns);
+  const carId = String((await trainOf(ns, memberId)).car_id);
+  const fork = (await look(ns)).provisions.find((c) => c.op === "FORK" && c.trainId === carId);
+  if (fork && fork.op === "FORK") await stub.reportProvisionResult({ commandId: fork.commandId, op: "FORK", trainId: carId, ok: true, artifactRepo: fork.forkName, baseSha: "c".repeat(40) });
+  await stub.reportMergeResult({ trainId: carId, ok: true, headSha: "d".repeat(40), baseSha: "c".repeat(40), merged: [memberId], fastForward: true });
+  await stub.reportLandResult({ trainId: carId, landed: true, mainSha: "e".repeat(40) });
+  expect(await trainOf(ns, memberId)).toMatchObject({ phase: "MERGED" });
+  return carId;
+}
+
+const distinctDeletes = (s: Awaited<ReturnType<typeof look>>, repo: string) => new Set(deletesOf(s.provisions, repo).map((c) => c.commandId)).size;
+
+describe("fork ownership across a car landing (fix round 1)", () => {
+  it("a WON attempt in a car pushes a follow-up; the car landing never deletes the shared fork; ending the attempt deletes it once", async () => {
+    const { ns, stub } = await externalHive({ race: { entryWindowMs: 0 } });
+    const r = await readyAttempt(ns, await fileItem(ns));
+    await push(ns, r);
+    await gatePass(ns, r.trainId);
+    expect((await trainOf(ns, r.trainId)).car_id).not.toBeNull();
+    const { res } = await push(ns, r, sha(), "Add a tip jar, v2");
+    expect(res.outcome).toBe("applied");
+    expect(res.trainId).not.toBe(r.trainId);
+    await landCarOf(ns, r.trainId);
+    let s = await look(ns);
+    expect(s.trains.find((t) => t.train_id === res.trainId)).toMatchObject({ phase: "DEPLOYING", artifact_repo: r.repo });
+    expect(deletesOf(s.provisions, r.repo)).toEqual([]);
+    expect(await stub.attemptEnd({ hive: ns, attemptId: r.attemptId, owner: OWNER, agentId: r.agent.agentId })).toMatchObject({ ok: true, attempt: { state: "ABANDONED" } });
+    s = await look(ns);
+    expect(distinctDeletes(s, r.repo)).toBe(1);
+  });
+
+  it("after a late push, the old passed train wins its race and lands by car without deleting the follow-up's fork", async () => {
+    const { ns, stub } = await externalHive();
+    const itemId = await fileItem(ns);
+    const a = await readyAttempt(ns, itemId, agent());
+    const b = await readyAttempt(ns, itemId, agent({ name: "haiku" }));
+    await push(ns, a);
+    await push(ns, b);
+    await gatePass(ns, a.trainId);
+    const raceId = String((await look(ns)).races[0]!.race_id);
+    await stub.closeRaceEntries({ hive: ns, raceId, user: OWNER });
+    const { res } = await push(ns, a, sha(), "Add a tip jar, v2");
+    expect(res.disposition).toBe("late-new-item");
+    await gateFail(ns, b.trainId);
+    expect(await trainOf(ns, a.trainId)).toMatchObject({ race_outcome: "WON" });
+    expect((await trainOf(ns, a.trainId)).car_id).not.toBeNull();
+    await landCarOf(ns, a.trainId);
+    let s = await look(ns);
+    expect(s.trains.find((t) => t.train_id === res.trainId)).toMatchObject({ phase: "DEPLOYING", artifact_repo: a.repo });
+    expect(s.attempts.find((x) => x.attempt_id === a.attemptId)).toMatchObject({ state: "PUSHED", train_id: res.trainId });
+    expect(deletesOf(s.provisions, a.repo)).toEqual([]);
+    await stub.attemptEnd({ hive: ns, attemptId: a.attemptId, owner: OWNER, agentId: a.agent.agentId });
+    s = await look(ns);
+    expect(distinctDeletes(s, a.repo)).toBe(1);
+  });
+});
+
+describe("out-of-order push events (fix round 1)", () => {
+  const pushAt = (ns: string, att: { attemptId: string; repo: string }, before: string, after: string, title: string) =>
+    stubFor(ns).attemptPushed({ hive: ns, attemptId: att.attemptId, repo: att.repo, before, after, title, message: title });
+
+  it("a newer push processed first: the older event (its after is the newer push's before) is ignored and the newer stays the candidate", async () => {
+    const { ns } = await externalHive();
+    const r = await readyAttempt(ns, await fileItem(ns));
+    const x = sha();
+    const y = sha();
+    const b = await pushAt(ns, r, x, y, "B");
+    expect(b).toMatchObject({ outcome: "applied", trainId: r.trainId, state: "PUSHED" });
+    const a = await pushAt(ns, r, BASE_SHA, x, "A");
+    expect(a).toMatchObject({ outcome: "duplicate", trainId: r.trainId });
+    const s = await look(ns);
+    expect(s.trains).toHaveLength(1);
+    expect(s.trains[0]).toMatchObject({ train_id: r.trainId, phase: "DEPLOYING" });
+    expect(s.attempts[0]).toMatchObject({ head_sha: y, train_id: r.trainId });
+    expect(s.submissions).toHaveLength(1);
+    expect(s.events.some((e) => e.type === "attempt.state" && JSON.parse(e.data).outcome === "stale")).toBe(true);
+  });
+
+  it("in order: the second push supersedes the first", async () => {
+    const { ns } = await externalHive();
+    const r = await readyAttempt(ns, await fileItem(ns));
+    const x = sha();
+    const y = sha();
+    expect(await pushAt(ns, r, BASE_SHA, x, "A")).toMatchObject({ outcome: "applied", trainId: r.trainId });
+    const b = await pushAt(ns, r, x, y, "B");
+    expect(b).toMatchObject({ outcome: "applied", disposition: "superseded" });
+    const s = await look(ns);
+    expect(s.trains.find((t) => t.train_id === r.trainId)).toMatchObject({ phase: "EJECTED" });
+    expect(s.attempts[0]).toMatchObject({ head_sha: y, train_id: b.trainId });
+    expect(s.submissions.map((x) => x.before_sha)).toEqual([BASE_SHA, x]);
+  });
+});

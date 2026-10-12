@@ -212,7 +212,11 @@ class Builder {
   cleanUp(trainId: string): void {
     const t = this.get(trainId);
     if (!t) return;
-    if (t.forkState === "PENDING" || t.forkState === "READY") {
+    // v17: an attempt train's fork is shared by the attempt's later trains (a follow-up may be building on it):
+    // the train only lets go of it (`NONE`), mirroring TrainPlanner.deleteFork. The Queen deletes it once, on the
+    // attempt's terminal transition (syncAttempts → deleteAttemptFork).
+    if (t.attemptId && (t.forkState === "PENDING" || t.forkState === "READY")) this.patch(t.trainId, { forkState: "NONE" });
+    else if (t.forkState === "PENDING" || t.forkState === "READY") {
       const deleteCommandId = nextCommandId(t.trainId, "delete", t.deleteCommandId);
       this.patch(t.trainId, { forkState: "DELETING", deleteCommandId });
       this.effects.push({
