@@ -301,6 +301,49 @@ importers:
         specifier: ^4.147.0
         version: 4.147.0(@cloudflare/workers-types@5.20261002.1)
 
+  apps/mcp:
+    dependencies:
+      '@modelcontextprotocol/sdk':
+        specifier: 1.30.0
+        version: 1.30.0(@cfworker/json-schema@4.1.1)(zod@4.6.5)
+      '@queenos/hive-kit':
+        specifier: workspace:*
+        version: link:../../packages/hive-kit
+      '@queenos/queen-types':
+        specifier: workspace:*
+        version: link:../../packages/queen-types
+      agents:
+        specifier: 0.26.0
+        version: 0.26.0(@ai-sdk/provider@4.0.21)(@babel/core@8.0.6)(@babel/runtime@7.29.7)(@cloudflare/codemode@0.5.3(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.6.5))(ai@7.0.127(zod@4.6.5))(zod@4.6.5))(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.6.5))(@modelcontextprotocol/server@2.0.0)(ai@7.0.127(zod@4.6.5))(chat@4.41.1(ai@7.0.127(zod@4.6.5))(zod@4.6.5))(just-bash@3.6.0)(react@19.3.0)(rolldown@1.2.12)(vite@8.3.2(esbuild@0.28.1)(yaml@2.9.1))(zod@4.6.5)
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      '@cloudflare/vitest-pool-workers':
+        specifier: 0.22.0
+        version: 0.22.0(@cloudflare/workers-types@5.20261002.1)(@vitest/runner@4.1.11)(@vitest/snapshot@4.1.11)(vitest@4.1.11(vite@8.3.2(esbuild@0.28.1)(yaml@2.9.1)))
+      '@cloudflare/workers-types':
+        specifier: ^5.20261002.1
+        version: 5.20261002.1
+      '@queenos/eslint-config':
+        specifier: workspace:*
+        version: link:../../packages/eslint-config
+      '@queenos/tsconfig':
+        specifier: workspace:*
+        version: link:../../packages/tsconfig
+      eslint:
+        specifier: ^9.39.5
+        version: 9.39.5
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^4.1.11
+        version: 4.1.11(vite@8.3.2(esbuild@0.28.1)(yaml@2.9.1))
+      wrangler:
+        specifier: ^4.147.0
+        version: 4.147.0(@cloudflare/workers-types@5.20261002.1)
+
   apps/oracle:
     dependencies:
       '@queenos/hive-kit':

@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // queenos-mcp (docs/superpowers/specs/2026-10-12-queenos-mcp-design.md §4.2): the MCP server agents use. One McpAgent
+  // DO per MCP session, one AgentIdentity DO per agent. Reachable ONLY through the edge's service binding (`MCP`), which
+  // checks the human's qgt_ token and sets `x-queen-user` / `x-queen-token-id`. No public surface.
+  "name": "queenos-mcp",
+  "main": "src/index.ts",
+  // Same date as apps/drones: `agents` / the MCP SDK use node:* through the nodejs_compat this date implies.
+  // Do not add nodejs_compat. Our own code imports no Node built-ins.
+  "compatibility_date": "2026-10-02",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  // start_attempt waits on forks (I/O, not CPU).
+  "limits": { "cpu_ms": 30000 },
+  // The whole `queenos` namespace, used only on <hive>-att-* and <hive>-base-* names the Queen allocated.
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "queenos" }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "MCP_SESSION", "class_name": "QueenMcp" },
+      { "name": "AGENT_IDENTITY", "class_name": "AgentIdentity" },
+      // Cross-script DO RPC to the Queen (apps/queen "name": "queen"); one QueenNode per hive.
+      { "name": "QUEEN", "class_name": "QueenNode", "script_name": "queen" },
+      // The edge's project registry (list_hives, hive existence). list() / get() only.
+      { "name": "REGISTRY", "class_name": "HiveRegistry", "script_name": "queenos-edge" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["QueenMcp", "AgentIdentity"] }],
+  "env": {
+    // Used only by vitest. No ARTIFACTS (remote-only), no cross-script DOs: tests inject fakes (test/worker.ts).
+    "test": {
+      "durable_objects": {
+        "bindings": [
+          { "name": "MCP_SESSION", "class_name": "QueenMcp" },
+          { "name": "AGENT_IDENTITY", "class_name": "AgentIdentity" }
+        ]
+      },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["QueenMcp", "AgentIdentity"] }]
+    }
+  }
+}
