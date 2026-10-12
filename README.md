@@ -78,7 +78,7 @@ The honest numbers (platform limits checked 2026-10-05, [design §4](docs/v2-des
 
 ## Architecture
 
-Eleven components (ten Workers plus the dashboard, which the edge serves as static assets), one Queen Durable Object per hive. Every executor reports its result back to the Queen over Durable Object RPC, keyed by command id, so retries and late results are ignored rather than corrupting state.
+Eleven components (ten Workers plus the dashboard, which the edge serves as static assets), one Queen Durable Object per hive. Every executor reports its result back to the Queen over Durable Object RPC, keyed by command id, so retries and late results are ignored rather than corrupting state. `mcp` (`queenos-mcp`) serves agents over MCP: one disposable Artifacts fork per attempt, reached through the edge's `/mcp` route.
 
 ```mermaid
 flowchart LR
@@ -89,6 +89,7 @@ flowchart LR
     Edge["edge<br/>Access JWT, routing, HiveRegistry DO,<br/>metrics proxy"]
     Genesis["genesis<br/>onboarding wizard DO"]
     Vault["vault<br/>encrypted Cloudflare creds"]
+    Mcp["mcp<br/>MCP server, attempt forks"]
   end
 
   subgraph Brain["Scheduler"]
@@ -122,6 +123,8 @@ flowchart LR
   Edge -->|serves| Dash
   Edge --> Queen
   Edge --> Genesis
+  Edge --> Mcp
+  Mcp --> Queen
   Edge -->|VaultWriter| Vault
   Edge -->|"metrics SQL"| AE
   Genesis -->|VaultWriter| Vault
@@ -274,6 +277,14 @@ curl -X POST localhost:8787/hives/demo/releases/<releaseId>/tap -H 'x-queen-user
 
 The older **Launch demo swarm** (4 prompts: `[fail]`, `[review-fail]` and two clean ones) is on the lanes page, `/p/demo/lanes`.
 
+### Agents over MCP
+
+Connect an MCP client (Claude Code shown) with a push-scoped git token from `/p/<hive>/push`:
+
+    claude mcp add --transport http queenos https://<host>/mcp --header "Authorization: Bearer $QUEENOS_TOKEN"
+
+Then `init_agent`, `start_attempt`, clone with the returned command, push `main`, `wait` for the verdict. Every attempt gets its own fork of the item's frozen base and a 2 h token for that fork only. Procedure: `docs/agent-protocol.md` §8.
+
 ## Tests
 
 ```bash
@@ -361,6 +372,7 @@ apps/queen         Hono Worker + QueenNode DO (scheduler, state, merge queue, ev
 apps/edge          Front door: Access JWT, routing, project registry, serves the dashboard
 apps/genesis       Onboarding wizard DO
 apps/vault         Per-hive encrypted Cloudflare credentials
+apps/mcp           MCP server for agents: one Artifacts fork per attempt
 apps/oracle        Workflow: decompose goals into items, triage bugs
 apps/provisioner   Workflow: Artifacts fork / delete, hive seeding, memory recall
 apps/drones        Workflow: Think builder (Dynamic Worker verify), rework, merge and lander drones

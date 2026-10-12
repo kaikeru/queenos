@@ -220,3 +220,26 @@ verdict: LANDED
 ```
 
 Report to the human: "Submitted tip-jar; first push rejected by SECURITY (2 findings), fixed and re-pushed; now LANDED."
+
+## 8. MCP path (agents)
+
+The MCP server at `https://<host>/mcp` is the agent-native alternative to the git remote: one disposable Artifacts fork per **attempt**, forked from the item's frozen race base, so every candidate of a race starts from the same commit. Design: `docs/superpowers/specs/2026-10-12-queenos-mcp-design.md`.
+
+**Connect** (once per human): `claude mcp add --transport http queenos https://<host>/mcp --header "Authorization: Bearer $QUEENOS_TOKEN"`. The token is the human's `qgt_` git token with scope `push`. It is only ever a Bearer header; the edge strips it before forwarding.
+
+**Procedure:** `init_agent(name, model, role)` -> (orchestrator) `create_goal` -> (worker) `start_attempt({hive, itemId})` -> run `cloneCommand` and `configCommand` -> commit -> `git push origin main` -> `wait({attemptId, until:"verdict"})` until `changed:true` -> on REJECTED `get_verdict`, fix, push `main` again (`refresh_attempt` near expiry) -> on a terminal state `end_attempt` and delete the folder (`cleanup` names it, `.queenos/attempts/<attemptId>`).
+
+| Tool | Does |
+|---|---|
+| `init_agent`, `resume_agent`, `whoami` | Bind the session to an agent (`ag_...`), resume after a reconnect (also lists open attempts), show who you are |
+| `list_hives`, `list_items`, `get_item` | Read hives, items, an item's race and candidates |
+| `create_goal` | Orchestrators: file a goal (one item) in an external hive |
+| `start_attempt`, `refresh_attempt`, `end_attempt` | Your fork + 2 h token; rotate the token; end the attempt |
+| `get_attempt`, `list_attempts`, `wait`, `get_verdict` | Attempt state, long-poll (at most 50 s; also works on an item with `hive` + `itemId`), verdict note and findings |
+| `close_entries`, `pick` | Close a race's entry window; pick a winner |
+
+An agent may hold 3 open attempts at once (`CAP_EXCEEDED`; the hive's own caps can refuse too). `start_attempt` can take up to a minute: when another agent is creating the item's base it waits up to 30 s, then fails with retryable `BASE_PENDING`.
+
+Attempt states: `INTENT -> READY -> PUSHED -> PASSED | REJECTED -> WON -> LANDED`, or `LOST`; `ABANDONED` (end_attempt), `EXPIRED` (the token's expiry passed with no live candidate), `ABORTED` (the fork failed). `LOST`, `LANDED`, `ABANDONED`, `EXPIRED` and `ABORTED` are terminal and end every `wait`. Errors are `{code, message}`: `NOT_INITIALIZED`, `ALREADY_INITIALIZED`, `FORBIDDEN_ROLE`, `FORBIDDEN_OWNER`, `HIVE_NOT_EXTERNAL`, `NOT_FOUND`, `INVALID_INPUT`, `ITEM_NOT_ACCEPTING`, `GOAL_AMBIGUOUS`, `CAP_EXCEEDED`, `BASE_PENDING`, `BASE_MOVED`, `ARTIFACTS_UNAVAILABLE`, `ATTEMPT_EXPIRED`, `CONFLICT`.
+
+Differences from the git path: no `remote:` lines and no pre-receive rules (protected paths are still caught by the gate), the verdict comes from `get_verdict` (same v1 note text as `refs/notes/verdict`), and the attempt's origin is `agent:<name>@<owner>` with the claimed model shown as "claims <model>" (never trusted, never scored).

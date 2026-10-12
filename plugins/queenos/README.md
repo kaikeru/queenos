@@ -2,6 +2,8 @@
 
 Lets Claude Code contribute to a QueenOS hive through its git inbox: submit a branch, wait for the verdict note, rework a rejection. One skill: `queenos-inbox` (invoked as `/queenos:queenos-inbox`, or automatically when you ask to submit code to QueenOS or read its verdicts).
 
+A second skill, `queenos-mcp`, does the same through the QueenOS MCP server (one disposable fork per attempt; no git token in the clone). Use it when the `queenos` MCP tools are connected.
+
 Protocol (tool-agnostic): `docs/agent-protocol.md`. The inbox endpoints ship with design tasks T1-T5 and may not be deployed yet.
 
 ## Install locally
