@@ -234,7 +234,7 @@ function MemberRow({ state, hive, id, n, conflict }: { state: State; hive: strin
           {itemId ? <Link to={hrefFor.item(hive, itemId)}>{title}</Link> : <span>{title}</span>}
         </div>
         <div className="mg-member__meta">
-          {isPushed(t) && <OriginChip badge={originBadge(t.origin)} />}
+          {isPushed(t) && <OriginChip badge={originBadge(t.origin, t.attemptId)} />}
           {t.model && <span>{modelLabel(t.model)}</span>}
           {t.score && <span>{kb(t.score.changedBytes)} · {t.score.changedFiles} file{t.score.changedFiles === 1 ? "" : "s"}</span>}
           <Score t={t} />
@@ -296,7 +296,7 @@ function BranchPanel({ b, layout, state, hive, onPick }: { b: BranchView; layout
         {b.itemId ? <Link to={hrefFor.item(hive, b.itemId)}>{b.title} ▸</Link> : b.title}
       </div>
       <dl className="mg-kv">
-        <dt>origin</dt><dd><OriginChip badge={originBadge(t?.origin)} /></dd>
+        <dt>origin</dt><dd><OriginChip badge={originBadge(t?.origin, t?.attemptId)} /></dd>
         {b.model && (<><dt>model</dt><dd>{modelLabel(b.model)}</dd></>)}
         <dt>forked</dt>
         <dd>{b.clippedLeft ? "before this window" : b.forkSha ? <>from main@<code>{short(b.forkSha)}</code></> : <>from main{t?.baseSha ? <> (<code>{short(t.baseSha)}</code>)</> : null}</>}{t && <> · {clock(t.createdAt)}</>}</dd>

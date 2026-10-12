@@ -43,7 +43,7 @@ function CarDetail({ car, state, hive }: { car: MergeTrain; state: State; hive: 
           : (car.members ?? []).map((id, i) => (
               <Fragment key={id}>
                 {i > 0 && " → "}
-                {id} <OriginChip badge={originBadge(state.trains[id]?.origin)} />
+                {id} <OriginChip badge={originBadge(state.trains[id]?.origin, state.trains[id]?.attemptId)} />
               </Fragment>
             ))}
       </dd>
@@ -113,7 +113,7 @@ export function QueuePage({ hive, state }: { hive: string; state: State }) {
                           </td>
                           <td>
                             {(t.members ?? []).length}{" "}
-                            {(t.members ?? []).map((m) => state.trains[m]).filter(isPushed).map((m) => <OriginChip key={m!.trainId} badge={originBadge(m!.origin)} />)}
+                            {(t.members ?? []).map((m) => state.trains[m]).filter(isPushed).map((m) => <OriginChip key={m!.trainId} badge={originBadge(m!.origin, m!.attemptId)} />)}
                           </td>
                           <td>{short(t.baseSha)} → {short(t.headSha)}</td>
                           <td>{t.status}</td>

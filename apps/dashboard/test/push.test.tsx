@@ -140,6 +140,19 @@ describe("origin badges", () => {
     expect(renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@kaikeru.com" })} />)).not.toContain("claims");
   });
 
+  test("an MCP attempt's candidate chip shows the attempt id next to 'claims <model>'", () => {
+    const b = originBadge({ kind: "agent", id: "opus@kyle@kaikeru.com", model: "claude-opus-5-5" }, "att_0123456789ab");
+    expect(b).toMatchObject({ kind: "agent", text: "agent:opus", claim: "claude-opus-5-5", attempt: "att_0123456789ab" });
+    expect(b.title).toContain("attempt att_0123456789ab");
+    const html = renderToString(<OriginChip badge={b} />);
+    expect(html).toContain("claims claude-opus-5-5");
+    expect(html).toContain("att_0123456789ab");
+    expect(originBadge({ kind: "human", id: "kyle@kaikeru.com" }).attempt).toBeNull();
+    expect(renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@kaikeru.com" })} />)).not.toContain("att_");
+    const t = { trainId: "t9", origin: { kind: "agent" as const, id: "opus@kyle@kaikeru.com" }, createdAt: NOW, attemptId: "att_0123456789ab" };
+    expect(itemOrigin(null, [t]).attempt).toBe("att_0123456789ab");
+  });
+
   test("an item takes its newest pushed train's origin, else its inbox handle, else drone", () => {
     const human = train("t1", { kind: "human", id: "a@kaikeru.com" }, NOW - 10);
     const agent = train("t2", { kind: "agent", id: "bot@a@kaikeru.com" }, NOW);

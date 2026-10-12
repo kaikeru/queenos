@@ -108,7 +108,7 @@ export function swarmTiles(state: Slice): SwarmTile[] {
       candidate: t.candidate ?? null,
       outcome: t.raceOutcome ?? null,
       previewUrl: t.previewUrl ?? null,
-      origin: isPushed(t) ? originBadge(t.origin) : null,
+      origin: isPushed(t) ? originBadge(t.origin, t.attemptId) : null,
     });
   }
   return out;

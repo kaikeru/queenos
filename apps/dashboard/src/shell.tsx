@@ -95,6 +95,7 @@ export function OriginChip({ badge }: { badge: OriginBadge | null }) {
     <span className={`chip chip--sm origin origin--${badge.kind}`} title={badge.title}>
       {badge.text}
       {badge.claim && <span className="origin__claim sh-muted"> claims {badge.claim}</span>}
+      {badge.attempt && <span className="origin__attempt sh-muted"> · {badge.attempt}</span>}
     </span>
   );
 }

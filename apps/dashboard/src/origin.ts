@@ -9,6 +9,8 @@ export interface OriginBadge {
   title: string;
   /** Agent origins: the model the token's minter claimed (self-reported, unverified); else null. */
   claim: string | null;
+  /** MCP attempts: the attempt id (one disposable fork per attempt); else null. */
+  attempt: string | null;
 }
 
 /** A train's origin; absent / null means drone code (the Queen's contract). */
@@ -16,7 +18,7 @@ export function originOf(t: Pick<MergeTrain, "origin"> | null | undefined): Subm
   return t?.origin ?? { kind: "drone", id: "" };
 }
 
-export function originBadge(o: SubmissionOrigin | null | undefined): OriginBadge {
+function baseBadge(o: SubmissionOrigin | null | undefined): Omit<OriginBadge, "attempt"> {
   if (!o || o.kind === "drone") return { kind: "drone", text: "drone", title: o?.id ? `drone code (${o.id})` : "drone code", claim: null };
   if (o.kind === "human") return { kind: "human", text: `human:${o.id}`, title: `pushed by ${o.id}`, claim: null };
   // agent ids are "<name>@<owner email>": show the name, keep the owner in the tooltip.
@@ -28,6 +30,12 @@ export function originBadge(o: SubmissionOrigin | null | undefined): OriginBadge
   return { kind: "agent", text: `agent:${name}`, title: claim ? `${who}; claims ${claim} (self-reported)` : who, claim };
 }
 
+export function originBadge(o: SubmissionOrigin | null | undefined, attemptId?: string | null): OriginBadge {
+  const b = baseBadge(o);
+  if (!attemptId) return { ...b, attempt: null };
+  return { ...b, attempt: attemptId, title: `${b.title}; attempt ${attemptId}` };
+}
+
 /** Non-drone code only (dense views badge the exception, not the rule). */
 export const isPushed = (t: Pick<MergeTrain, "origin"> | null | undefined): boolean => originOf(t).kind !== "drone";
 
@@ -35,11 +43,11 @@ export const isPushed = (t: Pick<MergeTrain, "origin"> | null | undefined): bool
  * An item's origin: the newest train carrying pushed (human / agent) code, else an inbox item's pusher handle,
  * else drone. Items carry no origin of their own; their trains do.
  */
-export function itemOrigin(item: Pick<WorkItem, "inbox"> | null, trains: readonly Pick<MergeTrain, "origin" | "createdAt">[]): OriginBadge {
-  let newest: Pick<MergeTrain, "origin" | "createdAt"> | null = null;
+export function itemOrigin(item: Pick<WorkItem, "inbox"> | null, trains: readonly Pick<MergeTrain, "origin" | "createdAt" | "attemptId">[]): OriginBadge {
+  let newest: Pick<MergeTrain, "origin" | "createdAt" | "attemptId"> | null = null;
   for (const t of trains) if (isPushed(t) && (!newest || t.createdAt >= newest.createdAt)) newest = t;
-  if (newest) return originBadge(newest.origin);
-  if (item?.inbox) return { kind: "human", text: `push:${item.inbox.handle}`, title: `pushed to ${item.inbox.ref.replace(/^refs\/heads\//, "")}`, claim: null };
+  if (newest) return originBadge(newest.origin, newest.attemptId);
+  if (item?.inbox) return { kind: "human", text: `push:${item.inbox.handle}`, title: `pushed to ${item.inbox.ref.replace(/^refs\/heads\//, "")}`, claim: null, attempt: null };
   return originBadge(null);
 }
 

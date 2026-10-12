@@ -198,7 +198,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
   return (
     <li className={`item__attempt${a.winner ? " item__attempt--winner" : ""}`}>
       <p>
-        <b>#{a.n} {a.kind}{a.kind === "RACE" ? ` c${(t.candidate ?? 0) + 1}` : ""}</b> <OriginChip badge={originBadge(t.origin)} />{" "}
+        <b>#{a.n} {a.kind}{a.kind === "RACE" ? ` c${(t.candidate ?? 0) + 1}` : ""}</b> <OriginChip badge={originBadge(t.origin, t.attemptId)} />{" "}
         {(t.origin?.kind ?? "drone") === "drone" && <span className="sh-muted">{t.model ?? "model pending"} </span>}
         <span className={`chip chip--${t.status.toLowerCase()}`}>{t.phase ?? t.status}</span>
         {a.winner && <span className="item__star" title={a.race?.reason ?? "winner"}> ★ winner</span>}

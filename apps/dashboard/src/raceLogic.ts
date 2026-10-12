@@ -83,7 +83,7 @@ export function pickCard(c: RaceCandidate, race: Race): PickCard {
     trainId: t.trainId,
     tag: `c${c.candidate + 1}`,
     model: c.model,
-    origin: originBadge(t.origin),
+    origin: originBadge(t.origin, t.attemptId),
     previewUrl: httpUrl(t.previewUrl),
     changedFiles: c.score?.changedFiles ?? null,
     changedBytes: c.score?.changedBytes ?? null,
