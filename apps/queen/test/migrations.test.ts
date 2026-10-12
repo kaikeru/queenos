@@ -44,6 +44,9 @@ import {
   updateSubmission,
   upsertInbox,
   upsertModelPreference,
+  upsertAttempt,
+  getAttemptRow,
+  attemptsOfItem,
 } from "../src/db";
 import type { QueenNode } from "../src/queen-node";
 import type { WorkItemRecord } from "../src/records";
@@ -69,30 +72,40 @@ const columns = (sql: SqlStorage, table: string) =>
   new Set(sql.exec(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((r) => String(r.name)));
 const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v FROM _migrations").one().v);
 
+/** Undo v17 (a test that rebuilds an older version first). */
+function dropV17(sql: SqlStorage): void {
+  sql.exec(`DROP TABLE attempts; DROP INDEX submissions_attempt;
+    ALTER TABLE submissions DROP COLUMN attempt_id; ALTER TABLE merge_trains DROP COLUMN attempt_id;
+    ALTER TABLE work_items DROP COLUMN base_repo; ALTER TABLE work_items DROP COLUMN base_sha;
+    ALTER TABLE work_items DROP COLUMN base_pending_at; ALTER TABLE work_items DROP COLUMN entry_window_ms;
+    DELETE FROM _migrations WHERE version = 17;`);
+}
+
 describe("migrations", () => {
-  it("a fresh DO migrates to v16", async () => {
-    expect(SCHEMA_VERSION).toBe(16);
+  it("a fresh DO migrates to v17", async () => {
+    expect(SCHEMA_VERSION).toBe(17);
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
-      expect(version(q.sql)).toBe(16);
+      expect(version(q.sql)).toBe(17);
       const t = tables(q.sql);
-      for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims", "inboxes", "submissions", "model_preference"]) {
+      for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims", "inboxes", "submissions", "model_preference", "attempts"]) {
         expect(t.has(name), name).toBe(true);
       }
-      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at", "origin_json", "gate_command_id", "gate_issued_at"]) {
+      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at", "origin_json", "gate_command_id", "gate_issued_at", "attempt_id"]) {
         expect(columns(q.sql, "merge_trains").has(c), c).toBe(true);
       }
       for (const c of ["entry_closes_at", "pick_deadline_at", "recommended_train_id", "recommend_reason", "decided_by", "rejections"]) expect(columns(q.sql, "races").has(c), c).toBe(true);
       expect(columns(q.sql, "submissions").has("agent")).toBe(true);
+      expect(columns(q.sql, "submissions").has("attempt_id")).toBe(true);
       for (const c of ["picks", "picks_against_recommendation"]) expect(columns(q.sql, "model_stats").has(c), c).toBe(true);
-      for (const c of ["paths", "wait_reason", "conflicts", "inbox_json", "judge"]) expect(columns(q.sql, "work_items").has(c), c).toBe(true);
+      for (const c of ["paths", "wait_reason", "conflicts", "inbox_json", "judge", "base_repo", "base_sha", "base_pending_at", "entry_window_ms"]) expect(columns(q.sql, "work_items").has(c), c).toBe(true);
       for (const c of ["leased_slots", "lease_expires_at", "car_infra_failures", "budget_boost"]) expect(columns(q.sql, "hive_settings").has(c), c).toBe(true);
       expect(columns(q.sql, "releases").has("trace_id")).toBe(true);
       expect(columns(q.sql, "prompt_runs").has("race_width")).toBe(true);
       // A new hive has no settings row yet (it gets one, autonomous, at its first v2 filing).
       expect(loadHiveSettings(q.sql)).toBeNull();
       // Idempotent: re-running is a no-op.
-      expect(migrate(state.storage)).toBe(16);
-      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(16);
+      expect(migrate(state.storage)).toBe(17);
+      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(17);
     });
   });
 
@@ -428,6 +441,7 @@ describe("v14: inbox, submissions, races, preference", () => {
       expect(before.items.length).toBeGreaterThan(0);
       expect(before.items.map((i) => i.itemId)).toContain(res.promptId);
       // Undo v14 (DO SQLite supports DROP COLUMN), leaving a v13 database with the same rows.
+      dropV17(sql);
       sql.exec(`DROP TABLE inboxes; DROP TABLE submissions; DROP TABLE model_preference; DROP INDEX races_item;
         ALTER TABLE work_items DROP COLUMN inbox_json; ALTER TABLE work_items DROP COLUMN judge;
         ALTER TABLE merge_trains DROP COLUMN origin_json;
@@ -532,15 +546,43 @@ describe("v16: agent identity on submissions", () => {
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
       const sql = q.sql;
       const A = "a".repeat(40), B = "b".repeat(40);
+      dropV17(sql);
       const base = { repo: "demo-in-kyle", ref: "refs/heads/x", originKind: "human" as const, originId: "kyle@example.com", itemId: null, trainId: null, outcome: "applied" as const, disposition: "filed" as const, target: null, createdAt: 1 };
       // Back to v15: no agent column, a row written by an older Queen.
       sql.exec("ALTER TABLE submissions DROP COLUMN agent; DELETE FROM _migrations WHERE version = 16;");
       expect(columns(sql, "submissions").has("agent")).toBe(false);
       sql.exec("INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, outcome, disposition, created_at) VALUES ('demo-in-kyle', ?, 'refs/heads/x', 'human', 'kyle@example.com', 'applied', 'filed', 1)", A);
-      expect(migrate(state.storage)).toBe(16);
+      expect(migrate(state.storage)).toBe(17);
       expect(getSubmission(sql, base.repo, A)).toEqual({ ...base, headSha: A, agent: null });
       expect(insertSubmission(sql, { ...base, headSha: B, originKind: "agent", agent: "opus" })).toBe(true);
       expect(getSubmission(sql, base.repo, B)).toMatchObject({ originKind: "agent", originId: "kyle@example.com", agent: "opus" });
+    });
+  });
+});
+
+describe("v17: MCP attempts", () => {
+  it("a v16 hive migrates to v17: the attempts table, nullable attempt / base / window columns; older rows unchanged", async () => {
+    await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
+      const sql = q.sql;
+      resetToEmpty(sql);
+      expect(migrate(state.storage, 16)).toBe(16);
+      const A = "a".repeat(40);
+      sql.exec("INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, outcome, disposition, created_at) VALUES ('demo-in-kyle', ?, 'refs/heads/x', 'human', 'kyle@example.com', 'applied', 'filed', 1)", A);
+      expect(migrate(state.storage)).toBe(17);
+      expect(tables(sql).has("attempts")).toBe(true);
+      for (const c of ["base_repo", "base_sha", "base_pending_at", "entry_window_ms"]) expect(columns(sql, "work_items").has(c), c).toBe(true);
+      expect(columns(sql, "merge_trains").has("attempt_id")).toBe(true);
+      expect(getSubmission(sql, "demo-in-kyle", A)).not.toHaveProperty("attemptId");
+      const att = {
+        attemptId: "att_0123456789ab", hive: "demo", itemId: "i1", raceId: null, trainId: "t1", repo: "demo-att-0123456789ab", baseSha: null,
+        agentId: `ag_${"a".repeat(32)}`, agentName: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "kyle@example.com",
+        state: "INTENT" as const, headSha: null, createdAt: 1, expiresAt: 2,
+      };
+      upsertAttempt(sql, att);
+      expect(getAttemptRow(sql, att.attemptId)).toEqual(att);
+      upsertAttempt(sql, { ...att, state: "READY", baseSha: "b".repeat(40), repo: `${att.repo}-r2` });
+      expect(getAttemptRow(sql, att.attemptId)).toMatchObject({ state: "READY", repo: `${att.repo}-r2`, baseSha: "b".repeat(40) });
+      expect(attemptsOfItem(sql, "i1").map((a) => a.attemptId)).toEqual([att.attemptId]);
     });
   });
 });

@@ -26,6 +26,8 @@ import {
   SentinelVerdictSchema,
   WorkItemSchema,
   InboxSchema,
+  AttemptSchema,
+  type Attempt,
   ModelPreferenceSchema,
   RaceJudgeSchema,
   RaceRejectionSchema,
@@ -493,6 +495,40 @@ const MIGRATIONS: readonly Migration[] = [
   -- token (and every older row). origin_id stays the owner's email so per-owner caps span all their agents.
   ALTER TABLE submissions ADD COLUMN agent TEXT;
   `,
+  `
+  -- v17: MCP attempts (docs/superpowers/specs/2026-10-12-queenos-mcp-design.md §8.2). One row per attempt (one agent on one
+  -- item, its own disposable Artifacts fork); every train of an attempt carries its id; an item's frozen race base repo.
+  CREATE TABLE attempts (
+    attempt_id TEXT PRIMARY KEY,            -- att_<12hex>
+    hive TEXT NOT NULL,
+    item_id TEXT NOT NULL,                  -- moves to the follow-up item on a late push
+    race_id TEXT,                           -- set when the first push enters a race
+    train_id TEXT NOT NULL,                 -- current train (the first one reserved at intent)
+    repo TEXT NOT NULL,                     -- <hive>-att-<12hex>[-rN]
+    base_sha TEXT,                          -- always the item's base_sha
+    agent_id TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    model TEXT NOT NULL,                    -- claimed, display only
+    role TEXT NOT NULL,
+    owner TEXT NOT NULL,                    -- token owner email (caps key)
+    state TEXT NOT NULL,
+    head_sha TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL             -- token expiry; refresh_attempt extends it
+  );
+  CREATE INDEX attempts_agent ON attempts(agent_id, state);
+  CREATE INDEX attempts_owner ON attempts(owner, state);
+  CREATE INDEX attempts_item ON attempts(item_id);
+  ALTER TABLE submissions ADD COLUMN attempt_id TEXT;
+  CREATE INDEX submissions_attempt ON submissions(attempt_id, created_at);
+  ALTER TABLE merge_trains ADD COLUMN attempt_id TEXT;
+  -- The item's race base: both NULL = none; base_repo set with base_sha NULL = being created (base_pending_at = since).
+  ALTER TABLE work_items ADD COLUMN base_repo TEXT;
+  ALTER TABLE work_items ADD COLUMN base_sha TEXT;
+  ALTER TABLE work_items ADD COLUMN base_pending_at INTEGER;
+  -- MCP create_goal: the entry window of this item's race (NULL = the hive's settings.race.entryWindowMs).
+  ALTER TABLE work_items ADD COLUMN entry_window_ms INTEGER;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -625,6 +661,8 @@ export function rowToTrain(r: Row): TrainRecord {
     // v15: the Queen-started gate (absent = none).
     ...withValue("gateCommandId", str(r.gate_command_id ?? null)),
     ...withValue("gateIssuedAt", num(r.gate_issued_at)),
+    // v17: the MCP attempt whose fork this train is (absent = none).
+    ...withValue("attemptId", str(r.attempt_id ?? null)),
   };
 }
 
@@ -813,9 +851,9 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        model, model_reason, model_choice, model_choice_attempt, model_outcome, model_probe, memories,
        trace_id, race_id, candidate, race_outcome, gate_score, credits,
        lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of, verified, passed_at, origin_json,
-       gate_command_id, gate_issued_at)
+       gate_command_id, gate_issued_at, attempt_id)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
        status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
@@ -835,7 +873,7 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        conflict = excluded.conflict, changed_paths = excluded.changed_paths,
        wait_for_car_seq = excluded.wait_for_car_seq, bisect_of = excluded.bisect_of, verified = excluded.verified,
        passed_at = excluded.passed_at, origin_json = excluded.origin_json,
-       gate_command_id = excluded.gate_command_id, gate_issued_at = excluded.gate_issued_at`,
+       gate_command_id = excluded.gate_command_id, gate_issued_at = excluded.gate_issued_at, attempt_id = excluded.attempt_id`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -891,6 +929,7 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     json(t.origin),
     t.gateCommandId ?? null,
     t.gateIssuedAt ?? null,
+    t.attemptId ?? null,
   );
 }
 
@@ -1188,6 +1227,7 @@ export function rowToWorkItem(r: Row): WorkItemRecord {
     // v14 (absent when NULL, so pre-v14 items compare equal).
     ...withValue("inbox", parseJson(r.inbox_json ?? null, schemaCheck<WorkItemInbox>(WorkItemInboxSchema))),
     ...withValue("judge", RaceJudgeSchema.safeParse(r.judge ?? null).data),
+    ...withValue("entryWindowMs", num(r.entry_window_ms ?? null)),
   });
   return {
     ...base,
@@ -1205,6 +1245,7 @@ const WORK_ITEM_COLUMNS = [
   "depends_on", "source_kind", "source_actor", "source_ref", "trace_id", "span_id", "difficulty", "best_of", "attempts",
   "duplicate_of", "blocked_reason", "release_id", "escalation_id", "command_id", "command_issued_at", "normalized_title",
   "created_at", "updated_at", "landed_at", "shipped_at", "paths", "wait_reason", "conflicts", "inbox_json", "judge",
+  "entry_window_ms",
 ] as const;
 /** Identity columns an upsert never rewrites. */
 const WORK_ITEM_FIXED = new Set<string>(["item_id", "seq", "hive", "root_id", "trace_id", "span_id", "source_kind", "source_actor", "source_ref", "created_at"]);
@@ -1254,6 +1295,7 @@ export function upsertWorkItem(sql: SqlStorage, w: WorkItemRecord): void {
     w.conflicts,
     json(w.inbox),
     w.judge ?? null,
+    w.entryWindowMs ?? null,
   );
 }
 
@@ -1578,6 +1620,8 @@ export interface SubmissionRecord {
   target: SubmissionTarget | null;
   /** The agent the push's git token is bound to (its name); null = a human token. originId stays the owner. */
   agent: string | null;
+  /** v17: the MCP attempt this push belongs to (absent: a git push). */
+  attemptId?: string | null;
   createdAt: number;
 }
 
@@ -1595,6 +1639,7 @@ export function rowToSubmission(r: Row): SubmissionRecord {
     disposition: SubmitDispositionSchema.safeParse(r.disposition ?? null).data ?? null,
     target: parseJson(r.target ?? null, schemaCheck<SubmissionTarget>(SubmissionTargetSchema)),
     agent: str(r.agent),
+    ...(r.attempt_id !== undefined && r.attempt_id !== null ? { attemptId: String(r.attempt_id) } : {}),
     createdAt: Number(r.created_at),
   };
 }
@@ -1603,8 +1648,8 @@ export function rowToSubmission(r: Row): SubmissionRecord {
 export function insertSubmission(sql: SqlStorage, s: SubmissionRecord): boolean {
   const row = sql
     .exec(
-      `INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, disposition, target, agent, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, item_id, train_id, outcome, disposition, target, agent, attempt_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(repo, head_sha) DO NOTHING RETURNING head_sha`,
       s.repo,
       s.headSha,
@@ -1617,6 +1662,7 @@ export function insertSubmission(sql: SqlStorage, s: SubmissionRecord): boolean 
       s.disposition,
       json(s.target),
       s.agent,
+      s.attemptId ?? null,
       s.createdAt,
     )
     .toArray()[0];
@@ -1669,4 +1715,78 @@ export function countSubmissionsSince(sql: SqlStorage, originId: string, since: 
 /** Drop submissions older than `before` (pruned with the event log). Returns rows deleted. */
 export function pruneSubmissions(sql: SqlStorage, before: number): number {
   return sql.exec("DELETE FROM submissions WHERE created_at < ?", before).rowsWritten;
+}
+
+// ── v17: MCP attempts and the item's race base ─────────────────────────
+
+export function rowToAttempt(r: Row): Attempt {
+  return AttemptSchema.parse({
+    attemptId: r.attempt_id,
+    hive: r.hive,
+    itemId: r.item_id,
+    raceId: str(r.race_id ?? null),
+    trainId: r.train_id,
+    repo: r.repo,
+    baseSha: str(r.base_sha ?? null),
+    agentId: r.agent_id,
+    agentName: r.agent_name,
+    model: r.model,
+    role: r.role,
+    owner: r.owner,
+    state: r.state,
+    headSha: str(r.head_sha ?? null),
+    createdAt: Number(r.created_at),
+    expiresAt: Number(r.expires_at),
+  });
+}
+
+export function upsertAttempt(sql: SqlStorage, a: Attempt): void {
+  sql.exec(
+    `INSERT INTO attempts (attempt_id, hive, item_id, race_id, train_id, repo, base_sha, agent_id, agent_name, model, role, owner, state, head_sha, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(attempt_id) DO UPDATE SET item_id = excluded.item_id, race_id = excluded.race_id, train_id = excluded.train_id,
+       repo = excluded.repo, base_sha = excluded.base_sha, state = excluded.state, head_sha = excluded.head_sha, expires_at = excluded.expires_at`,
+    a.attemptId,
+    a.hive,
+    a.itemId,
+    a.raceId,
+    a.trainId,
+    a.repo,
+    a.baseSha,
+    a.agentId,
+    a.agentName,
+    a.model,
+    a.role,
+    a.owner,
+    a.state,
+    a.headSha,
+    a.createdAt,
+    a.expiresAt,
+  );
+}
+
+export function getAttemptRow(sql: SqlStorage, attemptId: string): Attempt | null {
+  const r = sql.exec("SELECT * FROM attempts WHERE attempt_id = ?", attemptId).toArray()[0];
+  return r ? rowToAttempt(r) : null;
+}
+
+export function attemptsOfItem(sql: SqlStorage, itemId: string): Attempt[] {
+  return sql.exec("SELECT * FROM attempts WHERE item_id = ? ORDER BY created_at, attempt_id", itemId).toArray().map(rowToAttempt);
+}
+
+/** An item's race base (work_items v17 columns). `baseRepo` set with `baseSha` null = being created since `pendingAt`. */
+export interface ItemBase {
+  itemId: string;
+  baseRepo: string | null;
+  baseSha: string | null;
+  pendingAt: number | null;
+}
+
+export function getItemBase(sql: SqlStorage, itemId: string): ItemBase | null {
+  const r = sql.exec("SELECT item_id, base_repo, base_sha, base_pending_at FROM work_items WHERE item_id = ?", itemId).toArray()[0];
+  return r ? { itemId: String(r.item_id), baseRepo: str(r.base_repo ?? null), baseSha: str(r.base_sha ?? null), pendingAt: num(r.base_pending_at) } : null;
+}
+
+export function setItemBase(sql: SqlStorage, b: ItemBase): void {
+  sql.exec("UPDATE work_items SET base_repo = ?, base_sha = ?, base_pending_at = ? WHERE item_id = ?", b.baseRepo, b.baseSha, b.pendingAt, b.itemId);
 }

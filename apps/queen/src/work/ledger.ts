@@ -272,6 +272,8 @@ export interface FileGoalInput {
   bestOf?: number;
   /** `human`: the goal's children race for a human pick (§10.2). */
   judge?: RaceJudge;
+  /** MCP create_goal: the race entry window of this item (and, for a goal, its children). */
+  entryWindowMs?: number;
   /** `user:<email>` (or `user` for the open v1 route). */
   actor: string;
   itemId?: string;
@@ -289,6 +291,8 @@ export interface FilePromptInput {
   bestOf?: number;
   /** `human` ("you pick", §10.2): the item's races wait for a human pick. */
   judge?: RaceJudge;
+  /** MCP create_goal: the race entry window of this item (and, for a goal, its children). */
+  entryWindowMs?: number;
   actor: string;
   itemId?: string;
 }
@@ -384,6 +388,7 @@ export function toWorkItem(r: WorkItemRecord): WorkItem {
     ...(r.inbox ? { inbox: { ...r.inbox } } : {}),
     // §10.2: "you pick" (absent = the hive's race judge).
     ...(r.judge ? { judge: r.judge } : {}),
+    ...(r.entryWindowMs !== undefined ? { entryWindowMs: r.entryWindowMs } : {}),
   };
 }
 
@@ -428,6 +433,8 @@ interface NewItemSpec {
   duplicateOf?: string | null;
   /** Race judge (§10.2); absent = the hive's `settings.race.judge`. */
   judge?: RaceJudge;
+  /** MCP create_goal: the race entry window of this item (and, for a goal, its children). */
+  entryWindowMs?: number;
 }
 
 // ── the planner ──────────────────────────────────────────────────────────
@@ -530,6 +537,7 @@ export class WorkPlanner {
       bestOf: input.bestOf ?? null,
       paths: [],
       ...(input.judge !== undefined ? { judge: input.judge } : {}),
+      ...(input.entryWindowMs !== undefined ? { entryWindowMs: input.entryWindowMs } : {}),
     });
     this.event("item.filed", goal, `goal filed: ${goal.title}`, { kind: "goal", source: "user", status: goal.status }, input.actor);
     if (this.external) {
@@ -713,6 +721,7 @@ export class WorkPlanner {
           difficulty: c.difficulty,
           bestOf: goal.bestOf,
           ...(goal.judge !== undefined ? { judge: goal.judge } : {}),
+          ...(goal.entryWindowMs !== undefined ? { entryWindowMs: goal.entryWindowMs } : {}),
           paths: normalizePaths(c.paths),
           duplicateOf: dup,
         }),
@@ -1323,6 +1332,7 @@ export class WorkPlanner {
       landedAt: null,
       shippedAt: null,
       ...(spec.judge !== undefined ? { judge: spec.judge } : {}),
+      ...(spec.entryWindowMs !== undefined ? { entryWindowMs: spec.entryWindowMs } : {}),
     };
     this.items.set(item.itemId, item);
     this.markItem(item);

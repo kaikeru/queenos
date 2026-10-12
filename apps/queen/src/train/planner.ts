@@ -316,6 +316,8 @@ export interface PlannerItem {
   handoff?: boolean;
   /** Race judge (§10.2): `human` holds a race with ≥ 2 passes for a pick. Absent: the hive's (`PlannerContext.pick.judge`). */
   judge?: RaceJudge;
+  /** MCP create_goal: this item's race entry window (ms); absent = the hive's. */
+  entryWindowMs?: number;
 }
 
 export interface HiveState {
@@ -746,6 +748,7 @@ export function toMergeTrainV2(t: TrainRecord): MergeTrain {
   if (t.waitForCarSeq !== null && t.waitForCarSeq !== undefined) v2.waitForCarSeq = t.waitForCarSeq;
   if (t.lane === "QUEUE") v2.carSeq = t.seq;
   if (t.origin) v2.origin = { ...t.origin };
+  if (t.attemptId) v2.attemptId = t.attemptId;
   return { ...toMergeTrain(t), ...v2 };
 }
 
@@ -914,7 +917,7 @@ export class TrainPlanner {
    * forks hive main under `artifactRepo` itself; nothing is dispatched. `promptId` is the targeted item, or
    * the id intake will file the new item under. `forkIssuedAt` is the intent watchdog's clock.
    */
-  intent(input: { trainId: string; promptId: string; origin: SubmissionOrigin; traceId?: string | null; promptText?: string }): PlanResult {
+  intent(input: { trainId: string; promptId: string; origin: SubmissionOrigin; traceId?: string | null; promptText?: string; attemptId?: string }): PlanResult {
     if (this.find(input.trainId)) return this.finish("ignored:duplicate");
     // Every train row needs its prompt row (FK); `promptText` is passed when the item has none yet.
     if (input.promptText !== undefined) this.ensurePrompt(input.promptId, input.promptText, this.prompts.get(input.promptId)?.attempts ?? 0);
@@ -928,6 +931,7 @@ export class TrainPlanner {
       forkIssuedAt: this.ctx.now,
       traceId: input.traceId ?? this.item(input.promptId)?.traceId ?? traceIdFromUuid(input.promptId),
       origin: { ...input.origin },
+      ...(input.attemptId ? { attemptId: input.attemptId } : {}),
     };
     this.trains.push(train);
     this.markTrain(train);
@@ -989,7 +993,7 @@ export class TrainPlanner {
       });
     } else if (input.race && !closedJoin) {
       const raceId = this.ctx.newId();
-      const window = this.ctx.entryWindowMs ?? 0;
+      const window = input.item.entryWindowMs ?? this.ctx.entryWindowMs ?? 0;
       const created: RaceRecord = {
         raceId,
         itemId: input.promptId,

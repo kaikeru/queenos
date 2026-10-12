@@ -43,6 +43,14 @@ import { DurableObject } from "cloudflare:workers";
 import {
   AppendAuditSchema,
   AppendAuditsSchema,
+  AttemptAbortedSchema,
+  AttemptBaseFailedSchema,
+  AttemptBaseReadySchema,
+  AttemptIntentSchema,
+  AttemptReadySchema,
+  MAX_OPEN_ATTEMPTS_PER_AGENT,
+  attemptRepoName,
+  baseRepoName,
   BuildResultSchema,
   DeployResultSchema,
   ENTRY_WINDOW_DEFAULT_MS,
@@ -72,6 +80,19 @@ import {
   targetFromRef,
   traceIdFromUuid,
   type AppendAuditInput,
+  type Attempt,
+  type AttemptAborted,
+  type AttemptBase,
+  type AttemptBaseFailed,
+  type AttemptBaseReady,
+  type AttemptIntent,
+  type AttemptIntentDecision,
+  type AttemptReady,
+  type AttemptRefusalCode,
+  type AttemptResult,
+  type AttemptView,
+  type GoalChild,
+  type ItemAttempts,
   type AuditEvent,
   type BuildResult,
   type DeployResult,
@@ -121,7 +142,13 @@ import {
   applyModelStatDelta,
   applyPickDelta,
   appendAuditRow,
+  attemptsOfItem,
   deleteClaims,
+  getAttemptRow,
+  getItemBase,
+  setItemBase,
+  upsertAttempt,
+  type ItemBase,
   listModelStats,
   listRecentAudit,
   listRouterStats,
@@ -226,6 +253,7 @@ import {
 } from "./work/inbox";
 import { MAX_NOTES, projectNotes, type NotesInput, type NotesTrain } from "./work/notes";
 import { composePrompt } from "./work/compose";
+import { ATTEMPT_TTL_MS, OPEN_ATTEMPTS_SQL, acceptsEntries, attemptVerdict, checkAttemptCaps, randomHex } from "./work/attempts";
 import { queryMetrics, recordMetrics } from "./obs/rollup";
 import { AnalyticsSink } from "./obs/metrics-sink";
 import { logEvents } from "./obs/log";
@@ -406,6 +434,10 @@ class Acc {
   /** T1: submission rows to insert / update in the decision's transaction. */
   submissions: SubmissionRecord[] = [];
   submissionUpdates: { key: { repo: string; headSha: string }; patch: Partial<Pick<SubmissionRecord, "itemId" | "trainId" | "outcome" | "disposition">> }[] = [];
+  /** v17: MCP attempt rows to upsert in the decision's transaction (keyed by attemptId; the last write wins). */
+  attempts = new Map<string, Attempt>();
+  /** v17: race-base column changes (work_items.base_repo / base_sha / base_pending_at), keyed by itemId. */
+  itemBases = new Map<string, ItemBase>();
   rollbackStreak?: number;
   followUps: AbsorbFollowUps[] = [];
   credits = 0;
@@ -594,6 +626,7 @@ export class QueenNode extends DurableObject<Env> {
           ...(prompt.priority !== undefined ? { priority: prompt.priority } : {}),
           ...((prompt.bestOf ?? hints.bestOf) !== undefined ? { bestOf: prompt.bestOf ?? hints.bestOf } : {}),
           ...((prompt.judge ?? hints.judge) !== undefined ? { judge: prompt.judge ?? hints.judge } : {}),
+          ...(prompt.entryWindowMs !== undefined ? { entryWindowMs: prompt.entryWindowMs } : {}),
           actor,
         }),
       ),
@@ -950,6 +983,261 @@ export class QueenNode extends DurableObject<Env> {
     const { value: res, acc } = this.decide(hive, (d) => d.acc.train(d.tp.abort(a.trainId, a.reason)), { trains: [a.trainId] });
     await this.commit(hive, acc);
     return { outcome: res.outcome };
+  }
+
+  // ── RPC surface: MCP attempts (docs/superpowers/specs/2026-10-12-queenos-mcp-design.md §7, §8.3) ───────
+
+  /**
+   * `start_attempt`: caps, entry acceptance and the item's race base, then an INTENT row. The base lock: with no
+   * base and none pending, this caller alone gets `{base: create}` (the item is marked base-pending in the same
+   * synchronous decide + commit); any other intent gets BASE_PENDING until `attemptBaseReady` / `attemptBaseFailed`.
+   * No train row is created here: the first `attemptPushed` creates the reserved train and pushes it in one decide.
+   */
+  async attemptIntent(input: AttemptIntent): Promise<AttemptIntentDecision> {
+    const i = parseOrThrow(AttemptIntentSchema, input, "attempt intent");
+    const hive = this.hiveFor(i.hive);
+    const owner = i.owner.toLowerCase();
+    const refuse = (code: AttemptRefusalCode, message: string, items?: GoalChild[]): AttemptIntentDecision => ({ verdict: "refuse", code, message: clip(message, 200), ...(items ? { items } : {}) });
+    if (i.agent.owner.toLowerCase() !== owner) return refuse("FORBIDDEN_OWNER", "the agent belongs to another owner");
+    const attemptId = `att_${randomHex(6)}`;
+    const trainId = crypto.randomUUID();
+    const baseId = randomHex(6);
+    const actor = `agent:${clip(`${i.agent.name}@${owner}`, 320)}`;
+    const { value, acc } = this.decide(hive, (d): AttemptIntentDecision => {
+      if (d.hs.executors !== "external") return refuse("HIVE_NOT_EXTERNAL", `hive ${hive} runs its own swarm; attempts need an external hive`);
+      let itemId: string;
+      if ("goalId" in i.target) {
+        const goal = this.loadItem(i.target.goalId);
+        if (!goal || goal.kind !== "goal") return refuse("NOT_FOUND", `goal ${i.target.goalId} not found`);
+        const open = this.sql
+          .exec(`SELECT * FROM work_items WHERE parent_id = ? AND kind != 'goal' AND status NOT IN (${TERMINAL_ITEMS_SQL}) ORDER BY seq`, goal.itemId)
+          .toArray()
+          .map(rowToWorkItem);
+        if (open.length !== 1) {
+          return refuse("GOAL_AMBIGUOUS", `goal ${goal.itemId} has ${open.length} open items; call start_attempt with one itemId`, open.slice(0, 24).map((c) => ({ itemId: c.itemId, title: c.title, status: c.status })));
+        }
+        itemId = open[0]!.itemId;
+      } else {
+        itemId = i.target.itemId;
+      }
+      const item = d.state.items.find((x) => x.itemId === itemId) ?? this.loadItem(itemId);
+      if (!item || item.kind === "goal") return refuse("NOT_FOUND", `item ${itemId} not found`);
+      const race = d.state.races.find((r) => r.itemId === itemId && r.state === "RACING") ?? null;
+      if (!acceptsEntries(item, race, d.now)) {
+        return refuse("ITEM_NOT_ACCEPTING", `item ${itemId} is ${item.status}${item.waitReason ? ` (${item.waitReason})` : ""}; it takes no new attempts`);
+      }
+      const g = d.hs.guardrails;
+      const caps = checkAttemptCaps({
+        itemId,
+        agentOpen: Number(this.sql.exec(`SELECT COUNT(*) AS n FROM attempts WHERE agent_id = ? AND state IN (${OPEN_ATTEMPTS_SQL})`, i.agent.agentId).one().n),
+        ownerOpenItems: this.ownerOpenItems(owner),
+        ownerStartsLastHour: this.ownerStartsSince(owner, d.now - HOUR_MS),
+        maxPerAgent: MAX_OPEN_ATTEMPTS_PER_AGENT,
+        maxOpenPerContributor: g.maxInboxOpenPerContributor,
+        maxPushesPerHour: g.maxInboxPushesPerHour,
+      });
+      if (!caps.ok) return refuse("CAP_EXCEEDED", caps.message);
+      const b = this.baseOf(itemId, d.acc) ?? { itemId, baseRepo: null, baseSha: null, pendingAt: null };
+      let base: AttemptBase;
+      if (b.baseRepo && b.baseSha) {
+        base = { kind: "existing", baseRepo: b.baseRepo, baseSha: b.baseSha };
+      } else if (b.baseRepo) {
+        return refuse("BASE_PENDING", `item ${itemId}'s base repo is being created; retry in 2 s`);
+      } else {
+        base = { kind: "create", baseRepo: baseRepoName(hive, baseId) };
+        d.acc.itemBases.set(itemId, { itemId, baseRepo: base.baseRepo, baseSha: null, pendingAt: d.now });
+      }
+      const repo = attemptRepoName(hive, attemptId);
+      const expiresAt = d.now + ATTEMPT_TTL_MS;
+      d.acc.attempts.set(attemptId, {
+        attemptId,
+        hive,
+        itemId,
+        raceId: race?.raceId ?? null,
+        trainId,
+        repo,
+        baseSha: base.kind === "existing" ? base.baseSha : null,
+        agentId: i.agent.agentId,
+        agentName: i.agent.name,
+        model: i.agent.model,
+        role: i.agent.role,
+        owner,
+        state: "INTENT",
+        headSha: null,
+        createdAt: d.now,
+        expiresAt,
+      });
+      d.acc.events.push(
+        this.attemptEvent(
+          "attempt.intent",
+          itemId,
+          attemptId,
+          `attempt ${attemptId} by ${actor} (claims ${i.agent.model}) on item ${itemId}${base.kind === "create" ? `; creating base ${base.baseRepo}` : ""}`,
+          { attemptId, repo, agentId: i.agent.agentId, role: i.agent.role, model: i.agent.model, base: base.kind },
+          actor,
+        ),
+      );
+      return { verdict: "accept", attemptId, trainId, repo, itemId, raceId: race?.raceId ?? null, expiresAt, base };
+    });
+    await this.commit(hive, acc);
+    return value;
+  }
+
+  /** The base fork exists: pin `base_repo` (actual name, may be `-rN`) and `base_sha`; INTENTs of the item learn the sha. */
+  async attemptBaseReady(input: AttemptBaseReady): Promise<{ outcome: string }> {
+    const r = parseOrThrow(AttemptBaseReadySchema, input, "attempt base ready");
+    const hive = this.hiveFor(r.hive);
+    const b = getItemBase(this.sql, r.itemId);
+    if (!b) throw new QueenError("NOT_FOUND", `item ${r.itemId} not found`);
+    if (b.baseRepo && b.baseSha) {
+      if (b.baseRepo === r.baseRepo && b.baseSha === r.baseSha) return { outcome: "ignored:duplicate" };
+      throw new QueenError("CONFLICT", `item ${r.itemId} already has base ${b.baseRepo}`);
+    }
+    if (!b.baseRepo || !isForkOf(b.baseRepo, r.baseRepo)) throw new QueenError("CONFLICT", `item ${r.itemId} is not creating base ${r.baseRepo}`);
+    const { acc } = this.decide(hive, (d) => {
+      d.acc.itemBases.set(r.itemId, { itemId: r.itemId, baseRepo: r.baseRepo, baseSha: r.baseSha, pendingAt: null });
+      for (const a of attemptsOfItem(this.sql, r.itemId)) if (a.state === "INTENT" && a.baseSha === null) d.acc.attempts.set(a.attemptId, { ...a, baseSha: r.baseSha });
+      d.acc.events.push(this.attemptEvent("attempt.base", r.itemId, null, `base ${r.baseRepo} ready at ${short(r.baseSha)} for item ${r.itemId}`, { outcome: "ready", baseRepo: r.baseRepo, baseSha: r.baseSha }, "mcp"));
+    });
+    await this.commit(hive, acc);
+    return { outcome: "applied" };
+  }
+
+  /** The base fork failed after retries: free the base slot (the next intent may try again) and abort the caller's INTENT. */
+  async attemptBaseFailed(input: AttemptBaseFailed): Promise<{ outcome: string }> {
+    const r = parseOrThrow(AttemptBaseFailedSchema, input, "attempt base failed");
+    const hive = this.hiveFor(r.hive);
+    const b = getItemBase(this.sql, r.itemId);
+    if (!b) throw new QueenError("NOT_FOUND", `item ${r.itemId} not found`);
+    const pending = !!b.baseRepo && !b.baseSha && isForkOf(b.baseRepo, r.baseRepo);
+    const caller = r.attemptId ? getAttemptRow(this.sql, r.attemptId) : null;
+    if (!pending && caller?.state !== "INTENT") return { outcome: "ignored:stale" };
+    const { acc } = this.decide(hive, (d) => {
+      if (pending) d.acc.itemBases.set(r.itemId, { itemId: r.itemId, baseRepo: null, baseSha: null, pendingAt: null });
+      if (caller?.state === "INTENT") d.acc.attempts.set(caller.attemptId, { ...caller, state: "ABORTED" });
+      d.acc.events.push(this.attemptEvent("attempt.base", r.itemId, r.attemptId ?? null, `base ${r.baseRepo} failed: ${r.reason}`, { outcome: "failed", baseRepo: r.baseRepo, reason: r.reason }, "mcp", "warn"));
+    });
+    await this.commit(hive, acc);
+    return { outcome: "applied" };
+  }
+
+  /** The attempt fork exists, is pushable and has a token: INTENT → READY. Its head must be the item's base. */
+  async attemptReady(input: AttemptReady): Promise<AttemptResult> {
+    const r = parseOrThrow(AttemptReadySchema, input, "attempt ready");
+    const hive = this.hiveFor(r.hive);
+    const a = getAttemptRow(this.sql, r.attemptId);
+    if (!a) return { ok: false, code: "NOT_FOUND", message: `attempt ${r.attemptId} not found` };
+    if (a.state === "READY" && a.repo === r.repo) return { ok: true, attempt: this.attemptView(a), changed: false };
+    if (a.state !== "INTENT") return { ok: false, code: "ATTEMPT_EXPIRED", message: `attempt ${a.attemptId} is ${a.state}` };
+    if (!isForkOf(a.repo, r.repo)) throw new QueenError("INVALID_INPUT", `repo ${r.repo} is not attempt ${a.attemptId}'s fork`);
+    const b = getItemBase(this.sql, a.itemId);
+    if (!b?.baseSha || b.baseSha !== r.baseSha) {
+      return { ok: false, code: "BASE_MOVED", message: `fork head ${short(r.baseSha)} is not item ${a.itemId}'s base ${short(b?.baseSha ?? null)}` };
+    }
+    const next: Attempt = { ...a, state: "READY", repo: r.repo, baseSha: r.baseSha, expiresAt: r.expiresAt };
+    const { acc } = this.decide(hive, (d) => {
+      d.acc.attempts.set(a.attemptId, next);
+      d.acc.events.push(this.attemptEvent("attempt.state", a.itemId, a.attemptId, `attempt ${a.attemptId}: INTENT → READY (${r.repo})`, { from: "INTENT", to: "READY", repo: r.repo }, `agent:${a.agentName}@${a.owner}`));
+    });
+    await this.commit(hive, acc);
+    return { ok: true, attempt: this.attemptView(next), changed: true };
+  }
+
+  /** The fork or token failed (`queenos-mcp` already deleted the fork): INTENT → ABORTED. Anything else: ignored:stale. */
+  async attemptAborted(input: AttemptAborted): Promise<{ outcome: string }> {
+    const r = parseOrThrow(AttemptAbortedSchema, input, "attempt aborted");
+    const hive = this.hiveFor(r.hive);
+    const a = getAttemptRow(this.sql, r.attemptId);
+    if (!a) throw new QueenError("NOT_FOUND", `attempt ${r.attemptId} not found`);
+    if (a.state !== "INTENT") return { outcome: "ignored:stale" };
+    const { acc } = this.decide(hive, (d) => {
+      d.acc.attempts.set(a.attemptId, { ...a, state: "ABORTED" });
+      d.acc.events.push(this.attemptEvent("attempt.state", a.itemId, a.attemptId, `attempt ${a.attemptId}: INTENT → ABORTED (${r.reason})`, { from: "INTENT", to: "ABORTED", reason: r.reason }, "mcp", "warn"));
+    });
+    await this.commit(hive, acc);
+    return { outcome: "applied" };
+  }
+
+  /** `get_attempt` / `wait` / `get_verdict`: the row, its current train and race. Null: unknown. */
+  getAttempt(attemptId: string): AttemptView | null {
+    const a = getAttemptRow(this.sql, attemptId);
+    return a ? this.attemptView(a) : null;
+  }
+
+  /** `get_item`: the item's shared base and every attempt on it. */
+  attemptsForItem(itemId: string): ItemAttempts {
+    const b = getItemBase(this.sql, itemId);
+    if (!b) throw new QueenError("NOT_FOUND", `item ${itemId} not found`);
+    return { itemId, baseSha: b.baseSha, basePending: !!b.baseRepo && !b.baseSha, attempts: attemptsOfItem(this.sql, itemId).map((a) => this.attemptView(a)) };
+  }
+
+  // ── MCP attempts: reads and helpers ───────────────────────────────────
+
+  /** An attempt as this decision sees it: its pending row in `acc`, else SQLite. */
+  private attemptOf(attemptId: string, acc?: Acc): Attempt | null {
+    return acc?.attempts.get(attemptId) ?? getAttemptRow(this.sql, attemptId);
+  }
+
+  /** An item's race base as this decision sees it. */
+  private baseOf(itemId: string, acc?: Acc): ItemBase | null {
+    return acc?.itemBases.get(itemId) ?? getItemBase(this.sql, itemId);
+  }
+
+  private attemptView(a: Attempt): AttemptView {
+    const t = this.loadTrain(a.trainId);
+    const raceId = t?.raceId ?? a.raceId;
+    const row = raceId ? this.sql.exec("SELECT * FROM races WHERE race_id = ?", raceId).toArray()[0] : undefined;
+    const race = row ? rowToRace(row) : null;
+    return {
+      ...a,
+      train: t
+        ? { trainId: t.trainId, phase: t.phase, raceOutcome: t.raceOutcome ?? null, headSha: t.headSha, previewUrl: t.previewUrl, summary: t.summary, reason: t.reason, score: t.score ?? null }
+        : null,
+      race: race ? { raceId: race.raceId, state: race.state, entryClosesAt: race.entryClosesAt ?? null, winnerTrainId: race.winnerTrainId } : null,
+      verdict: attemptVerdict(t),
+    };
+  }
+
+  /** Distinct open items the owner has an open attempt or an applied push on (maxInboxOpenPerContributor). */
+  private ownerOpenItems(owner: string): Set<string> {
+    const ids = new Set<string>();
+    for (const r of this.sql.exec(`SELECT DISTINCT item_id FROM attempts WHERE owner = ? AND state IN (${OPEN_ATTEMPTS_SQL})`, owner).toArray()) ids.add(String(r.item_id));
+    for (const r of this.sql
+      .exec(`SELECT DISTINCT s.item_id FROM submissions s JOIN work_items w ON w.item_id = s.item_id WHERE s.origin_id = ? AND s.outcome = 'applied' AND w.status NOT IN ${OPEN_PUSHED_SQL}`, owner)
+      .toArray()) {
+      ids.add(String(r.item_id));
+    }
+    return ids;
+  }
+
+  /** maxInboxPushesPerHour: each attempt start and each applied / pending push counts one. */
+  private ownerStartsSince(owner: string, since: number): number {
+    const pushes = Number(this.sql.exec("SELECT COUNT(*) AS n FROM submissions WHERE origin_id = ? AND created_at >= ? AND outcome IN ('applied', 'pending')", owner, since).one().n);
+    const starts = Number(this.sql.exec("SELECT COUNT(*) AS n FROM attempts WHERE owner = ? AND created_at >= ?", owner, since).one().n);
+    return pushes + starts;
+  }
+
+  private attemptEvent(
+    type: "attempt.intent" | "attempt.state" | "attempt.base",
+    itemId: string | null,
+    attemptId: string | null,
+    summary: string,
+    data: Record<string, unknown>,
+    actor: string,
+    severity: EventDraft["severity"] = "info",
+  ): EventDraft {
+    return {
+      type,
+      severity,
+      actor: clip(actor, 340),
+      traceId: itemId ? (this.loadItem(itemId)?.traceId ?? traceIdFromUuid(itemId)) : null,
+      spanId: attemptId ? spanIdFor(attemptId) : null,
+      parentSpanId: itemId ? spanIdFor(itemId) : null,
+      itemId,
+      trainId: null,
+      summary: clip(summary, 500),
+      data,
+    };
   }
 
   /**
@@ -2183,6 +2471,7 @@ export class QueenNode extends DurableObject<Env> {
         for (const r of acc.releases.values()) upsertRelease(this.sql, r);
         for (const r of acc.races.values()) upsertRace(this.sql, r);
         for (const i of acc.items.values()) upsertWorkItem(this.sql, i);
+        for (const b of acc.itemBases.values()) setItemBase(this.sql, b);
         for (const id of acc.released) deleteClaims(this.sql, id);
         for (const c of claims) upsertClaim(this.sql, c);
         for (const e of acc.escalations.values()) upsertEscalation(this.sql, e);
@@ -2195,6 +2484,7 @@ export class QueenNode extends DurableObject<Env> {
         }
         for (const sub of acc.submissions) insertSubmission(this.sql, sub);
         for (const u of acc.submissionUpdates) updateSubmission(this.sql, u.key, u.patch);
+        for (const a of acc.attempts.values()) upsertAttempt(this.sql, a);
         for (const trainId of acc.abortedIntents) {
           this.sql.exec("UPDATE submissions SET outcome = 'aborted:transient' WHERE train_id = ? AND outcome = 'pending'", trainId);
         }
@@ -2759,6 +3049,7 @@ function plannerItem(i: WorkItemRecord): PlannerItem {
     status: i.status,
     ...(i.inbox?.handoff ? { handoff: true } : {}),
     ...(i.judge ? { judge: i.judge } : {}),
+    ...(i.entryWindowMs !== undefined ? { entryWindowMs: i.entryWindowMs } : {}),
   };
 }
 
