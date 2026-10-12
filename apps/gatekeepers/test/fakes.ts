@@ -4,7 +4,7 @@
  */
 import { NonRetryableError } from "cloudflare:workflows";
 import type { WorkflowStepConfig } from "cloudflare:workers";
-import type { AppendAuditInput, AuditEvent, GateTarget, MemoryRecord, ScribeSummary, TrainResult } from "@queenos/queen-types";
+import type { AppendAuditInput, AttemptPushed, AttemptPushedResult, AuditEvent, GateTarget, MemoryRecord, ScribeSummary, TrainResult } from "@queenos/queen-types";
 import { GitRepo, initRepo, type CompletionRequest, type CompletionResult, type LogFields } from "@queenos/hive-kit";
 import { readConfig, type GateConfig, type GateVars } from "../src/config";
 import type { GateTask } from "../src/event";
@@ -38,6 +38,14 @@ export function config(vars: GateVars = {}): GateConfig {
 export class FakeArtifacts implements ArtifactsPort {
   readonly calls: { repo: string; scope: string }[] = [];
   failWith: Error | null = null;
+  /** repo -> its `main` head (sha + full message) as `readHead` reports it. */
+  readonly heads = new Map<string, { sha: string; message: string }>();
+  readonly headReads: string[] = [];
+  async readHead(repo: string): Promise<{ sha: string; message: string } | null> {
+    this.headReads.push(repo);
+    if (this.failWith) throw this.failWith;
+    return this.heads.get(repo) ?? null;
+  }
   async access(repo: string, scope: "read" | "write"): Promise<RepoAccess> {
     this.calls.push({ repo, scope });
     if (this.failWith) throw this.failWith;
@@ -95,7 +103,8 @@ type QueenCall =
   | { method: "getGateTarget"; repo: string }
   | { method: "appendAudits"; inputs: AppendAuditInput[] }
   | { method: "recordScribeSummary"; input: ScribeSummary }
-  | { method: "reportTrainResult"; input: TrainResult };
+  | { method: "reportTrainResult"; input: TrainResult }
+  | { method: "attemptPushed"; input: AttemptPushed };
 
 export class FakeQueen implements QueenPort {
   readonly calls: QueenCall[] = [];
@@ -108,6 +117,20 @@ export class FakeQueen implements QueenPort {
   getGateTarget?: (repo: string) => Promise<GateTarget | null>;
   recentAudit: AuditEvent[] = [];
   reportError: Error | null = null;
+
+  /** Absent by default (an older Queen). `serveAttempts` installs it. */
+  attemptPushed?: (input: AttemptPushed) => Promise<AttemptPushedResult>;
+
+  serveAttempts(outcome: AttemptPushedResult["outcome"] = "applied"): void {
+    this.attemptPushed = async (input) => {
+      this.calls.push({ method: "attemptPushed", input });
+      return { outcome, attemptId: input.attemptId, state: "PUSHED", itemId: "item-1", trainId: "train-9", disposition: "joined-race" };
+    };
+  }
+
+  attemptPushes(): AttemptPushed[] {
+    return this.calls.flatMap((c) => (c.method === "attemptPushed" ? [c.input] : []));
+  }
 
   /** Install `getGateTarget`: answers `answer` (or throws it, when an Error). */
   serveTarget(answer: GateTarget | null | Error): void {
@@ -290,7 +313,7 @@ export function gateTask(after: string, overrides: Partial<GateTask> = {}): Gate
 }
 
 /** The documented `pushed` envelope. */
-export function pushedEnvelope(o: { repoName?: string; ref?: string; before?: string; after?: string; namespace?: string; message?: string } = {}) {
+export function pushedEnvelope(o: { repoName?: string; ref?: string; before?: string; after?: string; namespace?: string; message?: string; commits?: unknown[] } = {}) {
   return {
     type: "cf.artifacts.repo.pushed",
     source: { type: "artifacts.repo", namespace: o.namespace ?? "queenos", repoName: o.repoName ?? REPO },
@@ -298,7 +321,7 @@ export function pushedEnvelope(o: { repoName?: string; ref?: string; before?: st
       ref: o.ref ?? "refs/heads/main",
       before: o.before ?? "b".repeat(40),
       after: o.after ?? "a".repeat(40),
-      commits: [{ id: o.after ?? "a".repeat(40), message: o.message ?? "queen(build): x", parents: [], extra: "ignored" }],
+      commits: o.commits ?? [{ id: o.after ?? "a".repeat(40), message: o.message ?? "queen(build): x", parents: [], extra: "ignored" }],
       totalCommitsCount: 1,
       commitsTruncated: false,
       unknownFutureField: { x: 1 },

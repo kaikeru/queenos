@@ -16,10 +16,10 @@
  */
 import type { WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import { isTransientError, retryTransient, spanIdFor, type AppendAuditInput, type AuditEvent, type AuditStatus, type DroneRole, type FollowUp, type GateScore, type GateTarget, type GitNotesPayload, type MemoryOutcome, type SubmissionOrigin, type TrainLane } from "@queenos/queen-types";
+import { isTransientError, retryTransient, spanIdFor, type AppendAuditInput, type AttemptPushed, type AuditEvent, type AuditStatus, type DroneRole, type FollowUp, type GateScore, type GateTarget, type GitNotesPayload, type MemoryOutcome, type SubmissionOrigin, type TrainLane } from "@queenos/queen-types";
 import { AiGatewayError, LedgerError, buildGitNotesPayload, composeMemoryText, memoryIdFor } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
-import { classifyPush, gateInstanceId, parsePushEvent, type GateTask } from "./event";
+import { classifyPush, gateInstanceId, parsePushEvent, type AttemptTask, type GateTask } from "./event";
 import { formatFinding, type ScanReport } from "./findings";
 import { integrationRoutes, inspectPush, type Inspection, type IntegrationSpec } from "./inspect";
 import type { FailureChunk, GatekeeperPorts, QueenPort, QueenSnapshot } from "./ports";
@@ -73,7 +73,8 @@ export function toStepError(e: unknown): unknown {
 
 export type PushRunResult =
   | { status: "ignored"; reason: string }
-  | { status: "dispatched" | "duplicate"; gateId: string; repo: string; after: string };
+  | { status: "dispatched" | "duplicate"; gateId: string; repo: string; after: string }
+  | { status: "attempt"; attemptId: string; repo: string; after: string; outcome: string };
 
 export async function handlePush(payload: unknown, step: StepRunner, ports: GatekeeperPorts, config: GateConfig): Promise<PushRunResult> {
   const parsed = parsePushEvent(payload);
@@ -83,9 +84,39 @@ export async function handlePush(payload: unknown, step: StepRunner, ports: Gate
   }
   const c = classifyPush(parsed.event, { artifactsNamespace: config.artifactsNamespace });
   if (c.action === "ignore") return { status: "ignored", reason: c.reason };
+  if (c.action === "attempt") return reportAttempt(c.task, step, ports);
   const gateId = gateInstanceId(c.task);
   const started = await step.do("dispatch gate", DISPATCH_STEP, () => ports.dispatcher.start(gateId, c.task).catch((e) => Promise.reject(toStepError(e))));
   return { status: started === "started" ? "dispatched" : "duplicate", gateId, repo: c.task.repo, after: c.task.after };
+}
+
+// ── attempt forks (MCP, spec §9) ────────────────────────────────────────────
+
+/**
+ * A push to an attempt fork's `main`: report it to the Queen's `attemptPushed` when `after` is still the fork's head
+ * (events are at-least-once and unordered: an older event seen after a newer push is dropped; the newer push's own
+ * event reports it). The head commit's message comes from the event when it is complete, else from the fork.
+ */
+export async function reportAttempt(task: AttemptTask, step: StepRunner, ports: GatekeeperPorts): Promise<PushRunResult> {
+  const head = await step.do("attempt: fork head", LOOKUP_STEP, () => ports.artifacts.readHead(task.repo).catch((e) => Promise.reject(toStepError(e))));
+  if (!head) return { status: "ignored", reason: "fork-gone" };
+  if (head.sha !== task.after) return { status: "ignored", reason: "not-fork-head" };
+  const fromEvent = task.commits.find((c) => c.id === task.after) ?? task.commits.at(-1);
+  const message = clip(fromEvent?.message && !fromEvent.messageTruncated && (fromEvent.id === undefined || fromEvent.id === task.after) ? fromEvent.message : head.message, 4000);
+  const title = clip(message.split("\n")[0]!.trim() || `push ${task.after.slice(0, 12)}`, 120);
+  const queen = ports.queen(task.hive);
+  if (!queen.attemptPushed) return { status: "ignored", reason: "queen-without-attempts" };
+  const input: AttemptPushed = {
+    hive: task.hive,
+    attemptId: task.attemptId,
+    repo: task.repo,
+    ...(task.before && !/^0+$/.test(task.before) ? { before: task.before } : {}),
+    after: task.after,
+    title,
+    message,
+  };
+  const res = await step.do("report: attempt pushed", REPORT_STEP, () => queen.attemptPushed!(input).catch((e) => Promise.reject(toStepError(e))));
+  return { status: "attempt", attemptId: task.attemptId, repo: task.repo, after: task.after, outcome: res.outcome };
 }
 
 // ── the gate ────────────────────────────────────────────────────────────────

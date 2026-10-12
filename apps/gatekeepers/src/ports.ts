@@ -2,7 +2,7 @@
  * Gatekeeper ports: every side effect the gate performs goes through this
  * object (mirrors apps/drones). Tests swap in fakes via GatekeeperWorkflow.createPorts().
  */
-import type { AppendAuditInput, AuditEvent, GateTarget, MemoryRecord, QueenServerMessage, ScribeSummary, TrainResult } from "@queenos/queen-types";
+import type { AppendAuditInput, AttemptPushed, AttemptPushedResult, AuditEvent, GateTarget, MemoryRecord, QueenServerMessage, ScribeSummary, TrainResult } from "@queenos/queen-types";
 import { HiveMemory, cloneRepo, createAiClient, structuredLog, type AiRunner, type GitRepo, type LogFields } from "@queenos/hive-kit";
 import type { GateConfig } from "./config";
 import type { GateTask } from "./event";
@@ -21,6 +21,8 @@ export interface RepoAccess {
 
 export interface ArtifactsPort {
   access(repo: string, scope: "read" | "write"): Promise<RepoAccess>;
+  /** The repo's `main` head with its full message; null when the repo (or main) is gone. */
+  readHead(repo: string): Promise<{ sha: string; message: string } | null>;
 }
 
 export const TOKEN_TTL_SECONDS = 15 * 60;
@@ -32,6 +34,19 @@ export class BindingArtifactsPort implements ArtifactsPort {
     using handle = await this.artifacts.get(repo);
     const [{ remote }, { plaintext }] = await Promise.all([handle.info(), handle.createToken(scope, TOKEN_TTL_SECONDS)]);
     return { remote, token: plaintext };
+  }
+  async readHead(repo: string): Promise<{ sha: string; message: string } | null> {
+    if (!this.artifacts) throw new Error("UNAVAILABLE: ARTIFACTS binding is not configured");
+    let handle: ArtifactsRepo;
+    try {
+      handle = await this.artifacts.get(repo);
+    } catch (e) {
+      if ((e as { code?: string })?.code === "NOT_FOUND") return null;
+      throw e;
+    }
+    using r = handle;
+    const [head] = await r.log({ ref: "main", limit: 1 });
+    return head ? { sha: head.hash, message: String(head.message) } : null;
   }
 }
 
@@ -73,6 +88,8 @@ export interface QueenPort {
   appendAudits(inputs: AppendAuditInput[]): Promise<Pick<AuditEvent, "eventId">[]>;
   recordScribeSummary(input: ScribeSummary): Promise<unknown>;
   reportTrainResult(input: TrainResult): Promise<{ outcome: string }>;
+  /** v17 RPC (MCP attempts): a push to an attempt fork's main. Optional: an older Queen lacks it. */
+  attemptPushed?(input: AttemptPushed): Promise<AttemptPushedResult>;
 }
 
 /** Cross-script DO binding; one QueenNode per hive, `idFromName(hive)`. */

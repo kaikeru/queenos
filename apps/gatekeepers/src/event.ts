@@ -4,11 +4,13 @@
  *
  * The documented envelope is `{type, source:{type, namespace, repoName},
  * payload:{ref, before, after, commits[...]}, metadata}` (docs/discovery.md §1).
- * UNVERIFIED: whether a Workflow's `event.payload` is the whole envelope or just
- * the inner `payload`, so both (and a flat shape) are accepted. Unknown fields
+ * Whether a Workflow's `event.payload` is the whole envelope or just the inner
+ * `payload` is accepted both ways (plus a flat shape); the real event carries
+ * source.repoName, payload.before/after and commits[].id/message (spec §13.1 P2). Unknown fields
  * are kept, never rejected.
  */
 import { z } from "zod";
+import { ATTEMPT_REPO_RE, BASE_REPO_RE } from "@queenos/queen-types";
 
 export const ZERO_SHA = "0000000000000000000000000000000000000000";
 
@@ -48,6 +50,13 @@ const FlatSchema = InnerSchema.extend({
   namespace: z.string().optional(),
 });
 
+/** One commit of the event, as the gatekeeper uses it (unknown fields dropped). */
+export interface PushCommit {
+  id?: string;
+  message?: string;
+  messageTruncated?: boolean;
+}
+
 /** Normalised view used by the gatekeeper. */
 export interface PushEvent {
   /** Artifacts namespace of the repo (when the event says). */
@@ -57,6 +66,8 @@ export interface PushEvent {
   before: string | undefined;
   after: string;
   commitMessages: string[];
+  /** The event's commits (attempt pushes take the head's message from here when it is complete). */
+  commits: PushCommit[];
 }
 
 export type ParsedPush = { ok: true; event: PushEvent } | { ok: false; error: string };
@@ -74,6 +85,7 @@ export function parsePushEvent(raw: unknown): ParsedPush {
         before: payload.before,
         after: payload.after,
         commitMessages: payload.commits.flatMap((c) => (c.message ? [c.message] : [])),
+        commits: payload.commits,
       },
     };
   }
@@ -89,6 +101,7 @@ export function parsePushEvent(raw: unknown): ParsedPush {
         before: flat.data.before,
         after: flat.data.after,
         commitMessages: flat.data.commits.flatMap((c) => (c.message ? [c.message] : [])),
+        commits: flat.data.commits,
       },
     };
   }
@@ -120,13 +133,31 @@ export const GateTaskSchema = z.object({
 });
 export type GateTask = z.infer<typeof GateTaskSchema>;
 
-export type Classification = { action: "gate"; task: GateTask } | { action: "ignore"; reason: string };
+/** An attempt fork's `main` moved: the Queen's `attemptPushed` (spec §9). */
+export interface AttemptTask {
+  hive: string;
+  attemptId: string;
+  repo: string;
+  before?: string;
+  after: string;
+  commits: PushCommit[];
+}
+
+export type Classification = { action: "gate"; task: GateTask } | { action: "attempt"; task: AttemptTask } | { action: "ignore"; reason: string };
 
 export function classifyPush(e: PushEvent, opts: { artifactsNamespace: string }): Classification {
   if (e.namespace !== undefined && e.namespace !== opts.artifactsNamespace) return { action: "ignore", reason: "foreign-namespace" };
   if (e.ref.startsWith("refs/notes/")) return { action: "ignore", reason: "notes-ref" };
   if (!e.ref.startsWith("refs/heads/")) return { action: "ignore", reason: "not-a-branch" };
   if (/^0+$/.test(e.after)) return { action: "ignore", reason: "deletion" };
+  // MCP race bases are read-only and never a candidate: never route one as a train or an attempt.
+  if (BASE_REPO_RE.test(e.repoName)) return { action: "ignore", reason: "base-repo" };
+  const att = ATTEMPT_REPO_RE.exec(e.repoName);
+  if (att) {
+    // Only `main` is the submission; other refs and notes stay inside the agent's own fork (spec §7).
+    if (e.ref !== "refs/heads/main") return { action: "ignore", reason: "attempt-non-main" };
+    return { action: "attempt", task: { hive: att[1]!, attemptId: `att_${att[2]!}`, repo: e.repoName, ...(e.before ? { before: e.before } : {}), after: e.after, commits: e.commits } };
+  }
   const m = TRAIN_REPO_RE.exec(e.repoName);
   if (!m) return { action: "ignore", reason: "not-a-train-fork" };
   return {
