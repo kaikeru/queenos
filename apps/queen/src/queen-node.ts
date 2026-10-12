@@ -1527,9 +1527,13 @@ export class QueenNode extends DurableObject<Env> {
       if (stored && stored.itemId !== a.itemId) items.add(stored.itemId);
     }
     for (const i of d.acc.items.values()) if (i.status === "CANCELLED") items.add(i.itemId);
+    // A race resolved in this decision (window closed, entries closed, a pick) after the item's last attempt ended:
+    // no attempt row changes then, so the race names the item. The open-attempt and open-race checks below still gate it.
+    for (const r of d.acc.races.values()) if (r.state === "DECIDED" || r.state === "ABANDONED") items.add(r.itemId);
+    // A base pinned in this decision (attemptBaseReady) after its INTENT ended or its item was cancelled: nobody uses it.
+    for (const b of d.acc.itemBases.values()) if (b.baseRepo && b.baseSha) items.add(b.itemId);
     for (const itemId of items) {
       const b = this.baseOf(itemId, d.acc);
-      if (!b?.baseRepo || !b.baseSha) continue;
       const item = d.acc.items.get(itemId) ?? this.loadItem(itemId);
       const cancelled = item?.status === "CANCELLED";
       const open = this.attemptsOfItemNow(itemId, d.acc).filter((a) => !isTerminalAttemptState(a.state));
@@ -1539,7 +1543,10 @@ export class QueenNode extends DurableObject<Env> {
           if (a.state !== "INTENT") this.deleteAttemptRepo(d, a);
           d.acc.events.push(this.attemptEvent("attempt.state", itemId, a.attemptId, `attempt ${a.attemptId}: ${a.state} → ABANDONED (item cancelled)`, { from: a.state, to: "ABANDONED", cancelled: true }, "queen"));
         }
+        // A pending base (no sha yet) is left to the stale-base watchdog.
+        if (!b?.baseRepo || !b.baseSha) continue;
       } else {
+        if (!b?.baseRepo || !b.baseSha) continue;
         if (open.length) continue;
         const races = new Map(d.state.races.map((r) => [r.raceId, r]));
         for (const r of d.acc.races.values()) races.set(r.raceId, r);

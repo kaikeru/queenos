@@ -201,3 +201,82 @@ describe("repo DELETE redrive (deletes no train holds: attempt forks before a pu
     expect(deletesOf(s.provisions, baseRepo).map((c) => c.commandId)).toEqual([`base-${itemId}-delete-2`]);
   });
 });
+
+describe("base cleanup when the race resolves after the last attempt ended (fix round 1)", () => {
+  const WINDOW = 15 * 60_000;
+  const pushEnd = async () => {
+    const { ns, stub } = await externalHive({ race: { entryWindowMs: WINDOW } });
+    const itemId = await fileItem(ns);
+    const r = await readyAttempt(ns, itemId);
+    const baseRepo = String((await itemRow(ns, itemId)).base_repo);
+    await push(ns, r);
+    await stub.attemptEnd({ hive: ns, attemptId: r.attemptId, owner: OWNER, agentId: r.agent.agentId });
+    const s = await look(ns);
+    expect(s.races[0]).toMatchObject({ state: "RACING" });
+    expect(deletesOf(s.provisions, baseRepo)).toEqual([]); // the race is still open: the base stays
+    expect(await itemRow(ns, itemId)).toMatchObject({ base_repo: baseRepo });
+    return { ns, stub, itemId, baseRepo };
+  };
+
+  it("the entry window closes on the alarm: the race resolves and the base is deleted once", async () => {
+    const { ns, itemId, baseRepo } = await pushEnd();
+    await later(ns, WINDOW + 60_000);
+    let s = await look(ns);
+    expect(s.races[0]!.state === "DECIDED" || s.races[0]!.state === "ABANDONED").toBe(true);
+    expect(deletesOf(s.provisions, baseRepo)).toEqual([expect.objectContaining({ trainId: `base-${itemId}`, commandId: `base-${itemId}-delete-1` })]);
+    expect(await itemRow(ns, itemId)).toMatchObject({ base_repo: null, base_sha: BASE_SHA });
+    await later(ns, 60_000);
+    s = await look(ns);
+    expect(deletesOf(s.provisions, baseRepo)).toHaveLength(1);
+  });
+
+  it("a human closes entries early: the race resolves and the base is deleted once", async () => {
+    const { ns, stub, baseRepo } = await pushEnd();
+    await stub.closeRaceEntries({ hive: ns, raceId: String((await look(ns)).races[0]!.race_id), user: OWNER });
+    const s = await look(ns);
+    expect(s.races[0]!.state === "DECIDED" || s.races[0]!.state === "ABANDONED").toBe(true);
+    expect(deletesOf(s.provisions, baseRepo)).toHaveLength(1);
+  });
+
+  it("a resolving race never deletes the base while another attempt of the item is open", async () => {
+    const { ns, stub } = await externalHive({ race: { entryWindowMs: WINDOW } });
+    const itemId = await fileItem(ns);
+    const a = await readyAttempt(ns, itemId, agent());
+    await readyAttempt(ns, itemId, agent({ name: "haiku" })); // READY, never pushes: still open
+    const baseRepo = String((await itemRow(ns, itemId)).base_repo);
+    await push(ns, a);
+    await stub.attemptEnd({ hive: ns, attemptId: a.attemptId, owner: OWNER, agentId: a.agent.agentId });
+    await later(ns, WINDOW + 60_000);
+    const s = await look(ns);
+    expect(s.races[0]!.state === "DECIDED" || s.races[0]!.state === "ABANDONED").toBe(true);
+    expect(deletesOf(s.provisions, baseRepo)).toEqual([]);
+    expect(await itemRow(ns, itemId)).toMatchObject({ base_repo: baseRepo });
+  });
+});
+
+describe("cancel with a pending base (fix round 1)", () => {
+  it("cancelling an item abandons its INTENT even while the base is still being created", async () => {
+    const { ns, stub } = await externalHive();
+    const itemId = await fileItem(ns);
+    const d = accepted(await stub.attemptIntent({ hive: ns, owner: OWNER, agent: agent(), target: { itemId } }));
+    await stub.workAction({ hive: ns, itemId, user: OWNER, action: { action: "cancel" } });
+    const s = await look(ns);
+    expect(s.attempts[0]).toMatchObject({ attempt_id: d.attemptId, state: "ABANDONED" });
+    expect(deletesOf(s.provisions, d.base.baseRepo)).toEqual([]); // pending: nothing to delete yet
+    // queenos-mcp finishes the base fork after the cancel: the pinned base has no user and is deleted once.
+    await stub.attemptBaseReady({ hive: ns, itemId, baseRepo: d.base.baseRepo, baseSha: BASE_SHA });
+    expect(deletesOf((await look(ns)).provisions, d.base.baseRepo)).toEqual([expect.objectContaining({ trainId: `base-${itemId}` })]);
+    expect(await itemRow(ns, itemId)).toMatchObject({ base_repo: null });
+  });
+
+  it("a base pinned after its only INTENT ended is deleted once (no attempt needs it)", async () => {
+    const { ns, stub } = await externalHive();
+    const itemId = await fileItem(ns);
+    const a = agent();
+    const d = accepted(await stub.attemptIntent({ hive: ns, owner: OWNER, agent: a, target: { itemId } }));
+    await stub.attemptEnd({ hive: ns, attemptId: d.attemptId, owner: OWNER, agentId: a.agentId });
+    await stub.attemptBaseReady({ hive: ns, itemId, baseRepo: d.base.baseRepo, baseSha: BASE_SHA });
+    expect(deletesOf((await look(ns)).provisions, d.base.baseRepo)).toHaveLength(1);
+    expect(accepted(await stub.attemptIntent({ hive: ns, owner: OWNER, agent: agent(), target: { itemId } })).base.kind).toBe("create");
+  });
+});
