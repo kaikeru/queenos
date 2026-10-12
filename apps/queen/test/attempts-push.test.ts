@@ -6,11 +6,10 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { QueenNode } from "../src/queen-node";
 import { attemptStateOf } from "../src/work/attempts";
-import { BASE_SHA, MODEL, OTHER, OWNER, accepted, agent, deletesOf, externalHive, fileItem, gateFail, gatePass, later, look, readyAttempt, sha, stubFor } from "./attempt-helpers";
+import { BASE_SHA, MODEL, OTHER, OWNER, accepted, agent, deletesOf, distinctDeletes, externalHive, fileItem, gateFail, gatePass, landCarOf, later, look, readyAttempt, sha, stubFor, trainOf } from "./attempt-helpers";
 
 const push = (ns: string, att: { attemptId: string; repo: string }, after = sha(), title = "Add a tip jar") =>
   stubFor(ns).attemptPushed({ hive: ns, attemptId: att.attemptId, repo: att.repo, after, title, message: `${title}\n\nAcceptance:\n- shows a jar` }).then((res) => ({ after, res }));
-const trainOf = async (ns: string, trainId: string) => (await look(ns)).trains.find((t) => t.train_id === trainId)!;
 const attemptRow = async (ns: string, attemptId: string) => (await look(ns)).attempts.find((a) => a.attempt_id === attemptId)!;
 
 describe("attemptStateOf", () => {
@@ -206,20 +205,6 @@ describe("attemptRefresh / attemptEnd", () => {
     expect(deletesOf((await look(ns)).provisions, r.repo)).toEqual([]);
   });
 });
-
-/** Play the car executors for `memberId`'s car: its fork, the MERGE drone (fast-forward), the LANDER. */
-async function landCarOf(ns: string, memberId: string): Promise<string> {
-  const stub = stubFor(ns);
-  const carId = String((await trainOf(ns, memberId)).car_id);
-  const fork = (await look(ns)).provisions.find((c) => c.op === "FORK" && c.trainId === carId);
-  if (fork && fork.op === "FORK") await stub.reportProvisionResult({ commandId: fork.commandId, op: "FORK", trainId: carId, ok: true, artifactRepo: fork.forkName, baseSha: "c".repeat(40) });
-  await stub.reportMergeResult({ trainId: carId, ok: true, headSha: "d".repeat(40), baseSha: "c".repeat(40), merged: [memberId], fastForward: true });
-  await stub.reportLandResult({ trainId: carId, landed: true, mainSha: "e".repeat(40) });
-  expect(await trainOf(ns, memberId)).toMatchObject({ phase: "MERGED" });
-  return carId;
-}
-
-const distinctDeletes = (s: Awaited<ReturnType<typeof look>>, repo: string) => new Set(deletesOf(s.provisions, repo).map((c) => c.commandId)).size;
 
 describe("fork ownership across a car landing (fix round 1)", () => {
   it("a WON attempt in a car pushes a follow-up; the car landing never deletes the shared fork; ending the attempt deletes it once", async () => {

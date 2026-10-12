@@ -152,12 +152,16 @@ import {
   appendAuditRow,
   attemptsOfItem,
   deleteClaims,
+  dueRepoDeletes,
   getAttemptRow,
+  getRepoDelete,
   getItemBase,
   getSubmission,
   setItemBase,
   upsertAttempt,
+  upsertRepoDelete,
   type ItemBase,
+  type RepoDelete,
   listModelStats,
   listRecentAudit,
   listRouterStats,
@@ -167,6 +171,8 @@ import {
   insertSubmission,
   migrate,
   pruneSubmissions,
+  repoDeletesOfKey,
+  rowToAttempt,
   rowToDeployment,
   rowToEscalation,
   rowToEvent,
@@ -203,7 +209,9 @@ import { QueenError, asQueenError, parseOrThrow, type QueenErrorCode } from "./e
 import { DEFAULT_POLICY, toRouterFloor, type FloorState, type RouterPolicy } from "./models/router";
 import {
   DEFAULT_COMMAND_TIMEOUT_MS,
+  MAX_COMMAND_ATTEMPTS,
   TrainPlanner,
+  commandAttempt,
   awaitingPush,
   isActive,
   isCar,
@@ -262,7 +270,7 @@ import {
 } from "./work/inbox";
 import { MAX_NOTES, projectNotes, type NotesInput, type NotesTrain } from "./work/notes";
 import { composePrompt } from "./work/compose";
-import { ATTEMPT_TTL_MS, OPEN_ATTEMPTS_SQL, PUSHABLE_STATES, acceptsEntries, attemptStateOf, attemptVerdict, checkAttemptCaps, randomHex } from "./work/attempts";
+import { ATTEMPT_TTL_MS, BASE_PENDING_TTL_MS, INTENT_TTL_MS, OPEN_ATTEMPTS_SQL, PUSHABLE_STATES, acceptsEntries, attemptStateOf, attemptVerdict, checkAttemptCaps, randomHex } from "./work/attempts";
 import { queryMetrics, recordMetrics } from "./obs/rollup";
 import { AnalyticsSink } from "./obs/metrics-sink";
 import { logEvents } from "./obs/log";
@@ -447,6 +455,8 @@ class Acc {
   attempts = new Map<string, Attempt>();
   /** v17: race-base column changes (work_items.base_repo / base_sha / base_pending_at), keyed by itemId. */
   itemBases = new Map<string, ItemBase>();
+  /** v17: repo DELETEs no train holds (repo_deletes rows), keyed by repo. */
+  repoDeletes = new Map<string, RepoDelete>();
   rollbackStreak?: number;
   followUps: AbsorbFollowUps[] = [];
   credits = 0;
@@ -1344,7 +1354,7 @@ export class QueenNode extends DurableObject<Env> {
           if (isActive(t)) d.acc.train(d.tp.withdraw(t.trainId, `${att.agentName} ended attempt ${att.attemptId}`));
           d.acc.train(d.tp.deleteAttemptFork(t.trainId));
         } else if (att.state !== "INTENT") {
-          d.acc.effects.push(this.repoDelete(hive, att.attemptId, att.repo, this.loadItem(att.itemId)?.traceId ?? null));
+          this.repoDelete(d, att.attemptId, att.repo, this.loadItem(att.itemId)?.traceId ?? null);
         }
         d.acc.events.push(this.attemptEvent("attempt.state", att.itemId, att.attemptId, `attempt ${att.attemptId}: ${att.state} → ABANDONED (end_attempt)`, { from: att.state, to: "ABANDONED" }, `agent:${att.agentName}@${att.owner}`));
       },
@@ -1384,15 +1394,35 @@ export class QueenNode extends DurableObject<Env> {
 
   /**
    * v17: a Provisioner DELETE for a repo no train holds: an attempt fork before its first push (key = the attempt id)
-   * or a race base (key = `base-<itemId>`). `reportProvisionResult` acknowledges its report. Command id `<key>-delete-1`.
+   * or a race base (key = `base-<itemId>`). Recorded in repo_deletes (the attempt watchdog re-sends it until it is
+   * reported deleted); `reportProvisionResult` acknowledges its report. Command id `<key>-delete-<n>`, n unique per key
+   * (an item may delete a cleared pending base, then its real base).
    */
-  private repoDelete(hive: string, key: string, repo: string, traceId: string | null): Dispatchable {
-    const commandId = `${key}-delete-1`;
-    return {
+  private repoDelete(d: Decision, key: string, repo: string, traceId: string | null): void {
+    const prior = this.repoDeleteRow(repo, d.acc);
+    if (prior && prior.state !== "GAVE_UP") return; // already sent (or deleted): exactly once per repo
+    this.sendRepoDelete(d, { repo, key, hive: d.hive, commandId: this.nextRepoDeleteId(key, d.acc), traceId, state: "PENDING", sends: 0, issuedAt: d.now });
+  }
+
+  /** Dispatch `r` (sends + 1, issued now) and record it. */
+  private sendRepoDelete(d: Decision, r: RepoDelete): void {
+    const next: RepoDelete = { ...r, state: "PENDING", sends: r.sends + 1, issuedAt: d.now };
+    d.acc.repoDeletes.set(next.repo, next);
+    d.acc.effects.push({
       type: "provision",
-      trainId: key,
-      command: { op: "DELETE", commandId, hive, trainId: key, repo, ...(traceId ? { trace: { traceparent: traceparent(traceId, spanIdFor(commandId)) } } : {}) },
-    };
+      trainId: next.key,
+      command: { op: "DELETE", commandId: next.commandId, hive: next.hive, trainId: next.key, repo: next.repo, ...(next.traceId ? { trace: { traceparent: traceparent(next.traceId, spanIdFor(next.commandId)) } } : {}) },
+    });
+  }
+
+  private repoDeleteRow(repo: string, acc: Acc): RepoDelete | null {
+    return acc.repoDeletes.get(repo) ?? getRepoDelete(this.sql, repo);
+  }
+
+  /** `<key>-delete-<n>`: n one past every command id this key has used (rows in SQLite and in this decision). */
+  private nextRepoDeleteId(key: string, acc: Acc): string {
+    const ids = [...repoDeletesOfKey(this.sql, key), ...[...acc.repoDeletes.values()].filter((r) => r.key === key)].map((r) => commandAttempt(r.commandId));
+    return `${key}-delete-${Math.max(0, ...ids) + 1}`;
   }
 
   /**
@@ -1413,6 +1443,129 @@ export class QueenNode extends DurableObject<Env> {
       }
       if (isTerminalAttemptState(next)) d.acc.train(d.tp.deleteAttemptFork(t.trainId));
     }
+  }
+
+  /**
+   * v17 watchdog (reconcile alarm): READY / REJECTED attempts past `expires_at` (no live candidate) → EXPIRED, fork
+   * deleted; an INTENT older than INTENT_TTL_MS (start_attempt died) → ABORTED, its reserved fork name deleted (best
+   * effort); a base pending longer than BASE_PENDING_TTL_MS → cleared, its name deleted (best effort); repo DELETEs no
+   * train holds that went unreported (re-sent under the same id) or failed (re-sent under the next id), up to
+   * MAX_COMMAND_ATTEMPTS sends.
+   */
+  private attemptWatchdog(d: Decision): void {
+    for (const a of this.dueAttempts(d.now)) {
+      const to = a.state === "INTENT" ? "ABORTED" : "EXPIRED";
+      d.acc.attempts.set(a.attemptId, { ...a, state: to });
+      if (a.state === "INTENT") this.repoDelete(d, a.attemptId, a.repo, null);
+      else this.deleteAttemptRepo(d, a);
+      d.acc.events.push(this.attemptEvent("attempt.state", a.itemId, a.attemptId, `attempt ${a.attemptId}: ${a.state} → ${to} (watchdog)`, { from: a.state, to, watchdog: true }, "queen", "warn"));
+    }
+    const stale = this.sql
+      .exec("SELECT item_id, base_repo FROM work_items WHERE base_repo IS NOT NULL AND base_sha IS NULL AND base_pending_at <= ?", d.now - BASE_PENDING_TTL_MS)
+      .toArray();
+    for (const r of stale) {
+      const itemId = String(r.item_id);
+      const baseRepo = String(r.base_repo);
+      d.acc.itemBases.set(itemId, { itemId, baseRepo: null, baseSha: null, pendingAt: null });
+      this.repoDelete(d, `base-${itemId}`, baseRepo, null);
+      d.acc.events.push(this.attemptEvent("attempt.base", itemId, null, `pending base ${baseRepo} cleared after ${BASE_PENDING_TTL_MS / 60_000} min (watchdog)`, { outcome: "pending-cleared", baseRepo }, "queen", "warn"));
+    }
+    for (const r of dueRepoDeletes(this.sql, d.now - commandTimeoutMs(this.env))) {
+      if (d.acc.repoDeletes.has(r.repo)) continue;
+      const base = r.key.startsWith("base-");
+      const ev = (summary: string, data: Record<string, unknown>, severity: EventDraft["severity"]) =>
+        d.acc.events.push(this.attemptEvent(base ? "attempt.base" : "attempt.state", base ? r.key.slice(5) : null, base ? null : r.key, summary, { ...data, repo: r.repo }, "queen", severity));
+      if (r.sends >= MAX_COMMAND_ATTEMPTS) {
+        d.acc.repoDeletes.set(r.repo, { ...r, state: "GAVE_UP" });
+        ev(`repo delete of ${r.repo} gave up after ${r.sends} sends (${r.commandId})`, { outcome: "delete-gave-up", commandId: r.commandId }, "warn");
+        continue;
+      }
+      // Lost dispatch: the same id (the Provisioner's instance id; an existing instance counts as sent). Failed: the next id.
+      const commandId = r.state === "FAILED" ? this.nextRepoDeleteId(r.key, d.acc) : r.commandId;
+      this.sendRepoDelete(d, { ...r, commandId });
+      ev(`repo delete of ${r.repo} re-sent (${commandId})`, { outcome: "delete-resent", commandId, after: r.state }, "debug");
+    }
+  }
+
+  /** Attempts the watchdog ends now: READY / REJECTED past expiry, INTENT older than INTENT_TTL_MS. */
+  private dueAttempts(now: number): Attempt[] {
+    return this.sql
+      .exec("SELECT * FROM attempts WHERE (state IN ('READY', 'REJECTED') AND expires_at <= ?) OR (state = 'INTENT' AND created_at <= ?)", now, now - INTENT_TTL_MS)
+      .toArray()
+      .map(rowToAttempt);
+  }
+
+  /**
+   * Delete a terminal attempt's fork once: through its current train when the planner holds it (the train's DELETE
+   * path, watchdog-retried), else by a repo DELETE keyed by the attempt (no train yet, or the train is no longer loaded).
+   */
+  private deleteAttemptRepo(d: Decision, a: Attempt): void {
+    const r = this.trainExists(a.trainId) ? d.acc.train(d.tp.deleteAttemptFork(a.trainId)) : null;
+    if (!r || r.outcome === "ignored:unknown") this.repoDelete(d, a.attemptId, a.repo, null);
+  }
+
+  /** The item's attempts as this decision sees them: rows in `acc` override SQLite (an attempt that moved away no longer counts). */
+  private attemptsOfItemNow(itemId: string, acc: Acc): Attempt[] {
+    const byId = new Map(attemptsOfItem(this.sql, itemId).map((a) => [a.attemptId, a]));
+    for (const a of acc.attempts.values()) {
+      if (a.itemId === itemId) byId.set(a.attemptId, a);
+      else byId.delete(a.attemptId);
+    }
+    return [...byId.values()];
+  }
+
+  /**
+   * v17: an item's race base is deleted exactly once, when nothing needs it: the item was cancelled (its open attempts
+   * are abandoned, their forks deleted), or none of its attempts is open and it has no RACING / PICKING race.
+   * `base_repo` is cleared when the DELETE is issued (so it is never issued twice); `base_sha` stays for history.
+   */
+  private releaseBases(d: Decision): void {
+    const items = new Set<string>();
+    for (const a of d.acc.attempts.values()) {
+      items.add(a.itemId);
+      const stored = getAttemptRow(this.sql, a.attemptId);
+      if (stored && stored.itemId !== a.itemId) items.add(stored.itemId);
+    }
+    for (const i of d.acc.items.values()) if (i.status === "CANCELLED") items.add(i.itemId);
+    for (const itemId of items) {
+      const b = this.baseOf(itemId, d.acc);
+      if (!b?.baseRepo || !b.baseSha) continue;
+      const item = d.acc.items.get(itemId) ?? this.loadItem(itemId);
+      const cancelled = item?.status === "CANCELLED";
+      const open = this.attemptsOfItemNow(itemId, d.acc).filter((a) => !isTerminalAttemptState(a.state));
+      if (cancelled) {
+        for (const a of open) {
+          d.acc.attempts.set(a.attemptId, { ...a, state: "ABANDONED" });
+          if (a.state !== "INTENT") this.deleteAttemptRepo(d, a);
+          d.acc.events.push(this.attemptEvent("attempt.state", itemId, a.attemptId, `attempt ${a.attemptId}: ${a.state} → ABANDONED (item cancelled)`, { from: a.state, to: "ABANDONED", cancelled: true }, "queen"));
+        }
+      } else {
+        if (open.length) continue;
+        const races = new Map(d.state.races.map((r) => [r.raceId, r]));
+        for (const r of d.acc.races.values()) races.set(r.raceId, r);
+        if ([...races.values()].some((r) => r.itemId === itemId && (r.state === "RACING" || r.state === "PICKING"))) continue;
+      }
+      d.acc.itemBases.set(itemId, { itemId, baseRepo: null, baseSha: b.baseSha, pendingAt: null });
+      this.repoDelete(d, `base-${itemId}`, b.baseRepo, item?.traceId ?? null);
+      d.acc.events.push(this.attemptEvent("attempt.base", itemId, null, `base ${b.baseRepo} deleted (${cancelled ? "item cancelled" : "item resolved"})`, { outcome: "deleting", baseRepo: b.baseRepo }, "queen"));
+    }
+  }
+
+  /** v17: the next attempt watchdog deadline (an expiry, a stale INTENT, a stale pending base, a repo DELETE re-send), or null. */
+  private attemptDeadline(timeout: number): number | null {
+    const t = this.sql
+      .exec(
+        `SELECT MIN(t) AS t FROM (
+           SELECT MIN(expires_at) AS t FROM attempts WHERE state IN ('READY', 'REJECTED')
+           UNION ALL SELECT MIN(created_at) + ? AS t FROM attempts WHERE state = 'INTENT'
+           UNION ALL SELECT MIN(base_pending_at) + ? AS t FROM work_items WHERE base_repo IS NOT NULL AND base_sha IS NULL
+           UNION ALL SELECT MIN(issued_at) + ? AS t FROM repo_deletes WHERE state IN ('PENDING', 'FAILED'))`,
+        INTENT_TTL_MS,
+        BASE_PENDING_TTL_MS,
+        timeout,
+      )
+      .one().t;
+    return t === null || t === undefined ? null : Number(t);
   }
 
   /** An item's race base as this decision sees it. */
@@ -1776,6 +1929,9 @@ export class QueenNode extends DurableObject<Env> {
       if (hive !== null) {
         const base = r.trainId.startsWith("base-");
         const { acc } = this.decide(hive, (d) => {
+          // The row of this command (a stale id finds none): DELETED, or FAILED (the attempt watchdog retries it).
+          const row = repoDeletesOfKey(this.sql, r.trainId).find((x) => x.commandId === r.commandId);
+          if (row && (row.state === "PENDING" || (row.state === "FAILED" && r.ok))) d.acc.repoDeletes.set(row.repo, { ...row, state: r.ok ? "DELETED" : "FAILED" });
           d.acc.events.push(
             this.attemptEvent(base ? "attempt.base" : "attempt.state", base ? r.trainId.slice(5) : null, base ? null : r.trainId, `repo delete ${r.ok ? "done" : "failed"} (${r.commandId})`, {
               outcome: r.ok ? "deleted" : "delete-failed",
@@ -2246,11 +2402,18 @@ export class QueenNode extends DurableObject<Env> {
     if (hive === null) return;
     await this.maybeLease(hive, false);
     let leaseDue = false;
-    const { acc } = this.decide(hive, (d) => {
-      d.acc.train(d.tp.reconcile());
-      d.acc.release(d.rp.reconcile());
-      leaseDue = d.acc.work(d.wp.reconcile()).leaseDue ?? false;
-    });
+    // The trains of attempts the watchdog ends (a REJECTED one's is no longer active): their forks go through them.
+    const attemptTrains = this.dueAttempts(this.now()).map((a) => a.trainId);
+    const { acc } = this.decide(
+      hive,
+      (d) => {
+        d.acc.train(d.tp.reconcile());
+        d.acc.release(d.rp.reconcile());
+        leaseDue = d.acc.work(d.wp.reconcile()).leaseDue ?? false;
+        this.attemptWatchdog(d);
+      },
+      { trains: attemptTrains },
+    );
     await this.commit(hive, acc);
     try {
       this.ctx.storage.transactionSync(() => {
@@ -2612,6 +2775,7 @@ export class QueenNode extends DurableObject<Env> {
       acc.settings = { ...base, degradedBy: tr.degradedBy };
     }
     this.syncAttempts(d);
+    this.releaseBases(d);
     // Final settings row: the planners' counters plus streak, queue and lease.
     const s = acc.settings ?? settings;
     acc.settings = {
@@ -2727,6 +2891,7 @@ export class QueenNode extends DurableObject<Env> {
         for (const r of acc.races.values()) upsertRace(this.sql, r);
         for (const i of acc.items.values()) upsertWorkItem(this.sql, i);
         for (const b of acc.itemBases.values()) setItemBase(this.sql, b);
+        for (const r of acc.repoDeletes.values()) upsertRepoDelete(this.sql, r);
         for (const id of acc.released) deleteClaims(this.sql, id);
         for (const c of claims) upsertClaim(this.sql, c);
         for (const e of acc.escalations.values()) upsertEscalation(this.sql, e);
@@ -3021,6 +3186,7 @@ export class QueenNode extends DurableObject<Env> {
       watchdogDeadline([...state.trains, ...this.cleanup.values()], timeout, now, state.races),
       releaseWatchdogDeadline(state.releases, timeout, sentinelSettings(this.env).windowSeconds, now),
       workWatchdogDeadline(state.items, timeout, now),
+      this.attemptDeadline(timeout),
     ];
     // The lease needs no alarm: every RPC renews it before decide() when due, and
     // an expired lease means "no global cap" (fail open) until then.

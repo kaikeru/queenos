@@ -74,7 +74,7 @@ const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v F
 
 /** Undo v17 (a test that rebuilds an older version first). */
 function dropV17(sql: SqlStorage): void {
-  sql.exec(`DROP TABLE attempts; DROP INDEX submissions_attempt;
+  sql.exec(`DROP TABLE attempts; DROP TABLE repo_deletes; DROP INDEX submissions_attempt;
     ALTER TABLE submissions DROP COLUMN attempt_id; ALTER TABLE submissions DROP COLUMN before_sha; ALTER TABLE merge_trains DROP COLUMN attempt_id;
     ALTER TABLE work_items DROP COLUMN base_repo; ALTER TABLE work_items DROP COLUMN base_sha;
     ALTER TABLE work_items DROP COLUMN base_pending_at; ALTER TABLE work_items DROP COLUMN entry_window_ms;
@@ -87,7 +87,7 @@ describe("migrations", () => {
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
       expect(version(q.sql)).toBe(17);
       const t = tables(q.sql);
-      for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims", "inboxes", "submissions", "model_preference", "attempts"]) {
+      for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims", "inboxes", "submissions", "model_preference", "attempts", "repo_deletes"]) {
         expect(t.has(name), name).toBe(true);
       }
       for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at", "origin_json", "gate_command_id", "gate_issued_at", "attempt_id"]) {
@@ -571,6 +571,7 @@ describe("v17: MCP attempts", () => {
       sql.exec("INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, outcome, disposition, created_at) VALUES ('demo-in-kyle', ?, 'refs/heads/x', 'human', 'kyle@example.com', 'applied', 'filed', 1)", A);
       expect(migrate(state.storage)).toBe(17);
       expect(tables(sql).has("attempts")).toBe(true);
+      expect(tables(sql).has("repo_deletes")).toBe(true);
       for (const c of ["base_repo", "base_sha", "base_pending_at", "entry_window_ms"]) expect(columns(sql, "work_items").has(c), c).toBe(true);
       expect(columns(sql, "merge_trains").has("attempt_id")).toBe(true);
       expect(columns(sql, "submissions").has("before_sha")).toBe(true);

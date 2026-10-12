@@ -530,6 +530,21 @@ const MIGRATIONS: readonly Migration[] = [
   ALTER TABLE work_items ADD COLUMN base_pending_at INTEGER;
   -- MCP create_goal: the entry window of this item's race (NULL = the hive's settings.race.entryWindowMs).
   ALTER TABLE work_items ADD COLUMN entry_window_ms INTEGER;
+  -- Provisioner DELETEs of repos no train holds (an attempt fork before its first push, a race base), keyed by repo.
+  -- PENDING (sent) / FAILED (reported ok:false) until DELETED; the attempt watchdog re-sends a PENDING one under the
+  -- same command id after COMMAND_TIMEOUT_MS (a lost dispatch), a FAILED one under the next id, up to 3 sends (GAVE_UP).
+  CREATE TABLE repo_deletes (
+    repo TEXT PRIMARY KEY,
+    key TEXT NOT NULL,                      -- the command's trainId: att_<12hex> | base-<itemId>
+    hive TEXT NOT NULL,
+    command_id TEXT NOT NULL,               -- <key>-delete-<n>, n unique per key
+    trace_id TEXT,
+    state TEXT NOT NULL,                    -- PENDING | FAILED | DELETED | GAVE_UP
+    sends INTEGER NOT NULL,
+    issued_at INTEGER NOT NULL
+  );
+  CREATE INDEX repo_deletes_key ON repo_deletes(key);
+  CREATE INDEX repo_deletes_open ON repo_deletes(state, issued_at);
   `,
 ];
 
@@ -1795,4 +1810,63 @@ export function getItemBase(sql: SqlStorage, itemId: string): ItemBase | null {
 
 export function setItemBase(sql: SqlStorage, b: ItemBase): void {
   sql.exec("UPDATE work_items SET base_repo = ?, base_sha = ?, base_pending_at = ? WHERE item_id = ?", b.baseRepo, b.baseSha, b.pendingAt, b.itemId);
+}
+
+// ── v17: repo DELETEs no train holds (attempt forks before a push, race bases) ──
+
+export type RepoDeleteState = "PENDING" | "FAILED" | "DELETED" | "GAVE_UP";
+
+/** One outstanding (or settled) Provisioner DELETE keyed by an attempt or a race base (repo_deletes). */
+export interface RepoDelete {
+  repo: string;
+  key: string;
+  hive: string;
+  commandId: string;
+  traceId: string | null;
+  state: RepoDeleteState;
+  sends: number;
+  issuedAt: number;
+}
+
+export function rowToRepoDelete(r: Row): RepoDelete {
+  return {
+    repo: String(r.repo),
+    key: String(r.key),
+    hive: String(r.hive),
+    commandId: String(r.command_id),
+    traceId: str(r.trace_id ?? null),
+    state: String(r.state) as RepoDeleteState,
+    sends: Number(r.sends),
+    issuedAt: Number(r.issued_at),
+  };
+}
+
+export function upsertRepoDelete(sql: SqlStorage, d: RepoDelete): void {
+  sql.exec(
+    `INSERT INTO repo_deletes (repo, key, hive, command_id, trace_id, state, sends, issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(repo) DO UPDATE SET key = excluded.key, command_id = excluded.command_id, trace_id = excluded.trace_id,
+       state = excluded.state, sends = excluded.sends, issued_at = excluded.issued_at`,
+    d.repo,
+    d.key,
+    d.hive,
+    d.commandId,
+    d.traceId,
+    d.state,
+    d.sends,
+    d.issuedAt,
+  );
+}
+
+export function repoDeletesOfKey(sql: SqlStorage, key: string): RepoDelete[] {
+  return sql.exec("SELECT * FROM repo_deletes WHERE key = ?", key).toArray().map(rowToRepoDelete);
+}
+
+/** PENDING / FAILED deletes issued at or before `issuedBy` (due for a re-send). */
+export function dueRepoDeletes(sql: SqlStorage, issuedBy: number): RepoDelete[] {
+  return sql.exec("SELECT * FROM repo_deletes WHERE state IN ('PENDING', 'FAILED') AND issued_at <= ? ORDER BY issued_at, repo", issuedBy).toArray().map(rowToRepoDelete);
+}
+
+export function getRepoDelete(sql: SqlStorage, repo: string): RepoDelete | null {
+  const r = sql.exec("SELECT * FROM repo_deletes WHERE repo = ?", repo).toArray()[0];
+  return r ? rowToRepoDelete(r) : null;
 }

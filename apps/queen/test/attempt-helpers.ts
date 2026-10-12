@@ -1,6 +1,7 @@
 /** Shared helpers of the MCP attempt tests (docs/superpowers/specs/2026-10-12-queenos-mcp-design.md). */
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
+import { expect } from "vitest";
 import type { AttemptIntentDecision, DeployCommand, McpAgentIdentity, ProvisionCommand } from "@queenos/queen-types";
 import type { QueenNode } from "../src/queen-node";
 import type { RecordingHerald, RecordingProvisioner } from "./fakes";
@@ -87,3 +88,19 @@ export async function later(ns: string, ms: number): Promise<void> {
     await q.alarm();
   });
 }
+
+export const trainOf = async (ns: string, trainId: string) => (await look(ns)).trains.find((t) => t.train_id === trainId)!;
+
+/** Play the car executors for `memberId`'s car: its fork, the MERGE drone (fast-forward), the LANDER. */
+export async function landCarOf(ns: string, memberId: string): Promise<string> {
+  const stub = stubFor(ns);
+  const carId = String((await trainOf(ns, memberId)).car_id);
+  const fork = (await look(ns)).provisions.find((c) => c.op === "FORK" && c.trainId === carId);
+  if (fork && fork.op === "FORK") await stub.reportProvisionResult({ commandId: fork.commandId, op: "FORK", trainId: carId, ok: true, artifactRepo: fork.forkName, baseSha: "c".repeat(40) });
+  await stub.reportMergeResult({ trainId: carId, ok: true, headSha: "d".repeat(40), baseSha: "c".repeat(40), merged: [memberId], fastForward: true });
+  await stub.reportLandResult({ trainId: carId, landed: true, mainSha: "e".repeat(40) });
+  expect(await trainOf(ns, memberId)).toMatchObject({ phase: "MERGED" });
+  return carId;
+}
+
+export const distinctDeletes = (s: Awaited<ReturnType<typeof look>>, repo: string) => new Set(deletesOf(s.provisions, repo).map((c) => c.commandId)).size;
