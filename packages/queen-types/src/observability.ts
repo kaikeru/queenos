@@ -25,6 +25,10 @@ export const EventTypeSchema = z.enum([
   "inbox.opened",
   "inbox.revoked",
   "submission.received",
+  // MCP attempts (docs/superpowers/specs/2026-10-12-queenos-mcp-design.md §7).
+  "attempt.intent",
+  "attempt.state",
+  "attempt.base",
   "note.failed",
   "queue.car",
   "queue.merged",

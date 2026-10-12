@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { FollowUpSchema, PrioritySchema, RaceJudgeSchema } from "./work.js";
+import { ENTRY_WINDOW_MAX_MS, FollowUpSchema, PrioritySchema, RaceJudgeSchema } from "./work.js";
 
 export const TrainStateSchema = z.enum(["BUILDING", "TESTING", "MERGED", "EJECTED"]);
 export type TrainState = z.infer<typeof TrainStateSchema>;
@@ -40,6 +40,11 @@ export const SubmitPromptSchema = z.object({
   priority: PrioritySchema.optional(),
   /** `human` ("you pick"): a race of the filed item waits for a human pick (§10.2). Inert until T9a. */
   judge: RaceJudgeSchema.optional(),
+  /**
+   * MCP `create_goal` (external hives): the entry window of the race the filed item's first push opens, instead of
+   * `settings.race.entryWindowMs`. Stored on the item (goal and its child).
+   */
+  entryWindowMs: z.number().int().min(0).max(ENTRY_WINDOW_MAX_MS).optional(),
 });
 export type SubmitPrompt = z.infer<typeof SubmitPromptSchema>;
 

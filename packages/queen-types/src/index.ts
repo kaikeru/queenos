@@ -20,3 +20,4 @@ export * from "./observability.js";
 export * from "./queue.js";
 export * from "./rest.js";
 export * from "./transient.js";
+export * from "./attempt.js";

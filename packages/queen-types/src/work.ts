@@ -141,6 +141,8 @@ export const WorkItemSchema = z.object({
   inbox: WorkItemInboxSchema.nullable().optional(),
   /** Race judge for this item (§10.2); absent = the hive's `settings.race.judge`. Inert until T9a. */
   judge: RaceJudgeSchema.optional(),
+  /** Entry window of this item's race (ms; MCP `create_goal`); absent = the hive's `settings.race.entryWindowMs`. Max = ENTRY_WINDOW_MAX_MS. */
+  entryWindowMs: z.number().int().min(0).max(3_600_000).optional(),
 });
 export type WorkItem = z.infer<typeof WorkItemSchema>;
 export type WorkItemInput = z.input<typeof WorkItemSchema>;

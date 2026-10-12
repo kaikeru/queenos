@@ -79,6 +79,7 @@ export const MergeTrainSchema = z.object({
   carSeq: z.number().int().optional(), // QUEUE: the car's seq (queue rail ordering)
   fastForward: z.boolean().optional(), // QUEUE: a single member fast-forwarded (car gate skipped)
   origin: SubmissionOriginSchema.nullable().optional(), // origin_json (BUILD: whose code; absent = drone. Dashboard badge, gate fail-closed)
+  attemptId: z.string().nullable().optional(), // attempt_id (v17: the MCP attempt whose fork this train is; dashboard chip)
 });
 export type MergeTrain = z.infer<typeof MergeTrainSchema>;
 
