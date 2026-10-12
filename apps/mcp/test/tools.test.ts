@@ -249,3 +249,83 @@ describe("race tools", () => {
     expect(errOf(await run(w, s, "close_entries", { hive: HIVE, raceId: "race-1" }))).toEqual({ code: "CONFLICT", message: "race race-1 is DECIDED" });
   });
 });
+
+describe("fix round 1", () => {
+  it("start_attempt: attemptBaseReady CONFLICT deletes the new base and is CONFLICT, not ARTIFACTS_UNAVAILABLE", async () => {
+    const w = new FakeWorld();
+    w.queen.errors.set("attemptBaseReady", new Error("CONFLICT: base watchdog cleared"));
+    const { s, agent } = await worker(w);
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "CONFLICT" });
+    expect(w.artifacts.deleted).toContain(BASE_REPO);
+    expect(w.artifacts.repos.has(BASE_REPO)).toBe(false);
+    expect((await w.identity(agent.agentId).attempts())[0]).toMatchObject({ open: false });
+  });
+
+  it("start_attempt: a Queen throw from attemptReady maps through fromQueen; the fork is deleted and the attempt aborted", async () => {
+    const w = new FakeWorld();
+    w.queen.errors.set("attemptReady", new Error("NOT_FOUND: attempt gone"));
+    const { s } = await worker(w);
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toEqual({ code: "NOT_FOUND", message: "attempt gone" });
+    expect(w.artifacts.deleted).toContain(ATT_REPO);
+    expect(w.queen.methods()).toContain("attemptAborted");
+  });
+
+  it("the race base never gets a token", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    value(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }));
+    expect(w.artifacts.repos.has(BASE_REPO)).toBe(true);
+    expect(w.artifacts.activeTokens(BASE_REPO)).toEqual([]);
+  });
+
+  it("an unknown Queen error gives the generic message, no detail or stack", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    w.queen.errors.set("getSnapshot", new Error("secret internal detail at /x/y.ts:1"));
+    const e = errOf(await run(w, s, "list_items", { hive: HIVE }));
+    expect(e).toEqual({ code: "CONFLICT", message: "the hive is temporarily unavailable; retry" });
+  });
+
+  it("every gated tool is NOT_INITIALIZED before init_agent", async () => {
+    const w = new FakeWorld();
+    const args: Record<string, unknown> = {
+      create_goal: { hive: HIVE, title: "t", description: "d" },
+      list_items: { hive: HIVE },
+      get_item: { hive: HIVE, itemId: "item-1" },
+      start_attempt: { hive: HIVE, itemId: "item-1" },
+      refresh_attempt: { attemptId: ATT },
+      end_attempt: { attemptId: ATT },
+      get_attempt: { attemptId: ATT },
+      wait: { attemptId: ATT, until: "verdict", timeoutMs: 0 },
+      get_verdict: { attemptId: ATT },
+      close_entries: { hive: HIVE, raceId: "r" },
+      pick: { hive: HIVE, raceId: "r", attemptId: ATT },
+    };
+    for (const t of TOOLS.filter((x) => !["whoami", "init_agent", "resume_agent"].includes(x.name))) {
+      expect(errOf(await run(w, new FakeSession(), t.name, args[t.name] ?? {})), t.name).toMatchObject({ code: "NOT_INITIALIZED" });
+    }
+  });
+
+  it("wait by itemId: verdict / decided / landed, and the changed:false timeout", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    const detail = (status: string, raceState?: string) => {
+      w.queen.getItemDetail = async () => ({ item: { itemId: "item-1", status, waitReason: null }, children: [], trains: [], races: raceState ? [{ raceId: "race-1", state: raceState, trainIds: ["train-1"], winnerTrainId: null }] : [], release: null, escalations: [] }) as never;
+    };
+    const verdict = (v: "none" | "passed" | "rejected") => {
+      w.queen.attemptsForItem = async (itemId: string) => ({ itemId, baseSha: MAIN_SHA, basePending: false, attempts: [viewOf({ attemptId: ATT, verdict: v })] });
+    };
+    const go = async (until: string) => value<Record<string, unknown>>(await run(w, s, "wait", { hive: HIVE, itemId: "item-1", until, timeoutMs: 2000 }));
+    detail("READY");
+    verdict("none");
+    for (const u of ["verdict", "decided", "landed"]) expect(await go(u), u).toMatchObject({ changed: false });
+    verdict("passed");
+    expect(await go("verdict")).toMatchObject({ changed: true });
+    expect(await go("decided")).toMatchObject({ changed: false });
+    detail("READY", "DECIDED");
+    expect(await go("decided")).toMatchObject({ changed: true, item: { race: { raceId: "race-1", state: "DECIDED" } } });
+    expect(await go("landed")).toMatchObject({ changed: false });
+    detail("LANDED");
+    expect(await go("landed")).toMatchObject({ changed: true, state: "LANDED" });
+  });
+});

@@ -36,6 +36,11 @@ export class QueenMcp extends McpAgent<Env, SessionState, McpProps> {
   }
 
   async init(): Promise<void> {
+    // The SDK would validate arguments against each tool's schema before our handler and answer with a plain-text
+    // "MCP error -32602 …" that echoes zod issues. callTool is the single validator (spec §11: {code, message}, never
+    // input values), so skip the SDK's check; tools/list still advertises the real schemas. Pinned to
+    // @modelcontextprotocol/sdk 1.30.0 (`validateToolInput`); the wire test in mcp.test.ts fails if it changes.
+    (this.server as unknown as { validateToolInput: (tool: unknown, args: unknown) => Promise<unknown> }).validateToolInput = async (_tool, args) => args;
     for (const spec of TOOLS) {
       const handler = async (args: Record<string, unknown>) => {
         const out = await callTool(spec, { ports: this.ports(), session: this.session() }, args);
@@ -55,6 +60,11 @@ export class QueenMcp extends McpAgent<Env, SessionState, McpProps> {
     }
     if (bound === null) this.setState({ ...this.state, owner });
     return super.onConnect(conn, ctx);
+  }
+
+  /** RPC for the Worker's DELETE guard (index.ts): the owner this session bound to, or null before its first request. */
+  async sessionOwner(): Promise<string | null> {
+    return this.state.owner;
   }
 
   private session(): SessionPort {

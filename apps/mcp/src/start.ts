@@ -14,7 +14,7 @@ import {
 } from "@queenos/queen-types";
 import { RepoNotFoundError, deleteRepoQuietly, forkRepo, type ForkResult } from "@queenos/hive-kit/artifacts";
 import { GIT_NOTE, attemptDir, cloneCommand, configCommand } from "./commands";
-import { ToolError, artifactsUnavailable, messageOf } from "./errors";
+import { ToolError, artifactsUnavailable, fromQueen, messageOf } from "./errors";
 import type { McpPorts } from "./ports";
 
 export interface StartAttemptResult {
@@ -67,15 +67,19 @@ export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, inp
   let baseRepo: string;
   let baseSha: string;
   if (d.base.kind === "create") {
+    let b: ForkResult | null = null;
     try {
-      const b = await forkRepo(ports.fork, hive, "main", d.base.baseRepo, { readOnly: true, probe: false, description: `QueenOS race base of item ${d.itemId}`, logPrefix: "mcp" });
+      b = await forkRepo(ports.fork, hive, "main", d.base.baseRepo, { readOnly: true, probe: false, description: `QueenOS race base of item ${d.itemId}`, logPrefix: "mcp" });
       await queen.attemptBaseReady({ hive, itemId: d.itemId, baseRepo: b.repo, baseSha: b.baseSha });
       baseRepo = b.repo;
       baseSha = b.baseSha;
     } catch (e) {
-      await queen.attemptBaseFailed({ hive, itemId: d.itemId, baseRepo: d.base.baseRepo, attemptId: d.attemptId, reason: clip(messageOf(e)) }).catch(() => undefined);
+      // A base that was forked but not pinned is unknown to the Queen: delete it here or it leaks.
+      if (b) await deleteRepoQuietly(ports.fork, b.repo);
+      await queen.attemptBaseFailed({ hive, itemId: d.itemId, baseRepo: b?.repo ?? d.base.baseRepo, attemptId: d.attemptId, reason: clip(messageOf(e)) }).catch(() => undefined);
       await identity.closeAttempt(d.attemptId);
       if (e instanceof RepoNotFoundError) throw new ToolError("NOT_FOUND", `hive repo ${hive} not found`);
+      if (b) throw fromQueen(e);
       throw artifactsUnavailable("base fork", e);
     }
   } else {
@@ -84,12 +88,14 @@ export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, inp
   }
 
   let forked: ForkResult | null = null;
+  let queenCall = false; // once true, a non-ToolError throw came from the Queen, not Artifacts
   try {
     forked = await forkRepo(ports.fork, baseRepo, "main", d.repo, { description: `QueenOS attempt ${d.attemptId} (agent ${agent.name})`, logPrefix: "mcp" });
     if (forked.baseSha !== baseSha) throw new ToolError("BASE_MOVED", `the fork's head ${forked.baseSha.slice(0, 12)} is not the race base ${baseSha.slice(0, 12)}`);
     using h = await ports.artifacts.get(forked.repo);
     const [info, tok] = await Promise.all([h.info(), h.createToken("write", ATTEMPT_TOKEN_TTL_S)]);
     const expiresAt = Date.parse(tok.expiresAt) || ports.now() + ATTEMPT_TOKEN_TTL_S * 1000;
+    queenCall = true;
     const ready = await queen.attemptReady({ hive, attemptId: d.attemptId, repo: forked.repo, baseSha, expiresAt });
     if (!ready.ok) throw new ToolError(ready.code, ready.message);
     const remote = info.remote.replace(/\/+$/, "");
@@ -112,6 +118,7 @@ export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, inp
     await identity.closeAttempt(d.attemptId);
     if (e instanceof ToolError) throw e;
     if (e instanceof RepoNotFoundError) throw new ToolError("NOT_FOUND", `base repo of item ${d.itemId} not found`);
+    if (queenCall) throw fromQueen(e);
     throw artifactsUnavailable("attempt fork", e);
   }
 }

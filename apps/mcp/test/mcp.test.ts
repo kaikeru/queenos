@@ -54,4 +54,35 @@ describe("queenos-mcp Worker", () => {
     const ok = await rpc({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "whoami", arguments: {} } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
     expect(JSON.parse(ok.data.find((m) => m.id === 10)!.result!.content![0]!.text)).toMatchObject({ owner: OWNER });
   });
+
+  it("WIRE: a schema failure reaches the agent as JSON INVALID_INPUT without input values; tools/list still advertises the fields", async () => {
+    const sid = await session();
+    const bad = await rpc({ jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "init_agent", arguments: { name: "opus", model: "m", role: "boss" } } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
+    const r = bad.data.find((m) => m.id === 20)!.result!;
+    expect(r.isError).toBe(true);
+    const e = JSON.parse(r.content![0]!.text) as { code: string; message: string };
+    expect(e.code).toBe("INVALID_INPUT");
+    expect(e.message.length).toBeLessThanOrEqual(200);
+    expect(e.message).not.toContain("boss");
+    const list = await rpc({ jsonrpc: "2.0", id: 21, method: "tools/list" }, { "x-queen-user": OWNER, "mcp-session-id": sid });
+    const tool = (list.data.find((m) => m.id === 21)!.result!.tools as unknown as { name: string; inputSchema: { properties: Record<string, unknown>; required?: string[] } }[]).find((t) => t.name === "init_agent")!;
+    expect(Object.keys(tool.inputSchema.properties).sort()).toEqual(["model", "name", "role"]);
+    expect([...(tool.inputSchema.required ?? [])].sort()).toEqual(["model", "name", "role"]);
+  });
+
+  it("a DELETE of someone else's session is refused (403) and the session survives; the owner's DELETE ends it; an unknown session is 404", async () => {
+    const sid = await session();
+    const del = (owner: string, id: string) => exports.default.fetch(URL_, { method: "DELETE", headers: { "x-queen-user": owner, "mcp-session-id": id, "mcp-protocol-version": "2025-06-18" } });
+    const refused = await del(OTHER, sid);
+    expect(refused.status).toBe(403);
+    await refused.text();
+    const ok = await rpc({ jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "whoami", arguments: {} } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
+    expect(JSON.parse(ok.data.find((m) => m.id === 30)!.result!.content![0]!.text)).toMatchObject({ owner: OWNER });
+    const gone = await del(OWNER, sid);
+    expect(gone.status).toBe(204);
+    await gone.text();
+    const unknown = await del(OWNER, "0".repeat(32));
+    expect(unknown.status).toBe(404);
+    await unknown.text();
+  });
 });
