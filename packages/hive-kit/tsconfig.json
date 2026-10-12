@@ -1,1 +1,1 @@
-{ "extends": "@queenos/tsconfig/worker.json", "include": ["src"] }
+{ "extends": "@queenos/tsconfig/worker.json", "compilerOptions": { "lib": ["ES2022", "ESNext.Disposable"] }, "include": ["src"] }

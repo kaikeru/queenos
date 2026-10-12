@@ -7,6 +7,10 @@
  * gets a **read** token; a **write** token is minted only for a train fork of the hive
  * (`<hive>-train-<12 alnum>[-rN]`). A proxy bug therefore cannot write hive main.
  */
+import { RepoNotFoundError, errorCode } from "@queenos/hive-kit/artifacts";
+
+/** Moved to @queenos/hive-kit (shared with queenos-mcp); re-exported so the proxy's imports stay as they are. */
+export { RepoNotFoundError, errorCode };
 
 /** The subset of an Artifacts repo handle the proxy uses (the real binding's `ArtifactsRepo` fits it). */
 export interface ArtifactsRepoLike extends Disposable {
@@ -32,22 +36,6 @@ export interface UpstreamAuth {
   remote: string;
   /** The repo's default branch (hive main's is the branch the advert keeps and pushes may not target). */
   defaultBranch: string;
-}
-
-/** The repo does not exist (Artifacts NOT_FOUND). */
-export class RepoNotFoundError extends Error {
-  constructor(readonly repo: string) {
-    super(`no repo ${repo}`);
-    this.name = "RepoNotFoundError";
-  }
-}
-
-/** The Artifacts error code of a binding error (`.code`, or a `CODE:` message prefix), if any. */
-export function errorCode(e: unknown): string | null {
-  const code = (e as { code?: unknown } | null)?.code;
-  if (typeof code === "string") return code;
-  const m = /^([A-Z_]{3,}):/.exec(e instanceof Error ? e.message : String(e));
-  return m ? m[1]! : null;
 }
 
 /** `<hive>-train-<12 alnum>` (Queen `trainRepoName`), optionally with the `-rN` re-fork suffix. */

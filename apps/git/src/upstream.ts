@@ -4,7 +4,8 @@
  * commit 1deb7ab) and `readCommit`. Credentials come from {@link TokenCache} and are only ever put in the
  * `authorization` header of an upstream request.
  */
-import { errorCode, RepoNotFoundError, type ArtifactsLike, type TokenCache, type TokenScope } from "./tokens.js";
+import type { ArtifactsLike, TokenCache, TokenScope } from "./tokens.js";
+import { deleteRepoQuietly as deleteRepo, forkRepo, type ForkDeps, type ForkOptions, type ForkResult } from "@queenos/hive-kit/artifacts";
 
 export interface UpstreamDeps {
   artifacts: ArtifactsLike;
@@ -109,157 +110,41 @@ export async function upstreamFetch(deps: UpstreamDeps, r: UpstreamRequest): Pro
   }
 }
 
-// ── the push-path fork ──────────────────────────────────────────────────
+// ── the push-path fork (forkRepo lives in @queenos/hive-kit/artifacts, shared with queenos-mcp) ──────
 
-export interface ForkOptions {
-  /** Names tried (name, name-r2, …). Default 3: each try costs 2–6 s of the client's push. */
-  maxForks?: number;
-  /** One fork call. Default 30 s (a fork once hung; 1deb7ab). */
-  forkTimeoutMs?: number;
-  /** How long `get()` may say FORK_IN_PROGRESS. Default 30 s. */
-  readyTimeoutMs?: number;
-  /** How long the receive-pack probe tolerates 5xx before re-forking. Default 6 s. */
-  probeBudgetMs?: number;
-}
-
-export interface ForkResult {
-  /** The repo that exists and is pushable: `name`, or `name-rN` after a re-fork. */
-  repo: string;
-  /** Hive main at fork time (the fork's default branch head): the push's `old` and `gitPushed.baseSha`. */
-  baseSha: string;
-  /** Every name a fork was attempted under (the abandoned ones were deleted already). */
-  attempted: string[];
-}
-
-class TimeoutError extends Error {}
-
-/** This fork name is unusable (ghost, INTERNAL_ERROR, sick); delete it and try `-rN`. */
-class RetryableForkError extends Error {}
-
-function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new TimeoutError(message)), ms);
-  });
-  return Promise.race([p, timeout]).finally(() => {
-    if (timer !== undefined) clearTimeout(timer);
-  });
-}
+export type { ForkOptions, ForkResult };
 
 /**
- * Fork hive main into `name` (the repo the Queen's `gitIntent` returned) and wait until it accepts
- * smart-HTTP. A sick fork (5xx on `info/refs?service=git-receive-pack`, the per-repo 503 episodes a fork
- * inherits) or a ghost name is deleted and re-forked under `name-r2`, `name-r3` (§9). The client's body
- * has not been read yet, so nothing needs replaying. Throws {@link RepoNotFoundError} for a missing hive.
+ * Fork hive main into `name` (the repo the Queen's `gitIntent` returned) and wait until it accepts smart-HTTP. A sick
+ * fork (5xx on `info/refs?service=git-receive-pack`) or a ghost name is deleted and re-forked under `name-r2`, `name-r3`
+ * (§9). Throws RepoNotFoundError for a missing hive.
  */
-export async function forkTrain(deps: UpstreamDeps, hive: string, branch: string, name: string, opts: ForkOptions = {}): Promise<ForkResult> {
-  const maxForks = opts.maxForks ?? 3;
-  const attempted: string[] = [];
-  let last: unknown = null;
-  for (let n = 1; n <= maxForks; n++) {
-    const candidate = n === 1 ? name : `${name}-r${n}`;
-    attempted.push(candidate);
-    try {
-      const baseSha = await forkOnce(deps, hive, branch, candidate, opts);
-      return { repo: candidate, baseSha, attempted };
-    } catch (e) {
-      if (!(e instanceof RetryableForkError)) throw e;
-      last = e;
-      console.warn(`git: fork ${candidate} unusable (${e.message}); ${n < maxForks ? "re-forking under a new name" : "giving up"}`);
-      await deleteRepoQuietly(deps, candidate);
-      if (n < maxForks) await deps.sleep(500 * n);
-    }
-  }
-  throw new Error(`fork of ${hive} failed after ${maxForks} tries: ${last instanceof Error ? last.message : String(last)}`);
+export function forkTrain(deps: UpstreamDeps, hive: string, branch: string, name: string, opts: ForkOptions = {}): Promise<ForkResult> {
+  return forkRepo(forkDepsOf(deps, hive), hive, branch, name, { description: `QueenOS pushed submission (train fork of ${hive})`, logPrefix: "git", ...opts });
 }
 
-async function forkOnce(deps: UpstreamDeps, hive: string, branch: string, name: string, opts: ForkOptions): Promise<string> {
-  let source;
-  try {
-    source = await deps.artifacts.get(hive);
-  } catch (e) {
-    if (errorCode(e) === "NOT_FOUND") throw new RepoNotFoundError(hive);
-    throw e;
-  }
-  {
-    using src = source;
-    try {
-      await withTimeout(
-        src.fork(name, { defaultBranchOnly: true, description: `QueenOS pushed submission (train fork of ${hive})` }),
-        opts.forkTimeoutMs ?? 30_000,
-        `fork ${name} timed out`,
-      );
-    } catch (e) {
-      const code = errorCode(e);
-      // A fork from an earlier try of this name: reuse it (the name is the Queen's, fresh per intent).
-      if (code !== "ALREADY_EXISTS") {
-        if (code === "INTERNAL_ERROR" || code === "NOT_FOUND" || e instanceof TimeoutError) throw new RetryableForkError(`fork ${code ?? "timeout"}`);
-        throw e;
+/** Delete a repo, ignoring errors; its cached credentials are dropped first. */
+export function deleteRepoQuietly(deps: UpstreamDeps, repo: string): Promise<void> {
+  return deleteRepo({ artifacts: deps.artifacts, forget: (r) => deps.tokens.forget(r) }, repo);
+}
+
+/** The probe is exactly the proxy's own receive-pack advertisement request, with the write token of the train fork. */
+function forkDepsOf(deps: UpstreamDeps, hive: string): ForkDeps {
+  return {
+    artifacts: deps.artifacts,
+    sleep: deps.sleep,
+    now: deps.now,
+    forget: (repo) => deps.tokens.forget(repo),
+    probeStatus: async (repo) => {
+      try {
+        const res = await upstreamFetch(deps, { hive, repo, scope: "write", endpoint: "info/refs", search: "?service=git-receive-pack", method: "GET", clientHeaders: new Headers() });
+        await res.body?.cancel().catch(() => undefined);
+        return { status: res.status, ray: res.headers.get("cf-ray") };
+      } catch {
+        return null; // network trouble says nothing about the repo
       }
-    }
-  }
-
-  // `get()` throws FORK_IN_PROGRESS until the fork is usable.
-  const readyBy = deps.now() + (opts.readyTimeoutMs ?? 30_000);
-  let baseSha: string | null = null;
-  for (let delay = 250; ; delay = Math.min(delay * 2, 2000)) {
-    try {
-      using fork = await deps.artifacts.get(name);
-      const [head] = await fork.log({ ref: branch, limit: 1 });
-      if (!head) throw new RetryableForkError(`fork has no ${branch}`);
-      baseSha = head.hash;
-      break;
-    } catch (e) {
-      if (e instanceof RetryableForkError) throw e;
-      const code = errorCode(e);
-      if (code === "NOT_FOUND") throw new RetryableForkError("fork vanished (ghost name)");
-      if (code !== "FORK_IN_PROGRESS" && code !== "INTERNAL_ERROR") throw e;
-      if (deps.now() + delay > readyBy) throw new RetryableForkError(`fork not ready (${code})`);
-      await deps.sleep(delay);
-    }
-  }
-
-  // Readiness probe (1deb7ab): a fork can inherit its parent's 503 episode. The push goes to
-  // receive-pack, so probe exactly that advertisement with the write token.
-  if (!(await pushable(deps, hive, name, opts.probeBudgetMs ?? 6000))) throw new RetryableForkError("fork returns 5xx on receive-pack");
-  return baseSha;
-}
-
-/** false only when the fork keeps answering 5xx for the probe budget; inconclusive results count as pushable. */
-async function pushable(deps: UpstreamDeps, hive: string, repo: string, budgetMs: number): Promise<boolean> {
-  let waited = 0;
-  for (let delay = 1000; ; delay = Math.min(delay * 2, 4000)) {
-    let status: number;
-    try {
-      const res = await upstreamFetch(deps, {
-        hive,
-        repo,
-        scope: "write",
-        endpoint: "info/refs",
-        search: "?service=git-receive-pack",
-        method: "GET",
-        clientHeaders: new Headers(),
-      });
-      status = res.status;
-      await res.body?.cancel().catch(() => undefined);
-    } catch {
-      return true; // network trouble says nothing about the repo
-    }
-    if (status < 500) return true;
-    if (waited + delay > budgetMs) return false;
-    await deps.sleep(delay);
-    waited += delay;
-  }
-}
-
-/** Delete a repo, ignoring errors (a ghost may not exist; the Queen's cleanup is the backstop). */
-export async function deleteRepoQuietly(deps: UpstreamDeps, repo: string): Promise<void> {
-  deps.tokens.forget(repo);
-  try {
-    await withTimeout(deps.artifacts.delete(repo), 30_000, `delete ${repo} timed out`);
-  } catch {
-    // best effort
-  }
+    },
+  };
 }
 
 export interface HeadCommit {

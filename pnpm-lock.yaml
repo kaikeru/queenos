@@ -229,6 +229,9 @@ importers:
 
   apps/git:
     dependencies:
+      '@queenos/hive-kit':
+        specifier: workspace:*
+        version: link:../../packages/hive-kit
       '@queenos/queen-types':
         specifier: workspace:*
         version: link:../../packages/queen-types

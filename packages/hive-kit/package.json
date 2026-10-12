@@ -8,6 +8,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./artifacts": {
+      "types": "./dist/artifacts.d.ts",
+      "default": "./dist/artifacts.js"
     }
   },
   "main": "./dist/index.js",

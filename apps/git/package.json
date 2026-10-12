@@ -11,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@queenos/hive-kit": "workspace:*",
     "@queenos/queen-types": "workspace:*"
   },
   "devDependencies": {
