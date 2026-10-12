@@ -4,10 +4,7 @@ For any agent that speaks git (Claude Code, Codex, a script) and wants to contri
 
 Design background: `docs/human-push-design.md` (rev 2: the git proxy, Submissions, races, notes). If this file and that design disagree, the design wins; tell a maintainer.
 
-**Status legend.** The git proxy is not deployed yet. Each part below is marked:
-
-- **[LIVE]**: works today.
-- **[T1-T3]**: arrives with design tasks T1 (Queen intake and notes projection), T2/T2n (the git Worker and its notes pack) and T3 (edge git tokens and the `/git/*` route). Until those deploy, the commands below fail (no `/git` remote). The protocol is written against the design so agents can be built now.
+**Status.** The git proxy is live. The `[T1-T3]` markers below refer to the design tasks that delivered each part (T1 Queen intake and notes projection, T2/T2n the git Worker and its notes pack, T3 edge git tokens and the `/git/*` route); they are kept as pointers into the design. Repos seeded from the `worker-starter` template carry an `AGENTS.md` at the root: a short version of this doc for the agent that clones the hive.
 
 The one-line model: **a push is a proposal; the train decides.** You push code to an ordinary-looking git remote. The proxy checks the push rules at once and answers in the push output; the swarm then gates the code under the same rules as every drone, and you read the verdict as git notes afterwards. Nothing is merged by you.
 
@@ -15,9 +12,9 @@ The one-line model: **a push is a proposal; the train decides.** You push code t
 
 The remote is `https://queenos.kaikeru.com/git/<hive>`. It speaks plain git smart-HTTP (protocol v2 for fetch). There is no other URL, and no Artifacts token is ever involved.
 
-A **human** creates a git token once on the dashboard (**Push code → Create git token**, behind Cloudflare Access). It is shown once, is bound to their email, lasts 30 days by default, and can be revoked from the same panel at any time.
+A **human** creates a git token once on the dashboard page `https://<your QueenOS host>/p/<hive>/push` (**Push code → Create git token** / **Mint token**, behind Cloudflare Access). It is shown once, is bound to their email, lasts 30 days by default, and can be revoked from the same panel at any time.
 
-Agents use **their human's git token** (service-token agents come later). Give the agent one environment variable:
+Agents use a git token their human gives them: either a **plain token** (the agent then declares itself with the `Queen-Origin` trailer) or an **agent token** bound to the agent's name (see section 2; the token is then the identity). Give the agent one environment variable:
 
 ```sh
 export QUEENOS_GIT_TOKEN='qgt_...'
@@ -35,6 +32,7 @@ git config --local credential.https://queenos.kaikeru.com.helper \
 
   This stores only the helper (which reads the environment), not the token. A human can instead let git prompt once and keep the token in the OS keychain (`osxkeychain`, Git Credential Manager).
 - On `401` or `Authentication failed`, the token expired or was revoked: ask the human for a new one. Do not retry in a loop.
+- A one-off clone can pass the token through git's credential cache instead: `git -c credential.helper='cache --timeout=3600' clone https://queenos.kaikeru.com/git/<hive>` (username anything, password = token).
 - Clone, or add the remote to an existing checkout (the URL contains no secret):
 
 ```sh

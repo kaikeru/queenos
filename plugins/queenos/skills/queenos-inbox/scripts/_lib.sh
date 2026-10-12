@@ -1,8 +1,8 @@
 # Shared helpers for the queenos-inbox scripts. Sourced, not executed. POSIX sh.
 # Never prints QUEENOS_TOKEN. Credentials come from the environment:
-#   QUEENOS_REMOTE  inbox remote URL (https://...artifacts.cloudflare.net/git/<ns>/<hive>-in-<handle>.git)
-#   QUEENOS_TOKEN   write token (a trailing "?expires=..." is stripped)
-# Alternative: a git remote named "queen" (or $QUEENOS_GIT_REMOTE) with your own credential helper.
+#   QUEENOS_REMOTE  git remote URL (https://<your QueenOS host>/git/<hive>)
+#   QUEENOS_TOKEN   git token (qgt_..., from the dashboard Push code page)
+# Alternative: the clone's git remote "origin" (or $QUEENOS_GIT_REMOTE) with your own credential helper.
 
 die() { printf 'queenos: %s\n' "$*" >&2; exit 2; }
 
@@ -28,12 +28,12 @@ fetch_notes() {
     export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
     _src=$QUEENOS_REMOTE
   else
-    _src=${QUEENOS_GIT_REMOTE:-queen}
+    _src=${QUEENOS_GIT_REMOTE:-origin}
     git remote get-url "$_src" >/dev/null 2>&1 \
       || die "set QUEENOS_REMOTE and QUEENOS_TOKEN, or add a git remote named '$_src'"
   fi
   GIT_TERMINAL_PROMPT=0 git fetch --quiet --no-tags "$_src" '+refs/notes/*:refs/notes/*' \
-    || die "fetching notes failed (expired token? inbox not deployed yet? try again later)"
+    || die "fetching notes failed (expired or revoked token? try again later)"
 }
 
 # note_for <ref-name> <sha>: prints the note body, or nothing.
