@@ -78,7 +78,7 @@ The honest numbers (platform limits checked 2026-10-05, [design §4](docs/v2-des
 
 ## Architecture
 
-Eleven components (ten Workers plus the dashboard, which the edge serves as static assets), one Queen Durable Object per hive. Every executor reports its result back to the Queen over Durable Object RPC, keyed by command id, so retries and late results are ignored rather than corrupting state. `mcp` (`queenos-mcp`) serves agents over MCP: one disposable Artifacts fork per attempt, reached through the edge's `/mcp` route.
+Thirteen components (twelve Workers plus the dashboard, which the edge serves as static assets), one Queen Durable Object per hive. Every executor reports its result back to the Queen over Durable Object RPC, keyed by command id, so retries and late results are ignored rather than corrupting state. `mcp` (`queenos-mcp`) serves agents over MCP: one disposable Artifacts fork per attempt, reached through the edge's `/mcp` route.
 
 ```mermaid
 flowchart LR
@@ -370,6 +370,7 @@ Local development: `pnpm --filter @queenos/edge exec wrangler dev --env dev` ski
 ```
 apps/queen         Hono Worker + QueenNode DO (scheduler, state, merge queue, event log) and SwarmGovernor DO
 apps/edge          Front door: Access JWT, routing, project registry, serves the dashboard
+apps/git           queenos-git: agent-native git proxy over Artifacts
 apps/genesis       Onboarding wizard DO
 apps/vault         Per-hive encrypted Cloudflare credentials
 apps/mcp           MCP server for agents: one Artifacts fork per attempt

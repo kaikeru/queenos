@@ -78,7 +78,7 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 | 35d851c (step (d)) | **Step (d) dynamic race entry** (details below, §6). Also commits the `AGENTS.md` tool blocks (repo-graph, ast-grep). Queen 738 tests, git 80, queen-types 121, dashboard 201; full gate 46/46. LIVE (same deploys as efcccea) |
 | eab6a7b (step (b)) | **Step (b) agent identity on git tokens** (details below, §6). A git token can be bound to an agent (name + claimed model, self-reported) at mint (`POST /api/git-tokens` with `agent:{name, model?}`; dashboard Push code page fields). The edge forwards trusted `x-queen-agent` / `x-queen-agent-model` (client copies are stripped on every path); queenos-git validates them (401 if malformed) and refuses a branch handle suffix that doesn't match the token's agent. Queen schema v16 adds `submissions.agent`; the origin becomes `{kind:"agent", id:"<name>@<owner>", model?}` from the token (overrides the `Queen-Origin` trailer, which still works for human tokens). Supersede and same-head retry are keyed by (owner, ref, agent), so agents of one owner race instead of superseding; caps stay per owner email. The claimed model never reaches the router or `model_stats`; OriginChip shows "claims <model>". Tests: Queen 751 (+1 skipped), git 101, edge 85, queen-types 126, dashboard 208; full gate 46/46. LIVE (same deploys as efcccea) |
 
-**MCP (attempt = repo), Oct 12:** `apps/mcp` (`queenos-mcp`), Queen v17 attempts ledger, gatekeepers attempt routing, edge `/mcp`, dashboard attempt chip. Spec `docs/superpowers/specs/2026-10-12-queenos-mcp-design.md`, plan `docs/superpowers/plans/2026-10-12-queenos-mcp.md`. Probe results in spec §13.1 (P3 Claude Code client sub-check and P4 2 h token re-check still outstanding). **Oct 12 pivot:** the Herdr 3-session race rehearsal (shared git token, finding item ids behind Access) was dropped in favor of an MCP server, so agents race through MCP instead; the Oct 14 deadline is no longer the driver. Agent protocol: `docs/agent-protocol.md` §8; skill `plugins/queenos/skills/queenos-mcp`; template `AGENTS.md` has a "Through MCP" section. Not deployed yet (§4).
+**MCP (attempt = repo), Oct 12:** `apps/mcp` (`queenos-mcp`), Queen v17 attempts ledger, gatekeepers attempt routing, edge `/mcp`, dashboard attempt chip. Spec `docs/superpowers/specs/2026-10-12-queenos-mcp-design.md`, plan `docs/superpowers/plans/2026-10-12-queenos-mcp.md`. Probe results in spec §13.1 (P3 Claude Code client sub-check and P4 2 h token re-check still outstanding). **Oct 12 pivot:** the Herdr 3-session race rehearsal (shared git token, finding item ids behind Access) was dropped in favor of an MCP server, so agents race through MCP instead; the Oct 14 deadline is no longer the driver. Agent protocol: `docs/agent-protocol.md` §8; skill `plugins/queenos/skills/queenos-mcp`; template `AGENTS.md` has a "Through MCP" section. Not deployed yet (§4). Full gate 49/49; Queen 806 passed + 1 skipped.
 
 **Built and committed on Oct 12 (on `main`):**
 
@@ -165,8 +165,6 @@ Build order (Opus for the planner part, Sonnet for UI/template): (a) **DONE Oct 
 
 1. **Next: live MCP probe** (after the §4 deploys): two Claude Code sessions race on hive `demo` (external), the human picks. Replaces the Herdr 3-session rehearsal.
 
-   *Superseded by the MCP probe above:* prod smoke of an agent-token push on hive `demo` switched to external** (user mints the token and pushes; coordinator checks events/notes), then (g) rehearsal with 3 Claude sessions. (b3) and (f) are skipped unless time remains (recommendation Oct 12: go/no-go noon). (b2) agent API keys stay deferred. Ask the user before starting.
-
    **Done Oct 9: step (b) agent identity on git tokens** (eab6a7b, pushed, LIVE; Queen 751 (+1 skipped), git 101, edge 85, queen-types 126, dashboard 208; full gate 46/46):
    - **Mint:** `POST /api/git-tokens` takes `agent: {name, model?}`; the Push code page has name and model fields. The edge registry `git_tokens` gains `agent_name`, `agent_model`.
    - **Edge → git:** trusted `x-queen-agent` / `x-queen-agent-model` headers; client copies are stripped on every path. queenos-git validates them (401 if malformed) and refuses a branch handle suffix that differs from the token's agent name.
@@ -188,7 +186,7 @@ Build order (Opus for the planner part, Sonnet for UI/template): (a) **DONE Oct 
 
 **Roadmap:** Oct 12-13 rehearsal and recording (go/no-go for an all-sim cut by Oct 12 noon); Oct 14 submit. **Dropped or stubbed:** bisect + auto-revert on staging failure (a P0 bug is filed instead), real npm builds, custom domains for project sites.
 
-## 7. Architecture (13 Workers plus the dashboard)
+## 7. Architecture (12 Workers plus the dashboard)
 
 | Worker (dir) | Role |
 |---|---|
