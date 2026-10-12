@@ -67,10 +67,11 @@ export interface Seen {
   queen: Request[];
   assets: Request[];
   git: { req: Request; body: string }[];
+  mcp: { req: Request; body: string }[];
 }
 
 export function fakeBindings(overrides: Partial<Bindings> = {}): { env: Bindings; seen: Seen } {
-  const seen: Seen = { vault: [], genesis: [], queen: [], assets: [], git: [] };
+  const seen: Seen = { vault: [], genesis: [], queen: [], assets: [], git: [], mcp: [] };
   const vault: VaultPort = {
     async connectCloudflare(hive, creds, email) {
       seen.vault.push(["connect", hive, creds, email]);
@@ -109,6 +110,12 @@ export function fakeBindings(overrides: Partial<Bindings> = {}): { env: Bindings
           status: 200,
           headers: { "content-type": "application/x-git-upload-pack-advertisement", "x-from": "git" },
         });
+      },
+    },
+    MCP: {
+      async fetch(req) {
+        seen.mcp.push({ req, body: await req.clone().text() });
+        return new Response("event: message\ndata: {}\n\n", { status: 200, headers: { "content-type": "text/event-stream", "x-from": "mcp", "mcp-session-id": "sess-1" } });
       },
     },
     ASSETS: {

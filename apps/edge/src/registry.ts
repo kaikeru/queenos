@@ -202,6 +202,7 @@ export class HiveRegistry extends DurableObject {
 
   /** Checked on every git request: revocation and expiry take effect immediately. */
   async authGitToken(hash: string): Promise<{
+    id: string;
     email: string;
     scopes: ("read" | "push")[];
     agent: GitTokenAgent | null;
@@ -214,6 +215,7 @@ export class HiveRegistry extends DurableObject {
       this.ctx.storage.sql.exec("UPDATE git_tokens SET last_used_at = ? WHERE id = ?", t, r.id);
     }
     return {
+      id: r.id,
       email: r.email,
       scopes: r.scopes.split(",") as ("read" | "push")[],
       agent: r.agent_name ? { name: r.agent_name, model: r.agent_model ?? null } : null,

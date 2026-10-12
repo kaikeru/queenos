@@ -67,6 +67,8 @@ export interface Bindings {
   QUEEN: { fetch(req: Request): Promise<Response> };
   /** The git proxy Worker (queenos-git): the only thing /git/* is forwarded to. */
   GIT: { fetch(req: Request): Promise<Response> };
+  /** The MCP server Worker (queenos-mcp): the only thing /mcp is forwarded to. */
+  MCP: { fetch(req: Request): Promise<Response> };
   /** Cloudflare account id (a var) and the Account Analytics Read token (a secret) for the AE SQL API. */
   ACCOUNT_ID?: string;
   ANALYTICS_API_TOKEN?: string;
@@ -79,6 +81,9 @@ type Ctx = Context<AppEnv>;
 const defaultVerifier = createVerifier();
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** Client copies of the identity headers the edge sets, plus credentials: removed on every forwarded path. */
+const IDENTITY_HEADERS = ["x-queen-user", "x-queen-token-id", "x-queen-scopes", "x-queen-agent", "x-queen-agent-model", "authorization", "cookie", "cf-access-token", "cf-access-jwt-assertion"];
 
 export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher = (url, init) => fetch(url, init)) {
   const app = new Hono<AppEnv>();
@@ -147,18 +152,7 @@ export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher
     const headers = new Headers(c.req.raw.headers);
     // Client-supplied identity headers are removed on every path (token, Access JWT, dev mode);
     // only what the edge itself authenticated is set below.
-    for (const h of [
-      "x-queen-user",
-      "x-queen-scopes",
-      "x-queen-agent",
-      "x-queen-agent-model",
-      "authorization",
-      "cookie",
-      "cf-access-token",
-      "cf-access-jwt-assertion",
-    ]) {
-      headers.delete(h);
-    }
+    for (const h of IDENTITY_HEADERS) headers.delete(h);
     headers.set("x-queen-user", identity.email);
     headers.set("x-queen-scopes", identity.scopes.join(","));
     // Only a token bound to an agent carries one; Access JWT and dev identities never do.
@@ -169,6 +163,44 @@ export function createApp(verifier: Verifier = defaultVerifier, fetcher: Fetcher
     // Method, path, query and the streamed body are forwarded unchanged; the response streams back as-is.
     return env.GIT.fetch(new Request(c.req.raw, { headers }));
   });
+
+  // ---- MCP front door (docs/superpowers/specs/2026-10-12-queenos-mcp-design.md §4.1): BEFORE the Access middleware. ----
+  // Credential: `Authorization: Bearer qgt_…` only (agents' MCP configs send a header; no Basic, no Access JWT). Same
+  // failure rate limit as /git. The token's agent binding is ignored here: identity comes from init_agent. The token
+  // never reaches queenos-mcp.
+  const mcp = async (c: Ctx) => {
+    const env = c.env;
+    const unauthorized = () => c.json({ error: "unauthorized" }, 401, { "www-authenticate": 'Bearer realm="QueenOS"' });
+    let identity: { email: string; scopes: string[]; id: string };
+    if (env.ACCESS_MODE === "dev") {
+      if (!LOCAL_HOSTS.has(new URL(c.req.url).hostname)) return c.json({ error: "dev mode is localhost-only" }, 403);
+      if (!env.DEV_USER_EMAIL) return c.json({ error: "dev mode misconfigured" }, 503);
+      identity = { email: env.DEV_USER_EMAIL.toLowerCase(), scopes: [...ALL_SCOPES], id: "dev" };
+    } else {
+      const credential = /^Bearer\s+(\S+)\s*$/i.exec(c.req.header("authorization") ?? "")?.[1] ?? null;
+      if (!credential) return unauthorized();
+      const reg = registry(c);
+      const ip = c.req.header("cf-connecting-ip") ?? "unknown";
+      const keys = [`ip:${ip}`, `tok:${credential.slice(0, TOKEN_PREFIX.length + 6)}`];
+      const wait = await reg.gitAuthBlocked(keys);
+      if (wait > 0) return c.json({ error: "too many failed authentication attempts" }, 429, { "retry-after": String(wait) });
+      const found = credential.startsWith(TOKEN_PREFIX) ? await reg.authGitToken(await hashToken(credential)) : null;
+      if (!found) {
+        await reg.gitAuthFailed(keys);
+        return unauthorized();
+      }
+      identity = { email: found.email, scopes: found.scopes, id: found.id };
+    }
+    if (!identity.scopes.includes("push")) return c.json({ error: "token lacks push scope" }, 403);
+    const headers = new Headers(c.req.raw.headers);
+    for (const h of IDENTITY_HEADERS) headers.delete(h);
+    headers.set("x-queen-user", identity.email);
+    headers.set("x-queen-token-id", identity.id);
+    // Method, path, query and the (streamed) body unchanged; the SSE response streams back as-is.
+    return env.MCP.fetch(new Request(c.req.raw, { headers }));
+  };
+  app.all("/mcp", mcp);
+  app.all("/mcp/*", mcp);
 
   // Access JWT verification for everything else.
   app.use("*", async (c, next) => {
