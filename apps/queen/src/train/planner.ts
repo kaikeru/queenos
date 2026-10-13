@@ -1520,7 +1520,11 @@ export class TrainPlanner {
       this.setTrain(t, { raceOutcome: "PASSED", summary: r.summary, headSha: r.commitSha ?? t.headSha, score: r.score ?? null });
       // The others get the grace after the first pass, or after the entry window closes when that is later
       // (a candidate that entered just before the close still gets its grace).
-      if (race.deadlineAt === null) this.setRace(race, { deadlineAt: Math.max(this.ctx.now, race.entryClosesAt ?? 0) + (this.ctx.raceGraceMs ?? RACE_GRACE_MS) });
+      if (race.deadlineAt === null) {
+        const from = Math.max(this.ctx.now, race.entryClosesAt ?? 0);
+        // graceFrom is set once (the first time the clock starts) and never moved: rework holds measure from it (§5.2).
+        this.setRace(race, { deadlineAt: from + (this.ctx.raceGraceMs ?? RACE_GRACE_MS), ...(race.graceFrom == null ? { graceFrom: from } : {}) });
+      }
       this.maybeDecide(race);
       return this.finish("applied");
     }
@@ -2945,6 +2949,8 @@ export class TrainPlanner {
     this.setRace(race, {
       entryClosesAt: now,
       ...(race.deadlineAt !== null ? { deadlineAt: Math.min(race.deadlineAt, now + grace) } : {}),
+      // Entries closed early after a pass: "first pass, or entry close if later" is now this close (the pass came before it).
+      ...(race.graceFrom != null && race.graceFrom > now ? { graceFrom: now } : {}),
     });
     const who = input.by.replace(/^human:/, "");
     const first = this.find(race.trainIds[0] ?? "");

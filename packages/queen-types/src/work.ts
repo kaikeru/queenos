@@ -357,6 +357,12 @@ export const RaceSchema = z.object({
   rejections: z.array(RaceRejectionSchema).max(16).optional(),
   /** Rework loop: PICKING → RACING drops so far (reject one or all), capped by `maxRaceReopens`. Absent = 0. */
   reopens: z.number().int().min(0).optional(),
+  /**
+   * Rework loop (§5.2): when the grace clock first started (the first pass, or entry close if later). Set once; a rework
+   * slot fix moving `deadlineAt` (R3) never moves it, so findings holds measure from it. Absent / null (rows written before
+   * it existed): derived as `deadlineAt - raceGraceMs`.
+   */
+  graceFrom: z.number().int().nullable().optional(),
 });
 export type Race = z.infer<typeof RaceSchema>;
 

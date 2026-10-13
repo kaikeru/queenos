@@ -563,6 +563,8 @@ const MIGRATIONS: readonly Migration[] = [
   ALTER TABLE attempts ADD COLUMN reworks INTEGER NOT NULL DEFAULT 0; -- slots given (round of the current one)
   -- races.reopens: PICKING → RACING drops.
   ALTER TABLE races ADD COLUMN reopens INTEGER NOT NULL DEFAULT 0;
+  -- races.grace_from: when the grace clock first started (first pass or entry close); never moved. NULL = derive from deadline_at.
+  ALTER TABLE races ADD COLUMN grace_from INTEGER;
   `,
 ];
 
@@ -1360,19 +1362,21 @@ export function rowToRace(r: Row): RaceRecord {
     ...withValue("decidedBy", str(r.decided_by ?? null)),
     ...withValue("rejections", parseJson(r.rejections ?? null, schemaCheck<RaceRejection[]>(RaceRejectionSchema.array()))),
     ...(Number(r.reopens ?? 0) > 0 ? { reopens: Number(r.reopens) } : {}),
+    ...withValue("graceFrom", num(r.grace_from ?? null)),
   });
 }
 
 export function upsertRace(sql: SqlStorage, r: RaceRecord): void {
   sql.exec(
     `INSERT INTO races (race_id, item_id, width, state, train_ids, winner_train_id, reason, deadline_at, created_at, decided_at,
-       entry_closes_at, pick_deadline_at, recommended_train_id, recommend_reason, decided_by, rejections, reopens)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       entry_closes_at, pick_deadline_at, recommended_train_id, recommend_reason, decided_by, rejections, reopens, grace_from)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(race_id) DO UPDATE SET state = excluded.state, train_ids = excluded.train_ids, winner_train_id = excluded.winner_train_id,
        reason = excluded.reason, deadline_at = excluded.deadline_at, decided_at = excluded.decided_at,
        entry_closes_at = excluded.entry_closes_at, pick_deadline_at = excluded.pick_deadline_at,
        recommended_train_id = excluded.recommended_train_id, recommend_reason = excluded.recommend_reason,
-       decided_by = excluded.decided_by, rejections = excluded.rejections, reopens = excluded.reopens`,
+       decided_by = excluded.decided_by, rejections = excluded.rejections, reopens = excluded.reopens,
+       grace_from = excluded.grace_from`,
     r.raceId,
     r.itemId,
     r.width,
@@ -1390,6 +1394,7 @@ export function upsertRace(sql: SqlStorage, r: RaceRecord): void {
     r.decidedBy ?? null,
     r.rejections?.length ? JSON.stringify(r.rejections) : null,
     r.reopens ?? 0,
+    r.graceFrom ?? null,
   );
 }
 

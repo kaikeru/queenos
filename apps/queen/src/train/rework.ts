@@ -38,8 +38,12 @@ export function nextSlot(slot: AttemptSlot | undefined, attemptId: string, reaso
   return { attemptId, reworks: round, rework: { reason, dueAt: now + s.windowMs, round } };
 }
 
-/** When the race's grace clock started (the first pass, or entry close if later): `deadlineAt - raceGraceMs` (plan ruling R2). */
-export function graceStartOf(race: Pick<Race, "deadlineAt">, graceMs: number): number | null {
+/**
+ * When the race's grace clock started (the first pass, or entry close if later): the race's persisted `graceFrom`, which a
+ * rework fix's R3 deadline extension never moves; for a race written before it existed, `deadlineAt - raceGraceMs` (R2).
+ */
+export function graceStartOf(race: Pick<Race, "deadlineAt" | "graceFrom">, graceMs: number): number | null {
+  if (race.graceFrom != null) return race.graceFrom;
   return race.deadlineAt === null ? null : race.deadlineAt - graceMs;
 }
 
@@ -48,7 +52,7 @@ export function graceStartOf(race: Pick<Race, "deadlineAt">, graceMs: number): n
  * came from gate findings, at most `graceStart + reworkHoldMs`. A human reject-one holds until `dueAt` (the judge chose
  * to wait), whatever the grace clock says.
  */
-export function holdEnd(rework: AttemptRework, race: Pick<Race, "deadlineAt">, anyPassed: boolean, s: { holdMs: number; graceMs: number }): number {
+export function holdEnd(rework: AttemptRework, race: Pick<Race, "deadlineAt" | "graceFrom">, anyPassed: boolean, s: { holdMs: number; graceMs: number }): number {
   if (rework.reason === "human" || !anyPassed) return rework.dueAt;
   const start = graceStartOf(race, s.graceMs);
   return start === null ? rework.dueAt : Math.min(rework.dueAt, start + s.holdMs);
@@ -67,7 +71,7 @@ export interface DeadlineTrain {
  * candidate's hold end in a RACING race. Only future times (a past one would re-arm the alarm at once, forever).
  */
 export function reworkDeadlines(input: {
-  races: readonly Pick<Race, "state" | "trainIds" | "deadlineAt">[];
+  races: readonly Pick<Race, "state" | "trainIds" | "deadlineAt" | "graceFrom">[];
   trains: readonly DeadlineTrain[];
   slots: readonly AttemptSlot[];
   holdMs: number;

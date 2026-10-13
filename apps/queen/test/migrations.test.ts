@@ -76,7 +76,7 @@ const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v F
 /** Undo v19 (a test that rebuilds an older version first). */
 function dropV19(sql: SqlStorage): void {
   sql.exec(`ALTER TABLE attempts DROP COLUMN rework_reason; ALTER TABLE attempts DROP COLUMN rework_due_at;
-    ALTER TABLE attempts DROP COLUMN reworks; ALTER TABLE races DROP COLUMN reopens;
+    ALTER TABLE attempts DROP COLUMN reworks; ALTER TABLE races DROP COLUMN reopens; ALTER TABLE races DROP COLUMN grace_from;
     DELETE FROM _migrations WHERE version = 19;`);
 }
 
@@ -125,6 +125,7 @@ describe("migrations", () => {
       for (const c of ["regates", "last_regate_at"]) expect(columns(q.sql, "attempts").has(c), c).toBe(true);
       for (const c of ["rework_reason", "rework_due_at", "reworks"]) expect(columns(q.sql, "attempts").has(c), c).toBe(true);
       expect(columns(q.sql, "races").has("reopens")).toBe(true);
+      expect(columns(q.sql, "races").has("grace_from")).toBe(true);
       expect(migrate(state.storage)).toBe(19);
       expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(19);
     });
@@ -666,6 +667,7 @@ describe("v19: rework loop", () => {
       expect(migrate(state.storage)).toBe(SCHEMA_VERSION);
       for (const c of ["rework_reason", "rework_due_at", "reworks"]) expect(columns(sql, "attempts").has(c), c).toBe(true);
       expect(columns(sql, "races").has("reopens")).toBe(true);
+      expect(columns(sql, "races").has("grace_from")).toBe(true);
       expect(getAttemptRow(sql, att.attemptId)).toEqual(att);
       expect(rowToRace(sql.exec("SELECT * FROM races WHERE race_id = 'r1'").one())).toEqual(race);
 
@@ -675,6 +677,8 @@ describe("v19: rework loop", () => {
       expect(getAttemptRow(sql, att.attemptId)).toEqual({ ...att, reworks: 2 });
       upsertRace(sql, { ...race, state: "REWORKING", reopens: 1 });
       expect(rowToRace(sql.exec("SELECT * FROM races WHERE race_id = 'r1'").one())).toEqual({ ...race, state: "REWORKING", reopens: 1 });
+      upsertRace(sql, { ...race, deadlineAt: 500, graceFrom: 77 });
+      expect(rowToRace(sql.exec("SELECT * FROM races WHERE race_id = 'r1'").one())).toEqual({ ...race, deadlineAt: 500, graceFrom: 77 });
     });
   });
 
