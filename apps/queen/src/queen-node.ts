@@ -270,8 +270,11 @@ import {
   short,
   slugify,
   trailersOf,
+  lateReason,
+  raceClosedToEntries,
   type IntakeItem,
   type IntakeLookup,
+  type IntakePlan,
   type PriorSubmission,
 } from "./work/inbox";
 import { MAX_NOTES, projectNotes, type NotesInput, type NotesTrain } from "./work/notes";
@@ -1269,6 +1272,8 @@ export class QueenNode extends DurableObject<Env> {
     a: Attempt,
     head: { after: string; before: string | null; title: string; message: string },
     mode: "push" | "regate",
+    /** regate only: re-enter this RACING race (the previous train is its candidate), bypassing the intake. */
+    rejoinRaceId?: string,
   ): Promise<{ attempt: Attempt; trainId: string; disposition: SubmitDisposition }> {
     const ref = `refs/heads/item/${a.itemId}`;
     const prevRow = this.sql.exec("SELECT * FROM submissions WHERE attempt_id = ? AND outcome = 'applied' ORDER BY created_at DESC, rowid DESC LIMIT 1", a.attemptId).toArray()[0];
@@ -1281,10 +1286,12 @@ export class QueenNode extends DurableObject<Env> {
     const origin: SubmissionOrigin = { kind: "agent", id: clip(`${a.agentName}@${a.owner}`, 320), model: a.model };
     const actor = `agent:${origin.id}`;
     const now = this.now();
-    const plan = decideIntake(
-      { ref, headSha: head.after, title: head.title, message: head.message, trailers: trailersOf(head.message, {}), newItemId: crypto.randomUUID() },
-      { now, lookup: this.intakeLookup({ state: this.activeState() }), previousOnRef: previous },
-    );
+    const plan: IntakePlan = rejoinRaceId
+      ? { disposition: "joined-race", itemId: a.itemId, reopen: false, race: { join: rejoinRaceId }, messages: [] }
+      : decideIntake(
+          { ref, headSha: head.after, title: head.title, message: head.message, trailers: trailersOf(head.message, {}), newItemId: crypto.randomUUID() },
+          { now, lookup: this.intakeLookup({ state: this.activeState() }), previousOnRef: previous },
+        );
     const parent = plan.file?.parentId ?? null;
     let entered: Attempt = a;
     const { acc } = this.decide(
@@ -1309,6 +1316,7 @@ export class QueenNode extends DurableObject<Env> {
             item: plannerItem(item),
             race: plan.race,
             resume: item.status === "ACTIVE",
+            ...(rejoinRaceId ? { rejoin: true as const } : {}),
           }),
         );
         if (plan.supersedeTrainId) d.acc.train(d.tp.supersede(plan.supersedeTrainId, head.after));
@@ -1404,9 +1412,23 @@ export class QueenNode extends DurableObject<Env> {
     }
     const sub = getSubmission(this.sql, att.repo, att.headSha);
     if (!sub || sub.outcome !== "applied") return conflict(`attempt ${att.attemptId}'s head ${short(att.headSha)} has no submission; push again`);
+    // Where the head re-enters (decided before anything is committed): the RACING race its previous train is already a
+    // candidate of (even with entries closed: not a new entry), else the push intake, unless the item is late
+    // (decided, landed, closed to entries): then nothing to re-gate. A regate never files a follow-up item.
+    const intakeItem = this.intakeLookup({ state: this.activeState() }).item(att.itemId);
+    let rejoin: string | undefined;
+    if (intakeItem?.racing) {
+      const raceRow = this.sql.exec("SELECT * FROM races WHERE race_id = ?", intakeItem.racing.raceId).toArray()[0];
+      if (raceRow && rowToRace(raceRow).trainIds.includes(att.trainId)) rejoin = intakeItem.racing.raceId;
+    }
+    if (!rejoin && intakeItem && (lateReason(intakeItem, now) || raceClosedToEntries(intakeItem, now))) {
+      return { ok: false, code: "ITEM_NOT_ACCEPTING", message: clip(`item ${att.itemId} was decided without this head; nothing to re-gate`, 200) };
+    }
     const item = this.loadItem(att.itemId);
+    // The submission row keeps no title / message: the re-submission uses the item's title for both, so the original
+    // push's trailers are not carried (no effect on routing: the ref is item/<id>, and a regate never files new items).
     const title = clip(item?.title ?? `attempt ${att.attemptId}`, 120);
-    const entered = await this.enterAttemptHead(hive, att, { after: att.headSha, before: sub.beforeSha ?? null, title, message: title }, "regate");
+    const entered = await this.enterAttemptHead(hive, att, { after: att.headSha, before: sub.beforeSha ?? null, title, message: title }, "regate", rejoin);
     return { ok: true, attempt: this.attemptView(entered.attempt), changed: true };
   }
 

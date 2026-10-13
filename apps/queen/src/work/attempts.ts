@@ -86,7 +86,11 @@ export function attemptVerdictKind(t: Pick<TrainRecord, "phase" | "raceOutcome" 
   return isInfraStopped({ summary: t!.summary }) ? "infra" : "findings";
 }
 
-/** An automatic gate-infra re-gate in flight on the train (its verdict still pending), else null. */
+/**
+ * An automatic same-head gate-infra re-gate in flight on the train (TESTING, the re-gate's gate outstanding, the
+ * verdict still pending). Null = no automatic same-head re-gate pending; that includes a re-gated train sent back to
+ * DEPLOYING by the watchdog's infra path (its verdict is still pending, but it is re-deploying, not re-gating).
+ */
 export function attemptRegating(t: TrainRecord | null): NonNullable<AttemptView["regating"]> | null {
   if (!t || !(t.gateInfraRounds ?? 0) || !gateOutstanding(t) || attemptVerdict(t) !== "pending") return null;
   return { round: t.gateInfraRounds!, of: MAX_GATE_INFRA_ROUNDS, notBefore: t.gateNotBefore ?? null };

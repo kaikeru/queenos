@@ -998,6 +998,11 @@ export class TrainPlanner {
     item: PlannerItem;
     race: { join: string } | { create: true } | null;
     resume: boolean;
+    /**
+     * `attemptRegate`: the attempt's head re-enters the RACING race its previous train is already a candidate of. Its
+     * entry window may have closed since: that is not a new entry, so the closed-window guard does not apply.
+     */
+    rejoin?: true;
   }): PlanResult {
     const t = this.find(input.trainId);
     if (!t || !isContributed(t)) return this.finish("ignored:unknown");
@@ -1017,7 +1022,7 @@ export class TrainPlanner {
     });
     let race = input.race && "join" in input.race ? this.races.get(input.race.join) : undefined;
     // Defensive (intake already files a follow-up): never join a race whose entry window has closed.
-    const closedJoin = !!race && race.state === "RACING" && race.entryClosesAt != null && this.ctx.now >= race.entryClosesAt;
+    const closedJoin = !input.rejoin && !!race && race.state === "RACING" && race.entryClosesAt != null && this.ctx.now >= race.entryClosesAt;
     if (race && (race.state !== "RACING" || closedJoin)) race = undefined;
     if (race) {
       this.setRace(race, { trainIds: [...race.trainIds, t.trainId] });
@@ -2042,14 +2047,17 @@ export class TrainPlanner {
 
   /**
    * The re-gates are spent: an INFRA verdict, not a rejection. The summary carries INFRA_SUMMARY_PREFIX (the durable
-   * marker, `isInfraStopped`); the train then fails like any candidate (ejected, the race decides or abandons, the item
-   * awaits its contributor). The item is not reopened: the agent decides (`attemptRegate`, or a new push).
+   * marker, `isInfraStopped`); then infraExhausted: a race candidate fails like any candidate (ejected, the race decides
+   * or abandons, the item awaits its contributor); a train outside a race is ejected with EXECUTOR_LOST on its item.
+   * The item is not reopened: the agent decides (`attemptRegate`, or a new push).
    */
   private gateInfraExhausted(t: TrainRecord, summary: string, rounds: number): void {
     const s = clip500(`${INFRA_SUMMARY_PREFIX}gate could not run after ${rounds + 1} tries: ${summary}`);
     this.setTrain(t, { summary: s, gateNotBefore: null }, false);
     this.promptSummary(t, s);
-    this.fail(t, s);
+    // infraExhausted: a race candidate fails alone (its summary already carries the prefix); a contributed train
+    // outside a race keeps the EXECUTOR_LOST path (never a REWORK drone, never a silent FAILED).
+    this.infraExhausted(t, s);
   }
 
   /**

@@ -23,6 +23,7 @@ import {
   externalHive,
   fileItem,
   gateFail,
+  gitPush,
   gateInfra,
   gatePass,
   goLive,
@@ -407,5 +408,87 @@ describe("ledger test gaps (T2, T3, T4)", () => {
     expect(deletesOf(s.provisions, baseRepo)).toHaveLength(1);
     await later(ns, 0);
     expect(distinctDeletes(await look(ns), baseRepo)).toBe(1);
+  });
+});
+
+describe("fix round 1", () => {
+  /** Two attempts race (window open), entries close while B is pending, then A's gate infra-exhausts. */
+  async function closedRace() {
+    const { ns, stub } = await externalHive({ race: { entryWindowMs: 15 * 60_000 } });
+    const itemId = await fileItem(ns);
+    const a = await readyAttempt(ns, itemId, agent());
+    const b = await readyAttempt(ns, itemId, agent({ name: "haiku" }));
+    await push(ns, a);
+    await push(ns, b);
+    await goLive(ns, a.trainId);
+    const raceId = String((await look(ns)).races[0]!.race_id);
+    await stub.closeRaceEntries({ hive: ns, raceId, user: OWNER });
+    await infraRounds(ns, a.trainId, MAX_GATE_INFRA_ROUNDS + 1);
+    expect(await stub.getAttempt(a.attemptId)).toMatchObject({ state: "REJECTED", verdictKind: "infra" });
+    expect((await look(ns)).races[0]).toMatchObject({ state: "RACING" }); // B is still pending
+    return { ns, stub, itemId, a, b, raceId };
+  }
+
+  it("I1: a regate into a still-RACING race with entries closed rejoins that same race; no follow-up item is filed", async () => {
+    const { ns, stub, itemId, a, raceId } = await closedRace();
+    const items = (await look(ns)).items.length;
+    const res = await stub.attemptRegate(own(ns, a));
+    expect(res).toMatchObject({ ok: true, changed: true, attempt: { state: "PUSHED", itemId, raceId } });
+    if (!res.ok) throw new Error(res.message);
+    const s = await look(ns);
+    expect(s.items).toHaveLength(items);
+    expect(s.races).toHaveLength(1);
+    expect(JSON.parse(String(s.races[0]!.train_ids))).toContain(res.attempt.trainId);
+    expect(s.trains.find((t) => t.train_id === res.attempt.trainId)).toMatchObject({ race_id: raceId, race_outcome: "RACING", prompt_id: itemId });
+    expect(s.submissions.find((x) => x.attempt_id === a.attemptId)).toMatchObject({ train_id: res.attempt.trainId, disposition: "joined-race", item_id: itemId });
+  });
+
+  it("I1: once the other candidate won, a regate is refused (ITEM_NOT_ACCEPTING) and nothing is committed", async () => {
+    const { ns, stub, a, b } = await closedRace();
+    await gatePass(ns, b.trainId);
+    expect((await look(ns)).races[0]).toMatchObject({ state: "DECIDED", winner_train_id: b.trainId });
+    const before = await look(ns);
+    const res = await stub.attemptRegate(own(ns, a));
+    expect(res).toMatchObject({ ok: false, code: "ITEM_NOT_ACCEPTING", message: expect.stringMatching(/was decided without this head; nothing to re-gate/) });
+    const after = await look(ns);
+    expect(after.items).toHaveLength(before.items.length);
+    expect(after.trains).toHaveLength(before.trains.length);
+    expect(after.attempts.find((x) => x.attempt_id === a.attemptId)).toMatchObject({ state: "REJECTED", regates: 0, train_id: a.trainId });
+  });
+
+  it("I2: an uncorrelated human push (no race) whose gate keeps failing on infrastructure ends EJECTED with EXECUTOR_LOST, never a REWORK", async () => {
+    const ns = `inf-${crypto.randomUUID().slice(0, 8)}`;
+    const p = await gitPush(ns, "refs/heads/tip-jar", "Add a tip jar");
+    const trainId = p.decision.trainId;
+    expect(await trainOf(ns, trainId)).toMatchObject({ phase: "DEPLOYING", race_id: null });
+    await goLive(ns, trainId);
+    await infraRounds(ns, trainId, MAX_GATE_INFRA_ROUNDS + 1);
+    const t = await trainOf(ns, trainId);
+    expect(t).toMatchObject({ phase: "EJECTED" });
+    expect(isInfraStopped({ summary: String(t.summary) })).toBe(true);
+    const esc = await runInDurableObject(stubFor(ns), (q: QueenNode) => q.sql.exec("SELECT reason, subject_id FROM escalations").toArray());
+    expect(esc).toEqual([expect.objectContaining({ reason: "EXECUTOR_LOST", subject_id: t.prompt_id })]);
+    const rework = await runInDurableObject(stubFor(ns), (q: QueenNode) => q.sql.exec("SELECT COUNT(*) AS n FROM merge_trains WHERE action = 'REWORK'").one().n);
+    expect(Number(rework)).toBe(0);
+  });
+
+  it("M-b: a real second regate: exhaust, regate, exhaust again, wait past the interval, regate → regates 2 and the (2/3) event", async () => {
+    const { ns, stub, r } = await (async () => {
+      const g = await gating({ entryWindowMs: 0 });
+      await infraRounds(g.ns, g.r.trainId, MAX_GATE_INFRA_ROUNDS + 1);
+      return g;
+    })();
+    const first = await stub.attemptRegate(own(ns, r));
+    if (!first.ok) throw new Error(first.message);
+    await goLive(ns, first.attempt.trainId);
+    await infraRounds(ns, first.attempt.trainId, MAX_GATE_INFRA_ROUNDS + 1);
+    expect(await stub.getAttempt(r.attemptId)).toMatchObject({ state: "REJECTED", verdictKind: "infra" });
+    expect(await stub.attemptRegate(own(ns, r))).toMatchObject({ ok: false, code: "CAP_EXCEEDED", retryAfterMs: expect.any(Number) });
+    await later(ns, REGATE_MIN_INTERVAL_MS + 1_000);
+    const second = await stub.attemptRegate(own(ns, r));
+    expect(second).toMatchObject({ ok: true, changed: true, attempt: { state: "PUSHED", regates: 2 } });
+    const s = await look(ns);
+    expect(s.attempts[0]).toMatchObject({ regates: 2 });
+    expect(s.events.some((e) => e.type === "attempt.state" && /re-gate requested \(2\/3\)/.test(e.summary))).toBe(true);
   });
 });
