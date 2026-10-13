@@ -323,6 +323,28 @@ describe("the slot fix in a RACING race (§5.1, §5.2; Review Focus 1, 2)", () =
     expect(JSON.parse(String(race.train_ids))).not.toContain(res.trainId);
   });
 
+  it("after its slot expired, a late entrant's re-push into the new race is normal intake, not R4 (a follow-up after entry close)", async () => {
+    const { ns, stub } = await externalHive({ race: { entryWindowMs: 15 * MIN } });
+    const itemId = await fileItem(ns);
+    const a = await readyAttempt(ns, itemId);
+    await push(ns, a);
+    await goLive(ns, a.trainId);
+    await gateFail(ns, a.trainId);
+    await later(ns, 31 * MIN); // the slot expires: race ABANDONED, item FAILED
+    const r1 = String((await look(ns)).races.at(-1)!.race_id);
+    expect((await look(ns)).races.at(-1)).toMatchObject({ state: "ABANDONED" });
+    const late = await push(ns, a); // a late push: intake reopens the item with a new race R2
+    expect(late.res.disposition).not.toBe("late-new-item");
+    const r2 = (await look(ns)).races.at(-1)!;
+    expect(r2.race_id).not.toBe(r1);
+    expect(await stub.getAttempt(a.attemptId)).toMatchObject({ state: "PUSHED", reworks: 1 });
+    await skew(ns, 16 * MIN); // past R2's entry close, the first R2 head still gating
+    const { res } = await push(ns, a);
+    expect(res.disposition).toBe("late-new-item");
+    expect(await trainOf(ns, late.res.trainId!)).toMatchObject({ race_id: r2.race_id, race_outcome: "RACING" });
+    expect(JSON.parse(String((await look(ns)).races.find((r) => r.race_id === r2.race_id)!.train_ids))).not.toContain(res.trainId);
+  });
+
   it("a slot fix pushed before dueAt survives the expiry alarm (Review Focus 1)", async () => {
     const { ns, stub } = await externalHive({ race: { entryWindowMs: 0 } });
     const itemId = await fileItem(ns);

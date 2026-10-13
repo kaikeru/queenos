@@ -1540,8 +1540,15 @@ export class QueenNode extends DurableObject<Env> {
     if (race.state === "REWORKING" && !this.isReworkingWinner(race, a.attemptId)) return null;
     if (a.rework && a.rework.dueAt > now) return { raceId: race.raceId };
     const t = this.trainExists(a.trainId) ? this.loadTrain(a.trainId) : null;
-    if ((a.reworks ?? 0) > 0 && t && isActive(t) && t.raceId === race.raceId && t.raceOutcome === "RACING" && !t.carId) return { raceId: race.raceId, supersede: t.trainId };
-    return null;
+    if (!((a.reworks ?? 0) > 0 && t && isActive(t) && t.raceId === race.raceId && t.raceOutcome === "RACING" && !t.carId)) return null;
+    // R4 only for the fix of a slot held in THIS race: the slot's train (REWORK, or FAILED once the fix push closed the
+    // slot) is one of this race's candidates. A late entrant into a new race (its slot expired elsewhere) takes intake (§5.1).
+    const slotHere = race.trainIds.some((id) => {
+      if (id === t.trainId || !this.trainExists(id)) return false;
+      const x = this.loadTrain(id);
+      return x?.attemptId === a.attemptId && (x.raceOutcome === "REWORK" || x.raceOutcome === "FAILED");
+    });
+    return slotHere ? { raceId: race.raceId, supersede: t.trainId } : null;
   }
 
   /** A REWORKING race's winner (its `winnerTrainId`, kept until a fix wins) is `attemptId`'s train. */
