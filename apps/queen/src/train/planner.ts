@@ -1027,8 +1027,10 @@ export class TrainPlanner {
     race: { join: string } | { create: true } | null;
     resume: boolean;
     /**
-     * `attemptRegate`: the attempt's head re-enters the RACING race its previous train is already a candidate of. Its
-     * entry window may have closed since: that is not a new entry, so the closed-window guard does not apply.
+     * `attemptRegate`, or a rework slot's fix (rework-loop spec §5.1): the attempt's head re-enters the race its previous
+     * train is already a candidate of. Its entry window may have closed since: that is not a new entry, so the
+     * closed-window guard does not apply. A REWORKING race may be rejoined too (only the winner's attempt is routed
+     * there), and a push inside the attempt's open slot closes that slot (`closeSlotByPush`).
      */
     rejoin?: true;
   }): PlanResult {
@@ -1051,8 +1053,14 @@ export class TrainPlanner {
     let race = input.race && "join" in input.race ? this.races.get(input.race.join) : undefined;
     // Defensive (intake already files a follow-up): never join a race whose entry window has closed.
     const closedJoin = !input.rejoin && !!race && race.state === "RACING" && race.entryClosesAt != null && this.ctx.now >= race.entryClosesAt;
-    if (race && (race.state !== "RACING" || closedJoin)) race = undefined;
+    // A rejoin (re-gate, rework slot fix) may also re-enter a REWORKING race: only the winner's attempt is routed there.
+    const joinable = !!race && (race.state === "RACING" || (input.rejoin === true && race.state === "REWORKING"));
+    if (race && (!joinable || closedJoin)) race = undefined;
     if (race) {
+      const anyPassed = race.trainIds.some((id) => {
+        const x = this.find(id);
+        return !!x && isActive(x) && x.raceOutcome === "PASSED";
+      });
       this.setRace(race, { trainIds: [...race.trainIds, t.trainId] });
       this.setTrain(t, { raceId: race.raceId, candidate: race.trainIds.length - 1, raceOutcome: "RACING" }, false);
       this.event(t, {
@@ -1060,6 +1068,7 @@ export class TrainPlanner {
         summary: clip500(`pushed train ${t.trainId} joined race ${race.raceId} as candidate ${race.trainIds.length} (${input.origin.kind})`),
         data: { action: "BUILD", lane: "BUILD", raceId: race.raceId, candidate: race.trainIds.length - 1, origin: input.origin, joined: true },
       });
+      if (input.rejoin) this.closeSlotByPush(t, race, anyPassed);
     } else if (input.race && !closedJoin) {
       const raceId = this.ctx.newId();
       const window = input.item.entryWindowMs ?? this.ctx.entryWindowMs ?? 0;
@@ -1169,10 +1178,46 @@ export class TrainPlanner {
     if (t.carId || t.phase === "LANDING") return this.finish("ignored:stale");
     const race = this.racingRaceOf(t);
     this.eject(t, clip500(`withdrawn: ${reason}`), race ? { raceOutcome: "LOST" } : {});
+    if (race?.state === "REWORKING") {
+      this.abandonRework(race, `the winner's attempt withdrew its fix (${reason})`);
+      return this.finish("applied");
+    }
     if (race) this.maybeDecide(race);
-    if (!this.trains.some((x) => isActive(x) && !isCar(x) && x.promptId === t.promptId)) this.awaitContributor(t.promptId, `withdrawn: ${reason}`);
+    // Rework loop (§4, §5.6, pre-flight F4): a REWORK slot still holding the RACING race keeps the item open; the race's
+    // own resolution (decide, or the fallback at the slot's end) settles it, never a FAILED item mid-slot.
+    const held = race?.state === "RACING" && race.trainIds.some((id) => this.find(id)?.raceOutcome === "REWORK");
+    if (!held && !this.trains.some((x) => isActive(x) && !isCar(x) && x.promptId === t.promptId)) this.awaitContributor(t.promptId, `withdrawn: ${reason}`);
     this.maybeLand();
     return this.finish("applied");
+  }
+
+  /**
+   * Rework loop (§5.6): the attempt ended (end_attempt, or the watchdog expired it). Its REWORK candidate leaves its RACING
+   * race (FAILED; the race then decides), and a REWORKING race whose winner is this attempt falls back. Its slot closes.
+   * Call it after `withdraw` (which handles an active train). `ignored:stale` when it held nothing.
+   */
+  attemptEnded(attemptId: string, why: string): PlanResult {
+    let changed = false;
+    for (const race of [...this.races.values()]) {
+      if (race.state === "REWORKING") {
+        if (this.find(race.winnerTrainId ?? "")?.attemptId !== attemptId) continue;
+        this.abandonRework(race, `attempt ${attemptId} ended (${why})`);
+        changed = true;
+      } else if (race.state === "RACING") {
+        const rework = race.trainIds.map((id) => this.find(id)).filter((x): x is TrainRecord => !!x && x.attemptId === attemptId && x.raceOutcome === "REWORK");
+        if (!rework.length) continue;
+        for (const x of rework) this.endRework(x, "FAILED", `attempt ${attemptId} ended (${why})`);
+        this.maybeDecide(race);
+        changed = true;
+      }
+    }
+    const s = this.slots.get(attemptId);
+    if (s?.rework) {
+      this.setSlot({ ...s, rework: null });
+      changed = true;
+    }
+    this.maybeLand();
+    return this.finish(changed ? "applied" : "ignored:stale");
   }
 
   /**
@@ -1466,6 +1511,10 @@ export class TrainPlanner {
       return this.finish("applied");
     }
     const race = this.racingRaceOf(t);
+    if (race?.state === "REWORKING") {
+      this.reworkWon(t, race, r);
+      return this.finish("applied");
+    }
     if (race) {
       // A candidate stays in TESTING until the race is decided.
       this.setTrain(t, { raceOutcome: "PASSED", summary: r.summary, headSha: r.commitSha ?? t.headSha, score: r.score ?? null });
@@ -2122,6 +2171,14 @@ export class TrainPlanner {
       this.failCar(t, summary, opts.carCause ?? "infra");
       return;
     }
+    // Rework loop (§5.3): a race winner (an attempt's train) ejected from its car by a conflict or an integration failure.
+    if (opts.cause && t.attemptId && t.raceOutcome === "WON" && this.ctx.rework) {
+      const won = t.raceId ? this.races.get(t.raceId) : undefined;
+      if (won && won.state === "DECIDED" && won.winnerTrainId === t.trainId) {
+        this.winnerRejected(t, won, summary, opts);
+        return;
+      }
+    }
     const race = opts.cause ? undefined : this.racingRaceOf(t);
     if (race) {
       this.raceCandidateFailed(t, race, summary);
@@ -2445,11 +2502,11 @@ export class TrainPlanner {
 
   // ── internals: races ──────────────────────────────────────────────────
 
-  /** The train's race, if it is a candidate still in a RACING race (or a passed candidate held in a PICKING race). */
+  /** The train's race, if it is a candidate still in a RACING race (a passed candidate held in PICKING; a fix in REWORKING). */
   private racingRaceOf(t: TrainRecord): RaceRecord | undefined {
     if (!t.raceId || isCar(t)) return undefined;
     const race = this.races.get(t.raceId);
-    if (race?.state !== "RACING" && race?.state !== "PICKING") return undefined;
+    if (race?.state !== "RACING" && race?.state !== "PICKING" && race?.state !== "REWORKING") return undefined;
     return t.raceOutcome === "RACING" || t.raceOutcome === "PASSED" ? race : undefined;
   }
 
@@ -2511,8 +2568,105 @@ export class TrainPlanner {
       }
       const race = t.raceId ? this.races.get(t.raceId) : undefined;
       this.endRework(t, "FAILED", `rework slot ${s.rework.round} of attempt ${s.attemptId} expired at ${iso(s.rework.dueAt)}`);
-      if (race) this.maybeDecide(race);
+      if (race?.state === "REWORKING") this.abandonRework(race, `rework slot ${s.rework.round} of attempt ${s.attemptId} expired`);
+      else if (race) this.maybeDecide(race);
     }
+  }
+
+  /** Set (or clear) the item's REWORKING wait reason; its prompt rides along so the ledger absorbs it. */
+  private reworkWait(itemId: string, waitReason: string | null): void {
+    this.reworkWaits.set(itemId, waitReason === null ? null : clip(waitReason, 200));
+    const p = this.prompts.get(itemId);
+    if (p) this.markPrompt(p, false);
+  }
+
+  /**
+   * A push inside the attempt's open slot (§5.1): the slot closes (reworks kept), the old REWORK train of the attempt
+   * fails (no longer pending), and (R3) a RACING race's grace deadline moves out to the slot's hold end, so the fix is
+   * not cut off by a grace clock that started before it existed.
+   */
+  private closeSlotByPush(t: TrainRecord, race: RaceRecord, anyPassed: boolean): void {
+    const s = t.attemptId ? this.slots.get(t.attemptId) : undefined;
+    if (!s?.rework || s.rework.dueAt <= this.ctx.now) return;
+    const end = holdEnd(s.rework, race, anyPassed, { holdMs: this.ctx.rework?.holdMs ?? 0, graceMs: this.ctx.raceGraceMs ?? RACE_GRACE_MS });
+    for (const old of this.trains) if (old !== t && old.attemptId === t.attemptId && old.raceOutcome === "REWORK") this.setTrain(old, { raceOutcome: "FAILED" }, false);
+    this.setSlot({ ...s, rework: null });
+    if (race.state === "RACING" && race.deadlineAt !== null && end > race.deadlineAt) this.setRace(race, { deadlineAt: end });
+  }
+
+  /**
+   * §5.3: the winner was rejected in the merge train. With a slot: REWORK (conflict, or findings for an integration
+   * failure), race DECIDED → REWORKING, the item waits for the fix ("awaiting rework"); only this attempt may push, and its
+   * push rejoins this race (no new race, no entry window). Without one (R8): the fallback at once.
+   */
+  private winnerRejected(t: TrainRecord, race: RaceRecord, summary: string, opts: FailOptions): void {
+    const reason: ReworkReason = opts.cause === "conflict" ? "conflict" : "findings";
+    const extra: Partial<TrainRecord> = opts.conflict ? { conflict: opts.conflict } : {};
+    const slot = this.giveSlot(t, reason);
+    if (!slot) {
+      this.ejectKeepingFork(t, clip500(`failed: ${summary}`), { ...extra, raceOutcome: "FAILED" });
+      this.abandonRework(race, `winner ${t.trainId} was rejected in the train (${reason}) and attempt ${t.attemptId} has no rework slot left`);
+      return;
+    }
+    const { dueAt, round } = slot.rework!;
+    this.ejectKeepingFork(t, reworkReasonText(reason, dueAt, `failed: ${summary}`), { ...extra, raceOutcome: "REWORK" });
+    this.setRace(race, { state: "REWORKING" });
+    this.raceEvent(race, t, `race ${race.raceId} reworking: winner ${t.trainId} was rejected in the train (${reason}); attempt ${t.attemptId} may push a fix until ${iso(dueAt)}`, { outcome: "REWORKING", winner: t.trainId, reason, dueAt, round }, "warn");
+    this.reworkWait(race.itemId, `awaiting rework (attempt ${t.attemptId}, due ${iso(dueAt)})`);
+    this.maybeLand();
+  }
+
+  /** §5.3: the REWORKING race's fix passed its gate: it wins (a queue ticket), the race is DECIDED again. */
+  private reworkWon(t: TrainRecord, race: RaceRecord, r: TrainResult): void {
+    for (const id of race.trainIds) {
+      const x = this.find(id);
+      if (x && x !== t) this.endRework(x, "FAILED", `race ${race.raceId}: the rework of attempt ${t.attemptId ?? "?"} passed`);
+    }
+    const reason = clip(`reworked by attempt ${t.attemptId ?? "?"}: ${t.trainId} passed every gate`, 300);
+    this.pass(t, { raceOutcome: "WON", reason, summary: r.summary, headSha: r.commitSha ?? t.headSha, score: r.score ?? null });
+    this.setRace(race, { state: "DECIDED", winnerTrainId: t.trainId, reason, decidedAt: this.ctx.now });
+    this.raceEvent(race, t, `race ${race.raceId} decided again: ${t.trainId} (the rework of the winner) passed`, { winner: t.trainId, outcome: "DECIDED", rework: true });
+    this.reworkWait(race.itemId, null);
+    this.maybeLand();
+  }
+
+  /** §5.3: the REWORKING race's fix was rejected: the next round's slot, or the fallback. Infra keeps the race waiting (R7). */
+  private reworkFixFailed(t: TrainRecord, race: RaceRecord, summary: string): void {
+    const why = `failed in race: ${summary}`;
+    if (isInfraStopped({ summary })) {
+      this.ejectKeepingFork(t, why, { raceOutcome: "FAILED", summary: clip500(summary) });
+      this.reworkWait(race.itemId, `awaiting rework (attempt ${t.attemptId}: its rebased head could not be gated; retry_gates)`);
+      return;
+    }
+    const slot = this.giveSlot(t, "findings");
+    if (!slot) {
+      this.ejectKeepingFork(t, why, { raceOutcome: "FAILED", summary: clip500(summary) });
+      this.abandonRework(race, `the rebased head of attempt ${t.attemptId} was rejected and it has no rework slot left`);
+      return;
+    }
+    const { dueAt, round } = slot.rework!;
+    this.ejectKeepingFork(t, reworkReasonText("findings", dueAt, why), { raceOutcome: "REWORK", summary: clip500(summary) });
+    this.raceEvent(race, t, `race ${race.raceId} still reworking: the rebased head ${t.trainId} was rejected; attempt ${t.attemptId} has until ${iso(dueAt)} (round ${round})`, { outcome: "REWORKING", reason: "findings", dueAt, round }, "warn");
+    this.reworkWait(race.itemId, `awaiting rework (attempt ${t.attemptId}, due ${iso(dueAt)})`);
+  }
+
+  /**
+   * §5.6, the rework fallback: the race is ABANDONED (REWORK → FAILED, a fix in flight is withdrawn), the item goes FAILED
+   * "awaiting contributor", which reopens it to any agent's start_attempt. The Queen then releases its base (R6).
+   */
+  private abandonRework(race: RaceRecord, why: string): void {
+    if (race.state === "ABANDONED") return;
+    for (const id of race.trainIds) {
+      const x = this.find(id);
+      if (!x) continue;
+      if (x.raceOutcome === "REWORK") this.endRework(x, "FAILED", why);
+      else if (isActive(x) && x.raceOutcome === "RACING") this.eject(x, clip500(`withdrawn: race ${race.raceId} abandoned (${why})`), { raceOutcome: "LOST" });
+    }
+    this.setRace(race, { state: "ABANDONED", reason: clip(`abandoned: ${why}`, 300), decidedAt: this.ctx.now });
+    this.raceEvent(race, this.find(race.winnerTrainId ?? ""), `race ${race.raceId} abandoned: ${why}; the item reopens to any agent`, { outcome: "ABANDONED", fallback: true }, "warn");
+    this.reworkWait(race.itemId, null);
+    this.awaitContributor(race.itemId, `rework fallback: ${why}`);
+    this.maybeLand();
   }
 
   /**
@@ -2520,6 +2674,10 @@ export class TrainPlanner {
    * rejected on findings in a RACING race keeps its place with a rework slot (REWORK) instead; infra never uses a slot.
    */
   private raceCandidateFailed(t: TrainRecord, race: RaceRecord, summary: string): void {
+    if (race.state === "REWORKING") {
+      this.reworkFixFailed(t, race, summary);
+      return;
+    }
     const why = `failed in race: ${summary}`;
     const slot = race.state === "RACING" && !isInfraStopped({ summary }) ? this.giveSlot(t, "findings") : null;
     if (slot) {
