@@ -453,7 +453,7 @@ describe("planner: idempotency", () => {
     s.result("B", false);
     s.take("broadcast");
     const r = s.run((p) => p.trainResult({ trainId: "t2", passed: true, summary: "late" }));
-    expect(r).toEqual({ outcome: "ignored:stale", prompts: [], trains: [], deployments: [], effects: [], modelStats: [], events: [], races: [], itemConflicts: [], conflictClaims: [] });
+    expect(r).toEqual({ outcome: "ignored:stale", prompts: [], trains: [], deployments: [], effects: [], modelStats: [], events: [], races: [], itemConflicts: [], conflictClaims: [], slots: [], reworkWaits: [] });
   });
 
   it("ignores duplicate, unknown and premature results", () => {

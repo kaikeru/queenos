@@ -81,6 +81,7 @@ import type {
   ProvisionResult,
   QueenServerMessage,
   RecalledMemory,
+  ReworkReason,
   SubmissionOrigin,
   TraceContext,
   TrainPhase as QueenTrainPhase,
@@ -88,7 +89,18 @@ import type {
   TrainState,
   WorkStatus,
 } from "@queenos/queen-types";
-import { INFRA_SUMMARY_PREFIX, MAX_GATE_COMMAND_ID, MAX_RECALL_QUERY, RACE_GRACE_MS, memoryToRagSnippet, spanIdFor, traceIdFromUuid, traceparent } from "@queenos/queen-types";
+import {
+  INFRA_SUMMARY_PREFIX,
+  MAX_GATE_COMMAND_ID,
+  MAX_RECALL_QUERY,
+  RACE_GRACE_MS,
+  isInfraStopped,
+  memoryToRagSnippet,
+  reworkReasonText,
+  spanIdFor,
+  traceIdFromUuid,
+  traceparent,
+} from "@queenos/queen-types";
 import { droneInstanceId } from "../drones";
 import {
   DEFAULT_POLICY,
@@ -107,6 +119,7 @@ import type { RaceRecord } from "../records";
 import * as queue from "./queue";
 import { LOSER_FORK_KEEP_MS, checkPick, decideMode, isHumanBy, judgeOf, keptLoser, pickDeadline, pickDue, recommend, releaseLoser } from "./pick";
 import { buildCredits, rankCandidates, raceWidth, type RaceCandidate } from "./race";
+import { holdEnd, iso, nextSlot, type AttemptSlot, type ReworkSettings } from "./rework";
 
 /**
  * Planner-internal train lifecycle (TrainPhaseSchema in queen-types, exposed
@@ -379,6 +392,8 @@ export interface HiveState {
   items?: PlannerItem[];
   /** v2: MAX(passed_seq) over every train (terminal ones included): queue tickets stay monotonic. */
   maxPassedSeq?: number;
+  /** Rework loop (v19): slots of the hive's open attempts (attempts.reworks / rework_reason / rework_due_at). */
+  slots?: AttemptSlot[];
 }
 
 /** Race policy inputs (HiveSettings.race + Guardrails + budget), for rework widths. */
@@ -461,6 +476,11 @@ export interface PlannerContext {
    * stays null: decided as soon as every candidate reported, or at the grace deadline). Swarm hives leave it 0.
    */
   entryWindowMs?: number;
+  /**
+   * Rework loop (rework-loop spec §5.5): external hives' rework guardrails. Absent (swarm hives): no attempt ever gets a
+   * slot and every rejection is handled as before the rework loop.
+   */
+  rework?: ReworkSettings;
 }
 
 /** A human pick (§10.3): +1 pick for the winner's (model, role), +1 against the recommendation when it differed (db.applyPickDelta). */
@@ -520,6 +540,10 @@ export interface PlanResult {
   picks?: PickDelta[];
   /** T9a: a pick the rules refused (`pick()`): the route answers this status. */
   refused?: { status: 404 | 409; message: string };
+  /** Rework loop: attempt slots this plan changed (the Queen writes them onto attempts rows). */
+  slots: AttemptSlot[];
+  /** Rework loop: an item's wait reason while its race is REWORKING (`awaiting rework (...)`); null clears it (Task 3 sets it). */
+  reworkWaits: { itemId: string; waitReason: string | null }[];
 }
 
 const TERMINAL: ReadonlySet<TrainPhase> = new Set(["MERGED", "EJECTED"]);
@@ -835,6 +859,9 @@ export class TrainPlanner {
   private readonly dirtyDeployments = new Set<string>();
   private readonly races = new Map<string, RaceRecord>();
   private readonly dirtyRaces = new Set<string>();
+  private readonly slots = new Map<string, AttemptSlot>();
+  private readonly dirtySlots = new Set<string>();
+  private readonly reworkWaits = new Map<string, string | null>();
   private readonly items = new Map<string, PlannerItem>();
   private readonly conflicts = new Map<string, number>();
   private readonly dirtyConflicts = new Set<string>();
@@ -871,6 +898,7 @@ export class TrainPlanner {
     this.trains = state.trains.map(copyTrain);
     for (const d of state.deployments ?? []) this.deployments.set(d.deploymentId, { ...d });
     for (const r of state.races ?? []) this.races.set(r.raceId, { ...r, trainIds: [...r.trainIds] });
+    for (const s of state.slots ?? []) this.slots.set(s.attemptId, { ...s, rework: s.rework ? { ...s.rework } : null });
     for (const i of state.items ?? []) {
       this.items.set(i.itemId, { ...i });
       if (i.conflicts !== undefined) this.conflicts.set(i.itemId, i.conflicts);
@@ -1561,6 +1589,7 @@ export class TrainPlanner {
         this.dispatchGate(t, deployGateRound(t));
       }
     }
+    this.expireSlots();
     for (const race of [...this.races.values()]) {
       if (race.state === "RACING" || race.state === "PICKING") this.maybeDecide(race);
     }
@@ -2429,9 +2458,75 @@ export class TrainPlanner {
     this.dirtyRaces.add(r.raceId);
   }
 
-  /** A candidate failed (gate, build, watchdog): eject it alone; no rework yet. */
+  // ── internals: the rework loop (rework-loop spec §5) ─────────────────
+
+  private setSlot(s: AttemptSlot): void {
+    this.slots.set(s.attemptId, s);
+    this.dirtySlots.add(s.attemptId);
+  }
+
+  /** The train's attempt's open slot, or null. */
+  private openSlotOf(t: TrainRecord): AttemptSlot | null {
+    if (!t.attemptId) return null;
+    const s = this.slots.get(t.attemptId);
+    return s?.rework ? s : null;
+  }
+
+  /** Open the next slot of `t`'s attempt (an external hive, an attempt's train, a slot left, the item open), or null. */
+  private giveSlot(t: TrainRecord, reason: ReworkReason): AttemptSlot | null {
+    if (!this.ctx.rework || !t.attemptId || !isContributed(t)) return null;
+    const next = nextSlot(this.slots.get(t.attemptId), t.attemptId, reason, this.ctx.rework, this.ctx.now, this.item(t.promptId)?.status);
+    if (next) this.setSlot(next);
+    return next;
+  }
+
+  /** A REWORK candidate still holds its RACING race (§5.2): its slot is open and its hold has not ended. */
+  private holding(t: TrainRecord, race: RaceRecord, anyPassed: boolean): boolean {
+    const s = this.openSlotOf(t);
+    if (!s) return false;
+    return this.ctx.now < holdEnd(s.rework!, race, anyPassed, { holdMs: this.ctx.rework?.holdMs ?? 0, graceMs: this.ctx.raceGraceMs ?? RACE_GRACE_MS });
+  }
+
+  /**
+   * A REWORK candidate leaves the race: FAILED (its slot expired, its attempt ended, the race fell back) or LOST (the race
+   * was decided while it was still in rework). Its slot closes. The reason keeps the rework text (R20: the head still reads
+   * as rejected); `why` goes on the event.
+   */
+  private endRework(t: TrainRecord, outcome: "FAILED" | "LOST", why: string): void {
+    if (t.raceOutcome !== "REWORK") return;
+    this.setTrain(t, { raceOutcome: outcome });
+    const s = t.attemptId ? this.slots.get(t.attemptId) : undefined;
+    if (s?.rework) this.setSlot({ ...s, rework: null });
+    this.event(t, { type: "train.phase", severity: "warn", summary: clip500(`train ${t.trainId} ${outcome} (was in rework): ${why}`), data: { raceId: t.raceId ?? null, raceOutcome: outcome, rework: true } });
+  }
+
+  /** Slots whose dueAt passed (alarm): the REWORK candidate fails, its race decides (or abandons). */
+  private expireSlots(): void {
+    for (const s of [...this.slots.values()]) {
+      if (!s.rework || s.rework.dueAt > this.ctx.now) continue;
+      const t = this.trains.find((x) => x.attemptId === s.attemptId && x.raceOutcome === "REWORK");
+      if (!t) {
+        this.setSlot({ ...s, rework: null });
+        continue;
+      }
+      const race = t.raceId ? this.races.get(t.raceId) : undefined;
+      this.endRework(t, "FAILED", `rework slot ${s.rework.round} of attempt ${s.attemptId} expired at ${iso(s.rework.dueAt)}`);
+      if (race) this.maybeDecide(race);
+    }
+  }
+
+  /**
+   * A candidate failed (gate, build, watchdog): eject it alone; no rework yet. Rework loop (§5.2): an attempt's candidate
+   * rejected on findings in a RACING race keeps its place with a rework slot (REWORK) instead; infra never uses a slot.
+   */
   private raceCandidateFailed(t: TrainRecord, race: RaceRecord, summary: string): void {
     const why = `failed in race: ${summary}`;
+    const slot = race.state === "RACING" && !isInfraStopped({ summary }) ? this.giveSlot(t, "findings") : null;
+    if (slot) {
+      this.ejectKeepingFork(t, reworkReasonText("findings", slot.rework!.dueAt, why), { raceOutcome: "REWORK", summary: clip500(summary) });
+      this.maybeDecide(race);
+      return;
+    }
     const patch: Partial<TrainRecord> = { raceOutcome: "FAILED", summary: clip500(summary) };
     if (isContributed(t)) this.ejectKeepingFork(t, why, patch);
     else this.eject(t, why, patch);
@@ -2453,14 +2548,18 @@ export class TrainPlanner {
     const live = cands.filter(isActive);
     const pending = live.filter((t) => t.raceOutcome === "RACING");
     const passed = live.filter((t) => t.raceOutcome === "PASSED");
+    const reworking = cands.filter((t) => t.raceOutcome === "REWORK");
     // The grace clock belongs to a live pass: once the last one left (superseded, failed), the next pass restarts it.
     if (!passed.length && race.deadlineAt !== null) this.setRace(race, { deadlineAt: null });
     // An open entry window holds everything (passes and all-failed alike): another agent may still enter.
     if (race.entryClosesAt != null && this.ctx.now < race.entryClosesAt) return;
     const due = race.deadlineAt !== null && this.ctx.now >= race.deadlineAt;
     if (pending.length && !(due && passed.length)) return;
+    // Rework loop (§5.2): a REWORK candidate is pending until its hold ends, even though its train is no longer active.
+    if (reworking.some((t) => this.holding(t, race, passed.length > 0))) return;
     const predicted = this.item(race.itemId)?.paths ?? [];
     if (passed.length) {
+      for (const t of reworking) this.endRework(t, "LOST", `lost race ${race.raceId}: still in rework at the race deadline`);
       const judge = judgeOf(this.item(race.itemId)?.judge, this.ctx.pick?.judge);
       const picking = [...this.races.values()].filter((r) => r.state === "PICKING" && r.raceId !== race.raceId).length;
       const mode = decideMode({ judge, passed: passed.length, picking, maxPicking: this.ctx.pick?.maxPickingRaces ?? Number.NaN });
@@ -2484,6 +2583,7 @@ export class TrainPlanner {
 
   /** Nobody passed: one failure for the item, with the best failure's Scribe summary (no human, even when judged by one). */
   private abandonRace(race: RaceRecord, cands: TrainRecord[], predicted: readonly string[]): void {
+    for (const t of cands) this.endRework(t, "FAILED", `race ${race.raceId} abandoned: no candidate passed`);
     const prompt = this.prompts.get(race.itemId);
     const failed = cands.filter((t) => t.raceOutcome === "FAILED");
     const best = failed.length ? this.find(rankCandidates(failed.map(toCandidate), { predictedPaths: predicted }).winner!.trainId) : undefined;
@@ -3074,6 +3174,11 @@ export class TrainPlanner {
       ...(this.abortedIntents.length ? { abortedIntents: this.abortedIntents } : {}),
       ...(this.picks.length ? { picks: this.picks } : {}),
       ...(this.refused ? { refused: this.refused } : {}),
+      slots: [...this.dirtySlots].map((id) => {
+        const s = this.slots.get(id)!;
+        return { ...s, rework: s.rework ? { ...s.rework } : null };
+      }),
+      reworkWaits: [...this.reworkWaits].map(([itemId, waitReason]) => ({ itemId, waitReason })),
     };
     this.picks = [];
     this.refused = null;
@@ -3092,6 +3197,8 @@ export class TrainPlanner {
     this.dirtyDeployments.clear();
     this.dirtyRaces.clear();
     this.dirtyConflicts.clear();
+    this.dirtySlots.clear();
+    this.reworkWaits.clear();
     this.effects = [];
     return result;
   }
