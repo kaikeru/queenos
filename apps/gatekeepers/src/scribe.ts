@@ -20,7 +20,12 @@ export interface ScribeResult {
 }
 
 export function clip(s: string, n = MAX_SUMMARY_CHARS): string {
-  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+  if (s.length <= n) return s;
+  let head = s.slice(0, n - 1);
+  // Never leave half of a surrogate pair at the cut.
+  const last = head.charCodeAt(head.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) head = head.slice(0, -1);
+  return `${head}…`;
 }
 
 /** Keep the head and the tail of an over-long log (errors cluster at both ends). */

@@ -7,7 +7,8 @@
  *   renders a compact, capped evidence document (prompt, changed files, tree,
  *   what `GET /` on the preview served). Only that string leaves the step.
  * - runReview (its own step): one LLM call with a JSON schema, tolerant parse,
- *   one retry, and a fail-open result when the model is unusable.
+ *   up to three tries (empty or unparseable answers are retried with a 2 s / 4 s
+ *   backoff), and an `unavailable` result when the model stays unusable.
  */
 import { AiGatewayError, type CompletionRequest, type CompletionResult } from "@queenos/hive-kit";
 import { clip } from "./scribe";
@@ -21,6 +22,10 @@ export const REVIEW_FAIL_MARKER = "[review-fail]";
 export const MAX_FEEDBACK_CHARS = 400;
 export const MAX_REVIEW_ITEMS = 8;
 export const MAX_REVIEW_ITEM_CHARS = 200;
+/** Output budget: reasoning models think before answering, and an exhausted budget returns an empty answer. */
+export const REVIEW_MAX_TOKENS = 8_000;
+export const REVIEW_TRIES = 3;
+export const DEFAULT_REVIEW_RETRY_BASE_MS = 2_000;
 
 /** Input caps (characters). The rendered document never exceeds MAX_REVIEW_INPUT_CHARS. */
 export const MAX_REVIEW_INPUT_CHARS = 24_000;
@@ -176,6 +181,10 @@ export interface RunReviewOptions {
   model: string;
   input: string;
   timeoutMs: number;
+  /** Backoff before try n+1 is `retryBaseMs * 2^(n-1)` (2 s, 4 s by default). */
+  retryBaseMs?: number;
+  /** Test seam for the backoff wait. */
+  sleep?: (ms: number) => Promise<void>;
   metadata?: Record<string, string>;
 }
 
@@ -187,12 +196,15 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
 }
 
-/** One LLM call (twice on failure). Never throws: infrastructure trouble is `unavailable`. */
+/** Up to REVIEW_TRIES calls. Never throws: infrastructure trouble is `unavailable`. */
 export async function runReview(o: RunReviewOptions): Promise<ReviewOutcome> {
   if (!o.llm) return { kind: "unavailable", reason: "no AI binding for the reviewer", model: o.model };
   const llm = o.llm;
+  const base = o.retryBaseMs ?? DEFAULT_REVIEW_RETRY_BASE_MS;
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   let reason = "";
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= REVIEW_TRIES; attempt++) {
+    if (attempt > 1 && base > 0) await sleep(base * 2 ** (attempt - 2));
     try {
       const res = await withTimeout(
         llm.complete({
@@ -200,7 +212,7 @@ export async function runReview(o: RunReviewOptions): Promise<ReviewOutcome> {
           system: REVIEWER_SYSTEM_PROMPT,
           messages: [{ role: "user", content: o.input }],
           // Reasoning models think before answering; the answer itself is small.
-          maxTokens: 3_000,
+          maxTokens: REVIEW_MAX_TOKENS,
           responseFormat: { type: "json_schema", json_schema: { name: "review", description: "Verdict on whether the change satisfies the prompt", schema: REVIEW_JSON_SCHEMA as unknown as Record<string, unknown> } },
           ...(o.metadata ? { metadata: o.metadata } : {}),
         }),
@@ -209,6 +221,7 @@ export async function runReview(o: RunReviewOptions): Promise<ReviewOutcome> {
       const verdict = parseReview(res.text);
       if (verdict) return { kind: "verdict", verdict, model: res.model || o.model };
       reason = `unparseable reviewer output: ${clip(res.text.replace(/\s+/g, " "), 120) || "(empty)"}`;
+      console.warn(`gatekeeper: reviewer try ${attempt}/${REVIEW_TRIES} gave no verdict`, JSON.stringify({ model: o.model, finishReason: res.finishReason ?? null, outputTokens: res.usage?.outputTokens ?? null, empty: res.text.trim() === "" }));
     } catch (e) {
       reason = String((e as Error)?.message ?? e);
       // A non-retryable gateway error (bad model id, auth) will not improve on a second try.

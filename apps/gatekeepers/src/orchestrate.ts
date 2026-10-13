@@ -45,8 +45,8 @@ export const INSPECT_STEP: WorkflowStepConfig = { retries: { limit: 4, delay: "1
 export const INSPECT_TRANSIENT_ATTEMPTS = 4;
 export const SCRIBE_STEP: WorkflowStepConfig = { retries: { limit: 2, delay: "3 seconds", backoff: "exponential" }, timeout: "2 minutes" };
 export const REPORT_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
-/** The reviewer retries internally (and fails open), so Workflows must not retry it again. */
-export const REVIEW_STEP: WorkflowStepConfig = { retries: { limit: 0, delay: "1 second" }, timeout: "3 minutes" };
+/** The reviewer retries internally (3 tries, 2 s / 4 s backoff, each bounded by REVIEW_TIMEOUT_MS), so Workflows must not retry it again. */
+export const REVIEW_STEP: WorkflowStepConfig = { retries: { limit: 0, delay: "1 second" }, timeout: "5 minutes" };
 export const BEST_EFFORT_STEP: WorkflowStepConfig = { retries: { limit: 1, delay: "2 seconds" }, timeout: "1 minute" };
 export const DISPATCH_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" };
 
@@ -116,6 +116,7 @@ export async function reportAttempt(task: AttemptTask, step: StepRunner, ports: 
     message,
   };
   const res = await step.do("report: attempt pushed", REPORT_STEP, () => queen.attemptPushed!(input).catch((e) => Promise.reject(toStepError(e))));
+  if (res.outcome !== "applied") console.info("gatekeeper: attemptPushed not applied", JSON.stringify({ attemptId: task.attemptId, outcome: res.outcome }));
   return { status: "attempt", attemptId: task.attemptId, repo: task.repo, after: task.after, outcome: res.outcome };
 }
 
@@ -285,6 +286,8 @@ function roundSteps(step: StepRunner, round: number): StepRunner {
  * or the train left (ejected after the Queen's infra cap: EXECUTOR_LOST).
  */
 export async function runGate(task: GateTask, step: StepRunner, ports: GatekeeperPorts, config: GateConfig): Promise<GateRunResult> {
+  // An automatic infra re-gate (the Queen's GateCommand.notBefore): start no earlier than that. Past or absent: at once.
+  if (task.notBefore !== undefined) await step.sleep("infra: re-gate backoff", Math.max(0, task.notBefore - Date.now()));
   let last: GateRunResult | null = null;
   for (let round = 1; round <= config.infraRounds; round++) {
     const s = roundSteps(step, round);
@@ -442,6 +445,7 @@ async function reviewGate(ctx: Ctx, packet: ReviewPacket): Promise<ReviewGate> {
           model: config.reviewModel,
           input: packet.text,
           timeoutMs: config.reviewTimeoutMs,
+          retryBaseMs: config.reviewRetryBaseMs,
           metadata: { trainId: train.trainId, promptId: train.promptId, role: "REVIEWER" },
         });
         return { ...o, ms: Date.now() - t0 };

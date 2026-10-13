@@ -1,7 +1,7 @@
 /** Gatekeeper configuration from vars + secrets (wrangler.jsonc, .dev.vars). */
 import { modelForRole } from "@queenos/hive-kit";
 import type { AiGatewayConfig } from "@queenos/queen-types";
-import { DEFAULT_MODEL_REVIEWER, type ReviewMode } from "./review";
+import { DEFAULT_MODEL_REVIEWER, DEFAULT_REVIEW_RETRY_BASE_MS, type ReviewMode } from "./review";
 
 export type TestMode = "scripted" | "sandbox";
 export type ScribeMode = "auto" | "llm" | "extractive";
@@ -42,6 +42,8 @@ export interface GateConfig {
   reviewModel: string;
   /** Per-call reviewer timeout; the call is retried once, then the gate fails open. */
   reviewTimeoutMs: number;
+  /** Backoff base between reviewer tries: 2 s, then 4 s (REVIEW_RETRY_BASE_MS). */
+  reviewRetryBaseMs: number;
 }
 
 export interface GateVars {
@@ -59,6 +61,7 @@ export interface GateVars {
   REVIEW_MODE?: string;
   MODEL_REVIEWER?: string;
   REVIEW_TIMEOUT_MS?: string;
+  REVIEW_RETRY_BASE_MS?: string;
 }
 
 export class ConfigError extends Error {
@@ -103,6 +106,7 @@ export function readConfig(env: GateVars): GateConfig {
     reviewMode,
     reviewModel: env.MODEL_REVIEWER?.trim() || DEFAULT_MODEL_REVIEWER,
     reviewTimeoutMs: int(env.REVIEW_TIMEOUT_MS, 60_000, 1, 300_000),
+    reviewRetryBaseMs: int(env.REVIEW_RETRY_BASE_MS, DEFAULT_REVIEW_RETRY_BASE_MS, 0, 30_000),
   };
 }
 

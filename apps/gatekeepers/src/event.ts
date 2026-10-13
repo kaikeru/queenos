@@ -130,6 +130,8 @@ export const GateTaskSchema = z.object({
   commandId: z.string().min(1).max(100).optional(),
   /** A Queen-started gate: the train it was started for. */
   trainId: z.string().min(1).optional(),
+  /** Epoch ms (queen-types `GateCommand.notBefore`): an automatic infra re-gate starts no earlier than this. */
+  notBefore: z.number().int().optional(),
 });
 export type GateTask = z.infer<typeof GateTaskSchema>;
 

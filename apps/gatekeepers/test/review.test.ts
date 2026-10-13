@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AiGatewayError, memoryIdFor, type CompletionRequest, type CompletionResult } from "@queenos/hive-kit";
 import { runGate } from "../src/orchestrate";
-import { MAX_REVIEW_INPUT_CHARS, parseReview, renderReviewInput, scriptedReview } from "../src/review";
+import { MAX_REVIEW_INPUT_CHARS, REVIEW_MAX_TOKENS, parseReview, renderReviewInput, runReview, scriptedReview } from "../src/review";
 import type { ScribeLlm } from "../src/scribe";
 import { FakeLlm, FakeWorld, InlineSteps, REPO, config, gateTask } from "./fakes";
 
@@ -137,7 +137,7 @@ describe("reviewer: fail-open", () => {
     w.reviewLlm = llm;
     const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), llmConfig());
     expect(out).toMatchObject({ passed: true, review: "skipped" });
-    expect(llm.requests).toHaveLength(2);
+    expect(llm.requests).toHaveLength(3);
     expect(warned(w)).toMatch(/^warning: reviewer unavailable, failing open: .*overloaded/);
   });
 
@@ -158,13 +158,13 @@ describe("reviewer: fail-open", () => {
     expect(warned(w)).toContain("timed out");
   });
 
-  it("continues on garbage output twice", async () => {
+  it("continues on garbage output three times", async () => {
     const { w, after } = await setup();
-    const llm = new SeqLlm(["I think it is fine!", '{"verdict":"MAYBE"}']);
+    const llm = new SeqLlm(["I think it is fine!", '{"verdict":"MAYBE"}', ""]);
     w.reviewLlm = llm;
     const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), llmConfig());
     expect(out).toMatchObject({ passed: true, review: "skipped" });
-    expect(llm.requests).toHaveLength(2);
+    expect(llm.requests).toHaveLength(3);
     expect(warned(w)).toContain("unparseable");
   });
 
@@ -180,6 +180,44 @@ describe("reviewer: fail-open", () => {
     const out = await runGate(gateTask(after), new InlineSteps(), w.ports(), llmConfig());
     expect(out).toMatchObject({ passed: true, review: "skipped" });
     expect(warned(w)).toContain("no AI binding");
+  });
+});
+
+describe("runReview: hardening", () => {
+  const input = { model: "m", input: "evidence", timeoutMs: 1_000 };
+
+  it("asks for 8000 output tokens (a reasoning model can spend 3000 before answering)", async () => {
+    const llm = new SeqLlm([APPROVE]);
+    await runReview({ ...input, llm, retryBaseMs: 0 });
+    expect(REVIEW_MAX_TOKENS).toBe(8_000);
+    expect(llm.requests[0]!.maxTokens).toBe(8_000);
+  });
+
+  it("retries empty and unparseable answers up to 3 tries, backing off 2 s then 4 s", async () => {
+    const llm = new SeqLlm(["", "not json", APPROVE]);
+    const waits: number[] = [];
+    const out = await runReview({ ...input, llm, sleep: async (ms) => void waits.push(ms) });
+    expect(out).toMatchObject({ kind: "verdict", verdict: { verdict: "APPROVE" } });
+    expect(llm.requests).toHaveLength(3);
+    expect(waits).toEqual([2_000, 4_000]);
+  });
+
+  it("stays unavailable after 3 empty answers", async () => {
+    const llm = new SeqLlm([""]);
+    const out = await runReview({ ...input, llm, sleep: async () => undefined });
+    expect(out).toMatchObject({ kind: "unavailable", reason: expect.stringContaining("(empty)") });
+    expect(llm.requests).toHaveLength(3);
+  });
+
+  it("logs the finish reason of an answer without a verdict", async () => {
+    const llm = { complete: async (req: CompletionRequest): Promise<CompletionResult> => ({ text: "", model: req.model, finishReason: "length" }) };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await runReview({ ...input, llm, retryBaseMs: 0 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("gave no verdict"), expect.stringContaining('"finishReason":"length"'));
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

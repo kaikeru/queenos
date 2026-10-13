@@ -45,7 +45,14 @@ export class BindingArtifactsPort implements ArtifactsPort {
       throw e;
     }
     using r = handle;
-    const [head] = await r.log({ ref: "main", limit: 1 });
+    let head;
+    try {
+      [head] = await r.log({ ref: "main", limit: 1 });
+    } catch (e) {
+      // A fork with no `main` yet reads as gone, not as a failure of the Workflow.
+      if ((e as { code?: string })?.code === "NOT_FOUND") return null;
+      throw e;
+    }
     return head ? { sha: head.hash, message: String(head.message) } : null;
   }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AiGatewayError } from "@queenos/hive-kit";
-import { MAX_LOG_CHARS, SCRIBE_PROMPT, enforceSummary, extractiveSummary, summarizeFailure, truncateLog } from "../src/scribe";
+import { MAX_LOG_CHARS, clip, SCRIBE_PROMPT, enforceSummary, extractiveSummary, summarizeFailure, truncateLog } from "../src/scribe";
 import { ScriptedTestRunner } from "../src/test-runner";
 import { FakeLlm } from "./fakes";
 
@@ -70,5 +70,15 @@ describe("LLM scribe", () => {
     expect(t.length).toBeLessThanOrEqual(MAX_LOG_CHARS + 5);
     expect(t.startsWith("HEAD")).toBe(true);
     expect(t.endsWith("TAIL")).toBe(true);
+  });
+});
+
+describe("clip", () => {
+  it("never leaves half of a surrogate pair at the cut", () => {
+    const s = "ab" + "😀".repeat(5); // the cut at n-1 = 3 lands between the two halves of the first emoji
+    const out = clip(s, 4);
+    expect(out).toBe("ab…");
+    expect(out).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
+    expect(clip("short", 10)).toBe("short");
   });
 });

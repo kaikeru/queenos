@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { classifyPush, gateInstanceId, parsePushEvent, ZERO_SHA } from "../src/event";
 import { handlePush } from "../src/orchestrate";
 import { FakeWorld, InlineSteps, REPO, config, pushedEnvelope } from "./fakes";
@@ -167,6 +167,19 @@ describe("handlePush (attempt route)", () => {
     const w = new FakeWorld();
     w.artifacts.heads.set(ATT_REPO, { sha: AFTER, message: "x" });
     expect(await handlePush(pushedEnvelope({ repoName: ATT_REPO }), new InlineSteps(), w.ports(), cfg)).toEqual({ status: "ignored", reason: "queen-without-attempts" });
+  });
+
+  it("logs a non-applied attemptPushed outcome", async () => {
+    const w = new FakeWorld();
+    w.queen.serveAttempts("ignored:state");
+    w.artifacts.heads.set(ATT_REPO, { sha: AFTER, message: "x" });
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      await handlePush(pushedEnvelope({ repoName: ATT_REPO }), new InlineSteps(), w.ports(), cfg);
+      expect(info).toHaveBeenCalledWith(expect.stringContaining("attemptPushed not applied"), expect.stringContaining("ignored:state"));
+    } finally {
+      info.mockRestore();
+    }
   });
 
   it("a zero `before` (first push to a new ref) is not forwarded", async () => {

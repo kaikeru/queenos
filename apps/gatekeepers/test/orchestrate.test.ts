@@ -19,6 +19,31 @@ async function setup(opts: { prompt?: string; action?: "build" | "rework"; files
   return { w, base, after };
 }
 
+describe("runGate: notBefore (automatic infra re-gate backoff)", () => {
+  it("sleeps until notBefore before round 1, durably, then gates as usual", async () => {
+    const { w, after } = await setup();
+    const steps = new InlineSteps();
+    const notBefore = Date.now() + 60_000;
+    const out = await runGate(gateTask(after, { notBefore }), steps, w.ports(), config());
+    expect(out).toMatchObject({ status: "gated", passed: true });
+    const sleep = steps.sleeps.find((x) => x.name === "infra: re-gate backoff")!;
+    expect(sleep.ms).toBeGreaterThan(55_000);
+    expect(sleep.ms).toBeLessThanOrEqual(60_000);
+    expect(steps.sleeps[0]).toBe(sleep);
+  });
+
+  it("a notBefore in the past sleeps 0; no notBefore does not sleep at all", async () => {
+    const { w, after } = await setup();
+    const past = new InlineSteps();
+    await runGate(gateTask(after, { notBefore: Date.now() - 5_000 }), past, w.ports(), config());
+    expect(past.sleeps.find((x) => x.name === "infra: re-gate backoff")).toEqual({ name: "infra: re-gate backoff", ms: 0 });
+    const none = new InlineSteps();
+    const { w: w2, after: after2 } = await setup();
+    await runGate(gateTask(after2), none, w2.ports(), config());
+    expect(none.sleeps.find((x) => x.name === "infra: re-gate backoff")).toBeUndefined();
+  });
+});
+
 describe("runGate: pass path", () => {
   it("scans, tests and reports passed:true with the pushed SHA", async () => {
     const { w, base, after } = await setup();
