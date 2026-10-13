@@ -1267,7 +1267,7 @@ export class QueenNode extends DurableObject<Env> {
     }
     if (!PUSHABLE_STATES.has(a.state)) return res("ignored:state");
     if (p.after === a.baseSha) return res("ignored:base");
-    const entered = await this.enterAttemptHead(hive, a, { after: p.after, before: p.before ?? null, title: p.title, message: p.message }, "push");
+    const entered = await this.enterAttemptHead(hive, a, { after: p.after, before: p.before ?? null, title: p.title, message: p.message }, "push", this.reworkRejoin(a, this.now()) ?? undefined);
     return { outcome: "applied", attemptId: a.attemptId, state: entered.attempt.state, itemId: entered.attempt.itemId, trainId: entered.trainId, disposition: entered.disposition };
   }
 
@@ -1282,8 +1282,12 @@ export class QueenNode extends DurableObject<Env> {
     a: Attempt,
     head: { after: string; before: string | null; title: string; message: string },
     mode: "push" | "regate",
-    /** regate only: re-enter this RACING race (the previous train is its candidate), bypassing the intake. */
-    rejoinRaceId?: string,
+    /**
+     * Re-enter this RACING / REWORKING race without intake: a re-gate (the previous train is its candidate), a rework slot's
+     * fix, or (R4) a re-push of a pending fix, which `supersede`s that fix in place. The entry window may have closed: not
+     * a new entry.
+     */
+    rejoin?: { raceId: string; supersede?: string },
   ): Promise<{ attempt: Attempt; trainId: string; disposition: SubmitDisposition }> {
     const ref = `refs/heads/item/${a.itemId}`;
     const prevRow = this.sql.exec("SELECT * FROM submissions WHERE attempt_id = ? AND outcome = 'applied' ORDER BY created_at DESC, rowid DESC LIMIT 1", a.attemptId).toArray()[0];
@@ -1296,8 +1300,8 @@ export class QueenNode extends DurableObject<Env> {
     const origin: SubmissionOrigin = { kind: "agent", id: clip(`${a.agentName}@${a.owner}`, 320), model: a.model };
     const actor = `agent:${origin.id}`;
     const now = this.now();
-    const plan: IntakePlan = rejoinRaceId
-      ? { disposition: "joined-race", itemId: a.itemId, reopen: false, race: { join: rejoinRaceId }, messages: [] }
+    const plan: IntakePlan = rejoin
+      ? { disposition: "joined-race", itemId: a.itemId, reopen: false, race: { join: rejoin.raceId }, messages: [], ...(rejoin.supersede ? { supersedeTrainId: rejoin.supersede } : {}) }
       : decideIntake(
           { ref, headSha: head.after, title: head.title, message: head.message, trailers: trailersOf(head.message, {}), newItemId: crypto.randomUUID() },
           { now, lookup: this.intakeLookup({ state: this.activeState() }), previousOnRef: previous },
@@ -1326,7 +1330,7 @@ export class QueenNode extends DurableObject<Env> {
             item: plannerItem(item),
             race: plan.race,
             resume: item.status === "ACTIVE",
-            ...(rejoinRaceId ? { rejoin: true as const } : {}),
+            ...(rejoin ? { rejoin: true as const } : {}),
           }),
         );
         if (plan.supersedeTrainId) d.acc.train(d.tp.supersede(plan.supersedeTrainId, head.after));
@@ -1431,6 +1435,13 @@ export class QueenNode extends DurableObject<Env> {
       const raceRow = this.sql.exec("SELECT * FROM races WHERE race_id = ?", intakeItem.racing.raceId).toArray()[0];
       if (raceRow && rowToRace(raceRow).trainIds.includes(att.trainId)) rejoin = intakeItem.racing.raceId;
     }
+    // Rework loop (R7): an infra-stopped fix of a REWORKING race re-enters that race (no intake: the item is ACTIVE).
+    if (!rejoin && att.raceId) {
+      const row = this.sql.exec("SELECT * FROM races WHERE race_id = ?", att.raceId).toArray()[0];
+      const r = row ? rowToRace(row) : null;
+      // Only the winner's attempt (§5.3; check 2): a loser's infra-stopped candidate of that race is late (refused below).
+      if (r && r.state === "REWORKING" && r.trainIds.includes(att.trainId) && this.isReworkingWinner(r, att.attemptId)) rejoin = r.raceId;
+    }
     if (!rejoin && intakeItem && (lateReason(intakeItem, now) || raceClosedToEntries(intakeItem, now))) {
       return { ok: false, code: "ITEM_NOT_ACCEPTING", message: clip(`item ${att.itemId} was decided without this head; nothing to re-gate`, 200) };
     }
@@ -1438,7 +1449,7 @@ export class QueenNode extends DurableObject<Env> {
     // The submission row keeps no title / message: the re-submission uses the item's title for both, so the original
     // push's trailers are not carried (no effect on routing: the ref is item/<id>, and a regate never files new items).
     const title = clip(item?.title ?? `attempt ${att.attemptId}`, 120);
-    const entered = await this.enterAttemptHead(hive, att, { after: att.headSha, before: sub.beforeSha ?? null, title, message: title }, "regate", rejoin);
+    const entered = await this.enterAttemptHead(hive, att, { after: att.headSha, before: sub.beforeSha ?? null, title, message: title }, "regate", rejoin ? { raceId: rejoin } : undefined);
     return { ok: true, attempt: this.attemptView(entered.attempt), changed: true };
   }
 
@@ -1484,6 +1495,8 @@ export class QueenNode extends DurableObject<Env> {
         d.acc.attempts.set(att.attemptId, next);
         if (t) {
           if (isActive(t)) d.acc.train(d.tp.withdraw(t.trainId, `${att.agentName} ended attempt ${att.attemptId}`));
+          // Rework loop (§5.6): an open slot closes; a REWORK candidate leaves its race; a REWORKING race falls back.
+          d.acc.train(d.tp.attemptEnded(att.attemptId, "ended by the agent"));
           d.acc.train(d.tp.deleteAttemptFork(t.trainId));
         } else if (att.state !== "INTENT") {
           this.repoDelete(d, att.attemptId, att.repo, this.loadItem(att.itemId)?.traceId ?? null);
@@ -1493,7 +1506,8 @@ export class QueenNode extends DurableObject<Env> {
       { trains: t ? [t.trainId] : [], items: [att.itemId] },
     );
     await this.commit(hive, acc);
-    return { ok: true, attempt: this.attemptView(next), changed: true };
+    // The committed row: the decision may have changed more than the state (e.g. closed the rework slot).
+    return { ok: true, attempt: this.attemptView(getAttemptRow(this.sql, att.attemptId) ?? next), changed: true };
   }
 
   /** `get_attempt` / `wait` / `get_verdict`: the row, its current train and race. Null: unknown. */
@@ -1510,6 +1524,31 @@ export class QueenNode extends DurableObject<Env> {
   }
 
   // ── MCP attempts: reads and helpers ───────────────────────────────────
+
+  /**
+   * Rework loop: where an attempt's push re-enters without intake. Inside an open slot (dueAt still ahead), its own RACING
+   * or REWORKING race: the same candidate, never a follow-up (§5.1, §5.2, §5.3). While its slot's fix is still pending
+   * (R4: reworks > 0, its current train an active unboarded RACING candidate of that race), the same race, superseding
+   * that fix in place. Otherwise null: normal intake (a late push after dueAt included, §5.1).
+   */
+  private reworkRejoin(a: Attempt, now: number): { raceId: string; supersede?: string } | null {
+    if (!a.raceId) return null;
+    const row = this.sql.exec("SELECT * FROM races WHERE race_id = ?", a.raceId).toArray()[0];
+    const race = row ? rowToRace(row) : null;
+    if (!race || (race.state !== "RACING" && race.state !== "REWORKING")) return null;
+    // Only the winner's attempt pushes into a REWORKING race (§5.3); any other attempt takes intake ("already being built").
+    if (race.state === "REWORKING" && !this.isReworkingWinner(race, a.attemptId)) return null;
+    if (a.rework && a.rework.dueAt > now) return { raceId: race.raceId };
+    const t = this.trainExists(a.trainId) ? this.loadTrain(a.trainId) : null;
+    if ((a.reworks ?? 0) > 0 && t && isActive(t) && t.raceId === race.raceId && t.raceOutcome === "RACING" && !t.carId) return { raceId: race.raceId, supersede: t.trainId };
+    return null;
+  }
+
+  /** A REWORKING race's winner (its `winnerTrainId`, kept until a fix wins) is `attemptId`'s train. */
+  private isReworkingWinner(race: RaceRecord, attemptId: string): boolean {
+    const w = race.winnerTrainId && this.trainExists(race.winnerTrainId) ? this.loadTrain(race.winnerTrainId) : null;
+    return w?.attemptId === attemptId;
+  }
 
   /** An attempt as this decision sees it: its pending row in `acc`, else SQLite. */
   private attemptOf(attemptId: string, acc?: Acc): Attempt | null {
@@ -1609,7 +1648,11 @@ export class QueenNode extends DurableObject<Env> {
       const to = a.state === "INTENT" ? "ABORTED" : "EXPIRED";
       d.acc.attempts.set(a.attemptId, { ...a, state: to });
       if (a.state === "INTENT") this.repoDelete(d, a.attemptId, a.repo, null);
-      else this.deleteAttemptRepo(d, a);
+      else {
+        // Rework loop (§5.6): as end_attempt: the slot closes, a REWORK candidate leaves its race, a REWORKING race falls back.
+        d.acc.train(d.tp.attemptEnded(a.attemptId, "attempt expired"));
+        this.deleteAttemptRepo(d, a);
+      }
       d.acc.events.push(this.attemptEvent("attempt.state", a.itemId, a.attemptId, `attempt ${a.attemptId}: ${a.state} → ${to} (watchdog)`, { from: a.state, to, watchdog: true }, "queen", "warn"));
     }
     const stale = this.sql
