@@ -358,8 +358,9 @@ export const RaceSchema = z.object({
   /** Rework loop: PICKING → RACING drops so far (reject one or all), capped by `maxRaceReopens`. Absent = 0. */
   reopens: z.number().int().min(0).optional(),
   /**
-   * Rework loop (§5.2): when the grace clock first started (the first pass, or entry close if later). Set once; a rework
-   * slot fix moving `deadlineAt` (R3) never moves it, so findings holds measure from it. Absent / null (rows written before
+   * Rework loop (§5.2): when the running grace clock started (the first pass, or entry close if later). A rework slot
+   * fix moving `deadlineAt` (R3) never moves it; it clears with `deadlineAt` when the clock stops (no live pass left), so
+   * the next pass starts it afresh. Findings holds measure from it. Absent / null with a `deadlineAt` (rows written before
    * it existed): derived as `deadlineAt - raceGraceMs`.
    */
   graceFrom: z.number().int().nullable().optional(),

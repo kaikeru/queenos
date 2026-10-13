@@ -387,6 +387,46 @@ describe("planner: the grace start is fixed (review fix 1: R3 never moves it)", 
     expect(h.race().graceFrom).toBe(t0 + 5 * MIN);
   });
 
+  it("entries closed early after a pass: a findings hold ends at that close + reworkHoldMs, not the old window's end + hold", () => {
+    const h = new ReworkHive();
+    h.entryWindowMs = 15 * MIN;
+    const t0 = h.now;
+    const a = h.push(A1);
+    const b = h.push(B1);
+    h.pass(a);
+    h.fail(b);
+    h.at(5 * MIN);
+    h.run((p) => p.closeEntries({ raceId: h.race().raceId, by: "human:kyle" }));
+    h.at(10 * MIN - 1000); // t0 + 15 min − 1 s: B still holds
+    expect(h.now).toBe(t0 + 15 * MIN - 1000);
+    expect(h.race().state).toBe("RACING");
+    h.at(2000); // t0 + 15 min + 1 s: past close + hold (the old window would hold until t0 + 25 min)
+    expect(h.race()).toMatchObject({ state: "DECIDED", winnerTrainId: a });
+    expect(h.t(b).raceOutcome).toBe("LOST");
+  });
+
+  it("the grace clock stops when every pass leaves: a later pass restarts graceFrom, and holds measure from the re-pass", () => {
+    const h = new ReworkHive();
+    const t0 = h.now;
+    const a = h.push(A1);
+    const b = h.push(B1);
+    h.pass(a);
+    h.fail(b); // findings-REWORK: holds until graceFrom (t0) + 10 min
+    expect(h.race().graceFrom).toBe(t0);
+    h.run((p) => p.withdraw(a, "opus ended attempt")); // no pass left: the grace clock stops
+    expect(h.race()).toMatchObject({ state: "RACING", deadlineAt: null, graceFrom: null });
+    h.at(15 * MIN);
+    const c = h.push(C1);
+    h.pass(c); // the clock restarts at t0 + 15 min
+    expect(h.race()).toMatchObject({ state: "RACING", graceFrom: t0 + 15 * MIN });
+    expect(h.t(b).raceOutcome).toBe("REWORK");
+    h.at(10 * MIN - 1000);
+    expect(h.race().state).toBe("RACING");
+    h.at(2000);
+    expect(h.race()).toMatchObject({ state: "DECIDED", winnerTrainId: c });
+    expect(h.t(b).raceOutcome).toBe("LOST");
+  });
+
   it("graceStartOf: graceFrom when set, else deadlineAt − grace (rows written before it existed)", () => {
     expect(graceStartOf({ deadlineAt: 20 * MIN, graceFrom: 5 * MIN }, 90_000)).toBe(5 * MIN);
     expect(graceStartOf({ deadlineAt: 20 * MIN, graceFrom: null }, 90_000)).toBe(20 * MIN - 90_000);

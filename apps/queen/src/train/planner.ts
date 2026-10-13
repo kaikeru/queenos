@@ -1522,7 +1522,7 @@ export class TrainPlanner {
       // (a candidate that entered just before the close still gets its grace).
       if (race.deadlineAt === null) {
         const from = Math.max(this.ctx.now, race.entryClosesAt ?? 0);
-        // graceFrom is set once (the first time the clock starts) and never moved: rework holds measure from it (§5.2).
+        // graceFrom starts with the clock and never moves while it runs (R3 included); it clears only when the clock stops.
         this.setRace(race, { deadlineAt: from + (this.ctx.raceGraceMs ?? RACE_GRACE_MS), ...(race.graceFrom == null ? { graceFrom: from } : {}) });
       }
       this.maybeDecide(race);
@@ -2712,7 +2712,8 @@ export class TrainPlanner {
     const passed = live.filter((t) => t.raceOutcome === "PASSED");
     const reworking = cands.filter((t) => t.raceOutcome === "REWORK");
     // The grace clock belongs to a live pass: once the last one left (superseded, failed), the next pass restarts it.
-    if (!passed.length && race.deadlineAt !== null) this.setRace(race, { deadlineAt: null });
+    // graceFrom stops with it (rework holds measure from the restarted clock, never a stale pass).
+    if (!passed.length && (race.deadlineAt !== null || race.graceFrom != null)) this.setRace(race, { deadlineAt: null, graceFrom: null });
     // An open entry window holds everything (passes and all-failed alike): another agent may still enter.
     if (race.entryClosesAt != null && this.ctx.now < race.entryClosesAt) return;
     const due = race.deadlineAt !== null && this.ctx.now >= race.deadlineAt;
