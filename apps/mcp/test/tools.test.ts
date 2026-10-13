@@ -17,9 +17,9 @@ async function worker(w: FakeWorld, role: "worker" | "orchestrator" = "worker"):
 }
 
 describe("tool table", () => {
-  it("has the 16 tools of spec §6", () => {
+  it("has the 17 tools of spec §6", () => {
     expect(TOOLS.map((t) => t.name).sort()).toEqual(
-      ["close_entries", "create_goal", "end_attempt", "get_attempt", "get_item", "get_verdict", "init_agent", "list_attempts", "list_hives", "list_items", "pick", "refresh_attempt", "resume_agent", "start_attempt", "wait", "whoami"].sort(),
+      ["close_entries", "create_goal", "end_attempt", "get_attempt", "get_item", "get_verdict", "init_agent", "list_attempts", "list_hives", "list_items", "pick", "refresh_attempt", "resume_agent", "retry_gates", "start_attempt", "wait", "whoami"].sort(),
     );
   });
 });
@@ -85,7 +85,8 @@ describe("start_attempt", () => {
   it("the first attempt of an item forks hive main read-only into the base, then the attempt from the base; the token never sits in a URL", async () => {
     const w = new FakeWorld();
     const { s, agent } = await worker(w);
-    const r = value<Record<string, string | number>>(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }));
+    const out = await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" });
+    const r = value<Record<string, string | number>>(out);
     expect(w.artifacts.forks).toEqual([
       { name: BASE_REPO, source: HIVE, readOnly: true },
       { name: ATT_REPO, source: BASE_REPO, readOnly: false },
@@ -94,12 +95,25 @@ describe("start_attempt", () => {
     expect(w.queen.inputs("attemptReady")).toEqual([{ hive: HIVE, attemptId: ATT, repo: ATT_REPO, baseSha: MAIN_SHA, expiresAt: expect.any(Number) }]);
     expect(w.queen.inputs("attemptIntent")[0]).toEqual({ hive: HIVE, owner: OWNER, agent, target: { itemId: "item-1" } });
     expect(r).toMatchObject({ attemptId: ATT, itemId: "item-1", remote: REMOTE(ATT_REPO), baseSha: MAIN_SHA, dir: `.queenos/attempts/${ATT}` });
-    const token = String(r.token);
-    expect(token).toMatch(/^art_v1_/);
+    expect(r).not.toHaveProperty("token");
+    expect(r).not.toHaveProperty("cloneCommand");
+    expect(r).not.toHaveProperty("configCommand");
+    expect(r.expiresAt).toEqual(expect.any(Number));
+    const token = /Bearer (art_v1_\S+)"/.exec(String(r.setupCommand))![1]!;
     expect(String(r.remote)).not.toContain("art_v1");
-    expect(r.cloneCommand).toBe(`git -c http.extraHeader="Authorization: Bearer ${token}" clone ${REMOTE(ATT_REPO)} .queenos/attempts/${ATT}`);
-    expect(r.configCommand).toBe(`git -C .queenos/attempts/${ATT} config --local --replace-all http.${REMOTE(ATT_REPO)}.extraHeader "Authorization: Bearer ${token}"`);
-    expect(String(r.cloneCommand)).not.toMatch(/https:\/\/[^ ]*art_v1/);
+    const dir = `.queenos/attempts/${ATT}`;
+    expect(r.setupCommand).toBe(
+      [
+        `git init ${dir}`,
+        `git -C ${dir} config --local --replace-all http.${REMOTE(ATT_REPO)}.extraHeader "Authorization: Bearer ${token}"`,
+        `git -C ${dir} remote add origin ${REMOTE(ATT_REPO)}`,
+        `git -C ${dir} fetch origin main`,
+        `git -C ${dir} checkout -b main FETCH_HEAD`,
+      ].join(" && "),
+    );
+    // The token appears exactly once in the whole result, and never in a URL.
+    expect(JSON.stringify(r).split(token)).toHaveLength(2);
+    expect(String(r.setupCommand)).not.toMatch(/https:\/\/[^ ]*art_v1/);
     // The probe's own token was revoked; only the agent's token is active.
     expect(w.artifacts.activeTokens(ATT_REPO)).toHaveLength(1);
     expect(await w.identity(agent.agentId).attempts()).toEqual([{ hive: HIVE, attemptId: ATT, open: true }]);
@@ -165,7 +179,7 @@ describe("start_attempt", () => {
     const w = new FakeWorld();
     w.queen.intents = [{ verdict: "refuse", code: "GOAL_AMBIGUOUS", message: "2 open items", items: [{ itemId: "a", title: "A", status: "READY" }, { itemId: "b", title: "B", status: "READY" }] }];
     const { s } = await worker(w);
-    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, goalId: "goal-1" }))).toEqual({ code: "GOAL_AMBIGUOUS", message: "2 open items", items: [{ itemId: "a", title: "A", status: "READY" }, { itemId: "b", title: "B", status: "READY" }] });
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, goalId: "goal-1" }))).toEqual({ code: "GOAL_AMBIGUOUS", message: "2 open items", retryable: false, items: [{ itemId: "a", title: "A", status: "READY" }, { itemId: "b", title: "B", status: "READY" }] });
     expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "i", goalId: "g" }))).toMatchObject({ code: "INVALID_INPUT" });
     expect(errOf(await run(w, s, "start_attempt", { hive: HIVE }))).toMatchObject({ code: "INVALID_INPUT" });
   });
@@ -194,11 +208,15 @@ describe("own-attempt tools", () => {
   it("refresh_attempt mints a new token and revokes the fork's other tokens", async () => {
     const { w, s } = await started();
     const before = w.artifacts.activeTokens(ATT_REPO);
-    const r = value<{ token: string; configCommand: string }>(await run(w, s, "refresh_attempt", { attemptId: ATT }));
+    const r = value<{ expiresAt: number; configCommand: string }>(await run(w, s, "refresh_attempt", { attemptId: ATT }));
     const after = w.artifacts.activeTokens(ATT_REPO);
     expect(after).toHaveLength(1);
     expect(after[0]).not.toBe(before[0]);
-    expect(r.configCommand).toContain(`Authorization: Bearer ${r.token}`);
+    expect(r).not.toHaveProperty("token");
+    expect(r.expiresAt).toEqual(expect.any(Number));
+    const token = /Bearer (art_v1_\S+)"/.exec(r.configCommand)![1]!;
+    expect(r.configCommand).toBe(`git -C .queenos/attempts/${ATT} config --local --replace-all http.${REMOTE(ATT_REPO)}.extraHeader "Authorization: Bearer ${token}"`);
+    expect(JSON.stringify(r).split(token)).toHaveLength(2);
   });
 
   it("an attempt that is not the agent's is FORBIDDEN_OWNER on get / refresh / end / verdict / wait", async () => {
@@ -226,7 +244,7 @@ describe("own-attempt tools", () => {
     const head = "c".repeat(40);
     w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "REJECTED", headSha: head, verdict: "rejected", train: { trainId: "train-1", phase: "EJECTED", raceOutcome: "FAILED", headSha: head, previewUrl: "https://p.dev", summary: "security: nope", reason: "failed: security: nope", score: null } }));
     w.queen.notes.set(head, "Queen-Verdict: REJECTED");
-    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toEqual({ headSha: head, verdict: "rejected", findings: ["failed: security: nope"], summary: "security: nope", note: "Queen-Verdict: REJECTED", previewUrl: "https://p.dev" });
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toEqual({ headSha: head, verdict: "rejected", kind: null, findings: ["failed: security: nope"], summary: "security: nope", note: "Queen-Verdict: REJECTED", previewUrl: "https://p.dev", regating: null, next: null });
   });
 
   it("end_attempt returns the state and the cleanup, and closes the attempt in the agent's identity", async () => {
@@ -246,7 +264,7 @@ describe("race tools", () => {
     w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "LOST" }));
     expect(errOf(await run(w, s, "pick", { hive: HIVE, raceId: "race-1", attemptId: ATT }))).toMatchObject({ code: "ATTEMPT_EXPIRED" });
     w.queen.errors.set("closeRaceEntries", new Error("CONFLICT: race race-1 is DECIDED"));
-    expect(errOf(await run(w, s, "close_entries", { hive: HIVE, raceId: "race-1" }))).toEqual({ code: "CONFLICT", message: "race race-1 is DECIDED" });
+    expect(errOf(await run(w, s, "close_entries", { hive: HIVE, raceId: "race-1" }))).toEqual({ code: "CONFLICT", message: "race race-1 is DECIDED", retryable: false });
   });
 });
 
@@ -265,7 +283,7 @@ describe("fix round 1", () => {
     const w = new FakeWorld();
     w.queen.errors.set("attemptReady", new Error("NOT_FOUND: attempt gone"));
     const { s } = await worker(w);
-    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toEqual({ code: "NOT_FOUND", message: "attempt gone" });
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toEqual({ code: "NOT_FOUND", message: "attempt gone", retryable: false });
     expect(w.artifacts.deleted).toContain(ATT_REPO);
     expect(w.queen.methods()).toContain("attemptAborted");
   });
@@ -283,7 +301,7 @@ describe("fix round 1", () => {
     const { s } = await worker(w);
     w.queen.errors.set("getSnapshot", new Error("secret internal detail at /x/y.ts:1"));
     const e = errOf(await run(w, s, "list_items", { hive: HIVE }));
-    expect(e).toEqual({ code: "CONFLICT", message: "the hive is temporarily unavailable; retry" });
+    expect(e).toEqual({ code: "UNAVAILABLE", message: "the hive is temporarily unavailable; retry", retryable: true, retryAfterMs: 2000 });
   });
 
   it("every gated tool is NOT_INITIALIZED before init_agent", async () => {
@@ -300,6 +318,7 @@ describe("fix round 1", () => {
       get_verdict: { attemptId: ATT },
       close_entries: { hive: HIVE, raceId: "r" },
       pick: { hive: HIVE, raceId: "r", attemptId: ATT },
+      retry_gates: { attemptId: ATT },
     };
     for (const t of TOOLS.filter((x) => !["whoami", "init_agent", "resume_agent"].includes(x.name))) {
       expect(errOf(await run(w, new FakeSession(), t.name, args[t.name] ?? {})), t.name).toMatchObject({ code: "NOT_INITIALIZED" });
@@ -327,5 +346,179 @@ describe("fix round 1", () => {
     expect(await go("landed")).toMatchObject({ changed: false });
     detail("LANDED");
     expect(await go("landed")).toMatchObject({ changed: true, state: "LANDED" });
+  });
+});
+
+const REJ = (over: Record<string, unknown> = {}) => viewOf({ attemptId: ATT, state: "REJECTED", headSha: "c".repeat(40), verdict: "rejected", ...over } as never);
+
+describe("batch B: retryable errors", () => {
+  it("every code carries retryable from MCP_ERROR_RETRYABLE; a retryAfterMs makes it retryable and is propagated", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    // not initialised / forbidden / invalid / not found
+    expect(errOf(await run(w, new FakeSession(), "list_hives"))).toMatchObject({ code: "NOT_INITIALIZED", retryable: false });
+    expect(errOf(await run(w, s, "get_attempt", { attemptId: ATT }))).toMatchObject({ code: "FORBIDDEN_OWNER", retryable: false });
+    expect(errOf(await run(w, s, "get_attempt", {}))).toMatchObject({ code: "INVALID_INPUT", retryable: false });
+    expect(errOf(await run(w, s, "list_items", { hive: "nope" }))).toMatchObject({ code: "NOT_FOUND", retryable: false });
+    // Queen refusals at intent
+    const refuse = (code: "CAP_EXCEEDED" | "BASE_PENDING" | "ITEM_NOT_ACCEPTING", retryAfterMs?: number) => {
+      w.queen.intents = [{ verdict: "refuse", code, message: "no", ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) }];
+    };
+    refuse("CAP_EXCEEDED");
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toEqual({ code: "CAP_EXCEEDED", message: "no", retryable: false });
+    refuse("CAP_EXCEEDED", 90_000);
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toEqual({ code: "CAP_EXCEEDED", message: "no", retryable: true, retryAfterMs: 90_000 });
+    refuse("ITEM_NOT_ACCEPTING");
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "ITEM_NOT_ACCEPTING", retryable: false });
+    refuse("BASE_PENDING");
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "BASE_PENDING", retryable: true, retryAfterMs: 2000 });
+    // attemptReady refusal keeps its retryAfterMs
+    w.queen.intents = [acceptCreate()];
+    w.queen.readyRefusal = { ok: false, code: "BASE_MOVED", message: "moved", retryAfterMs: 1500 };
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "BASE_MOVED", retryable: true, retryAfterMs: 1500 });
+  });
+
+  it("ARTIFACTS_UNAVAILABLE is retryable after 5 s; an unknown or UNAVAILABLE Queen error is UNAVAILABLE, not CONFLICT", async () => {
+    const w = new FakeWorld();
+    w.artifacts.forkErrors.set(BASE_REPO, "INTERNAL");
+    const { s } = await worker(w);
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "ARTIFACTS_UNAVAILABLE", retryable: true, retryAfterMs: 5000 });
+    w.queen.errors.set("getSnapshot", new Error("UNAVAILABLE: queen restarting"));
+    expect(errOf(await run(w, s, "list_items", { hive: HIVE }))).toMatchObject({ code: "UNAVAILABLE", retryable: true, retryAfterMs: 2000 });
+  });
+});
+
+describe("batch B: verdict kind", () => {
+  async function withAttempt() {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    value(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }));
+    return { w, s };
+  }
+
+  it("get_verdict: findings kind lists the note's Queen-Finding lines and says fix and push", async () => {
+    const { w, s } = await withAttempt();
+    const head = "c".repeat(40);
+    w.queen.views.set(ATT, REJ({ verdictKind: "findings", train: { trainId: "train-1", phase: "EJECTED", raceOutcome: "FAILED", headSha: head, previewUrl: null, summary: "s", reason: "failed: x", score: null } }));
+    w.queen.notes.set(head, 'Queen-Verdict: REJECTED\nQueen-Finding: error src/a.js:3 bad fetch\nQueen-Finding: warn src/b.js nit');
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({ kind: "findings", findings: ["error src/a.js:3 bad fetch", "warn src/b.js nit"], next: "fix and push", regating: null });
+  });
+
+  it("get_verdict: infra kind has no findings and says retry_gates; regating passes through", async () => {
+    const { w, s } = await withAttempt();
+    w.queen.views.set(ATT, REJ({ verdictKind: "infra", train: { trainId: "train-1", phase: "EJECTED", raceOutcome: "FAILED", headSha: "c".repeat(40), previewUrl: null, summary: "Infrastructure: x", reason: "boom", score: null } }));
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({ kind: "infra", findings: [], next: "retry_gates" });
+    w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "PUSHED", headSha: "d".repeat(40), regating: { round: 1, of: 3, notBefore: 5 } }));
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({ kind: null, regating: { round: 1, of: 3, notBefore: 5 }, next: null });
+  });
+
+  it("get_attempt reads the new view fields as null on an older Queen and passes them on a newer one", async () => {
+    const { w, s } = await withAttempt();
+    w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "PUSHED" }));
+    expect(value(await run(w, s, "get_attempt", { attemptId: ATT }))).toMatchObject({ verdictKind: null, regating: null });
+    w.queen.views.set(ATT, REJ({ verdictKind: "infra" }));
+    expect(value(await run(w, s, "get_attempt", { attemptId: ATT }))).toMatchObject({ verdictKind: "infra" });
+  });
+});
+
+describe("batch B: retry_gates", () => {
+  async function withAttempt() {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    value(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }));
+    return { w, s };
+  }
+
+  it("re-gates through the Queen with the agent's owner and id", async () => {
+    const { w, s } = await withAttempt();
+    w.queen.regate = (i) => ({ ok: true, changed: true, attempt: viewOf({ attemptId: i.attemptId, state: "PUSHED", trainId: "train-9" }) });
+    expect(value(await run(w, s, "retry_gates", { attemptId: ATT }))).toEqual({ changed: true, state: "PUSHED", trainId: "train-9", race: null });
+    expect(w.queen.inputs("attemptRegate")).toEqual([{ hive: HIVE, attemptId: ATT, owner: OWNER, agentId: expect.stringMatching(/^ag_/) }]);
+  });
+
+  it("a Queen refusal keeps code and retryAfterMs; CAP_EXCEEDED with a wait is retryable", async () => {
+    const { w, s } = await withAttempt();
+    w.queen.regate = () => ({ ok: false, code: "CAP_EXCEEDED", message: "one a minute", retryAfterMs: 42_000 });
+    expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toEqual({ code: "CAP_EXCEEDED", message: "one a minute", retryable: true, retryAfterMs: 42_000 });
+    w.queen.regate = () => ({ ok: false, code: "CONFLICT", message: "push a fix" });
+    expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toMatchObject({ code: "CONFLICT", retryable: false });
+  });
+
+  it("someone else's attempt is FORBIDDEN_OWNER; a Queen without the RPC is UNAVAILABLE, not retryable", async () => {
+    const { w, s } = await withAttempt();
+    const { s: other } = await worker(w);
+    expect(errOf(await run(w, other, "retry_gates", { attemptId: ATT }))).toMatchObject({ code: "FORBIDDEN_OWNER" });
+    expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toEqual({ code: "UNAVAILABLE", message: "retry_gates needs a newer Queen", retryable: false });
+  });
+});
+
+describe("batch B: requireHive", () => {
+  it("get_item, wait by item, close_entries and pick answer NOT_FOUND for an unknown hive without touching the Queen", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    const before = w.queen.calls.length;
+    for (const [name, args] of [
+      ["get_item", { hive: "nope", itemId: "item-1" }],
+      ["wait", { hive: "nope", itemId: "item-1", until: "verdict", timeoutMs: 0 }],
+      ["close_entries", { hive: "nope", raceId: "r" }],
+      ["pick", { hive: "nope", raceId: "r", attemptId: ATT }],
+    ] as const) {
+      expect(errOf(await run(w, s, name, args)), name).toMatchObject({ code: "NOT_FOUND", message: "hive nope not found" });
+    }
+    expect(w.queen.calls.length).toBe(before);
+  });
+});
+
+describe("batch B: happy-path reads", () => {
+  it("list_items filters by state; get_item shows the race with candidate kinds; list_attempts and get_attempt", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    w.queen.items = [
+      { itemId: "i1", title: "A", kind: "TASK", status: "READY", waitReason: "awaiting submissions", parentId: null },
+      { itemId: "i2", title: "B", kind: "TASK", status: "LANDED", parentId: "g" },
+    ] as never;
+    expect(value<unknown[]>(await run(w, s, "list_items", { hive: HIVE }))).toEqual([
+      { itemId: "i1", title: "A", kind: "TASK", status: "READY", waitReason: "awaiting submissions", parentId: null },
+      { itemId: "i2", title: "B", kind: "TASK", status: "LANDED", waitReason: null, parentId: "g" },
+    ]);
+    expect(value<unknown[]>(await run(w, s, "list_items", { hive: HIVE, state: "LANDED" }))).toHaveLength(1);
+
+    const started = value(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }));
+    expect(started).toMatchObject({ attemptId: ATT });
+    w.queen.views.set(ATT, REJ({ verdictKind: "infra", train: { trainId: "train-1", phase: "EJECTED", raceOutcome: "FAILED", headSha: null, previewUrl: "https://p.dev", summary: null, reason: null, score: null } }));
+    w.queen.getItemDetail = async (itemId: string) =>
+      ({ item: { itemId, status: "READY" }, children: [], trains: [], races: [{ raceId: "race-1", state: "RACING", trainIds: ["train-1"], entryClosesAt: 77, winnerTrainId: null }], release: null, escalations: [] }) as never;
+    expect(value(await run(w, s, "get_item", { hive: HIVE, itemId: "item-1" }))).toMatchObject({
+      race: { raceId: "race-1", state: "RACING", baseSha: MAIN_SHA, entryClosesAt: 77, candidates: [{ attemptId: ATT, agent: "opus", claimedModel: "claude-opus-5-5", verdict: "rejected", kind: "infra", previewUrl: "https://p.dev" }] },
+    });
+
+    const list = value<{ attemptId: string }[]>(await run(w, s, "list_attempts"));
+    expect(list.map((a) => a.attemptId)).toEqual([ATT]);
+    expect(value(await run(w, s, "get_attempt", { attemptId: ATT }))).toMatchObject({ attemptId: ATT, state: "REJECTED", verdictKind: "infra", regating: null });
+    w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "LOST" }));
+    expect(value(await run(w, s, "get_attempt", { attemptId: ATT }))).toMatchObject({ cleanup: `remove .queenos/attempts/${ATT}` });
+  });
+});
+
+describe("batch B: I4 base pin after a transport throw", () => {
+  it("attemptBaseReady commits then throws: the pinned base is kept and the attempt continues", async () => {
+    const w = new FakeWorld();
+    w.queen.errors.set("attemptBaseReady", new Error("Network connection lost"));
+    w.queen.attemptsForItem = async (itemId: string) => ({ itemId, baseSha: MAIN_SHA, basePending: false, attempts: [] });
+    const { s } = await worker(w);
+    expect((await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" })).ok).toBe(true);
+    expect(w.artifacts.deleted).not.toContain(BASE_REPO);
+    expect(w.queen.methods()).not.toContain("attemptBaseFailed");
+    expect(w.artifacts.forks.map((f) => f.name)).toEqual([BASE_REPO, ATT_REPO]);
+  });
+
+  it("a transport throw where the Queen did not pin still deletes the base and fails retryably", async () => {
+    const w = new FakeWorld();
+    w.queen.errors.set("attemptBaseReady", new Error("Network connection lost"));
+    w.queen.attemptsForItem = async (itemId: string) => ({ itemId, baseSha: null, basePending: true, attempts: [] });
+    const { s } = await worker(w);
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "UNAVAILABLE", retryable: true });
+    expect(w.artifacts.deleted).toContain(BASE_REPO);
+    expect(w.queen.methods()).toContain("attemptBaseFailed");
   });
 });

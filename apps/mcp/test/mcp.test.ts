@@ -1,6 +1,6 @@
 import { exports } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FakeWorld, OTHER, OWNER, setWorld } from "./fakes";
+import { FakeWorld, OTHER, OWNER, currentWorld, setWorld } from "./fakes";
 
 const URL_ = "http://mcp.test/mcp";
 const base = { "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-06-18" };
@@ -32,10 +32,10 @@ describe("queenos-mcp Worker", () => {
     expect(await (await exports.default.fetch("http://mcp.test/health")).json()).toEqual({ ok: true, service: "mcp" });
   });
 
-  it("initialize, tools/list (16 tools), whoami and init_agent over Streamable HTTP", async () => {
+  it("initialize, tools/list (17 tools), whoami and init_agent over Streamable HTTP", async () => {
     const sid = await session();
     const list = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { "x-queen-user": OWNER, "mcp-session-id": sid });
-    expect(list.data.find((m) => m.id === 2)?.result?.tools).toHaveLength(16);
+    expect(list.data.find((m) => m.id === 2)?.result?.tools).toHaveLength(17);
     const who = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "whoami", arguments: {} } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
     expect(JSON.parse(who.data.find((m) => m.id === 3)!.result!.content![0]!.text)).toEqual({ owner: OWNER, agent: null });
     const init = await rpc({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "init_agent", arguments: { name: "opus", model: "claude-opus-5-5", role: "worker" } } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
@@ -43,13 +43,17 @@ describe("queenos-mcp Worker", () => {
     const again = await rpc({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "init_agent", arguments: { name: "opus", model: "m", role: "worker" } } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
     const r5 = again.data.find((m) => m.id === 5)!.result!;
     expect(r5.isError).toBe(true);
-    expect(JSON.parse(r5.content![0]!.text)).toMatchObject({ code: "ALREADY_INITIALIZED" });
+    expect(JSON.parse(r5.content![0]!.text)).toMatchObject({ code: "ALREADY_INITIALIZED", retryable: false });
   });
 
-  it("a session id replayed by another owner gets no tool result", async () => {
+  it("a session id replayed by another owner is refused with 403 JSON (POST and GET)", async () => {
     const sid = await session();
     const stolen = await rpc({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "whoami", arguments: {} } }, { "x-queen-user": OTHER, "mcp-session-id": sid });
+    expect(stolen.res.status).toBe(403);
     expect(stolen.data.find((m) => m.id === 9)).toBeUndefined();
+    const get = await exports.default.fetch(URL_, { method: "GET", headers: { accept: "text/event-stream", "x-queen-user": OTHER, "mcp-session-id": sid, "mcp-protocol-version": "2025-06-18" } });
+    expect(get.status).toBe(403);
+    expect(await get.json()).toEqual({ error: "forbidden" });
     // The rightful owner still works.
     const ok = await rpc({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "whoami", arguments: {} } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
     expect(JSON.parse(ok.data.find((m) => m.id === 10)!.result!.content![0]!.text)).toMatchObject({ owner: OWNER });
@@ -60,8 +64,9 @@ describe("queenos-mcp Worker", () => {
     const bad = await rpc({ jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "init_agent", arguments: { name: "opus", model: "m", role: "boss" } } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
     const r = bad.data.find((m) => m.id === 20)!.result!;
     expect(r.isError).toBe(true);
-    const e = JSON.parse(r.content![0]!.text) as { code: string; message: string };
+    const e = JSON.parse(r.content![0]!.text) as { code: string; message: string; retryable: boolean };
     expect(e.code).toBe("INVALID_INPUT");
+    expect(e.retryable).toBe(false);
     expect(e.message.length).toBeLessThanOrEqual(200);
     expect(e.message).not.toContain("boss");
     const list = await rpc({ jsonrpc: "2.0", id: 21, method: "tools/list" }, { "x-queen-user": OWNER, "mcp-session-id": sid });
@@ -84,5 +89,17 @@ describe("queenos-mcp Worker", () => {
     const unknown = await del(OWNER, "0".repeat(32));
     expect(unknown.status).toBe(404);
     await unknown.text();
+  });
+
+  it("WIRE: a retryable tool error carries retryable true and retryAfterMs on the wire", async () => {
+    const sid = await session();
+    const call = async (id: number, name: string, args: unknown) => rpc({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
+    await call(40, "init_agent", { name: "opus", model: "claude-opus-5-5", role: "worker" });
+    const w = currentWorld();
+    w.queen.errors.set("getSnapshot", new Error("UNAVAILABLE: restarting"));
+    const out = await call(41, "list_items", { hive: "demo" });
+    const r = out.data.find((m) => m.id === 41)!.result!;
+    expect(r.isError).toBe(true);
+    expect(JSON.parse(r.content![0]!.text)).toEqual({ code: "UNAVAILABLE", message: "the hive is temporarily unavailable; retry", retryable: true, retryAfterMs: 2000 });
   });
 });

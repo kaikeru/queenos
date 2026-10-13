@@ -1,5 +1,5 @@
 /**
- * The MCP tools (spec §6). Each takes and returns JSON; errors are `{code, message}` (spec §11). Every tool except
+ * The MCP tools (spec §6). Each takes and returns JSON; errors are `{code, message, retryable, retryAfterMs?}` (spec §11). Every tool except
  * whoami / init_agent / resume_agent needs the session's agent ("call init_agent first"). Never log a tool result:
  * start_attempt and refresh_attempt return an attempt token.
  */
@@ -19,13 +19,12 @@ import {
   type AttemptState,
   type AttemptVerdict,
   type AttemptView,
-  type GoalChild,
   type McpAgentIdentity,
-  type McpErrorCode,
+  type McpToolError,
   type Race,
 } from "@queenos/queen-types";
 import { attemptDir, cleanupOf, configCommand } from "./commands";
-import { ToolError, artifactsUnavailable, fromQueen } from "./errors";
+import { ToolError, artifactsUnavailable, fromQueen, messageOf, refusal } from "./errors";
 import type { McpPorts } from "./ports";
 import { openAttempts, startAttempt } from "./start";
 
@@ -49,7 +48,7 @@ export interface ToolSpec {
   run(ctx: ToolCtx, args: never): Promise<unknown>;
 }
 
-export type ToolOutcome = { ok: true; value: unknown } | { ok: false; error: { code: McpErrorCode; message: string; items?: GoalChild[] } };
+export type ToolOutcome = { ok: true; value: unknown } | { ok: false; error: McpToolError };
 
 export const WAIT_POLL_MS = 2_000;
 const ItemIdSchema = z.string().min(1).max(64);
@@ -59,13 +58,13 @@ export async function callTool(spec: ToolSpec, ctx: ToolCtx, raw: unknown): Prom
   const parsed = z.object(spec.shape).safeParse(raw ?? {});
   if (!parsed.success) {
     const fields = [...new Set(parsed.error.issues.map((i) => i.path.join(".") || "(input)"))].join(", ");
-    return { ok: false, error: { code: "INVALID_INPUT", message: `invalid ${fields}`.slice(0, 200) } };
+    return { ok: false, error: { code: "INVALID_INPUT", message: `invalid ${fields}`.slice(0, 200), retryable: false } };
   }
   try {
     return { ok: true, value: await spec.run(ctx, parsed.data as never) };
   } catch (e) {
     const t = e instanceof ToolError ? e : fromQueen(e);
-    return { ok: false, error: { code: t.code, message: t.message, ...(t.items ? { items: t.items } : {}) } };
+    return { ok: false, error: { code: t.code, message: t.message, retryable: t.retryable, ...(t.retryAfterMs !== undefined ? { retryAfterMs: t.retryAfterMs } : {}), ...(t.items ? { items: t.items } : {}) } };
   }
 }
 
@@ -91,7 +90,24 @@ async function requireHive(ctx: ToolCtx, hive: string): Promise<void> {
   if (!(await ctx.ports.registry.get(hive))) throw new ToolError("NOT_FOUND", `hive ${hive} not found`);
 }
 
-const withCleanup = (v: AttemptView) => (isTerminalAttemptState(v.state) ? { ...v, cleanup: cleanupOf(v.attemptId) } : v);
+/** The attempt view as the agent sees it: the v18 fields read `?? null` (an older Queen omits them), terminal ones carry the cleanup. */
+const withCleanup = (v: AttemptView) => {
+  const view = { ...v, verdictKind: v.verdictKind ?? null, regating: v.regating ?? null };
+  return isTerminalAttemptState(v.state) ? { ...view, cleanup: cleanupOf(v.attemptId) } : view;
+};
+
+const FINDING = /^Queen-Finding: (.+)$/gm;
+
+/** The findings of a rejection: the note's `Queen-Finding` lines, else the train's reason. Infra has none. */
+function findingsOf(view: AttemptView, note: string | null): string[] {
+  if (view.verdict !== "rejected" || view.verdictKind === "infra") return [];
+  const lines = note ? [...note.matchAll(FINDING)].map((m) => m[1]!.trim().slice(0, 300)) : [];
+  if (lines.length) return lines;
+  return view.train?.reason ? [view.train.reason] : [];
+}
+
+/** retry_gates against a Queen that predates the attemptRegate RPC: workerd's "The RPC receiver does not implement the method". */
+const lacksRpc = (e: unknown): boolean => /does not implement|is not a function/i.test(messageOf(e));
 
 /** `wait` on an attempt: verdict = its head PASSED / REJECTED (or WON); decided = WON / LOST; landed = LANDED. Any terminal state ends every wait. */
 export function attemptReached(state: AttemptState, until: "verdict" | "decided" | "landed"): boolean {
@@ -201,10 +217,11 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: "get_item",
-    description: "One item and its race: state, shared base commit, entry window and candidates (attempt, agent, claimed model, verdict, preview).",
+    description: "One item and its race: state, shared base commit, entry window and candidates (attempt, agent, claimed model, verdict, kind: findings or infra, preview).",
     shape: { hive: HiveSlugSchema, itemId: ItemIdSchema },
     run: async (ctx, a: { hive: string; itemId: string }) => {
       agentOf(ctx);
+      await requireHive(ctx, a.hive);
       const queen = ctx.ports.queen(a.hive);
       const [detail, atts] = await Promise.all([queen.getItemDetail(a.itemId), queen.attemptsForItem(a.itemId)]);
       const race = detail.races.at(-1) ?? null;
@@ -218,7 +235,7 @@ export const TOOLS: ToolSpec[] = [
               entryClosesAt: race.entryClosesAt ?? null,
               candidates: atts.attempts
                 .filter((x) => race.trainIds.includes(x.trainId))
-                .map((x) => ({ attemptId: x.attemptId, agent: x.agentName, claimedModel: x.model, verdict: x.verdict, previewUrl: x.train?.previewUrl ?? null })),
+                .map((x) => ({ attemptId: x.attemptId, agent: x.agentName, claimedModel: x.model, verdict: x.verdict, kind: x.verdictKind ?? null, previewUrl: x.train?.previewUrl ?? null })),
             }
           : null,
       };
@@ -227,7 +244,7 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "start_attempt",
     description:
-      "Start an attempt on an item (or a goal with one open item): you get your own fork of the item's frozen base and a 2 h token for it. Run cloneCommand then configCommand, commit, `git push origin main`. Can take up to a minute.",
+      "Start an attempt on an item (or a goal with one open item): you get your own fork of the item's frozen base and a 2 h token for it. Run setupCommand (it creates the clone), commit, `git push origin main`. Can take up to a minute.",
     shape: { hive: HiveSlugSchema, itemId: ItemIdSchema.optional(), goalId: ItemIdSchema.optional() },
     run: async (ctx, a: { hive: string; itemId?: string; goalId?: string }) => {
       const agent = agentOf(ctx);
@@ -238,19 +255,19 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: "refresh_attempt",
-    description: "Your attempt: a fresh 2 h token (older tokens of the fork are revoked). Run the returned configCommand.",
+    description: "Your attempt: a fresh 2 h token (older tokens of the fork are revoked). Run the returned configCommand (it replaces the clone's header).",
     shape: { attemptId: AttemptIdSchema },
     run: async (ctx, a: { attemptId: string }) => {
       const agent = agentOf(ctx);
       const { hive } = await ownAttempt(ctx, agent, a.attemptId);
       const r = await ctx.ports.queen(hive).attemptRefresh({ hive, attemptId: a.attemptId, owner: agent.owner, agentId: agent.agentId });
-      if (!r.ok) throw new ToolError(r.code, r.message);
+      if (!r.ok) throw refusal(r);
       try {
         using h = await ctx.ports.artifacts.get(r.attempt.repo);
         const [info, tok] = await Promise.all([h.info(), h.createToken("write", ATTEMPT_TOKEN_TTL_S)]);
         for (const t of (await h.listTokens()).tokens) if (t.id !== tok.id && t.state === "active") await h.revokeToken(t.id);
         const remote = info.remote.replace(/\/+$/, "");
-        return { token: tok.plaintext, expiresAt: Date.parse(tok.expiresAt) || r.attempt.expiresAt, configCommand: configCommand(remote, tok.plaintext, attemptDir(a.attemptId)) };
+        return { expiresAt: Date.parse(tok.expiresAt) || r.attempt.expiresAt, configCommand: configCommand(remote, tok.plaintext, attemptDir(a.attemptId)) };
       } catch (e) {
         throw artifactsUnavailable("token refresh", e);
       }
@@ -264,7 +281,7 @@ export const TOOLS: ToolSpec[] = [
       const agent = agentOf(ctx);
       const { hive } = await ownAttempt(ctx, agent, a.attemptId);
       const r = await ctx.ports.queen(hive).attemptEnd({ hive, attemptId: a.attemptId, owner: agent.owner, agentId: agent.agentId });
-      if (!r.ok) throw new ToolError(r.code, r.message);
+      if (!r.ok) throw refusal(r);
       if (isTerminalAttemptState(r.attempt.state)) await ctx.ports.identity(agent.agentId).closeAttempt(a.attemptId);
       return { state: r.attempt.state, cleanup: cleanupOf(a.attemptId) };
     },
@@ -308,6 +325,7 @@ export const TOOLS: ToolSpec[] = [
       const timeout = Math.min(a.timeoutMs ?? WAIT_MAX_MS, WAIT_MAX_MS);
       const start = ctx.ports.now();
       const own = byAttempt ? await ownAttempt(ctx, agent, a.attemptId!) : null;
+      if (!own) await requireHive(ctx, a.hive!);
       const queen = ctx.ports.queen(own?.hive ?? a.hive!);
       for (;;) {
         let done: boolean;
@@ -334,19 +352,41 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: "get_verdict",
-    description: "Your attempt's verdict on its current head: the v1 verdict note (as on refs/notes/verdict), findings and the preview URL.",
+    description: "Your attempt's verdict on its current head: the v1 verdict note (as on refs/notes/verdict), kind (findings = fix and push; infra = the gate could not run, call retry_gates), findings, regating and the preview URL.",
     shape: { attemptId: AttemptIdSchema },
     run: async (ctx, a: { attemptId: string }) => {
       const { hive, view } = await ownAttempt(ctx, agentOf(ctx), a.attemptId);
       const note = view.headSha ? await ctx.ports.queen(hive).verdictNote(view.headSha) : null;
+      const kind = view.verdictKind ?? null;
       return {
         headSha: view.headSha,
         verdict: view.verdict,
-        findings: view.verdict === "rejected" && view.train?.reason ? [view.train.reason] : [],
+        kind,
+        findings: findingsOf(view, note),
         summary: view.train?.summary ?? null,
         note,
         previewUrl: view.train?.previewUrl ?? null,
+        regating: view.regating ?? null,
+        next: kind === "infra" ? "retry_gates" : kind === "findings" ? "fix and push" : null,
       };
+    },
+  },
+  {
+    name: "retry_gates",
+    description: "Your attempt: re-run the gates on its current head when the last verdict was kind infra (the gate could not run, nothing is wrong with your change). Idempotent; at most 3 per attempt, one a minute.",
+    shape: { attemptId: AttemptIdSchema },
+    run: async (ctx, a: { attemptId: string }) => {
+      const agent = agentOf(ctx);
+      const { hive } = await ownAttempt(ctx, agent, a.attemptId);
+      let r;
+      try {
+        r = await ctx.ports.queen(hive).attemptRegate({ hive, attemptId: a.attemptId, owner: agent.owner, agentId: agent.agentId });
+      } catch (e) {
+        if (lacksRpc(e)) throw new ToolError("UNAVAILABLE", "retry_gates needs a newer Queen", { retryable: false });
+        throw e;
+      }
+      if (!r.ok) throw refusal(r);
+      return { changed: r.changed, state: r.attempt.state, trainId: r.attempt.trainId, race: r.attempt.race };
     },
   },
   {
@@ -355,6 +395,7 @@ export const TOOLS: ToolSpec[] = [
     shape: { hive: HiveSlugSchema, raceId: z.string().min(1).max(64) },
     run: async (ctx, a: { hive: string; raceId: string }) => {
       const agent = agentOf(ctx);
+      await requireHive(ctx, a.hive);
       return ctx.ports.queen(a.hive).closeRaceEntries({ hive: a.hive, raceId: a.raceId, user: agent.owner });
     },
   },
@@ -364,6 +405,7 @@ export const TOOLS: ToolSpec[] = [
     shape: { hive: HiveSlugSchema, raceId: z.string().min(1).max(64), attemptId: AttemptIdSchema },
     run: async (ctx, a: { hive: string; raceId: string; attemptId: string }) => {
       const agent = agentOf(ctx);
+      await requireHive(ctx, a.hive);
       const queen = ctx.ports.queen(a.hive);
       const view = await queen.getAttempt(a.attemptId);
       if (!view) throw new ToolError("NOT_FOUND", `attempt ${a.attemptId} not found`);

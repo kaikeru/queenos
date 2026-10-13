@@ -196,6 +196,13 @@ export class FakeQueen implements QueenPort {
     this.views.set(input.attemptId, ended);
     return { ok: true, attempt: ended, changed: true };
   }
+  /** null = behave like a Queen without the RPC. */
+  regate: ((input: AttemptOwnerAction) => AttemptResult) | null = null;
+  async attemptRegate(input: AttemptOwnerAction): Promise<AttemptResult> {
+    this.rec("attemptRegate", input);
+    if (!this.regate) throw new Error('The RPC receiver does not implement the method "attemptRegate".');
+    return this.regate(input);
+  }
   async getAttempt(attemptId: string) {
     this.rec("getAttempt", attemptId);
     return this.views.get(attemptId) ?? null;

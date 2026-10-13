@@ -42,6 +42,8 @@ export interface QueenPort {
   attemptAborted(input: AttemptAborted): Promise<{ outcome: string }>;
   attemptRefresh(input: AttemptOwnerAction): Promise<AttemptResult>;
   attemptEnd(input: AttemptOwnerAction): Promise<AttemptResult>;
+  /** A Queen older than the regate fix lacks this RPC: the call then throws "does not implement" (see retry_gates). */
+  attemptRegate(input: AttemptOwnerAction): Promise<AttemptResult>;
   getAttempt(attemptId: string): Promise<AttemptView | null>;
   attemptsForItem(itemId: string): Promise<ItemAttempts>;
   verdictNote(sha: string): Promise<string | null>;

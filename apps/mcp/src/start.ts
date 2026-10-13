@@ -13,21 +13,20 @@ import {
   type McpAgentIdentity,
 } from "@queenos/queen-types";
 import { RepoNotFoundError, deleteRepoQuietly, forkRepo, type ForkResult } from "@queenos/hive-kit/artifacts";
-import { GIT_NOTE, attemptDir, cloneCommand, configCommand } from "./commands";
-import { ToolError, artifactsUnavailable, fromQueen, messageOf } from "./errors";
-import type { McpPorts } from "./ports";
+import { GIT_NOTE, attemptDir, setupCommand } from "./commands";
+import { ToolError, artifactsUnavailable, fromQueen, messageOf, refusal } from "./errors";
+import type { McpPorts, QueenPort } from "./ports";
 
 export interface StartAttemptResult {
   attemptId: string;
   itemId: string;
   remote: string;
-  token: string;
   expiresAt: number;
   /** The item's shared base commit (every candidate of the race starts here). */
   baseSha: string;
   dir: string;
-  cloneCommand: string;
-  configCommand: string;
+  /** Creates the clone with the token in its local git config; the token appears nowhere else in this result. */
+  setupCommand: string;
   note: string;
 }
 
@@ -45,6 +44,15 @@ export async function openAttempts(ports: McpPorts, agent: McpAgentIdentity): Pr
   return open;
 }
 
+/** Did the Queen pin exactly this base for the item? A failed read counts as "no" (the original delete-and-fail path). */
+async function basePinned(queen: QueenPort, itemId: string, baseSha: string): Promise<boolean> {
+  try {
+    return (await queen.attemptsForItem(itemId)).baseSha === baseSha;
+  } catch {
+    return false;
+  }
+}
+
 export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, input: { hive: string; itemId?: string; goalId?: string }): Promise<StartAttemptResult> {
   const { hive } = input;
   if ((await openAttempts(ports, agent)).length >= MAX_OPEN_ATTEMPTS_PER_AGENT) {
@@ -60,7 +68,10 @@ export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, inp
     if (d.verdict === "accept" || d.code !== "BASE_PENDING" || ports.now() - started + BASE_PENDING_POLL_MS > BASE_PENDING_MAX_WAIT_MS) break;
     await ports.sleep(BASE_PENDING_POLL_MS);
   }
-  if (d.verdict === "refuse") throw new ToolError(d.code, d.message, d.items);
+  if (d.verdict === "refuse") {
+    const retryAfterMs = d.retryAfterMs ?? (d.code === "BASE_PENDING" ? BASE_PENDING_POLL_MS : undefined);
+    throw new ToolError(d.code, d.message, { ...(d.items ? { items: d.items } : {}), ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) });
+  }
   const identity = ports.identity(agent.agentId);
   await identity.addAttempt({ hive, attemptId: d.attemptId });
 
@@ -70,7 +81,12 @@ export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, inp
     let b: ForkResult | null = null;
     try {
       b = await forkRepo(ports.fork, hive, "main", d.base.baseRepo, { readOnly: true, probe: false, description: `QueenOS race base of item ${d.itemId}`, logPrefix: "mcp" });
-      await queen.attemptBaseReady({ hive, itemId: d.itemId, baseRepo: b.repo, baseSha: b.baseSha });
+      try {
+        await queen.attemptBaseReady({ hive, itemId: d.itemId, baseRepo: b.repo, baseSha: b.baseSha });
+      } catch (e) {
+        // A transport throw can follow a commit: if the Queen already pinned this very base, deleting it would wedge the item.
+        if (fromQueen(e).code !== "UNAVAILABLE" || !(await basePinned(queen, d.itemId, b.baseSha))) throw e;
+      }
       baseRepo = b.repo;
       baseSha = b.baseSha;
     } catch (e) {
@@ -97,19 +113,17 @@ export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, inp
     const expiresAt = Date.parse(tok.expiresAt) || ports.now() + ATTEMPT_TOKEN_TTL_S * 1000;
     queenCall = true;
     const ready = await queen.attemptReady({ hive, attemptId: d.attemptId, repo: forked.repo, baseSha, expiresAt });
-    if (!ready.ok) throw new ToolError(ready.code, ready.message);
+    if (!ready.ok) throw refusal(ready);
     const remote = info.remote.replace(/\/+$/, "");
     const dir = attemptDir(d.attemptId);
     return {
       attemptId: d.attemptId,
       itemId: d.itemId,
       remote,
-      token: tok.plaintext,
       expiresAt,
       baseSha,
       dir,
-      cloneCommand: cloneCommand(remote, tok.plaintext, dir),
-      configCommand: configCommand(remote, tok.plaintext, dir),
+      setupCommand: setupCommand(remote, tok.plaintext, dir),
       note: GIT_NOTE,
     };
   } catch (e) {
