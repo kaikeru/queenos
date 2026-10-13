@@ -95,3 +95,17 @@ export function reworkDeadlines(input: {
   }
   return out;
 }
+
+export type RejectCheck = { ok: true; targets: string[] } | { ok: false; status: 409; message: string };
+
+/**
+ * Who a reject applies to (§7.4): only a PICKING race; a trainId must be a live (not terminal) passed candidate; "all"
+ * means every live passed candidate. Otherwise 409 (the route answers it; 404 for an unknown race is the caller's).
+ */
+export function checkReject(race: Pick<Race, "raceId" | "state" | "trainIds">, target: string, cands: readonly { trainId: string; phase: string; raceOutcome?: string | null }[]): RejectCheck {
+  if (race.state !== "PICKING") return { ok: false, status: 409, message: `race ${race.raceId} is ${race.state}, not PICKING` };
+  const live = cands.filter((c) => race.trainIds.includes(c.trainId) && c.phase !== "EJECTED" && c.phase !== "MERGED" && c.raceOutcome === "PASSED");
+  if (target === "all") return live.length ? { ok: true, targets: live.map((c) => c.trainId) } : { ok: false, status: 409, message: `race ${race.raceId} has no live passed candidate` };
+  if (!live.some((c) => c.trainId === target)) return { ok: false, status: 409, message: `train ${target} is not a live passed candidate of race ${race.raceId}` };
+  return { ok: true, targets: [target] };
+}

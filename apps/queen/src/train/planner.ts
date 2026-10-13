@@ -119,7 +119,7 @@ import type { RaceRecord } from "../records";
 import * as queue from "./queue";
 import { LOSER_FORK_KEEP_MS, checkPick, decideMode, isHumanBy, judgeOf, keptLoser, pickDeadline, pickDue, recommend, releaseLoser } from "./pick";
 import { buildCredits, rankCandidates, raceWidth, type RaceCandidate } from "./race";
-import { holdEnd, iso, nextSlot, type AttemptSlot, type ReworkSettings } from "./rework";
+import { checkReject, holdEnd, iso, nextSlot, type AttemptSlot, type ReworkSettings } from "./rework";
 
 /**
  * Planner-internal train lifecycle (TrainPhaseSchema in queen-types, exposed
@@ -540,6 +540,8 @@ export interface PlanResult {
   picks?: PickDelta[];
   /** T9a: a pick the rules refused (`pick()`): the route answers this status. */
   refused?: { status: 404 | 409; message: string };
+  /** Rework loop (§7.4): a reject applied; `fallback` = it ended the race (maxRaceReopens spent) and the item reopened. */
+  rejected?: { fallback: boolean };
   /** Rework loop: attempt slots this plan changed (the Queen writes them onto attempts rows). */
   slots: AttemptSlot[];
   /** Rework loop: an item's wait reason while its race is REWORKING (`awaiting rework (...)`); null clears it (Task 3 sets it). */
@@ -885,6 +887,7 @@ export class TrainPlanner {
   private abortedIntents: string[] = [];
   private picks: PickDelta[] = [];
   private refused: { status: 404 | 409; message: string } | null = null;
+  private rejected: { fallback: boolean } | null = null;
   private readonly hooks: QueueHooks;
   private readonly activeBuildsAtStart: number;
   private landing = false;
@@ -2658,7 +2661,7 @@ export class TrainPlanner {
    * §5.6, the rework fallback: the race is ABANDONED (REWORK → FAILED, a fix in flight is withdrawn), the item goes FAILED
    * "awaiting contributor", which reopens it to any agent's start_attempt. The Queen then releases its base (R6).
    */
-  private abandonRework(race: RaceRecord, why: string): void {
+  private abandonRework(race: RaceRecord, why: string, data: Record<string, unknown> = {}): void {
     if (race.state === "ABANDONED") return;
     for (const id of race.trainIds) {
       const x = this.find(id);
@@ -2666,8 +2669,8 @@ export class TrainPlanner {
       if (x.raceOutcome === "REWORK") this.endRework(x, "FAILED", why);
       else if (isActive(x) && x.raceOutcome === "RACING") this.eject(x, clip500(`withdrawn: race ${race.raceId} abandoned (${why})`), { raceOutcome: "LOST" });
     }
-    this.setRace(race, { state: "ABANDONED", reason: clip(`abandoned: ${why}`, 300), decidedAt: this.ctx.now });
-    this.raceEvent(race, this.find(race.winnerTrainId ?? ""), `race ${race.raceId} abandoned: ${why}; the item reopens to any agent`, { outcome: "ABANDONED", fallback: true }, "warn");
+    this.setRace(race, { state: "ABANDONED", reason: clip(`abandoned: ${why}`, 300), decidedAt: this.ctx.now, pickDeadlineAt: null });
+    this.raceEvent(race, this.find(race.winnerTrainId ?? ""), `race ${race.raceId} abandoned: ${why}; the item reopens to any agent`, { outcome: "ABANDONED", fallback: true, ...data }, "warn");
     this.reworkWait(race.itemId, null);
     this.awaitContributor(race.itemId, `rework fallback: ${why}`);
     this.maybeLand();
@@ -2968,6 +2971,118 @@ export class TrainPlanner {
     });
     this.maybeDecide(race);
     return this.finish("applied");
+  }
+
+  /**
+   * `POST /hives/:hive/races/:raceId/reject` (rework-loop spec §7): a human sends candidates of a PICKING race back with a
+   * reason. External hives (§7.2): a candidate with a slot left goes to REWORK (reason `human`, preview torn down, fork
+   * kept) and the race drops to RACING, using one of its reopens. Reject one holds the race until the slot's dueAt (the
+   * grace clock restarts at the drop; a human hold ignores it); reject all also reopens entries for reworkWindowMs and
+   * stops the grace clock. Past maxRaceReopens: one is LOST (the race stays PICKING); all is the fallback. Swarm hives
+   * (§7.3, T9b): LOST; all → ABANDONED and a REWORK. Refusals in `refused` (404 / 409), nothing changes.
+   */
+  reject(input: { raceId: string; target: string; by: string; reason: string }): PlanResult {
+    const race = this.races.get(input.raceId);
+    if (!race) {
+      this.refused = { status: 404, message: `race ${input.raceId} not found` };
+      return this.finish("ignored:unknown");
+    }
+    const cands = race.trainIds.map((id) => this.find(id)).filter((t): t is TrainRecord => !!t);
+    const check = checkReject(race, input.target, cands);
+    if (!check.ok) {
+      this.refused = { status: check.status, message: check.message };
+      return this.finish("ignored:stale");
+    }
+    const reason = clip(input.reason.trim(), 300);
+    const rej: Rejection = { by: input.by, reason, all: input.target === "all", why: clip500(`rejected by ${input.by.replace(/^human:/, "")}: ${reason}`) };
+    const targets = check.targets.map((id) => this.find(id)!);
+    this.setRace(race, { rejections: [...(race.rejections ?? []), ...targets.map((t) => ({ trainId: t.trainId, by: input.by, reason }))].slice(-16) });
+    this.rejected = { fallback: false };
+    if (!this.ctx.external || !this.ctx.rework) {
+      this.rejectSwarm(race, targets, rej);
+      return this.finish("applied");
+    }
+    const reopens = race.reopens ?? 0;
+    const canReopen = reopens < this.ctx.rework.maxRaceReopens;
+    if (rej.all && !canReopen) {
+      // §7.2: past maxRaceReopens, reject all is the fallback (the race ABANDONED, the item reopens to any agent).
+      this.loseRejected(race, targets, rej);
+      this.abandonRework(race, clip(`${rej.why} (maxRaceReopens ${this.ctx.rework.maxRaceReopens} reached)`, 280), { by: input.by });
+      this.rejected = { fallback: true };
+      return this.finish("applied");
+    }
+    let dropped = false;
+    for (const t of targets) {
+      const slot = canReopen ? this.giveSlot(t, "human") : null;
+      if (!slot) {
+        // No reopen left, or the attempt's slots are spent (§7.2, R18): LOST.
+        this.loseRejected(race, [t], rej);
+        continue;
+      }
+      this.ejectKeepingFork(t, reworkReasonText("human", slot.rework!.dueAt, rej.why), { raceOutcome: "REWORK", summary: rej.why });
+      this.rejectedEvent(race, t, rej, "REWORK");
+      dropped = true;
+    }
+    const back = { state: "RACING" as const, reopens: reopens + 1, pickDeadlineAt: null, recommendedTrainId: null, recommendReason: null };
+    if (rej.all) {
+      // No auto-pick and no pass left to time: the grace clock stops (graceFrom with it); new agents may enter.
+      this.setRace(race, { ...back, deadlineAt: null, graceFrom: null, entryClosesAt: this.ctx.now + this.ctx.rework.windowMs });
+      this.maybeDecide(race);
+    } else if (dropped) {
+      // R5: the grace clock restarts at the drop, so no stale pre-PICKING start or deadline is left on the race. The
+      // human hold itself runs to the slot's dueAt whatever this clock says (holdEnd).
+      const grace = this.ctx.raceGraceMs ?? RACE_GRACE_MS;
+      this.setRace(race, { ...back, deadlineAt: this.ctx.now + grace, graceFrom: this.ctx.now });
+      this.maybeDecide(race);
+    } else {
+      this.maybeDecidePicking(race);
+    }
+    this.maybeLand();
+    return this.finish("applied");
+  }
+
+  /** T9b (human-push design §10.4), swarm hives: one → LOST (fork and preview cleaned up); all → ABANDONED and a REWORK. */
+  private rejectSwarm(race: RaceRecord, targets: TrainRecord[], rej: Rejection): void {
+    this.loseRejected(race, targets, rej);
+    if (!rej.all) {
+      this.maybeDecidePicking(race);
+      this.maybeLand();
+      return;
+    }
+    const summary = clip500(`Human rejected all candidates: ${rej.reason}`);
+    this.setRace(race, { state: "ABANDONED", reason: clip(`abandoned: ${rej.why}`, 300), decidedAt: this.ctx.now, pickDeadlineAt: null });
+    this.raceEvent(race, targets[0], `race ${race.raceId} abandoned: none of these (${rej.by.replace(/^human:/, "")})`, { outcome: "ABANDONED", by: rej.by }, "warn");
+    const p = this.prompts.get(race.itemId);
+    if (p) {
+      this.setPromptSummary(p.promptId, summary);
+      this.rework(p.promptId, { summary });
+    }
+    this.maybeLand();
+  }
+
+  /** Rejected candidates that take no slot (swarm hives, no reopen left, the attempt's slots spent): EJECTED, LOST. */
+  private loseRejected(race: RaceRecord, targets: TrainRecord[], rej: Rejection): void {
+    for (const t of targets) {
+      this.eject(t, clip500(`lost race ${race.raceId}: ${rej.why}`), { raceOutcome: "LOST" });
+      this.rejectedEvent(race, t, rej, "LOST");
+    }
+  }
+
+  /** `race.rejected` per rejected candidate (§7.4); the actor is the human. */
+  private rejectedEvent(race: RaceRecord, t: TrainRecord, rej: Rejection, outcome: "REWORK" | "LOST"): void {
+    const who = rej.by.replace(/^human:/, "");
+    this.events.push({
+      type: "race.rejected",
+      severity: "warn",
+      actor: clip(`user:${who}`, 340),
+      traceId: traceOfTrain(t),
+      spanId: spanIdFor(race.raceId),
+      parentSpanId: spanIdFor(race.itemId),
+      itemId: race.itemId,
+      trainId: t.trainId,
+      summary: clip500(`race ${race.raceId}: ${t.trainId} rejected by ${who} (${outcome === "REWORK" ? "rework" : "lost"}): ${rej.reason}`),
+      data: { raceId: race.raceId, trainId: t.trainId, target: rej.all ? "all" : t.trainId, by: rej.by, reason: rej.reason, model: t.model, outcome },
+    });
   }
 
   private raceEvent(race: RaceRecord, t: TrainRecord | undefined, summary: string, data: Record<string, unknown>, severity: EventDraft["severity"] = "info"): void {
@@ -3339,6 +3454,7 @@ export class TrainPlanner {
       ...(this.abortedIntents.length ? { abortedIntents: this.abortedIntents } : {}),
       ...(this.picks.length ? { picks: this.picks } : {}),
       ...(this.refused ? { refused: this.refused } : {}),
+      ...(this.rejected ? { rejected: this.rejected } : {}),
       slots: [...this.dirtySlots].map((id) => {
         const s = this.slots.get(id)!;
         return { ...s, rework: s.rework ? { ...s.rework } : null };
@@ -3347,6 +3463,7 @@ export class TrainPlanner {
     };
     this.picks = [];
     this.refused = null;
+    this.rejected = null;
     this.infraFailed = [];
     this.awaitingContributor = [];
     this.abortedIntents = [];
@@ -3385,6 +3502,14 @@ function toCandidate(t: TrainRecord): RaceCandidate {
     credits: t.credits ?? null,
     model: t.model,
   };
+}
+
+/** A human reject as `reject()` applies it (§7.4): `why` is the candidate's finding, `rejected by <email>: <reason>`. */
+interface Rejection {
+  by: string;
+  reason: string;
+  all: boolean;
+  why: string;
 }
 
 function clip(s: string, n: number): string {

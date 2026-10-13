@@ -1,7 +1,7 @@
 /** Rework loop, planner (rework-loop spec §5.2, §5.5, §5.6): REWORK candidates, holds, slot expiry, caps. Pure. */
 import { describe, expect, it } from "vitest";
 import { INFRA_SUMMARY_PREFIX, parseReworkReason } from "@queenos/queen-types";
-import { graceStartOf, holdEnd, nextSlot, reworkDeadlines, type ReworkSettings } from "../src/train/rework";
+import { checkReject, graceStartOf, holdEnd, nextSlot, reworkDeadlines, type ReworkSettings } from "../src/train/rework";
 import { A1, B1, C1, MIN, ReworkHive } from "./rework-harness";
 
 const S: ReworkSettings = { windowMs: 30 * MIN, holdMs: 10 * MIN, maxPerAttempt: 3, maxRaceReopens: 3 };
@@ -432,5 +432,143 @@ describe("planner: the grace start is fixed (review fix 1: R3 never moves it)", 
     expect(graceStartOf({ deadlineAt: 20 * MIN, graceFrom: null }, 90_000)).toBe(20 * MIN - 90_000);
     expect(graceStartOf({ deadlineAt: 20 * MIN }, 90_000)).toBe(20 * MIN - 90_000);
     expect(graceStartOf({ deadlineAt: null }, 90_000)).toBeNull();
+  });
+});
+
+describe("planner: reject with a reason (§7)", () => {
+  const BY = "human:k@kaikeru.com";
+  /** Judge human: A, B, C all pass → PICKING. */
+  function picking() {
+    const h = new ReworkHive();
+    h.judge = "human";
+    const a = h.push(A1);
+    const b = h.push(B1);
+    const c = h.push(C1);
+    h.pass(a);
+    h.pass(b);
+    h.pass(c);
+    expect(h.race().state).toBe("PICKING");
+    return { h, a, b, c };
+  }
+  const reject = (h: ReworkHive, target: string, reason = "the button is unreadable") => h.run((p) => p.reject({ raceId: h.race().raceId, target, by: BY, reason }));
+
+  it("checkReject: PICKING only; one live passed candidate, or all of them", () => {
+    const cands = [
+      { trainId: "a", phase: "TESTING", raceOutcome: "PASSED" },
+      { trainId: "b", phase: "EJECTED", raceOutcome: "FAILED" },
+    ];
+    expect(checkReject({ raceId: "r", state: "PICKING", trainIds: ["a", "b"] }, "a", cands)).toEqual({ ok: true, targets: ["a"] });
+    expect(checkReject({ raceId: "r", state: "PICKING", trainIds: ["a", "b"] }, "all", cands)).toEqual({ ok: true, targets: ["a"] });
+    expect(checkReject({ raceId: "r", state: "PICKING", trainIds: ["a", "b"] }, "b", cands)).toMatchObject({ ok: false, status: 409 });
+    expect(checkReject({ raceId: "r", state: "RACING", trainIds: ["a", "b"] }, "a", cands)).toMatchObject({ ok: false, status: 409 });
+  });
+
+  it("refusals change nothing: unknown race 404, a race not PICKING 409, not a live passed candidate 409", () => {
+    const { h, a } = picking();
+    expect(h.run((p) => p.reject({ raceId: "nope", target: a, by: BY, reason: "x" })).refused).toMatchObject({ status: 404 });
+    const before = JSON.stringify([...h.races.values()]);
+    expect(h.run((p) => p.reject({ raceId: h.race().raceId, target: "ghost", by: BY, reason: "x" })).refused).toMatchObject({ status: 409 });
+    expect(JSON.stringify([...h.races.values()])).toBe(before);
+  });
+
+  it("reject one: REWORK (human), back to RACING (reopens 1); the hold runs to dueAt despite the stale grace clock; then PICKING again", () => {
+    const { h, b } = picking();
+    const r = reject(h, b);
+    expect(r.rejected).toEqual({ fallback: false });
+    expect(h.t(b)).toMatchObject({ phase: "EJECTED", raceOutcome: "REWORK", summary: "rejected by k@kaikeru.com: the button is unreadable" });
+    expect(parseReworkReason(h.t(b).reason)).toEqual({ reason: "human", dueAt: h.now + 30 * MIN });
+    expect(h.slot(B1)!.rework).toMatchObject({ reason: "human", round: 1 });
+    expect(h.race()).toMatchObject({ state: "RACING", reopens: 1, pickDeadlineAt: null, recommendedTrainId: null, deadlineAt: h.now + h.graceMs });
+    expect(h.race().rejections).toEqual([{ trainId: b, by: BY, reason: "the button is unreadable" }]);
+    expect(h.events.filter((e) => e.type === "race.rejected")).toEqual([expect.objectContaining({ trainId: b, data: expect.objectContaining({ target: b, by: BY, outcome: "REWORK" }) })]);
+    h.at(20 * MIN);
+    expect(h.race().state).toBe("RACING"); // not 90 s, not 10 min
+    h.at(11 * MIN);
+    expect(h.t(b).raceOutcome).toBe("FAILED");
+    expect(h.race()).toMatchObject({ state: "PICKING", pickDeadlineAt: h.now + 15 * MIN });
+  });
+
+  it("a human reject-one hold is not cut short by the grace clock from before PICKING: it lasts until the slot's dueAt", () => {
+    const { h, b } = picking();
+    const before = h.race();
+    expect(before.graceFrom).not.toBeNull(); // the first pass started it, long before the reject
+    h.at(14 * MIN); // still PICKING (pick window 15 min); the old grace start and deadline are 14 min stale
+    expect(h.race().state).toBe("PICKING");
+    reject(h, b);
+    const due = h.slot(B1)!.rework!.dueAt;
+    // The grace clock restarts at the drop: no stale start left on the race.
+    expect(h.race()).toMatchObject({ graceFrom: h.now, deadlineAt: h.now + h.graceMs });
+    h.at(29 * MIN); // well past graceFrom + reworkHoldMs, by either the old or the new start
+    expect(h.race().state).toBe("RACING");
+    expect(h.t(b).raceOutcome).toBe("REWORK");
+    h.at(due - h.now);
+    expect(h.t(b).raceOutcome).toBe("FAILED");
+    expect(h.race().state).toBe("PICKING");
+  });
+
+  it("the rejected candidate's fix brings it back; with three passes the race picks again", () => {
+    const { h, a, b, c } = picking();
+    reject(h, b);
+    const fix = h.push(B1, { rejoin: true });
+    h.pass(fix);
+    expect(h.race().state).toBe("PICKING");
+    expect([a, c, fix].every((id) => h.t(id).raceOutcome === "PASSED")).toBe(true);
+  });
+
+  it("reject all: every candidate in rework, entries reopen for reworkWindowMs, no auto-pick, no grace deadline", () => {
+    const { h, a, b, c } = picking();
+    expect(reject(h, "all", "none of these handle an empty cart").rejected).toEqual({ fallback: false });
+    for (const id of [a, b, c]) expect(h.t(id).raceOutcome).toBe("REWORK");
+    expect(h.race()).toMatchObject({ state: "RACING", reopens: 1, entryClosesAt: h.now + 30 * MIN, pickDeadlineAt: null, deadlineAt: null, graceFrom: null });
+    expect(h.race().rejections).toHaveLength(3);
+    expect(h.events.filter((e) => e.type === "race.rejected")).toHaveLength(3);
+  });
+
+  it("past maxRaceReopens: reject one is LOST and the race stays PICKING (one pass left → queen:single); reject all falls back", () => {
+    const { h, a, b, c } = picking();
+    h.rework = { ...h.rework!, maxRaceReopens: 0 };
+    reject(h, a);
+    expect(h.t(a).raceOutcome).toBe("LOST");
+    expect(h.race().state).toBe("PICKING");
+    reject(h, b);
+    expect(h.race()).toMatchObject({ state: "DECIDED", winnerTrainId: c, decidedBy: "queen:single" });
+
+    const z = picking().h;
+    z.rework = { ...z.rework!, maxRaceReopens: 0 };
+    expect(reject(z, "all").rejected).toEqual({ fallback: true });
+    expect(z.race().state).toBe("ABANDONED");
+    expect(z.awaiting).toEqual(["A"]);
+  });
+
+  it("a candidate past maxReworksPerAttempt is LOST instead of REWORK; no reopen is used", () => {
+    const { h, b } = picking();
+    h.slots.set(B1, { attemptId: B1, reworks: 3, rework: null });
+    reject(h, b);
+    expect(h.t(b).raceOutcome).toBe("LOST");
+    expect(h.race().state).toBe("PICKING");
+    expect(h.race().reopens ?? 0).toBe(0);
+  });
+
+  it("a second reject or a pick of the rejected candidate after a reject is refused (409), nothing changes", () => {
+    const { h, b, c } = picking();
+    reject(h, b);
+    expect(reject(h, c).refused).toMatchObject({ status: 409 });
+    expect(h.run((p) => p.pick({ raceId: h.race().raceId, trainId: b, by: BY })).refused).toMatchObject({ status: 409 });
+    expect(h.race()).toMatchObject({ state: "RACING", reopens: 1 });
+  });
+
+  it("swarm hive (T9b): reject one is LOST (fork deleted, preview down); reject all abandons and reworks with the summary", () => {
+    const h = ReworkHive.swarmRace();
+    for (const id of ["t2", "t3", "t4"]) h.pass(id);
+    expect(h.race()).toMatchObject({ raceId: "t1", state: "PICKING" });
+    reject(h, "t2", "ugly");
+    expect(h.t("t2")).toMatchObject({ phase: "EJECTED", raceOutcome: "LOST", forkState: "DELETING" });
+    expect(h.race().state).toBe("PICKING");
+    expect(h.race().reopens ?? 0).toBe(0);
+
+    reject(h, "all", "neither handles an empty cart");
+    expect(h.race().state).toBe("ABANDONED");
+    expect(h.prompts.get("A")!.summary).toBe("Human rejected all candidates: neither handles an empty cart");
+    expect([...h.trains.values()].some((t) => t.action === "REWORK" && t.promptId === "A")).toBe(true);
   });
 });

@@ -170,4 +170,34 @@ export class ReworkHive {
   slot(attemptId: string): AttemptSlot | undefined {
     return this.slots.get(attemptId);
   }
+
+  /** Complete every pending FORK and preview DEPLOY (swarm races; pick.test.ts's Hive.settle). */
+  settle(): void {
+    for (;;) {
+      const forks = this.effects.filter((e): e is Extract<Effect, { type: "provision" }> => e.type === "provision" && e.command.op === "FORK");
+      const deploys = this.effects.filter((e): e is Extract<Effect, { type: "deploy" }> => e.type === "deploy" && e.command.op === "DEPLOY");
+      if (!forks.length && !deploys.length) return;
+      this.effects = this.effects.filter((e) => !forks.includes(e as never) && !deploys.includes(e as never));
+      for (const f of forks) {
+        const c = f.command as Extract<ProvisionCommand, { op: "FORK" }>;
+        this.run((p) => p.provisionResult({ commandId: c.commandId, op: "FORK", trainId: c.trainId, ok: true, artifactRepo: c.forkName, baseSha: "base" }));
+      }
+      for (const d of deploys) {
+        this.run((p) => p.deployResult({ commandId: d.command.commandId, op: "DEPLOY", environment: "preview", trainId: d.trainId, ok: true, url: `https://${d.trainId}.preview` }));
+      }
+    }
+  }
+
+  /** A swarm hive (no rework settings): item A races 3 drone candidates t2, t3, t4 (race t1), all built and live. */
+  static swarmRace(): ReworkHive {
+    const h = new ReworkHive();
+    h.external = false;
+    h.rework = undefined;
+    h.judge = "human";
+    h.run((p) => p.submit({ promptId: "A", promptText: "do A", raceWidth: 3 }));
+    h.settle();
+    for (const id of ["t2", "t3", "t4"]) h.run((p) => p.buildResult({ trainId: id, headSha: `h-${id}` }));
+    h.settle();
+    return h;
+  }
 }
