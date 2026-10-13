@@ -29,6 +29,10 @@ const HOUR_MS = 3_600_000;
 /** The shortest pick window (RaceSettingsSchema min; train/pick.ts PICK_WINDOW_MIN_MS). */
 const PICK_WINDOW_MIN_MS = 60_000;
 
+/** Guardrails whose floor is 0 (0 = off), and the millisecond ones whose floor is 1 min. */
+const ZERO_OK: ReadonlySet<keyof Guardrails> = new Set(["maxAutoFiledPerHour", "maxFollowUpsPerBuild", "maxConflictReworks", "maxReworksPerAttempt", "maxRaceReopens"]);
+const MIN_MS: Partial<Record<keyof Guardrails, number>> = { reworkWindowMs: 60_000, reworkHoldMs: 60_000 };
+
 // ── settings ─────────────────────────────────────────────────────────────
 
 function clampInt(v: number | undefined, min: number, max: number, fallback: number): number {
@@ -45,7 +49,7 @@ export function effectiveGuardrails(overrides: Partial<Guardrails> | undefined):
   const o = overrides ?? {};
   const out = { ...GUARDRAIL_DEFAULTS } as Guardrails;
   for (const key of Object.keys(GUARDRAIL_DEFAULTS) as (keyof Guardrails)[]) {
-    const min = key === "maxAutoFiledPerHour" || key === "maxFollowUpsPerBuild" || key === "maxConflictReworks" ? 0 : 1;
+    const min = MIN_MS[key] ?? (ZERO_OK.has(key) ? 0 : 1);
     out[key] = clampInt(o[key], min, GUARDRAIL_MAX[key], GUARDRAIL_DEFAULTS[key]);
   }
   return out;

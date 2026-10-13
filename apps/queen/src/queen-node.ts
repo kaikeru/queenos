@@ -2397,7 +2397,7 @@ export class QueenNode extends DurableObject<Env> {
       .toArray()
       .map(rowToEscalation);
     const races = this.sql
-      .exec("SELECT * FROM races WHERE state IN ('RACING', 'PICKING') OR race_id IN (SELECT race_id FROM races ORDER BY created_at DESC LIMIT 20) ORDER BY created_at")
+      .exec("SELECT * FROM races WHERE state IN ('RACING', 'PICKING', 'REWORKING') OR race_id IN (SELECT race_id FROM races ORDER BY created_at DESC LIMIT 20) ORDER BY created_at")
       .toArray()
       .map(rowToRace);
     const recentEvents = this.sql

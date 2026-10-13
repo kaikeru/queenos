@@ -505,7 +505,7 @@ const MIGRATIONS: readonly Migration[] = [
     race_id TEXT,                           -- set when the first push enters a race
     train_id TEXT NOT NULL,                 -- current train (the first one reserved at intent)
     repo TEXT NOT NULL,                     -- <hive>-att-<12hex>[-rN]
-    base_sha TEXT,                          -- always the item's base_sha
+    base_sha TEXT,                          -- the base the next push is gated against: the item's base_sha, or main recorded by sync_base (v19)
     agent_id TEXT NOT NULL,
     agent_name TEXT NOT NULL,
     model TEXT NOT NULL,                    -- claimed, display only
@@ -555,6 +555,14 @@ const MIGRATIONS: readonly Migration[] = [
   -- attemptRegate (MCP retry_gates): manual re-gates of an attempt's head and when the last one was asked for.
   ALTER TABLE attempts ADD COLUMN regates INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE attempts ADD COLUMN last_regate_at INTEGER;
+  `,
+  `
+  -- v19: rework loop (docs/superpowers/specs/2026-10-13-queenos-rework-loop-design.md §10). An open slot is rework_due_at NOT NULL.
+  ALTER TABLE attempts ADD COLUMN rework_reason TEXT;               -- findings | conflict | human; NULL = no open slot
+  ALTER TABLE attempts ADD COLUMN rework_due_at INTEGER;            -- epoch ms
+  ALTER TABLE attempts ADD COLUMN reworks INTEGER NOT NULL DEFAULT 0; -- slots given (round of the current one)
+  -- races.reopens: PICKING → RACING drops.
+  ALTER TABLE races ADD COLUMN reopens INTEGER NOT NULL DEFAULT 0;
   `,
 ];
 
@@ -1351,19 +1359,20 @@ export function rowToRace(r: Row): RaceRecord {
     ...withValue("recommendReason", str(r.recommend_reason ?? null)),
     ...withValue("decidedBy", str(r.decided_by ?? null)),
     ...withValue("rejections", parseJson(r.rejections ?? null, schemaCheck<RaceRejection[]>(RaceRejectionSchema.array()))),
+    ...(Number(r.reopens ?? 0) > 0 ? { reopens: Number(r.reopens) } : {}),
   });
 }
 
 export function upsertRace(sql: SqlStorage, r: RaceRecord): void {
   sql.exec(
     `INSERT INTO races (race_id, item_id, width, state, train_ids, winner_train_id, reason, deadline_at, created_at, decided_at,
-       entry_closes_at, pick_deadline_at, recommended_train_id, recommend_reason, decided_by, rejections)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       entry_closes_at, pick_deadline_at, recommended_train_id, recommend_reason, decided_by, rejections, reopens)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(race_id) DO UPDATE SET state = excluded.state, train_ids = excluded.train_ids, winner_train_id = excluded.winner_train_id,
        reason = excluded.reason, deadline_at = excluded.deadline_at, decided_at = excluded.decided_at,
        entry_closes_at = excluded.entry_closes_at, pick_deadline_at = excluded.pick_deadline_at,
        recommended_train_id = excluded.recommended_train_id, recommend_reason = excluded.recommend_reason,
-       decided_by = excluded.decided_by, rejections = excluded.rejections`,
+       decided_by = excluded.decided_by, rejections = excluded.rejections, reopens = excluded.reopens`,
     r.raceId,
     r.itemId,
     r.width,
@@ -1380,6 +1389,7 @@ export function upsertRace(sql: SqlStorage, r: RaceRecord): void {
     r.recommendReason ?? null,
     r.decidedBy ?? null,
     r.rejections?.length ? JSON.stringify(r.rejections) : null,
+    r.reopens ?? 0,
   );
 }
 
@@ -1777,17 +1787,23 @@ export function rowToAttempt(r: Row): Attempt {
     // v18: manual re-gates (absent = 0 / never, so pre-v18 rows compare equal).
     ...(Number(r.regates ?? 0) > 0 ? { regates: Number(r.regates) } : {}),
     ...withValue("lastRegateAt", num(r.last_regate_at)),
+    // v19: rework slots (absent = 0 / none, so pre-v19 rows compare equal).
+    ...(Number(r.reworks ?? 0) > 0 ? { reworks: Number(r.reworks) } : {}),
+    ...(r.rework_due_at !== null && r.rework_due_at !== undefined
+      ? { rework: { reason: String(r.rework_reason), dueAt: Number(r.rework_due_at), round: Number(r.reworks ?? 0) } }
+      : {}),
   });
 }
 
 export function upsertAttempt(sql: SqlStorage, a: Attempt): void {
   sql.exec(
     `INSERT INTO attempts (attempt_id, hive, item_id, race_id, train_id, repo, base_sha, agent_id, agent_name, model, role, owner, state, head_sha, created_at, expires_at,
-       regates, last_regate_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       regates, last_regate_at, rework_reason, rework_due_at, reworks)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(attempt_id) DO UPDATE SET item_id = excluded.item_id, race_id = excluded.race_id, train_id = excluded.train_id,
        repo = excluded.repo, base_sha = excluded.base_sha, state = excluded.state, head_sha = excluded.head_sha, expires_at = excluded.expires_at,
-       regates = excluded.regates, last_regate_at = excluded.last_regate_at`,
+       regates = excluded.regates, last_regate_at = excluded.last_regate_at,
+       rework_reason = excluded.rework_reason, rework_due_at = excluded.rework_due_at, reworks = excluded.reworks`,
     a.attemptId,
     a.hive,
     a.itemId,
@@ -1806,6 +1822,9 @@ export function upsertAttempt(sql: SqlStorage, a: Attempt): void {
     a.expiresAt,
     a.regates ?? 0,
     a.lastRegateAt ?? null,
+    a.rework?.reason ?? null,
+    a.rework?.dueAt ?? null,
+    a.reworks ?? 0,
   );
 }
 

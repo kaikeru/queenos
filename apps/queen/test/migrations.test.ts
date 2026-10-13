@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { GitNotesPayloadSchema, QueenServerMessageSchema, spanIdFor, traceIdFromUuid, type AuditEvent } from "@queenos/queen-types";
+import { GitNotesPayloadSchema, QueenServerMessageSchema, spanIdFor, traceIdFromUuid, type Attempt, type AuditEvent } from "@queenos/queen-types";
 import {
   ESCALATION_SELECT,
   SCHEMA_VERSION,
@@ -48,6 +48,7 @@ import {
   getAttemptRow,
   attemptsOfItem,
 } from "../src/db";
+import { effectiveGuardrails } from "../src/work/guardrails";
 import type { QueenNode } from "../src/queen-node";
 import type { WorkItemRecord } from "../src/records";
 import { toRelease } from "../src/release/planner";
@@ -72,8 +73,16 @@ const columns = (sql: SqlStorage, table: string) =>
   new Set(sql.exec(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((r) => String(r.name)));
 const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v FROM _migrations").one().v);
 
+/** Undo v19 (a test that rebuilds an older version first). */
+function dropV19(sql: SqlStorage): void {
+  sql.exec(`ALTER TABLE attempts DROP COLUMN rework_reason; ALTER TABLE attempts DROP COLUMN rework_due_at;
+    ALTER TABLE attempts DROP COLUMN reworks; ALTER TABLE races DROP COLUMN reopens;
+    DELETE FROM _migrations WHERE version = 19;`);
+}
+
 /** Undo v18 (a test that rebuilds an older version first). */
 function dropV18(sql: SqlStorage): void {
+  dropV19(sql);
   sql.exec(`ALTER TABLE merge_trains DROP COLUMN gate_infra_rounds; ALTER TABLE merge_trains DROP COLUMN gate_not_before;
     ALTER TABLE attempts DROP COLUMN regates; ALTER TABLE attempts DROP COLUMN last_regate_at;
     DELETE FROM _migrations WHERE version = 18;`);
@@ -90,10 +99,10 @@ function dropV17(sql: SqlStorage): void {
 }
 
 describe("migrations", () => {
-  it("a fresh DO migrates to v18", async () => {
-    expect(SCHEMA_VERSION).toBe(18);
+  it("a fresh DO migrates to v19", async () => {
+    expect(SCHEMA_VERSION).toBe(19);
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
-      expect(version(q.sql)).toBe(18);
+      expect(version(q.sql)).toBe(19);
       const t = tables(q.sql);
       for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims", "inboxes", "submissions", "model_preference", "attempts", "repo_deletes"]) {
         expect(t.has(name), name).toBe(true);
@@ -114,8 +123,10 @@ describe("migrations", () => {
       expect(loadHiveSettings(q.sql)).toBeNull();
       // Idempotent: re-running is a no-op.
       for (const c of ["regates", "last_regate_at"]) expect(columns(q.sql, "attempts").has(c), c).toBe(true);
-      expect(migrate(state.storage)).toBe(18);
-      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(18);
+      for (const c of ["rework_reason", "rework_due_at", "reworks"]) expect(columns(q.sql, "attempts").has(c), c).toBe(true);
+      expect(columns(q.sql, "races").has("reopens")).toBe(true);
+      expect(migrate(state.storage)).toBe(19);
+      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(19);
     });
   });
 
@@ -617,7 +628,7 @@ describe("v18: gate-infra re-gates and manual re-gates", () => {
       expect(version(sql)).toBe(17);
       const before = sql.exec("SELECT * FROM merge_trains ORDER BY train_id").toArray().map(rowToTrain);
       expect(before.length).toBeGreaterThan(0);
-      expect(migrate(state.storage)).toBe(18);
+      expect(migrate(state.storage)).toBe(SCHEMA_VERSION);
       const after = sql.exec("SELECT * FROM merge_trains ORDER BY train_id").toArray().map(rowToTrain);
       expect(after).toEqual(before);
       for (const t of after) {
@@ -636,3 +647,49 @@ describe("v18: gate-infra re-gates and manual re-gates", () => {
     });
   });
 });
+
+describe("v19: rework loop", () => {
+  it("a v18 hive migrates to v19: attempts and races keep their rows (no slot, 0 reopens); the new columns round-trip", async () => {
+    const hive = newHive();
+    await runInDurableObject(stubFor(hive), (q: QueenNode, state) => {
+      const sql = q.sql;
+      const att = {
+        attemptId: "att_0123456789ab", hive, itemId: "i1", raceId: "r1", trainId: "t1", repo: `${hive}-att-0123456789ab`, baseSha: "b".repeat(40),
+        agentId: `ag_${"a".repeat(32)}`, agentName: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "kyle@example.com",
+        state: "REJECTED" as const, headSha: "c".repeat(40), createdAt: 1, expiresAt: 2,
+      };
+      const race = { raceId: "r1", itemId: "i1", width: 1, state: "RACING" as const, trainIds: ["t1"], winnerTrainId: null, reason: null, deadlineAt: null, createdAt: 1, decidedAt: null };
+      dropV19(sql);
+      expect(version(sql)).toBe(18);
+      upsertAttemptV18(sql, att);
+      sql.exec("INSERT INTO races (race_id, item_id, width, state, train_ids, created_at) VALUES ('r1', 'i1', 1, 'RACING', '[\"t1\"]', 1)");
+      expect(migrate(state.storage)).toBe(SCHEMA_VERSION);
+      for (const c of ["rework_reason", "rework_due_at", "reworks"]) expect(columns(sql, "attempts").has(c), c).toBe(true);
+      expect(columns(sql, "races").has("reopens")).toBe(true);
+      expect(getAttemptRow(sql, att.attemptId)).toEqual(att);
+      expect(rowToRace(sql.exec("SELECT * FROM races WHERE race_id = 'r1'").one())).toEqual(race);
+
+      upsertAttempt(sql, { ...att, reworks: 2, rework: { reason: "conflict", dueAt: 99, round: 2 } });
+      expect(getAttemptRow(sql, att.attemptId)).toEqual({ ...att, reworks: 2, rework: { reason: "conflict", dueAt: 99, round: 2 } });
+      upsertAttempt(sql, { ...att, reworks: 2, rework: null });
+      expect(getAttemptRow(sql, att.attemptId)).toEqual({ ...att, reworks: 2 });
+      upsertRace(sql, { ...race, state: "REWORKING", reopens: 1 });
+      expect(rowToRace(sql.exec("SELECT * FROM races WHERE race_id = 'r1'").one())).toEqual({ ...race, state: "REWORKING", reopens: 1 });
+    });
+  });
+
+  it("effectiveGuardrails: the rework guardrails default, clamp to their bounds, and allow 0 slots / 0 reopens", () => {
+    expect(effectiveGuardrails({})).toMatchObject({ reworkWindowMs: 1_800_000, reworkHoldMs: 600_000, maxReworksPerAttempt: 3, maxRaceReopens: 3 });
+    expect(effectiveGuardrails({ reworkWindowMs: 1, reworkHoldMs: 9e9, maxReworksPerAttempt: 0, maxRaceReopens: 0 })).toMatchObject({ reworkWindowMs: 60_000, reworkHoldMs: 3_600_000, maxReworksPerAttempt: 0, maxRaceReopens: 0 });
+    expect(effectiveGuardrails({ maxReworksPerAttempt: 9 }).maxReworksPerAttempt).toBe(5);
+  });
+});
+
+/** An attempt row as v18 wrote it (no v19 columns exist yet). */
+function upsertAttemptV18(sql: SqlStorage, a: Attempt): void {
+  sql.exec(
+    `INSERT INTO attempts (attempt_id, hive, item_id, race_id, train_id, repo, base_sha, agent_id, agent_name, model, role, owner, state, head_sha, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    a.attemptId, a.hive, a.itemId, a.raceId, a.trainId, a.repo, a.baseSha, a.agentId, a.agentName, a.model, a.role, a.owner, a.state, a.headSha, a.createdAt, a.expiresAt,
+  );
+}

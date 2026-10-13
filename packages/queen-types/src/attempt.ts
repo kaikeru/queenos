@@ -223,6 +223,46 @@ export const MAX_MANUAL_REGATES = 3;
 /** ...at most one per this interval. */
 export const REGATE_MIN_INTERVAL_MS = 60_000;
 
+// ── rework loop (docs/superpowers/specs/2026-10-13-queenos-rework-loop-design.md) ──
+
+/** Why an attempt got a rework slot: gate findings (or an integration failure in the train), a merge conflict, a human reject. */
+export const ReworkReasonSchema = z.enum(["findings", "conflict", "human"]);
+export type ReworkReason = z.infer<typeof ReworkReasonSchema>;
+
+/** An open rework slot: fix and push again before `dueAt` (epoch ms), as the same candidate. `round` is 1-based. */
+export const AttemptReworkSchema = z.object({ reason: ReworkReasonSchema, dueAt: z.number().int(), round: z.number().int().min(1) });
+export type AttemptRework = z.infer<typeof AttemptReworkSchema>;
+
+/** Opening a slot extends `expires_at` to at least `dueAt +` this, so the watchdog never expires an attempt mid-slot (§5.1). */
+export const REWORK_EXPIRY_GRACE_MS = 10 * 60_000;
+/** `sync_base`: the read token on the hive repo lives this long. */
+export const SYNC_TOKEN_TTL_S = 1800;
+
+const REWORK_REASON_RE = /^in rework \((findings|conflict|human)\) until (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z): /;
+
+/**
+ * A REWORK train's `reason`: `in rework (<reason>) until <ISO>: <why>` (≤ 500). It carries the slot's due time to the
+ * dashboard and the notes; the attempt row stays the authority for the slot itself.
+ */
+export function reworkReasonText(reason: ReworkReason, dueAt: number, why: string): string {
+  const s = `in rework (${reason}) until ${new Date(dueAt).toISOString()}: ${why}`;
+  return s.length <= 500 ? s : `${s.slice(0, 499)}…`;
+}
+
+/** The slot reason and due time of a REWORK train's `reason`, or null for any other text. */
+export function parseReworkReason(text: string | null | undefined): { reason: ReworkReason; dueAt: number } | null {
+  const m = text ? REWORK_REASON_RE.exec(text) : null;
+  return m ? { reason: m[1] as ReworkReason, dueAt: Date.parse(m[2]!) } : null;
+}
+
+/** `attemptSyncBase` (MCP `sync_base`): record hive `main`'s sha (read from Artifacts by queenos-mcp) as the attempt's base. */
+export const AttemptSyncBaseSchema = AttemptOwnerActionSchema.extend({ baseSha: Sha40 });
+export type AttemptSyncBase = z.infer<typeof AttemptSyncBaseSchema>;
+
+/** `sync_base`'s answer. The read token appears only inside `syncCommand`. */
+export const SyncBaseResultSchema = z.object({ baseSha: Sha40, syncCommand: z.string().min(1), next: z.string().min(1) });
+export type SyncBaseResult = z.infer<typeof SyncBaseResultSchema>;
+
 /** Row of the Queen's `attempts` table (migration v17). */
 export const AttemptSchema = z.object({
   attemptId: AttemptIdSchema,
@@ -233,7 +273,7 @@ export const AttemptSchema = z.object({
   /** The current train (the first one reserved at intent). */
   trainId: z.string().min(1),
   repo: z.string().min(1),
-  /** Always the item's base_sha (null until the base is pinned). */
+  /** The base the attempt's next push is gated against: the item's base_sha, or hive main recorded by `sync_base` (v19). */
   baseSha: Sha40.nullable(),
   agentId: AgentIdSchema,
   agentName: AgentHandleSchema,
@@ -248,6 +288,10 @@ export const AttemptSchema = z.object({
   regates: z.number().int().min(0).optional(),
   /** v18: when the last manual re-gate was requested (epoch ms); absent = never. */
   lastRegateAt: z.number().int().optional(),
+  /** v19: slots given so far (findings, conflicts and human rejects share it); absent = 0. */
+  reworks: z.number().int().min(0).optional(),
+  /** v19: the open rework slot; null / absent = none. */
+  rework: AttemptReworkSchema.nullable().optional(),
 });
 export type Attempt = z.infer<typeof AttemptSchema>;
 
@@ -256,10 +300,11 @@ export const AttemptVerdictSchema = z.enum(["none", "pending", "passed", "reject
 export type AttemptVerdict = z.infer<typeof AttemptVerdictSchema>;
 
 /**
- * Why a `rejected` verdict: `findings` (the gate judged the change; fix and push) or `infra` (the gate could not run
- * after its automatic re-gates; not a verdict on the change: `retry_gates` or push again).
+ * Why a `rejected` verdict: `findings` (the gate judged the change, or it failed integrated in the train: fix and push),
+ * `infra` (the gate could not run: `retry_gates`), `conflict` (it conflicted with work that landed: `sync_base`, rebase,
+ * push), `human` (a judge rejected it with a reason: address it and push).
  */
-export const AttemptVerdictKindSchema = z.enum(["findings", "infra"]);
+export const AttemptVerdictKindSchema = z.enum(["findings", "infra", "conflict", "human"]);
 export type AttemptVerdictKind = z.infer<typeof AttemptVerdictKindSchema>;
 
 /** `getAttempt`: the row plus its current train and race. */
@@ -276,9 +321,13 @@ export const AttemptViewSchema = AttemptSchema.extend({
       score: GateScoreSchema.nullable(),
       /** Automatic gate-infra re-gates of this train so far (v18). Optional: absent from an older Queen. */
       gateInfraRounds: z.number().int().min(0).optional(),
+      /** The merge conflict that ejected it from its car (v19 views; absent from an older Queen). */
+      conflict: z.object({ paths: z.array(z.string()), summary: z.string() }).nullable().optional(),
     })
     .nullable(),
-  race: z.object({ raceId: z.string(), state: RaceStateSchema, entryClosesAt: z.number().int().nullable(), winnerTrainId: z.string().nullable() }).nullable(),
+  race: z
+    .object({ raceId: z.string(), state: RaceStateSchema, entryClosesAt: z.number().int().nullable(), winnerTrainId: z.string().nullable(), reopens: z.number().int().min(0).optional() })
+    .nullable(),
   verdict: AttemptVerdictSchema,
   /** Set when `verdict === "rejected"`, else null. Optional: absent from an older Queen (read absent as unknown). */
   verdictKind: AttemptVerdictKindSchema.nullable().optional(),

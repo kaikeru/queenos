@@ -224,6 +224,19 @@ describe("StateCache", () => {
     });
   });
 
+  it("keeps REWORKING races warm (rework loop), on load and on apply; DECIDED and ABANDONED ones are evicted", async () => {
+    await runInDurableObject(stubFor(newHive()), (q: QueenNode) => {
+      const sql = q.sql;
+      const race = (id: string, state: RaceRecord["state"]): RaceRecord => ({ raceId: id, itemId: "i1", width: 1, state, trainIds: [], winnerTrainId: null, reason: null, deadlineAt: null, createdAt: 1, decidedAt: null });
+      upsertRace(sql, race("r1", "REWORKING"));
+      upsertRace(sql, race("r2", "DECIDED"));
+      const cache = new StateCache();
+      expect(cache.load(sql).races.map((r) => r.raceId)).toEqual(["r1"]);
+      cache.apply({ races: [race("r3", "REWORKING"), race("r1", "ABANDONED")] });
+      expect(cache.get()!.races.map((r) => r.raceId)).toEqual(["r3"]);
+    });
+  });
+
   it("with 500 active trains a warm apply and read cost zero SQLite reads", async () => {
     await runInDurableObject(stubFor(newHive()), (q: QueenNode) => {
       const sql = q.sql;

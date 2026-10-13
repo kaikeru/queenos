@@ -207,6 +207,14 @@ const GUARDRAIL_FIELDS = {
   maxInboxPushesPerHour: z.number().int().min(1).max(60),
   /** Races held in PICKING at once (§10.3); one more auto-decides (`queen:cap`). Inert until T9a. */
   maxPickingRaces: z.number().int().min(0).max(5),
+  /** Rework loop (rework-loop spec §5.5): length of an attempt's rework slot; also the reopened entry window after a reject-all. */
+  reworkWindowMs: z.number().int().min(60_000).max(7_200_000),
+  /** How long a findings-REWORK candidate holds its race after another candidate passed (from the grace clock's start). */
+  reworkHoldMs: z.number().int().min(60_000).max(3_600_000),
+  /** Rework slots one attempt may get (findings, conflicts and human rejects share it). 0 = none: the fallback runs at once. */
+  maxReworksPerAttempt: z.number().int().min(0).max(5),
+  /** PICKING → RACING drops (reject one or all) per race. */
+  maxRaceReopens: z.number().int().min(0).max(5),
 };
 
 /**
@@ -218,6 +226,10 @@ export const GuardrailsSchema = z.object({
   maxInboxOpenPerContributor: GUARDRAIL_FIELDS.maxInboxOpenPerContributor.default(3),
   maxInboxPushesPerHour: GUARDRAIL_FIELDS.maxInboxPushesPerHour.default(20),
   maxPickingRaces: GUARDRAIL_FIELDS.maxPickingRaces.default(2),
+  reworkWindowMs: GUARDRAIL_FIELDS.reworkWindowMs.default(1_800_000),
+  reworkHoldMs: GUARDRAIL_FIELDS.reworkHoldMs.default(600_000),
+  maxReworksPerAttempt: GUARDRAIL_FIELDS.maxReworksPerAttempt.default(3),
+  maxRaceReopens: GUARDRAIL_FIELDS.maxRaceReopens.default(3),
 });
 export type Guardrails = z.infer<typeof GuardrailsSchema>;
 
@@ -242,6 +254,10 @@ export const GUARDRAIL_DEFAULTS = {
   maxInboxOpenPerContributor: 3,
   maxInboxPushesPerHour: 20,
   maxPickingRaces: 2,
+  reworkWindowMs: 1_800_000,
+  reworkHoldMs: 600_000,
+  maxReworksPerAttempt: 3,
+  maxRaceReopens: 3,
 } as const satisfies Guardrails;
 
 /** The "max" column of §2.9: per-hive overrides are clamped to these (same as GuardrailsSchema's bounds). */
@@ -259,6 +275,10 @@ export const GUARDRAIL_MAX = {
   maxInboxOpenPerContributor: 10,
   maxInboxPushesPerHour: 60,
   maxPickingRaces: 5,
+  reworkWindowMs: 7_200_000,
+  reworkHoldMs: 3_600_000,
+  maxReworksPerAttempt: 5,
+  maxRaceReopens: 5,
 } as const satisfies Guardrails;
 
 /** TRIAGE: an auto-filed item scoring ≥ this against an open item is a DUPLICATE. */
@@ -268,8 +288,12 @@ export const CHILD_DEDUPE_THRESHOLD = 0.92;
 /** After a race's first passing candidate, the others get this long to report. */
 export const RACE_GRACE_MS = 90_000;
 
-/** PICKING (§10.2): `judge = human` and ≥ 2 candidates passed; held for a human pick until `pickDeadlineAt`. */
-export const RaceStateSchema = z.enum(["RACING", "PICKING", "DECIDED", "ABANDONED"]);
+/**
+ * PICKING (§10.2): `judge = human` and ≥ 2 candidates passed; held for a human pick until `pickDeadlineAt`.
+ * REWORKING (rework-loop spec §5.3): the winner (an attempt's train) was rejected in the merge train; its attempt has a
+ * rework slot and the race waits for its fix. `winnerTrainId` keeps the old train until a new winner exists.
+ */
+export const RaceStateSchema = z.enum(["RACING", "PICKING", "DECIDED", "ABANDONED", "REWORKING"]);
 export type RaceState = z.infer<typeof RaceStateSchema>;
 
 /** A PICKING race's default and longest pick window (§10.2). */
@@ -331,6 +355,8 @@ export const RaceSchema = z.object({
   recommendReason: z.string().max(300).nullable().optional(),
   decidedBy: RaceDecidedBySchema.nullable().optional(),
   rejections: z.array(RaceRejectionSchema).max(16).optional(),
+  /** Rework loop: PICKING → RACING drops so far (reject one or all), capped by `maxRaceReopens`. Absent = 0. */
+  reopens: z.number().int().min(0).optional(),
 });
 export type Race = z.infer<typeof RaceSchema>;
 
@@ -347,3 +373,7 @@ export const RejectRaceSchema = z.object({
   reason: z.string().min(1).max(300),
 });
 export type RejectRace = z.infer<typeof RejectRaceSchema>;
+
+/** The reject route's answer: `fallback` = the reject ended the race (reopens spent) and the item reopened to any agent. */
+export const RejectRaceResultSchema = z.object({ outcome: z.string(), race: RaceSchema, fallback: z.boolean() });
+export type RejectRaceResult = z.infer<typeof RejectRaceResultSchema>;

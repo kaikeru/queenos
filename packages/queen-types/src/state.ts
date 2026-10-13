@@ -41,8 +41,8 @@ export const PromptRunSchema = z.object({
 });
 export type PromptRun = z.infer<typeof PromptRunSchema>;
 
-/** A race candidate's standing (§2.3.6). */
-export const RaceOutcomeSchema = z.enum(["RACING", "PASSED", "FAILED", "WON", "LOST"]);
+/** A race candidate's standing (§2.3.6). REWORK (rework-loop spec §5.2, §5.3): rejected, its attempt holds a rework slot. */
+export const RaceOutcomeSchema = z.enum(["RACING", "PASSED", "FAILED", "WON", "LOST", "REWORK"]);
 export type RaceOutcome = z.infer<typeof RaceOutcomeSchema>;
 
 /** Row of `merge_trains`. */

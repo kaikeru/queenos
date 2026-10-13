@@ -829,7 +829,7 @@ describe("human-push design T0 contracts (inbox, Submission, races)", () => {
   });
 
   it("races: PICKING, pick/reject inputs, decidedBy and the new optional fields", () => {
-    expect(RaceStateSchema.options).toEqual(["RACING", "PICKING", "DECIDED", "ABANDONED"]);
+    expect(RaceStateSchema.options).toEqual(["RACING", "PICKING", "DECIDED", "ABANDONED", "REWORKING"]);
     const race = { raceId: "r", itemId: "i", width: 3, state: "PICKING", trainIds: ["a", "b", "c"], winnerTrainId: null, reason: null, deadlineAt: 5, createdAt: 1, decidedAt: null,
       pickDeadlineAt: 900_005, recommendedTrainId: "a", recommendReason: "verified, smallest diff", decidedBy: null, rejections: [{ trainId: "c", by: "human:kyle@example.com", reason: "wrong colour" }] };
     expect(roundTrip(RaceSchema, race)).toEqual(race);

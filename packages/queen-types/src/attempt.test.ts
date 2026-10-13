@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  AttemptReworkSchema, AttemptSyncBaseSchema, GuardrailsSchema, GUARDRAIL_DEFAULTS, GUARDRAIL_MAX, RaceOutcomeSchema, RaceSchema, RaceStateSchema, REWORK_EXPIRY_GRACE_MS, RejectRaceResultSchema, SYNC_TOKEN_TTL_S, SyncBaseResultSchema, parseReworkReason, reworkReasonText,
   ATTEMPT_REPO_RE,
   ATTEMPT_TOKEN_TTL_S,
   AgentIdSchema,
@@ -173,7 +174,7 @@ describe("fix wave: the retryable contract, verdict kind, regate, gate notBefore
   });
 
   it("the view carries verdictKind, regating and the train's gateInfraRounds (optional for older peers)", () => {
-    expect(AttemptVerdictKindSchema.options).toEqual(["findings", "infra"]);
+    expect(AttemptVerdictKindSchema.options).toEqual(["findings", "infra", "conflict", "human"]);
     const train = { trainId: "t1", phase: "TESTING", raceOutcome: "RACING", headSha: SHA, previewUrl: null, summary: null, reason: null, score: null };
     const view = { ...attempt, state: "PUSHED" as const, train: { ...train, gateInfraRounds: 2 }, race: null, verdict: "pending" as const, verdictKind: null, regating: { round: 2, of: 3, notBefore: 99 } };
     expect(AttemptViewSchema.parse(view)).toEqual(view);
@@ -188,5 +189,51 @@ describe("fix wave: the retryable contract, verdict kind, regate, gate notBefore
     expect(GateCommandSchema.parse(cmd)).not.toHaveProperty("notBefore");
     expect(GateCommandSchema.parse({ ...cmd, notBefore: 1_700_000_000_000 })).toMatchObject({ notBefore: 1_700_000_000_000 });
     expect(GateCommandSchema.safeParse({ ...cmd, notBefore: 1.5 }).success).toBe(false);
+  });
+});
+
+describe("rework loop contracts (rework-loop spec §5, §6, §10)", () => {
+  it("race state REWORKING, candidate outcome REWORK, optional reopens", () => {
+    expect(RaceStateSchema.options).toContain("REWORKING");
+    expect(RaceOutcomeSchema.options).toContain("REWORK");
+    const race = { raceId: "r", itemId: "i", width: 1, state: "REWORKING", trainIds: ["t"], winnerTrainId: "t", reason: null, deadlineAt: null, createdAt: 1, decidedAt: 2 };
+    expect(RaceSchema.parse(race)).not.toHaveProperty("reopens");
+    expect(RaceSchema.parse({ ...race, reopens: 2 }).reopens).toBe(2);
+    expect(RaceSchema.safeParse({ ...race, reopens: -1 }).success).toBe(false);
+  });
+
+  it("guardrails: defaults on parse, bounds", () => {
+    expect(GUARDRAIL_DEFAULTS).toMatchObject({ reworkWindowMs: 1_800_000, reworkHoldMs: 600_000, maxReworksPerAttempt: 3, maxRaceReopens: 3 });
+    expect(GUARDRAIL_MAX).toMatchObject({ reworkWindowMs: 7_200_000, reworkHoldMs: 3_600_000, maxReworksPerAttempt: 5, maxRaceReopens: 5 });
+    // A payload from an older Queen has none of the four keys: they default on parse.
+    const older: Record<string, number> = { ...GUARDRAIL_DEFAULTS };
+    for (const k of ["reworkWindowMs", "reworkHoldMs", "maxReworksPerAttempt", "maxRaceReopens"]) delete older[k];
+    expect(GuardrailsSchema.parse(older)).toMatchObject({ reworkWindowMs: 1_800_000, reworkHoldMs: 600_000, maxReworksPerAttempt: 3, maxRaceReopens: 3 });
+    expect(GuardrailsSchema.safeParse({ ...GUARDRAIL_DEFAULTS, reworkWindowMs: 59_999 }).success).toBe(false);
+    expect(GuardrailsSchema.safeParse({ ...GUARDRAIL_DEFAULTS, maxReworksPerAttempt: 0, maxRaceReopens: 0 }).success).toBe(true);
+    expect(GuardrailsSchema.safeParse({ ...GUARDRAIL_DEFAULTS, maxRaceReopens: 6 }).success).toBe(false);
+  });
+
+  it("an attempt's rework slot, and the reason text that carries its due time", () => {
+    expect(REWORK_EXPIRY_GRACE_MS).toBe(600_000);
+    expect(SYNC_TOKEN_TTL_S).toBe(1800);
+    expect(AttemptReworkSchema.parse({ reason: "conflict", dueAt: 5, round: 1 })).toEqual({ reason: "conflict", dueAt: 5, round: 1 });
+    expect(AttemptReworkSchema.safeParse({ reason: "infra", dueAt: 5, round: 1 }).success).toBe(false);
+    const due = Date.UTC(2026, 9, 13, 12, 30);
+    const text = reworkReasonText("human", due, "rejected by k@kaikeru.com: the button is unreadable");
+    expect(text).toBe("in rework (human) until 2026-10-13T12:30:00.000Z: rejected by k@kaikeru.com: the button is unreadable");
+    expect(parseReworkReason(text)).toEqual({ reason: "human", dueAt: due });
+    expect(parseReworkReason("failed in race: lint")).toBeNull();
+    expect(parseReworkReason(null)).toBeNull();
+    expect(reworkReasonText("findings", due, "x".repeat(600))).toHaveLength(500);
+  });
+
+  it("sync_base and reject payloads", () => {
+    const own = { hive: "demo", attemptId: "att_0123456789ab", owner: "ada@example.com", agentId: `ag_${"a".repeat(32)}` };
+    expect(AttemptSyncBaseSchema.parse({ ...own, baseSha: "c".repeat(40) }).baseSha).toBe("c".repeat(40));
+    expect(AttemptSyncBaseSchema.safeParse({ ...own, baseSha: "main" }).success).toBe(false);
+    expect(SyncBaseResultSchema.parse({ baseSha: "c".repeat(40), syncCommand: "git ...", next: "rebase" }).next).toBe("rebase");
+    const race = { raceId: "r", itemId: "i", width: 1, state: "RACING", trainIds: [], winnerTrainId: null, reason: null, deadlineAt: null, createdAt: 1, decidedAt: null };
+    expect(RejectRaceResultSchema.parse({ outcome: "applied", race, fallback: false }).fallback).toBe(false);
   });
 });
