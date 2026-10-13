@@ -30,6 +30,11 @@ function baseBadge(o: SubmissionOrigin | null | undefined): Omit<OriginBadge, "a
   return { kind: "agent", text: `agent:${name}`, title: claim ? `${who}; claims ${claim} (self-reported)` : who, claim };
 }
 
+/** The chip's visible attempt text: `att_…` plus the last 6 characters (the tooltip keeps the full id). */
+export function attemptChipText(attemptId: string): string {
+  return `att_…${attemptId.slice(-6)}`;
+}
+
 export function originBadge(o: SubmissionOrigin | null | undefined, attemptId?: string | null): OriginBadge {
   const b = baseBadge(o);
   if (!attemptId) return { ...b, attempt: null };

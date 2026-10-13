@@ -3,7 +3,7 @@ import { useState } from "react";
 import { api } from "./api";
 import { useNow } from "./components";
 import { OriginChip } from "./shell";
-import { countdownLine, decidedSummary, pickCards, pickFailure, PICK_REASON_MAX, type PickCard } from "./raceLogic";
+import { countdownLine, decidedSummary, pickCards, pickFailure, pickHint, PICK_REASON_MAX, type PickCard } from "./raceLogic";
 import { hrefFor } from "./route";
 import { Link } from "./router";
 import type { RaceView } from "./swarm";
@@ -24,6 +24,8 @@ export function RacePick({ hive, view, now: nowProp, onChanged, showItem = false
   const { race } = view;
   const decided = decidedSummary(race);
   const picking = race.state === "PICKING";
+  const hint = pickHint(view, now);
+  if (hint) return <p className="sh-muted rp__hint" role="note" data-race={race.raceId}>{hint}</p>;
   if (!picking && !(decided && (decided.human || view.item?.judge === "human"))) return null;
 
   const cards = pickCards(view);

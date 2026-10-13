@@ -42,6 +42,20 @@ export function entriesLine(race: Pick<Race, "state" | "entryClosesAt">, candida
   return e.kind === "open" ? `Entries open · closes in ${countdownText(e.remainingMs)} (${plural(candidates, "candidate")})` : "Entries closed · deciding…";
 }
 
+const pad2 = (n: number): string => String(n).padStart(2, "0");
+
+/**
+ * While a human-judged race is still RACING there are no pick buttons yet: say when they appear. Null for any other race.
+ * The closing time is local `HH:MM` and only shown while the window is still in the future.
+ */
+export function pickHint(view: Pick<RaceView, "race" | "item">, now: number): string | null {
+  const { race, item } = view;
+  if (race.state !== "RACING" || item?.judge !== "human") return null;
+  const at = race.entryClosesAt != null && race.entryClosesAt > now ? new Date(race.entryClosesAt) : null;
+  const when = at ? ` at ${pad2(at.getHours())}:${pad2(at.getMinutes())}` : "";
+  return `You pick the winner once entries close${when} and two or more candidates pass. With one pass, the Queen takes it.`;
+}
+
 /** 409 means the race is no longer RACING or its entries already closed: refetch rather than retry. */
 export function closeEntriesFailure(e: unknown): PickFailure {
   if (e instanceof ApiError && e.status === 409) {

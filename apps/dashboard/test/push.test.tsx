@@ -4,7 +4,7 @@ import { describe, expect, test } from "vitest";
 import type { GitToken, MergeTrain } from "@queenos/queen-types";
 
 import { ApiError } from "../src/api";
-import { itemOrigin, originBadge, pushedItemOrigin } from "../src/origin";
+import { attemptChipText, itemOrigin, originBadge, pushedItemOrigin } from "../src/origin";
 import { PushCode } from "../src/PushCode";
 import { agentTokenSteps, checkAgentInput, gitRemote, pushSteps, tokenAgentText, sortTokens, tokenApiUnavailable, tokenState } from "../src/pushLogic";
 import { OriginChip } from "../src/shell";
@@ -146,7 +146,10 @@ describe("origin badges", () => {
     expect(b.title).toContain("attempt att_0123456789ab");
     const html = renderToString(<OriginChip badge={b} />);
     expect(html).toContain("claims claude-opus-5-5");
-    expect(html).toContain("att_0123456789ab");
+    expect(html).toContain("att_…6789ab"); // short chip text: the last 6 characters
+    expect(html).not.toContain(">att_0123456789ab<");
+    expect(html).toContain('title="pushed by agent opus for kyle@kaikeru.com; claims claude-opus-5-5 (self-reported); attempt att_0123456789ab"'); // the tooltip keeps the full id
+    expect(attemptChipText("att_0123456789ab")).toBe("att_…6789ab");
     expect(originBadge({ kind: "human", id: "kyle@kaikeru.com" }).attempt).toBeNull();
     expect(renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@kaikeru.com" })} />)).not.toContain("att_");
     const t = { trainId: "t9", origin: { kind: "agent" as const, id: "opus@kyle@kaikeru.com" }, createdAt: NOW, attemptId: "att_0123456789ab" };

@@ -1,7 +1,7 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { api, errorMessage, isAuthError } from "./api";
 import { SIM_BADGE_TEXT } from "./homeLogic";
-import type { OriginBadge } from "./origin";
+import { attemptChipText, type OriginBadge } from "./origin";
 import { useEscape, useResource } from "./hooks";
 import { Link } from "./router";
 import { hrefFor } from "./route";
@@ -95,7 +95,7 @@ export function OriginChip({ badge }: { badge: OriginBadge | null }) {
     <span className={`chip chip--sm origin origin--${badge.kind}`} title={badge.title}>
       {badge.text}
       {badge.claim && <span className="origin__claim sh-muted"> claims {badge.claim}</span>}
-      {badge.attempt && <span className="origin__attempt sh-muted"> · {badge.attempt}</span>}
+      {badge.attempt && <span className="origin__attempt sh-muted"> · {attemptChipText(badge.attempt)}</span>}
     </span>
   );
 }

@@ -79,6 +79,15 @@ describe("/mcp", () => {
     expect((await mcp("/mcp/sse", { method: "GET", headers: { authorization: `Bearer ${token}` } })).status).toBe(200); // /mcp/* too
   });
 
+  it("strips the Access credentials too: cf-access-token and cf-access-jwt-assertion never reach queenos-mcp", async () => {
+    const { mcp, mint, seen, access } = await ctx();
+    const { token } = await mint();
+    const r = await mcp("/mcp", post({ authorization: `Bearer ${token}`, "cf-access-token": access, "cf-access-jwt-assertion": access }));
+    expect(r.status).toBe(200);
+    const h = seen.mcp[0]!.req.headers;
+    for (const gone of ["authorization", "cf-access-token", "cf-access-jwt-assertion"]) expect(h.get(gone), gone).toBeNull();
+  });
+
   it("a read-only token is 403 (an attempt writes code)", async () => {
     const { mcp, mint } = await ctx();
     const { token } = await mint({ scopes: ["read"] });
@@ -112,6 +121,33 @@ describe("/mcp", () => {
     expect(local.seen.mcp[0]!.req.headers.get("x-queen-token-id")).toBe("dev");
     const remote = await ctx(dev);
     expect((await remote.mcp("/mcp", post({}))).status).toBe(403);
+  });
+
+  it("dev mode ignores a forged x-queen-user and x-queen-token-id from the client", async () => {
+    const dev = { ACCESS_MODE: "dev", DEV_USER_EMAIL: "dev@kaikeru.com" } as Partial<Bindings>;
+    const local = await ctx(dev, "http://localhost:8787");
+    const r = await local.mcp("/mcp", post({ "x-queen-user": "evil@kaikeru.com", "x-queen-token-id": "forged", "x-queen-agent": "forged" }));
+    expect(r.status).toBe(200);
+    const h = local.seen.mcp[0]!.req.headers;
+    expect(h.get("x-queen-user")).toBe("dev@kaikeru.com");
+    expect(h.get("x-queen-token-id")).toBe("dev");
+    expect(h.get("x-queen-agent")).toBeNull();
+  });
+});
+
+describe("/git header hygiene", () => {
+  it("strips a client-supplied x-queen-token-id (the git door never sets one) and forged identity", async () => {
+    const { mcp, mint, seen } = await ctx();
+    const { token } = await mint();
+    const r = await mcp("/git/demo-hive.git/info/refs?service=git-upload-pack", {
+      method: "GET",
+      headers: { authorization: `Bearer ${token}`, "x-queen-token-id": "forged", "x-queen-user": "evil@kaikeru.com" },
+    });
+    expect(r.status).toBe(200);
+    const h = seen.git[0]!.req.headers;
+    expect(h.get("x-queen-token-id")).toBeNull();
+    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(h.get("authorization")).toBeNull();
   });
 });
 

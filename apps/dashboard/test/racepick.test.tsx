@@ -6,8 +6,8 @@ import type { MergeTrain, Race, WorkItem } from "@queenos/queen-types";
 import { api, ApiError, pickBody } from "../src/api";
 import { RaceEntries } from "../src/RaceEntries";
 import { RacePick } from "../src/RacePick";
-import { closeEntriesFailure, composerRace, countdownLine, countdownText, decidedSummary, entriesLine, entryState, pickCards, pickFailure, pickRemainingMs } from "../src/raceLogic";
-import { raceView, raceViewForItem } from "../src/swarm";
+import { closeEntriesFailure, composerRace, pickHint, countdownLine, countdownText, decidedSummary, entriesLine, entryState, pickCards, pickFailure, pickRemainingMs } from "../src/raceLogic";
+import { raceView, raceViewForItem, swarmTiles } from "../src/swarm";
 
 const NOW = 1_800_000_000_000;
 const race = (over: Partial<Race> = {}): Race => ({
@@ -205,5 +205,52 @@ describe("race entries (external hives)", () => {
     expect(renderToString(<RaceEntries hive="demo" view={view(racing({ entryClosesAt: null }))} now={NOW} />)).toBe("");
     expect(renderToString(<RaceEntries hive="demo" view={view(racing({ state: "PICKING" }))} now={NOW} />)).toBe("");
     expect(renderToString(<RaceEntries hive="demo" view={view(racing({ state: "DECIDED" }))} now={NOW} />)).toBe("");
+  });
+});
+
+describe("pick hint (human judge, race still RACING)", () => {
+  const racing = (over: Partial<Race> = {}) => race({ state: "RACING", pickDeadlineAt: undefined, recommendedTrainId: undefined, recommendReason: undefined, entryClosesAt: NOW + 723_000, ...over });
+  const v = (r: Race, judge: "human" | "auto" = "human") => {
+    const view = raceView(state(r, three()), "r1", NOW)!;
+    view.item = { ...item, judge: judge === "human" ? "human" : undefined } as WorkItem;
+    return view;
+  };
+  const clock = (ms: number) => `${String(new Date(ms).getHours()).padStart(2, "0")}:${String(new Date(ms).getMinutes()).padStart(2, "0")}`;
+
+  test("explains when the pick buttons appear, with the closing time", () => {
+    const hint = pickHint(v(racing()), NOW)!;
+    expect(hint).toBe(`You pick the winner once entries close at ${clock(NOW + 723_000)} and two or more candidates pass. With one pass, the Queen takes it.`);
+  });
+  test("no clock time once the window has passed or when there is none", () => {
+    expect(pickHint(v(racing({ entryClosesAt: NOW - 1 })), NOW)).toBe("You pick the winner once entries close and two or more candidates pass. With one pass, the Queen takes it.");
+    expect(pickHint(v(racing({ entryClosesAt: undefined })), NOW)).toContain("once entries close and");
+  });
+  test("only for a RACING race with a human judge", () => {
+    expect(pickHint(v(racing(), "auto"), NOW)).toBeNull();
+    expect(pickHint(v(racing({ state: "PICKING" })), NOW)).toBeNull();
+    expect(pickHint(v(racing({ state: "DECIDED" })), NOW)).toBeNull();
+  });
+  test("RacePick renders the hint (and no pick buttons) while RACING", () => {
+    const html = renderToString(<RacePick hive="demo" view={v(racing())} now={NOW} />);
+    expect(html).toContain("You pick the winner once entries close at");
+    expect(html).not.toContain("Pick this one");
+  });
+  test("a RACING race with an auto judge still renders nothing", () => {
+    expect(renderToString(<RacePick hive="demo" view={v(racing(), "auto")} now={NOW} />)).toBe("");
+  });
+});
+
+describe("attempt id reaches the chips through the callers", () => {
+  const att = (id: string, i: number, attemptId: string) => train(id, i, { origin: { kind: "agent", id: "opus@kyle@kaikeru.com" }, attemptId } as Partial<MergeTrain>);
+  test("raceLogic pickCards forward attemptId to the origin badge", () => {
+    const ts = [att("a", 0, "att_0123456789ab"), train("b", 1)];
+    const cards = pickCards(raceView(state(race(), ts), "r1", NOW)!);
+    expect(cards[0]!.origin).toMatchObject({ kind: "agent", attempt: "att_0123456789ab" });
+    expect(cards[1]!.origin.attempt).toBeNull();
+  });
+  test("swarm tiles forward attemptId to the origin badge", () => {
+    const ts = [att("a", 0, "att_0123456789ab")];
+    const tile = swarmTiles(state(race({ state: "RACING" }), ts)).find((t) => t.trainId === "a");
+    expect(tile?.origin).toMatchObject({ attempt: "att_0123456789ab" });
   });
 });

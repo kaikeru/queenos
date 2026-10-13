@@ -11,6 +11,8 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import {
+  ATTEMPT_REPO_RE,
+  BASE_REPO_RE,
   CharterSchema,
   HiveCreatedResultSchema,
   HiveSlugSchema,
@@ -136,6 +138,9 @@ export class GenesisNode extends DurableObject<Env> {
   /** Start (or resume) a project. Registers it as ONBOARDING. */
   async start(input: { hive: string; name: string; createdBy: string }): Promise<WizardState> {
     const hive = parse(HiveSlugSchema.safeParse(input.hive), "hive");
+    // The git proxy routes `<slug>-att-<12hex>` / `<slug>-base-<12hex>` repos as MCP attempt / base forks: a hive named
+    // like that would have its own pushes misrouted. (Not part of HiveSlugSchema, so existing slugs still parse.)
+    if (ATTEMPT_REPO_RE.test(hive) || BASE_REPO_RE.test(hive)) throw new GenesisError("INVALID_INPUT", "invalid hive: a slug may not end in -att-<12 hex> or -base-<12 hex> (reserved for MCP attempt forks)");
     const existing = this.load();
     if (existing) return this.view(existing);
     try {

@@ -21,6 +21,24 @@ async function call(method: string, path: string, body?: unknown, user: string |
 
 const stubFor = (hive: string) => env.GENESIS.get(env.GENESIS.idFromName(hive));
 
+describe("hive slug reservations (M10)", () => {
+  it.each(["demo-att-0123456789ab", "demo-base-0123456789ab", "my-app-att-abcdef012345", "demo-att-0123456789ab-r2"])("refuses %s: its pushes would be routed as an attempt / base fork", async (hive) => {
+    const w = new FakeWorld();
+    setWorld(w);
+    const r = await call("POST", "/api/genesis", { hive, name: "Nope" });
+    expect(r.status).toBe(400);
+    expect(JSON.stringify(r.json)).toMatch(/-att-<12 hex>/);
+    expect(w.registry.calls.filter((c) => c.startsWith("register"))).toHaveLength(0);
+  });
+
+  it("still accepts look-alikes that are not the reserved shape", async () => {
+    for (const hive of ["demo-att-0123", "demo-attempt-0123456789ab", "demo-base-0123456789abc", "demo-att-0123456789ag"]) {
+      setWorld(new FakeWorld());
+      expect((await call("POST", "/api/genesis", { hive, name: "Ok" })).status, hive).toBe(200);
+    }
+  });
+});
+
 async function startHive(w = new FakeWorld()) {
   setWorld(w);
   const hive = slug();
