@@ -66,13 +66,18 @@ describe("attempt watchdog", () => {
 
 describe("base cleanup", () => {
   it("the base is deleted exactly once when the last open attempt ends and no race is open", async () => {
-    const { ns, stub } = await externalHive({ race: { entryWindowMs: 0 } });
+    // No rework slots: the rejection abandons the race at once (the fallback), and the fallback releases the base then
+    // (rework loop R6, spec §5.6.3: a REJECTED attempt with no slot never forks from it again). end_attempt ending a
+    // slot is Task 6's.
+    const { ns, stub } = await externalHive({ race: { entryWindowMs: 0 }, guardrails: { maxReworksPerAttempt: 0 } });
     const itemId = await fileItem(ns);
     const r = await readyAttempt(ns, itemId);
     const baseRepo = String((await itemRow(ns, itemId)).base_repo);
     await push(ns, r);
+    expect(deletesOf((await look(ns)).provisions, baseRepo)).toEqual([]);
     await gateFail(ns, r.trainId);
-    expect(deletesOf((await look(ns)).provisions, baseRepo)).toEqual([]); // REJECTED is still open: the agent may rework
+    expect((await look(ns)).races[0]).toMatchObject({ state: "ABANDONED" });
+    expect(deletesOf((await look(ns)).provisions, baseRepo)).toHaveLength(1);
     const own = { hive: ns, attemptId: r.attemptId, owner: OWNER, agentId: r.agent.agentId };
     await stub.attemptEnd(own);
     expect(deletesOf((await look(ns)).provisions, baseRepo)).toHaveLength(1);
@@ -242,15 +247,35 @@ describe("base cleanup when the race resolves after the last attempt ended (fix 
     const { ns, stub } = await externalHive({ race: { entryWindowMs: WINDOW } });
     const itemId = await fileItem(ns);
     const a = await readyAttempt(ns, itemId, agent());
-    await readyAttempt(ns, itemId, agent({ name: "haiku" })); // READY, never pushes: still open
+    const b = await readyAttempt(ns, itemId, agent({ name: "haiku" })); // READY, never pushes: still open
+    const c = await readyAttempt(ns, itemId, agent({ name: "glm" }));
+    const baseRepo = String((await itemRow(ns, itemId)).base_repo);
+    await push(ns, a);
+    await push(ns, c);
+    await stub.attemptEnd({ hive: ns, attemptId: a.attemptId, owner: OWNER, agentId: a.agent.agentId });
+    await gatePass(ns, c.trainId);
+    await later(ns, WINDOW + 60_000);
+    const s = await look(ns);
+    expect(s.races[0]!.state).toBe("DECIDED");
+    expect(deletesOf(s.provisions, baseRepo)).toEqual([]);
+    expect(await itemRow(ns, itemId)).toMatchObject({ base_repo: baseRepo });
+    expect((await stubFor(ns).getAttempt(b.attemptId))!.state).toBe("READY");
+  });
+
+  it("rework loop F3 (spec §5.6.3): a race ABANDONED (the fallback) releases the base although a READY attempt is open", async () => {
+    const { ns, stub } = await externalHive({ race: { entryWindowMs: WINDOW } });
+    const itemId = await fileItem(ns);
+    const a = await readyAttempt(ns, itemId, agent());
+    const b = await readyAttempt(ns, itemId, agent({ name: "haiku" })); // READY, never pushes: forked from the old base
     const baseRepo = String((await itemRow(ns, itemId)).base_repo);
     await push(ns, a);
     await stub.attemptEnd({ hive: ns, attemptId: a.attemptId, owner: OWNER, agentId: a.agent.agentId });
     await later(ns, WINDOW + 60_000);
     const s = await look(ns);
-    expect(s.races[0]!.state === "DECIDED" || s.races[0]!.state === "ABANDONED").toBe(true);
-    expect(deletesOf(s.provisions, baseRepo)).toEqual([]);
-    expect(await itemRow(ns, itemId)).toMatchObject({ base_repo: baseRepo });
+    expect(s.races[0]!.state).toBe("ABANDONED");
+    expect(deletesOf(s.provisions, baseRepo)).toHaveLength(1);
+    expect(await itemRow(ns, itemId)).toMatchObject({ base_repo: null });
+    expect((await stubFor(ns).getAttempt(b.attemptId))!.state).toBe("READY");
   });
 });
 

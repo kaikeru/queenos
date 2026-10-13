@@ -54,7 +54,9 @@ import {
   AttemptRegateSchema,
   BASE_PENDING_POLL_MS,
   MAX_MANUAL_REGATES,
+  RACE_GRACE_MS,
   REGATE_MIN_INTERVAL_MS,
+  REWORK_EXPIRY_GRACE_MS,
   isTerminalAttemptState,
   traceparent,
   MAX_OPEN_ATTEMPTS_PER_AGENT,
@@ -137,6 +139,7 @@ import {
   type QueenServerUnitMessage,
   type QueueView,
   type Race,
+  type ReworkReason,
   type RaceJudge,
   type Release,
   type ScribeSummary,
@@ -255,6 +258,7 @@ import {
 import { WorkPlanner, toWorkItem, workWatchdogDeadline, type AbsorbFollowUps, type WorkEffect, type WorkPlanResult } from "./work/ledger";
 import { budgetExhausted, creditsFor, defaultSettingsRecord, effectiveSettings, rollBudgetDay, utcDay } from "./work/guardrails";
 import { raceWidth } from "./train/race";
+import { iso, reworkDeadlines, type AttemptSlot } from "./train/rework";
 import { humanBy, keptLoser } from "./train/pick";
 import { EscalationPlanner, type EscalationIntent, type EscalationPlanResult } from "./autonomy/escalation";
 import { autonomyTransition, changeSuccessFromReleases, effectiveAutonomy, errorBudget, hiveHeadline, type EffectiveAutonomy, type SloStatus } from "./autonomy/policy";
@@ -479,6 +483,10 @@ class Acc {
   itemBases = new Map<string, ItemBase>();
   /** v17: repo DELETEs no train holds (repo_deletes rows), keyed by repo. */
   repoDeletes = new Map<string, RepoDelete>();
+  /** Rework loop: attempt slots the planner changed (applied to attempt rows in syncAttempts). */
+  slots = new Map<string, AttemptSlot>();
+  /** Rework loop: REWORKING wait reasons per item (null clears). */
+  reworkWaits = new Map<string, string | null>();
   rollbackStreak?: number;
   followUps: AbsorbFollowUps[] = [];
   credits = 0;
@@ -503,6 +511,8 @@ class Acc {
     for (const f of r.infraFailed ?? []) this.infraFailed.set(f.promptId, f.summary);
     for (const f of r.awaitingContributor ?? []) this.awaiting.set(f.promptId, f.summary);
     this.abortedIntents.push(...(r.abortedIntents ?? []));
+    for (const s of r.slots) this.slots.set(s.attemptId, s);
+    for (const w of r.reworkWaits) this.reworkWaits.set(w.itemId, w.waitReason);
     if (r.landed && r.landed.trainIds.length) this.onLanded?.(r.landed);
     return r;
   }
@@ -1439,7 +1449,9 @@ export class QueenNode extends DurableObject<Env> {
     const a = getAttemptRow(this.sql, r.attemptId);
     const refused = this.ownerRefusal(a, r);
     if (refused) return refused;
-    const next: Attempt = { ...a!, expiresAt: this.now() + ATTEMPT_TTL_MS };
+    // A refresh never shortens an open slot's protection (§5.1): max(now + 2 h, dueAt + 10 min).
+    const floor = a!.rework ? a!.rework.dueAt + REWORK_EXPIRY_GRACE_MS : 0;
+    const next: Attempt = { ...a!, expiresAt: Math.max(this.now() + ATTEMPT_TTL_MS, floor) };
     const { acc } = this.decide(hive, (d) => {
       d.acc.attempts.set(next.attemptId, next);
       d.acc.events.push(this.attemptEvent("attempt.state", next.itemId, next.attemptId, `attempt ${next.attemptId}: token refreshed`, { refreshed: true, expiresAt: next.expiresAt }, `agent:${next.agentName}@${next.owner}`, "debug"));
@@ -1555,6 +1567,22 @@ export class QueenNode extends DurableObject<Env> {
    * the attempt no longer points at them.
    */
   private syncAttempts(d: Decision): void {
+    // Rework loop: the planner's slot changes land on the attempt rows first. A new slot extends expires_at to at least
+    // dueAt + REWORK_EXPIRY_GRACE_MS, so the watchdog never expires an attempt mid-slot (§5.1).
+    for (const s of d.acc.slots.values()) {
+      const a = this.attemptOf(s.attemptId, d.acc);
+      if (!a) continue;
+      const prev = a.rework ?? null;
+      const opened = !!s.rework && (!prev || prev.round !== s.rework.round);
+      const next: Attempt = { ...a, reworks: s.reworks, rework: s.rework, ...(opened ? { expiresAt: Math.max(a.expiresAt, s.rework!.dueAt + REWORK_EXPIRY_GRACE_MS) } : {}) };
+      d.acc.attempts.set(a.attemptId, next);
+      if (opened) {
+        const r = s.rework!;
+        d.acc.events.push(this.attemptEvent("attempt.state", a.itemId, a.attemptId, `attempt ${a.attemptId}: rework slot ${r.round}/${d.hs.guardrails.maxReworksPerAttempt} (${r.reason}) until ${iso(r.dueAt)}`, { rework: r, expiresAt: next.expiresAt }, "queen", "warn"));
+      } else if (prev && !s.rework) {
+        d.acc.events.push(this.attemptEvent("attempt.state", a.itemId, a.attemptId, `attempt ${a.attemptId}: rework slot ${prev.round} closed`, { reworkClosed: prev }, "queen"));
+      }
+    }
     for (const t of [...d.acc.trains.values()]) {
       if (!t.attemptId) continue;
       const a = this.attemptOf(t.attemptId, d.acc);
@@ -1640,7 +1668,8 @@ export class QueenNode extends DurableObject<Env> {
 
   /**
    * v17: an item's race base is deleted exactly once, when nothing needs it: the item was cancelled (its open attempts
-   * are abandoned, their forks deleted), or none of its attempts is open and it has no RACING / PICKING race.
+   * are abandoned, their forks deleted), or none of its attempts holds it and it has no RACING / PICKING / REWORKING race.
+   * After a fallback (R6, F3: the item's newest race ABANDONED) only an INTENT attempt holds it.
    * `base_repo` is cleared when the DELETE is issued (so it is never issued twice); `base_sha` stays for history.
    */
   private releaseBases(d: Decision): void {
@@ -1660,9 +1689,20 @@ export class QueenNode extends DurableObject<Env> {
       const b = this.baseOf(itemId, d.acc);
       const item = d.acc.items.get(itemId) ?? this.loadItem(itemId);
       const cancelled = item?.status === "CANCELLED";
-      const open = this.attemptsOfItemNow(itemId, d.acc).filter((a) => !isTerminalAttemptState(a.state));
+      const nonTerminal = this.attemptsOfItemNow(itemId, d.acc).filter((a) => !isTerminalAttemptState(a.state));
+      const races = new Map(this.sql.exec("SELECT * FROM races WHERE item_id = ?", itemId).toArray().map((r) => [String(r.race_id), rowToRace(r)] as const));
+      for (const r of d.acc.races.values()) if (r.itemId === itemId) races.set(r.raceId, r);
+      const itemRaces = [...races.values()].sort((x, y) => x.createdAt - y.createdAt);
+      const openRace = itemRaces.some((r) => r.state === "RACING" || r.state === "PICKING" || r.state === "REWORKING");
+      // R6 / F3 (§5.6.3): after a fallback (the newest race ABANDONED, none open) the attempts of the abandoned race's
+      // time no longer hold the base (their forks are their own), only an INTENT does (it may be forking it now), so the
+      // next start_attempt forks a fresh base from current main. An attempt started after the fallback is on that fresh
+      // base and holds it as usual.
+      const newest = itemRaces.at(-1);
+      const fallbackAt = !openRace && newest?.state === "ABANDONED" ? (newest.decidedAt ?? newest.createdAt) : null;
+      const holders = fallbackAt === null ? nonTerminal : nonTerminal.filter((a) => a.state === "INTENT" || a.createdAt >= fallbackAt);
       if (cancelled) {
-        for (const a of open) {
+        for (const a of nonTerminal) {
           d.acc.attempts.set(a.attemptId, { ...a, state: "ABANDONED" });
           if (a.state !== "INTENT") this.deleteAttemptRepo(d, a);
           d.acc.events.push(this.attemptEvent("attempt.state", itemId, a.attemptId, `attempt ${a.attemptId}: ${a.state} → ABANDONED (item cancelled)`, { from: a.state, to: "ABANDONED", cancelled: true }, "queen"));
@@ -1671,10 +1711,7 @@ export class QueenNode extends DurableObject<Env> {
         if (!b?.baseRepo || !b.baseSha) continue;
       } else {
         if (!b?.baseRepo || !b.baseSha) continue;
-        if (open.length) continue;
-        const races = new Map(d.state.races.map((r) => [r.raceId, r]));
-        for (const r of d.acc.races.values()) races.set(r.raceId, r);
-        if ([...races.values()].some((r) => r.itemId === itemId && (r.state === "RACING" || r.state === "PICKING"))) continue;
+        if (holders.length || openRace) continue;
       }
       d.acc.itemBases.set(itemId, { itemId, baseRepo: null, baseSha: b.baseSha, pendingAt: null });
       this.repoDelete(d, `base-${itemId}`, b.baseRepo, item?.traceId ?? null);
@@ -1682,12 +1719,28 @@ export class QueenNode extends DurableObject<Env> {
     }
   }
 
-  /** v17: the next attempt watchdog deadline (an expiry, a stale INTENT, a stale pending base, a repo DELETE re-send), or null. */
+  /** v19: the slots of the hive's open attempts (the planner's HiveState.slots). */
+  private attemptSlots(): AttemptSlot[] {
+    return this.sql
+      .exec(`SELECT attempt_id, reworks, rework_reason, rework_due_at FROM attempts WHERE state IN (${OPEN_ATTEMPTS_SQL}) AND (reworks > 0 OR rework_due_at IS NOT NULL)`)
+      .toArray()
+      .map((r) => ({
+        attemptId: String(r.attempt_id),
+        reworks: Number(r.reworks ?? 0),
+        rework:
+          r.rework_due_at === null || r.rework_due_at === undefined
+            ? null
+            : { reason: String(r.rework_reason) as ReworkReason, dueAt: Number(r.rework_due_at), round: Number(r.reworks ?? 0) },
+      }));
+  }
+
+  /** v17: the next attempt watchdog deadline (an expiry, an open rework slot's dueAt, a stale INTENT, a stale pending base, a repo DELETE re-send), or null. */
   private attemptDeadline(timeout: number): number | null {
     const t = this.sql
       .exec(
         `SELECT MIN(t) AS t FROM (
            SELECT MIN(expires_at) AS t FROM attempts WHERE state IN ('READY', 'REJECTED')
+           UNION ALL SELECT MIN(rework_due_at) AS t FROM attempts WHERE rework_due_at IS NOT NULL AND state IN (${OPEN_ATTEMPTS_SQL})
            UNION ALL SELECT MIN(created_at) + ? AS t FROM attempts WHERE state = 'INTENT'
            UNION ALL SELECT MIN(base_pending_at) + ? AS t FROM work_items WHERE base_repo IS NOT NULL AND base_sha IS NULL
            UNION ALL SELECT MIN(issued_at) + ? AS t FROM repo_deletes WHERE state IN ('PENDING', 'FAILED'))`,
@@ -1711,6 +1764,7 @@ export class QueenNode extends DurableObject<Env> {
     const race = row ? rowToRace(row) : null;
     return {
       ...a,
+      rework: a.rework ?? null,
       train: t
         ? {
             trainId: t.trainId,
@@ -1722,11 +1776,12 @@ export class QueenNode extends DurableObject<Env> {
             reason: t.reason,
             score: t.score ?? null,
             gateInfraRounds: t.gateInfraRounds ?? 0,
+            conflict: t.conflict ? { paths: [...t.conflict.paths], summary: t.conflict.summary } : null,
           }
         : null,
-      race: race ? { raceId: race.raceId, state: race.state, entryClosesAt: race.entryClosesAt ?? null, winnerTrainId: race.winnerTrainId } : null,
+      race: race ? { raceId: race.raceId, state: race.state, entryClosesAt: race.entryClosesAt ?? null, winnerTrainId: race.winnerTrainId, reopens: race.reopens ?? 0 } : null,
       verdict: attemptVerdict(t),
-      verdictKind: attemptVerdictKind(t),
+      verdictKind: attemptVerdictKind(t, a.rework ?? null),
       regating: attemptRegating(t),
     };
   }
@@ -2806,6 +2861,7 @@ export class QueenNode extends DurableObject<Env> {
       races: state.races,
       items: state.items.map(plannerItem),
       maxPassedSeq: this.maxPassedSeq,
+      slots: this.attemptSlots(),
     };
     const tp = new TrainPlanner(hiveState, {
       namespace: hive,
@@ -2825,6 +2881,8 @@ export class QueenNode extends DurableObject<Env> {
       pick: { judge: hs.race.judge ?? "auto", pickWindowMs: hs.race.pickWindowMs, maxPickingRaces: g.maxPickingRaces },
       external: hs.executors === "external",
       entryWindowMs: hs.executors === "external" ? (hs.race.entryWindowMs ?? ENTRY_WINDOW_DEFAULT_MS) : 0,
+      // Rework loop (rework-loop spec §5.5): external hives only; swarm hives keep today's rejections.
+      ...(external ? { rework: { windowMs: g.reworkWindowMs, holdMs: g.reworkHoldMs, maxPerAttempt: g.maxReworksPerAttempt, maxRaceReopens: g.maxRaceReopens } } : {}),
     });
     const releaseIds = state.releases.map((r) => r.releaseId);
     const releaseEscalations = releaseIds.length
@@ -2893,6 +2951,7 @@ export class QueenNode extends DurableObject<Env> {
         ...(acc.itemConflicts.has(p.promptId) ? { conflicts: acc.itemConflicts.get(p.promptId)! } : {}),
         ...(acc.infraFailed.has(p.promptId) ? { infra: true } : {}),
         ...(acc.awaiting.has(p.promptId) ? { awaiting: true } : {}),
+        ...(acc.reworkWaits.has(p.promptId) ? { reworkWait: acc.reworkWaits.get(p.promptId)! } : {}),
       }));
       acc.work(
         wp.absorb({
@@ -2993,9 +3052,29 @@ export class QueenNode extends DurableObject<Env> {
         changed = true;
       }
     }
+    // Rework loop (R13): a DECIDED race whose winner (an attempt's train) is still active, so a car conflict can move it to REWORKING.
+    const wonRaceIds = [...new Set([...trains.values()].filter((t) => t.attemptId && t.raceOutcome === "WON" && isActive(t) && t.raceId).map((t) => t.raceId!))].filter((id) => !races.some((r) => r.raceId === id));
+    if (wonRaceIds.length) {
+      const extra = this.sql.exec(`SELECT * FROM races WHERE race_id IN (${wonRaceIds.map(() => "?").join(",")})`, ...wonRaceIds).toArray().map(rowToRace);
+      if (extra.length) {
+        races = [...races, ...extra];
+        changed = true;
+      }
+    }
+    // Every candidate of a loaded race, EJECTED ones included (a REWORK candidate is EJECTED and must be seen).
+    let prompts = state.prompts;
     if (races.length) {
       const ids = races.flatMap((r) => r.trainIds).filter((id) => !trains.has(id));
       if (ids.length) addTrains(this.loadTrains(ids));
+      // Rework loop: a race held only by REWORK candidates (or a REWORKING race) has no active train, so the warm state
+      // lacks its item's prompt; a slot expiry or fallback then must still fail the prompt (the item awaits a contributor).
+      const have = new Set(prompts.map((p) => p.promptId));
+      const want = [...new Set(races.filter((r) => r.state === "RACING" || r.state === "REWORKING").map((r) => r.itemId))].filter((id) => !have.has(id));
+      const extra = want.map((id) => this.loadPrompt(id)).filter((p): p is PromptRecord => !!p);
+      if (extra.length) {
+        prompts = [...prompts, ...extra];
+        changed = true;
+      }
     }
     const items = new Map(state.items.map((i) => [i.itemId, i]));
     const wantItems = new Set<string>(opts.items ?? []);
@@ -3034,7 +3113,7 @@ export class QueenNode extends DurableObject<Env> {
     }
     if (!changed) return state;
     const bySeq = <X extends { seq: number }>(a: X, b: X) => a.seq - b.seq;
-    return { ...state, trains: [...trains.values()].sort(bySeq), items: [...items.values()].sort(bySeq), releases: [...releases.values()].sort(bySeq), races };
+    return { ...state, trains: [...trains.values()].sort(bySeq), items: [...items.values()].sort(bySeq), releases: [...releases.values()].sort(bySeq), races, prompts: [...prompts].sort(bySeq) };
   }
 
   /**
@@ -3367,6 +3446,14 @@ export class QueenNode extends DurableObject<Env> {
       workWatchdogDeadline(state.items, timeout, now),
       this.attemptDeadline(timeout),
     ];
+    const slots = this.attemptSlots();
+    if (slots.some((s) => s.rework)) {
+      // REWORK candidates are EJECTED, so the warm state does not hold them: read the RACING races' candidates.
+      const racing = state.races.filter((r) => r.state === "RACING");
+      const trains = this.loadTrains(racing.flatMap((r) => r.trainIds));
+      const holdMs = effectiveSettings(state.settings, now).guardrails.reworkHoldMs;
+      deadlines.push(...reworkDeadlines({ races: racing, trains, slots, holdMs, graceMs: RACE_GRACE_MS, now }));
+    }
     // The lease needs no alarm: every RPC renews it before decide() when due, and
     // an expired lease means "no global cap" (fail open) until then.
     const due = deadlines.filter((d): d is number => d !== null);

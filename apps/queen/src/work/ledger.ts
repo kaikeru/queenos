@@ -184,6 +184,8 @@ export interface AbsorbPrompt {
   infra?: boolean;
   /** T1: contributed (human / agent) code FAILED at the gate: FAILED "awaiting contributor", no escalation. */
   awaiting?: boolean;
+  /** Rework loop: the item's REWORKING wait reason (`awaiting rework (...)`); null clears one the loop set. */
+  reworkWait?: string | null;
 }
 
 /** Train-planner train rows (structurally: TrainRecord). */
@@ -815,6 +817,13 @@ export class WorkPlanner {
         mirroredConflicts.add(item.itemId);
         if (p.conflicts !== item.conflicts) {
           item.conflicts = p.conflicts;
+          this.markItem(item);
+        }
+      }
+      if (p.reworkWait !== undefined) {
+        if (p.reworkWait !== null) this.setWait(item, p.reworkWait);
+        else if (item.waitReason?.startsWith("awaiting rework")) {
+          item.waitReason = null;
           this.markItem(item);
         }
       }

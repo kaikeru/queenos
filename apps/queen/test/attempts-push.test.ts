@@ -6,10 +6,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { QueenNode } from "../src/queen-node";
 import { attemptStateOf } from "../src/work/attempts";
-import { BASE_SHA, MODEL, OTHER, OWNER, accepted, agent, deletesOf, distinctDeletes, externalHive, fileItem, gateFail, gatePass, landCarOf, later, look, readyAttempt, sha, stubFor, trainOf } from "./attempt-helpers";
+import { BASE_SHA, MODEL, OTHER, OWNER, accepted, agent, deletesOf, distinctDeletes, externalHive, fileItem, gateFail, gatePass, landCarOf, later, look, push, readyAttempt, sha, stubFor, trainOf } from "./attempt-helpers";
 
-const push = (ns: string, att: { attemptId: string; repo: string }, after = sha(), title = "Add a tip jar") =>
-  stubFor(ns).attemptPushed({ hive: ns, attemptId: att.attemptId, repo: att.repo, after, title, message: `${title}\n\nAcceptance:\n- shows a jar` }).then((res) => ({ after, res }));
 const attemptRow = async (ns: string, attemptId: string) => (await look(ns)).attempts.find((a) => a.attempt_id === attemptId)!;
 
 describe("attemptStateOf", () => {
@@ -227,7 +225,8 @@ describe("fork ownership across a car landing (fix round 1)", () => {
   });
 
   it("after a late push, the old passed train wins its race and lands by car without deleting the follow-up's fork", async () => {
-    const { ns, stub } = await externalHive();
+    // No rework slots: b's rejection must not hold the race (today's path).
+    const { ns, stub } = await externalHive({ guardrails: { maxReworksPerAttempt: 0 } });
     const itemId = await fileItem(ns);
     const a = await readyAttempt(ns, itemId, agent());
     const b = await readyAttempt(ns, itemId, agent({ name: "haiku" }));

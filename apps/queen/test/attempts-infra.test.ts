@@ -30,15 +30,13 @@ import {
   landCarOf,
   later,
   look,
+  own,
+  push,
   readyAttempt,
-  sha,
   stubFor,
   trainOf,
 } from "./attempt-helpers";
 
-const push = (ns: string, att: { attemptId: string; repo: string }, after = sha(), title = "Add a tip jar") =>
-  stubFor(ns).attemptPushed({ hive: ns, attemptId: att.attemptId, repo: att.repo, after, title, message: `${title}\n\nAcceptance:\n- shows a jar` }).then((res) => ({ after, res }));
-const own = (ns: string, r: { attemptId: string; agent: { agentId: string } }) => ({ hive: ns, attemptId: r.attemptId, owner: OWNER, agentId: r.agent.agentId });
 const noteOf = (ns: string, head: string) => runInDurableObject(stubFor(ns), (q: QueenNode) => q.verdictNote(head));
 
 /** A pushed attempt whose preview is live and whose first Queen-started gate (q1) is out. */
@@ -207,9 +205,9 @@ describe("gate-infra re-gate on the same head (contributed trains)", () => {
     await gateFail(ns, r.trainId);
     expect(await stub.getAttempt(r.attemptId)).toMatchObject({ state: "REJECTED", verdict: "rejected", verdictKind: "findings", regating: null });
     expect(attemptVerdictKind(null)).toBeNull();
-    expect(attemptVerdictKind({ phase: "TESTING", raceOutcome: "RACING", summary: null })).toBeNull();
-    expect(attemptVerdictKind({ phase: "EJECTED", raceOutcome: "FAILED", summary: `${INFRA_SUMMARY_PREFIX}x` })).toBe("infra");
-    expect(attemptVerdictKind({ phase: "EJECTED", raceOutcome: "FAILED", summary: "security: nope" })).toBe("findings");
+    expect(attemptVerdictKind({ phase: "TESTING", raceOutcome: "RACING", summary: null, reason: null, conflict: null })).toBeNull();
+    expect(attemptVerdictKind({ phase: "EJECTED", raceOutcome: "FAILED", summary: `${INFRA_SUMMARY_PREFIX}x`, reason: null, conflict: null })).toBe("infra");
+    expect(attemptVerdictKind({ phase: "EJECTED", raceOutcome: "FAILED", summary: "security: nope", reason: null, conflict: null })).toBe("findings");
   });
 });
 

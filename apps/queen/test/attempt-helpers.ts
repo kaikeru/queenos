@@ -116,3 +116,20 @@ export async function landCarOf(ns: string, memberId: string): Promise<string> {
 }
 
 export const distinctDeletes = (s: Awaited<ReturnType<typeof look>>, repo: string) => new Set(deletesOf(s.provisions, repo).map((c) => c.commandId)).size;
+
+/** An attempt's push through the MCP intake (attemptPushed): the push is the submission. Returns the head and the result. */
+export const push = (ns: string, att: { attemptId: string; repo: string }, after = sha(), title = "Add a tip jar") =>
+  stubFor(ns).attemptPushed({ hive: ns, attemptId: att.attemptId, repo: att.repo, after, title, message: `${title}\n\nAcceptance:\n- shows a jar` }).then((res) => ({ after, res }));
+
+/** The owner action (refresh / end / regate) of an attempt's own agent. */
+export const own = (ns: string, r: { attemptId: string; agent: { agentId: string; owner?: string } }) => ({ hive: ns, attemptId: r.attemptId, owner: r.agent.owner ?? OWNER, agentId: r.agent.agentId });
+
+/** Play the car of `memberId` up to its MERGE drone, which reports `memberId` conflicting. Returns the car id. */
+export async function conflictCarOf(ns: string, memberId: string, paths: string[] = ["src/shared.js"]): Promise<string> {
+  const stub = stubFor(ns);
+  const carId = String((await trainOf(ns, memberId)).car_id);
+  const fork = (await look(ns)).provisions.find((c) => c.op === "FORK" && c.trainId === carId);
+  if (fork && fork.op === "FORK") await stub.reportProvisionResult({ commandId: fork.commandId, op: "FORK", trainId: carId, ok: true, artifactRepo: fork.forkName, baseSha: "c".repeat(40) });
+  await stub.reportMergeResult({ trainId: carId, ok: true, headSha: "d".repeat(40), baseSha: "c".repeat(40), merged: [], conflicts: [{ trainId: memberId, kind: "content", paths, summary: `Merge conflict in ${paths.join(", ")}` }] });
+  return carId;
+}

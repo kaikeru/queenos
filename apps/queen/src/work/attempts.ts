@@ -1,7 +1,7 @@
 /**
  * MCP attempt rules (docs/superpowers/specs/2026-10-12-queenos-mcp-design.md §7, §8.3, §10). Pure: no SQL, no clock.
  */
-import { ATTEMPT_TOKEN_TTL_S, isInfraStopped, type AttemptState, type AttemptVerdict, type AttemptVerdictKind, type AttemptView, type RaceState } from "@queenos/queen-types";
+import { ATTEMPT_TOKEN_TTL_S, isInfraStopped, parseReworkReason, type AttemptRework, type AttemptState, type AttemptVerdict, type AttemptVerdictKind, type AttemptView, type RaceState } from "@queenos/queen-types";
 import { MAX_GATE_INFRA_ROUNDS, gateOutstanding, type TrainRecord } from "../train/planner";
 
 export const OPEN_ATTEMPT_STATES: readonly AttemptState[] = ["INTENT", "READY", "PUSHED", "PASSED", "REJECTED", "WON"];
@@ -67,23 +67,32 @@ export function checkAttemptCaps(c: CapInput): { ok: true } | { ok: false; messa
   return { ok: true };
 }
 
-/** The gate's word on a train: none (no train yet), pending, passed (incl. a race loser that passed) or rejected. */
-export function attemptVerdict(t: Pick<TrainRecord, "phase" | "raceOutcome"> | null): AttemptVerdict {
+/**
+ * The gate's word on a train: none (no train yet), pending, passed (incl. a race loser that passed) or rejected.
+ * Rework loop §6.2: an ejected train is rejected even when it had won (a merge conflict or an integration failure in its
+ * car); a REWORK candidate is rejected; one that lost while in rework keeps its rework reason (R20) and stays rejected.
+ */
+export function attemptVerdict(t: Pick<TrainRecord, "phase" | "raceOutcome" | "reason"> | null): AttemptVerdict {
   if (!t) return "none";
-  if (t.raceOutcome === "FAILED") return "rejected";
-  if (t.raceOutcome === "PASSED" || t.raceOutcome === "WON" || t.raceOutcome === "LOST") return "passed";
-  if (t.phase === "PASSED" || t.phase === "LANDING" || t.phase === "MERGED") return "passed";
+  if (t.raceOutcome === "FAILED" || t.raceOutcome === "REWORK") return "rejected";
+  if (t.raceOutcome === "LOST") return parseReworkReason(t.reason) ? "rejected" : "passed";
   if (t.phase === "EJECTED") return "rejected";
+  if (t.raceOutcome === "PASSED" || t.raceOutcome === "WON") return "passed";
+  if (t.phase === "PASSED" || t.phase === "LANDING" || t.phase === "MERGED") return "passed";
   return "pending";
 }
 
 /**
- * Why a rejected train was rejected: `infra` when it stopped on infrastructure (its summary carries
- * INFRA_SUMMARY_PREFIX: the gate could not run after its re-gates), else `findings`. Null unless rejected.
+ * Why a rejected train was rejected: `infra` (INFRA_SUMMARY_PREFIX: the gate could not run), `conflict` (a merge conflict
+ * ejected it from its car), `human` (a judge's reject: the open slot's reason, or the train's rework reason text, R10),
+ * else `findings`. Null unless rejected.
  */
-export function attemptVerdictKind(t: Pick<TrainRecord, "phase" | "raceOutcome" | "summary"> | null): AttemptVerdictKind | null {
+export function attemptVerdictKind(t: Pick<TrainRecord, "phase" | "raceOutcome" | "summary" | "reason" | "conflict"> | null, rework?: AttemptRework | null): AttemptVerdictKind | null {
   if (attemptVerdict(t) !== "rejected") return null;
-  return isInfraStopped({ summary: t!.summary }) ? "infra" : "findings";
+  if (isInfraStopped({ summary: t!.summary })) return "infra";
+  if (t!.conflict) return "conflict";
+  if (rework?.reason === "human" || parseReworkReason(t!.reason)?.reason === "human") return "human";
+  return "findings";
 }
 
 /**
