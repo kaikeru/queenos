@@ -212,5 +212,11 @@ export const GateCommandSchema = z.object({
   branch: z.string().min(1),
   /** The head to gate (the train's `headSha`). */
   after: z.string().min(1),
+  /**
+   * Epoch ms. Set only on an automatic gate-infra re-gate (the previous gate could not run): the gatekeeper waits
+   * until then (a durable `step.sleep` of `max(0, notBefore - Date.now())`) before it starts the gate's first round.
+   * Absent: start at once. An older gatekeeper ignores it (the re-gate then runs at once).
+   */
+  notBefore: z.number().int().optional(),
 });
 export type GateCommand = z.infer<typeof GateCommandSchema>;

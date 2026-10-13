@@ -12,7 +12,11 @@ import {
   AttemptResultSchema,
   AttemptSchema,
   AttemptViewSchema,
+  AttemptRegateSchema,
+  AttemptVerdictKindSchema,
   BASE_PENDING_MAX_WAIT_MS,
+  GateCommandSchema,
+  MCP_ERROR_RETRYABLE,
   BASE_PENDING_POLL_MS,
   BASE_REPO_RE,
   EventTypeSchema,
@@ -121,8 +125,9 @@ describe("attempt schemas", () => {
     expect(McpErrorCodeSchema.options).toEqual([
       "NOT_INITIALIZED", "ALREADY_INITIALIZED", "FORBIDDEN_ROLE", "FORBIDDEN_OWNER", "HIVE_NOT_EXTERNAL", "NOT_FOUND", "INVALID_INPUT",
       "ITEM_NOT_ACCEPTING", "GOAL_AMBIGUOUS", "CAP_EXCEEDED", "BASE_PENDING", "BASE_MOVED", "ARTIFACTS_UNAVAILABLE", "ATTEMPT_EXPIRED", "CONFLICT",
+      "UNAVAILABLE",
     ]);
-    expect(McpToolErrorSchema.safeParse({ code: "CONFLICT", message: "x".repeat(201) }).success).toBe(false);
+    expect(McpToolErrorSchema.safeParse({ code: "CONFLICT", message: "x".repeat(201), retryable: false }).success).toBe(false);
   });
 });
 
@@ -143,5 +148,45 @@ describe("additive fields on existing contracts", () => {
 
   it("attempt event types exist", () => {
     expect(EventTypeSchema.options).toEqual(expect.arrayContaining(["attempt.intent", "attempt.state", "attempt.base"]));
+  });
+});
+
+describe("fix wave: the retryable contract, verdict kind, regate, gate notBefore", () => {
+  it("every code has a retryable default: only BASE_PENDING, BASE_MOVED, ARTIFACTS_UNAVAILABLE and UNAVAILABLE", () => {
+    expect(Object.keys(MCP_ERROR_RETRYABLE).sort()).toEqual([...McpErrorCodeSchema.options].sort());
+    expect(McpErrorCodeSchema.options.filter((c) => MCP_ERROR_RETRYABLE[c]).sort()).toEqual(["ARTIFACTS_UNAVAILABLE", "BASE_MOVED", "BASE_PENDING", "UNAVAILABLE"]);
+  });
+
+  it("a tool error body is {code, message, retryable, retryAfterMs?, items?}", () => {
+    expect(McpToolErrorSchema.parse({ code: "UNAVAILABLE", message: "retry", retryable: true, retryAfterMs: 2000 })).toEqual({ code: "UNAVAILABLE", message: "retry", retryable: true, retryAfterMs: 2000 });
+    expect(McpToolErrorSchema.safeParse({ code: "CONFLICT", message: "x" }).success).toBe(false); // retryable is required
+    expect(McpToolErrorSchema.safeParse({ code: "CAP_EXCEEDED", message: "x", retryable: true, retryAfterMs: 3_600_001 }).success).toBe(false);
+    expect(McpToolErrorSchema.parse({ code: "GOAL_AMBIGUOUS", message: "x", retryable: false, items: [{ itemId: "a", title: "A", status: "READY" }] }).items).toHaveLength(1);
+  });
+
+  it("Queen refusals may carry retryAfterMs (old peers omit it); CONFLICT is a refusal code (attemptRegate)", () => {
+    expect(AttemptIntentDecisionSchema.parse({ verdict: "refuse", code: "CAP_EXCEEDED", message: "hourly", retryAfterMs: 60_000 })).toMatchObject({ retryAfterMs: 60_000 });
+    expect(AttemptIntentDecisionSchema.parse({ verdict: "refuse", code: "CAP_EXCEEDED", message: "hourly" })).not.toHaveProperty("retryAfterMs");
+    expect(AttemptResultSchema.parse({ ok: false, code: "CONFLICT", message: "push first", retryAfterMs: 1 })).toMatchObject({ code: "CONFLICT", retryAfterMs: 1 });
+    expect(AttemptResultSchema.safeParse({ ok: false, code: "CAP_EXCEEDED", message: "x", retryAfterMs: -1 }).success).toBe(false);
+    expect(AttemptRegateSchema.parse({ hive: "demo", attemptId: ATT, owner: "ada@kaikeru.com", agentId: AG })).toMatchObject({ attemptId: ATT });
+  });
+
+  it("the view carries verdictKind, regating and the train's gateInfraRounds (optional for older peers)", () => {
+    expect(AttemptVerdictKindSchema.options).toEqual(["findings", "infra"]);
+    const train = { trainId: "t1", phase: "TESTING", raceOutcome: "RACING", headSha: SHA, previewUrl: null, summary: null, reason: null, score: null };
+    const view = { ...attempt, state: "PUSHED" as const, train: { ...train, gateInfraRounds: 2 }, race: null, verdict: "pending" as const, verdictKind: null, regating: { round: 2, of: 3, notBefore: 99 } };
+    expect(AttemptViewSchema.parse(view)).toEqual(view);
+    const old = { ...attempt, train, race: null, verdict: "none" as const };
+    expect(AttemptViewSchema.parse(old)).toEqual(old);
+    expect(AttemptViewSchema.safeParse({ ...view, verdictKind: "flaky" }).success).toBe(false);
+    expect(AttemptSchema.parse({ ...attempt, regates: 1, lastRegateAt: 5 })).toMatchObject({ regates: 1, lastRegateAt: 5 });
+  });
+
+  it("GateCommand.notBefore is optional epoch ms", () => {
+    const cmd = { kind: "gate", commandId: "gate-r-h-q3", trace: { traceparent: `00-${"a".repeat(32)}-${"b".repeat(16)}-01` }, hive: "demo", trainId: "t1", repo: "r", branch: "main", after: SHA };
+    expect(GateCommandSchema.parse(cmd)).not.toHaveProperty("notBefore");
+    expect(GateCommandSchema.parse({ ...cmd, notBefore: 1_700_000_000_000 })).toMatchObject({ notBefore: 1_700_000_000_000 });
+    expect(GateCommandSchema.safeParse({ ...cmd, notBefore: 1.5 }).success).toBe(false);
   });
 });

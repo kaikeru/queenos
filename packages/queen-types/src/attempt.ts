@@ -64,8 +64,36 @@ export const McpErrorCodeSchema = z.enum([
   "ARTIFACTS_UNAVAILABLE",
   "ATTEMPT_EXPIRED",
   "CONFLICT",
+  /** A transient Queen / DO / RPC failure (a deploy, an overload, an unrecognised error). Retryable. */
+  "UNAVAILABLE",
 ]);
 export type McpErrorCode = z.infer<typeof McpErrorCodeSchema>;
+
+/**
+ * Whether an agent should call the tool again (after `retryAfterMs`, default 2 s) on each code. A specific error may
+ * override it: `CAP_EXCEEDED` with a `retryAfterMs` (a cap that frees up at a known time) is retryable.
+ */
+export const MCP_ERROR_RETRYABLE: Readonly<Record<McpErrorCode, boolean>> = {
+  NOT_INITIALIZED: false,
+  ALREADY_INITIALIZED: false,
+  FORBIDDEN_ROLE: false,
+  FORBIDDEN_OWNER: false,
+  HIVE_NOT_EXTERNAL: false,
+  NOT_FOUND: false,
+  INVALID_INPUT: false,
+  ITEM_NOT_ACCEPTING: false,
+  GOAL_AMBIGUOUS: false,
+  CAP_EXCEEDED: false,
+  BASE_PENDING: true,
+  BASE_MOVED: true,
+  ARTIFACTS_UNAVAILABLE: true,
+  ATTEMPT_EXPIRED: false,
+  CONFLICT: false,
+  UNAVAILABLE: true,
+};
+
+/** How long to wait before calling again (ms, at most 1 h). */
+export const RetryAfterMsSchema = z.number().int().min(0).max(3_600_000);
 
 /** The codes a Queen attempt RPC answers with (a refusal is a value, not a thrown QueenError). */
 export const AttemptRefusalCodeSchema = McpErrorCodeSchema.extract([
@@ -78,11 +106,24 @@ export const AttemptRefusalCodeSchema = McpErrorCodeSchema.extract([
   "BASE_MOVED",
   "FORBIDDEN_OWNER",
   "ATTEMPT_EXPIRED",
+  /** attemptRegate: nothing to re-gate (no push yet, the head passed, or the last verdict was findings). */
+  "CONFLICT",
 ]);
 export type AttemptRefusalCode = z.infer<typeof AttemptRefusalCodeSchema>;
 
+export const GoalChildSchema = z.object({ itemId: z.string(), title: z.string(), status: z.string() });
+export type GoalChild = z.infer<typeof GoalChildSchema>;
+
 /** The JSON body of an MCP tool error (`isError: true`). Safe to show: no tokens, no input values. */
-export const McpToolErrorSchema = z.object({ code: McpErrorCodeSchema, message: z.string().max(200) });
+export const McpToolErrorSchema = z.object({
+  code: McpErrorCodeSchema,
+  message: z.string().max(200),
+  /** Call again (after `retryAfterMs`, default 2 s)? Defaults to MCP_ERROR_RETRYABLE[code]. */
+  retryable: z.boolean(),
+  retryAfterMs: RetryAfterMsSchema.optional(),
+  /** GOAL_AMBIGUOUS: the goal's open children. */
+  items: z.array(GoalChildSchema).max(24).optional(),
+});
 export type McpToolError = z.infer<typeof McpToolErrorSchema>;
 
 export const AttemptTargetSchema = z.union([z.object({ itemId: z.string().min(1).max(64) }).strict(), z.object({ goalId: z.string().min(1).max(64) }).strict()]);
@@ -104,9 +145,6 @@ export const AttemptBaseSchema = z.discriminatedUnion("kind", [
 ]);
 export type AttemptBase = z.infer<typeof AttemptBaseSchema>;
 
-export const GoalChildSchema = z.object({ itemId: z.string(), title: z.string(), status: z.string() });
-export type GoalChild = z.infer<typeof GoalChildSchema>;
-
 export const AttemptIntentDecisionSchema = z.discriminatedUnion("verdict", [
   z.object({
     verdict: z.literal("accept"),
@@ -126,6 +164,8 @@ export const AttemptIntentDecisionSchema = z.discriminatedUnion("verdict", [
     message: z.string().max(200),
     /** GOAL_AMBIGUOUS: the goal's open children. */
     items: z.array(GoalChildSchema).max(24).optional(),
+    /** When the refusal is known to clear (CAP_EXCEEDED hourly cap: its oldest counted start ages out; BASE_PENDING: the poll). */
+    retryAfterMs: RetryAfterMsSchema.optional(),
   }),
 ]);
 export type AttemptIntentDecision = z.infer<typeof AttemptIntentDecisionSchema>;
@@ -175,6 +215,13 @@ export const AttemptOwnerActionSchema = z.object({ hive: HiveSlugSchema, attempt
 export type AttemptOwnerAction = z.infer<typeof AttemptOwnerActionSchema>;
 export const AttemptRefreshSchema = AttemptOwnerActionSchema;
 export const AttemptEndSchema = AttemptOwnerActionSchema;
+/** `attemptRegate` (MCP `retry_gates`): re-run the gates on the attempt's current head after an infra verdict. */
+export const AttemptRegateSchema = AttemptOwnerActionSchema;
+export type AttemptRegate = AttemptOwnerAction;
+/** Manual re-gates (`attemptRegate`) one attempt may request... */
+export const MAX_MANUAL_REGATES = 3;
+/** ...at most one per this interval. */
+export const REGATE_MIN_INTERVAL_MS = 60_000;
 
 /** Row of the Queen's `attempts` table (migration v17). */
 export const AttemptSchema = z.object({
@@ -197,12 +244,23 @@ export const AttemptSchema = z.object({
   headSha: Sha40.nullable(),
   createdAt: z.number().int(),
   expiresAt: z.number().int(),
+  /** v18: manual re-gates requested (`attemptRegate`); absent = 0. */
+  regates: z.number().int().min(0).optional(),
+  /** v18: when the last manual re-gate was requested (epoch ms); absent = never. */
+  lastRegateAt: z.number().int().optional(),
 });
 export type Attempt = z.infer<typeof AttemptSchema>;
 
 /** The gate's word on the attempt's current head: none (no push yet), pending, passed or rejected. */
 export const AttemptVerdictSchema = z.enum(["none", "pending", "passed", "rejected"]);
 export type AttemptVerdict = z.infer<typeof AttemptVerdictSchema>;
+
+/**
+ * Why a `rejected` verdict: `findings` (the gate judged the change; fix and push) or `infra` (the gate could not run
+ * after its automatic re-gates; not a verdict on the change: `retry_gates` or push again).
+ */
+export const AttemptVerdictKindSchema = z.enum(["findings", "infra"]);
+export type AttemptVerdictKind = z.infer<typeof AttemptVerdictKindSchema>;
 
 /** `getAttempt`: the row plus its current train and race. */
 export const AttemptViewSchema = AttemptSchema.extend({
@@ -216,10 +274,19 @@ export const AttemptViewSchema = AttemptSchema.extend({
       summary: z.string().max(500).nullable(),
       reason: z.string().nullable(),
       score: GateScoreSchema.nullable(),
+      /** Automatic gate-infra re-gates of this train so far (v18). Optional: absent from an older Queen. */
+      gateInfraRounds: z.number().int().min(0).optional(),
     })
     .nullable(),
   race: z.object({ raceId: z.string(), state: RaceStateSchema, entryClosesAt: z.number().int().nullable(), winnerTrainId: z.string().nullable() }).nullable(),
   verdict: AttemptVerdictSchema,
+  /** Set when `verdict === "rejected"`, else null. Optional: absent from an older Queen (read absent as unknown). */
+  verdictKind: AttemptVerdictKindSchema.nullable().optional(),
+  /**
+   * The gate could not run and the Queen re-gates the same head automatically: re-gate `round` of `of`, starting no
+   * earlier than `notBefore` (epoch ms). The verdict stays `pending`. Null: no automatic re-gate pending.
+   */
+  regating: z.object({ round: z.number().int().min(1), of: z.number().int().min(1), notBefore: z.number().int().nullable() }).nullable().optional(),
 });
 export type AttemptView = z.infer<typeof AttemptViewSchema>;
 
@@ -235,7 +302,7 @@ export type ItemAttempts = z.infer<typeof ItemAttemptsSchema>;
 /** `attemptReady` / `attemptRefresh` / `attemptEnd`. `changed: false`: a no-op (a repeat, or a boarded attempt on end). */
 export const AttemptResultSchema = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(true), attempt: AttemptViewSchema, changed: z.boolean() }),
-  z.object({ ok: z.literal(false), code: AttemptRefusalCodeSchema, message: z.string().max(200) }),
+  z.object({ ok: z.literal(false), code: AttemptRefusalCodeSchema, message: z.string().max(200), retryAfterMs: RetryAfterMsSchema.optional() }),
 ]);
 export type AttemptResult = z.infer<typeof AttemptResultSchema>;
 

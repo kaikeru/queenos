@@ -137,7 +137,12 @@ export const WorkItemSchema = z.object({
   escalationId: z.string().nullable(),
   createdAt: z.number().int(),
   updatedAt: z.number().int(),
-  /** Inbox origin (human or agent push): the branch and its latest head. Absent / null: Queen-solicited work. */
+  /**
+   * Inbox origin (human or agent push): the branch and its latest head. Absent / null: Queen-solicited work.
+   * It is the item's LATEST submission slot, not one contributor's: with several MCP attempts on one item it names the
+   * newest attempt fork pushed (handoff and the dashboard origin fallback read it that way; external hives never hand
+   * off). Per-attempt forks and heads are on the attempts (`attemptsForItem`), not here.
+   */
   inbox: WorkItemInboxSchema.nullable().optional(),
   /** Race judge for this item (§10.2); absent = the hive's `settings.race.judge`. Inert until T9a. */
   judge: RaceJudgeSchema.optional(),
