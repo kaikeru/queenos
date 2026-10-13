@@ -445,6 +445,10 @@ describe("batch B: retry_gates", () => {
     expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toEqual({ code: "CAP_EXCEEDED", message: "one a minute", retryable: true, retryAfterMs: 42_000 });
     w.queen.regate = () => ({ ok: false, code: "CONFLICT", message: "push a fix" });
     expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toMatchObject({ code: "CONFLICT", retryable: false });
+    w.queen.regate = () => {
+      throw new TypeError("x is not a function");
+    };
+    expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toEqual({ code: "UNAVAILABLE", message: "the hive is temporarily unavailable; retry", retryable: true, retryAfterMs: 2000 });
     w.queen.regate = () => ({ ok: false, code: "ITEM_NOT_ACCEPTING", message: "decided without this head" });
     expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toEqual({ code: "ITEM_NOT_ACCEPTING", message: "decided without this head", retryable: false });
   });
@@ -554,6 +558,36 @@ describe("batch B: shell-safe commands", () => {
     w.artifacts.get = async (name: string) => ({ ...(await real(name)), info: async () => ({ remote: "https://x.test/a'; rm -rf ~ #" }) });
     expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "ARTIFACTS_UNAVAILABLE", retryable: true });
     expect(w.artifacts.deleted).toContain(ATT_REPO);
+    expect(w.queen.methods()).not.toContain("attemptReady");
+  });
+
+  it("a hostile token fails start_attempt before attemptReady (no orphaned READY attempt)", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    const real = w.artifacts.get.bind(w.artifacts);
+    w.artifacts.get = async (name: string) => {
+      const h = await real(name);
+      return { ...h, createToken: async (sc, ttl) => ({ ...(await h.createToken(sc, ttl)), plaintext: "tok'; rm -rf ~ #" }) };
+    };
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "ARTIFACTS_UNAVAILABLE", retryable: true });
+    expect(w.queen.methods()).not.toContain("attemptReady");
+    expect(w.queen.methods()).toContain("attemptAborted");
+    expect(w.artifacts.deleted).toContain(ATT_REPO);
+  });
+
+  it("refresh_attempt with a hostile new token revokes the new token and keeps the old ones", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    value(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }));
+    const old = w.artifacts.activeTokens(ATT_REPO);
+    expect(old).toHaveLength(1);
+    const real = w.artifacts.get.bind(w.artifacts);
+    w.artifacts.get = async (name: string) => {
+      const h = await real(name);
+      return { ...h, createToken: async (sc, ttl) => ({ ...(await h.createToken(sc, ttl)), plaintext: "tok'; rm -rf ~ #" }) };
+    };
+    expect(errOf(await run(w, s, "refresh_attempt", { attemptId: ATT }))).toMatchObject({ code: "ARTIFACTS_UNAVAILABLE" });
+    expect(w.artifacts.activeTokens(ATT_REPO)).toEqual(old);
   });
 
   it("a hostile token is refused too", () => {

@@ -265,9 +265,17 @@ export const TOOLS: ToolSpec[] = [
       try {
         using h = await ctx.ports.artifacts.get(r.attempt.repo);
         const [info, tok] = await Promise.all([h.info(), h.createToken("write", ATTEMPT_TOKEN_TTL_S)]);
-        for (const t of (await h.listTokens()).tokens) if (t.id !== tok.id && t.state === "active") await h.revokeToken(t.id);
         const remote = info.remote.replace(/\/+$/, "");
-        return { expiresAt: Date.parse(tok.expiresAt) || r.attempt.expiresAt, configCommand: configCommand(remote, tok.plaintext, attemptDir(a.attemptId)) };
+        let cmd: string;
+        try {
+          cmd = configCommand(remote, tok.plaintext, attemptDir(a.attemptId));
+        } catch (e) {
+          // A malformed token must not cost the agent its working one: drop the new token, keep the old.
+          await h.revokeToken(tok.id).catch(() => undefined);
+          throw e;
+        }
+        for (const t of (await h.listTokens()).tokens) if (t.id !== tok.id && t.state === "active") await h.revokeToken(t.id);
+        return { expiresAt: Date.parse(tok.expiresAt) || r.attempt.expiresAt, configCommand: cmd };
       } catch (e) {
         throw artifactsUnavailable("token refresh", e);
       }

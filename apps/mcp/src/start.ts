@@ -110,11 +110,14 @@ export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, inp
     using h = await ports.artifacts.get(forked.repo);
     const [info, tok] = await Promise.all([h.info(), h.createToken("write", ATTEMPT_TOKEN_TTL_S)]);
     const expiresAt = Date.parse(tok.expiresAt) || ports.now() + ATTEMPT_TOKEN_TTL_S * 1000;
+    // Build (and so validate) the command before telling the Queen the attempt is READY: a malformed remote or token
+    // must fail while the attempt is still in INTENT, where attemptAborted can clean it up.
+    const remote = info.remote.replace(/\/+$/, "");
+    const dir = attemptDir(d.attemptId);
+    const cmd = setupCommand(remote, tok.plaintext, dir);
     queenCall = true;
     const ready = await queen.attemptReady({ hive, attemptId: d.attemptId, repo: forked.repo, baseSha, expiresAt });
     if (!ready.ok) throw refusal(ready);
-    const remote = info.remote.replace(/\/+$/, "");
-    const dir = attemptDir(d.attemptId);
     return {
       attemptId: d.attemptId,
       itemId: d.itemId,
@@ -122,7 +125,7 @@ export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, inp
       expiresAt,
       baseSha,
       dir,
-      setupCommand: setupCommand(remote, tok.plaintext, dir),
+      setupCommand: cmd,
       note: GIT_NOTE,
     };
   } catch (e) {
