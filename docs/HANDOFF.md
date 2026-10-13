@@ -106,22 +106,20 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 **Last production deploys (UTC):** Oct 12: queenos-git 14:13 (steps b, d and efcccea now live). Oct 9: queen 20:41 and edge 20:42 (after eab6a7b). Oct 8: queen 18:12 and edge 18:14 (T9a/T9d), gatekeepers 16:33 (T4), **queenos-git 16:33 (T2n)**, edge 17:01 (T7 dashboard). Oct 7: queen 21:17, herald 21:18. provisioner/drones Oct 7 14:49-14:51.
 
-**Pending (user runs this): the MCP fix-wave deploy, in this order** (same env setup as below):
+**Pending (user runs this): the MCP fix-wave deploy, in this order:**
 ```
+cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
 ./scripts/deploy.sh --only queen
 ./scripts/deploy.sh --only gatekeepers --force
 (cd apps/mcp && pnpm exec wrangler deploy)
 ./scripts/deploy.sh --only edge
 ./scripts/deploy.sh --only provisioner
+./scripts/deploy.sh --only genesis
+./scripts/deploy.sh --only drones
 ```
-1. `queen` ships schema **v18** (gate-infra rounds, `attemptRegate`, verdict kinds). 2. `gatekeepers` honours `GateCommand.notBefore` and the hardened reviewer (an old Queen never sends `notBefore`, so either order is safe). 3. `queenos-mcp` is NOT in `deploy.sh` (17 tools; `retry_gates` degrades to `UNAVAILABLE` on an old Queen; deploy it before the edge, whose `MCP` binding needs it). 4. `edge` also ships the dashboard (pick hint, short attempt chip). 5. `provisioner` ships the regenerated templates (new registry header and AGENTS.md for new hives). The **Access Bypass for `/mcp` is DONE** (Access app "QueenOS MCP (edge checks tokens)").
+All these Workers already exist, so single `--only` deploys need no bootstrap pass. 1. `queen` ships schema **v18** (gate-infra rounds, `attemptRegate`, verdict kinds). 2. `gatekeepers` honours `GateCommand.notBefore` and the hardened reviewer (an old Queen never sends `notBefore`, so either order is safe). 3. `queenos-mcp` is NOT in `deploy.sh` (17 tools; `retry_gates` degrades to `UNAVAILABLE` on an old Queen; deploy it before the edge, whose `MCP` binding needs it). 4. `edge` also ships the dashboard (pick hint, short attempt chip). 5. `provisioner` ships the regenerated templates (new registry header and AGENTS.md for new hives). 6. `genesis` refuses new hive slugs ending in `-att-<12hex>` / `-base-<12hex>`. 7. `drones` carries the new registry header in the builder prompt. The **Access Bypass for `/mcp` is DONE** (Access app "QueenOS MCP (edge checks tokens)").
 
-**Pending (user runs this): the provisioner, for step (e)** (new hives get `AGENTS.md`). Same env setup as before (keep the export line):
-```
-cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
-./scripts/deploy.sh --only provisioner
-```
-Same pattern for a gatekeepers redeploy (`--only gatekeepers --force`). External mode is live on the Queen. Switch hive `demo` (or a new hive) to external with the dashboard "workers" select, or `PATCH /hives/<hive>/settings {"executors":"external"}`. Not yet seen in a browser or live.
+External mode is live on the Queen. Switch hive `demo` (or a new hive) to external with the dashboard "workers" select, or `PATCH /hives/<hive>/settings {"executors":"external"}`.
 Verify with the Cloudflare deployments API before assuming it is or isn't done.
 
 - **Access:** the user created a second Access app "QueenOS git (edge checks tokens)" on `queenos.kaikeru.com/git` with a **Bypass** policy (the edge checks `qgt_` tokens itself). Verified: `/git` without creds gives 401 Basic; the dashboard still 302s to Access.
