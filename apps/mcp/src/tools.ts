@@ -107,7 +107,7 @@ function findingsOf(view: AttemptView, note: string | null): string[] {
 }
 
 /** retry_gates against a Queen that predates the attemptRegate RPC: workerd's "The RPC receiver does not implement the method". */
-const lacksRpc = (e: unknown): boolean => /does not implement|is not a function/i.test(messageOf(e));
+const lacksRpc = (e: unknown): boolean => /does not implement the method/i.test(messageOf(e));
 
 /** `wait` on an attempt: verdict = its head PASSED / REJECTED (or WON); decided = WON / LOST; landed = LANDED. Any terminal state ends every wait. */
 export function attemptReached(state: AttemptState, until: "verdict" | "decided" | "landed"): boolean {

@@ -8,11 +8,17 @@ const base = { "content-type": "application/json", accept: "application/json, te
 async function rpc(body: unknown, headers: Record<string, string>) {
   const res = await exports.default.fetch(URL_, { method: "POST", headers: { ...base, ...headers }, body: JSON.stringify(body) });
   const text = await res.text();
+  let json: unknown = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // an SSE body
+  }
   const data = text
     .split("\n")
     .filter((l) => l.startsWith("data: "))
     .map((l) => JSON.parse(l.slice(6)) as { id?: number; result?: { content?: { text: string }[]; isError?: boolean; tools?: { name: string }[] } });
-  return { res, data, sid: res.headers.get("mcp-session-id") };
+  return { res, data, json, sid: res.headers.get("mcp-session-id") };
 }
 
 async function session(owner = OWNER): Promise<string> {
@@ -51,6 +57,7 @@ describe("queenos-mcp Worker", () => {
     const stolen = await rpc({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "whoami", arguments: {} } }, { "x-queen-user": OTHER, "mcp-session-id": sid });
     expect(stolen.res.status).toBe(403);
     expect(stolen.data.find((m) => m.id === 9)).toBeUndefined();
+    expect(stolen.json).toEqual({ error: "forbidden" });
     const get = await exports.default.fetch(URL_, { method: "GET", headers: { accept: "text/event-stream", "x-queen-user": OTHER, "mcp-session-id": sid, "mcp-protocol-version": "2025-06-18" } });
     expect(get.status).toBe(403);
     expect(await get.json()).toEqual({ error: "forbidden" });

@@ -15,7 +15,7 @@ import {
 import { RepoNotFoundError, deleteRepoQuietly, forkRepo, type ForkResult } from "@queenos/hive-kit/artifacts";
 import { GIT_NOTE, attemptDir, setupCommand } from "./commands";
 import { ToolError, artifactsUnavailable, fromQueen, messageOf, refusal } from "./errors";
-import type { McpPorts, QueenPort } from "./ports";
+import type { McpPorts } from "./ports";
 
 export interface StartAttemptResult {
   attemptId: string;
@@ -44,15 +44,6 @@ export async function openAttempts(ports: McpPorts, agent: McpAgentIdentity): Pr
   return open;
 }
 
-/** Did the Queen pin exactly this base for the item? A failed read counts as "no" (the original delete-and-fail path). */
-async function basePinned(queen: QueenPort, itemId: string, baseSha: string): Promise<boolean> {
-  try {
-    return (await queen.attemptsForItem(itemId)).baseSha === baseSha;
-  } catch {
-    return false;
-  }
-}
-
 export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, input: { hive: string; itemId?: string; goalId?: string }): Promise<StartAttemptResult> {
   const { hive } = input;
   if ((await openAttempts(ports, agent)).length >= MAX_OPEN_ATTEMPTS_PER_AGENT) {
@@ -79,19 +70,27 @@ export async function startAttempt(ports: McpPorts, agent: McpAgentIdentity, inp
   let baseSha: string;
   if (d.base.kind === "create") {
     let b: ForkResult | null = null;
+    let keepBase = false;
     try {
       b = await forkRepo(ports.fork, hive, "main", d.base.baseRepo, { readOnly: true, probe: false, description: `QueenOS race base of item ${d.itemId}`, logPrefix: "mcp" });
       try {
         await queen.attemptBaseReady({ hive, itemId: d.itemId, baseRepo: b.repo, baseSha: b.baseSha });
       } catch (e) {
-        // A transport throw can follow a commit: if the Queen already pinned this very base, deleting it would wedge the item.
-        if (fromQueen(e).code !== "UNAVAILABLE" || !(await basePinned(queen, d.itemId, b.baseSha))) throw e;
+        // A transport throw can follow a commit. attemptBaseReady is idempotent (duplicate when pinned), so ask again.
+        if (fromQueen(e).code !== "UNAVAILABLE") throw e;
+        try {
+          await queen.attemptBaseReady({ hive, itemId: d.itemId, baseRepo: b.repo, baseSha: b.baseSha });
+        } catch (e2) {
+          // Still unknown whether the Queen pinned it: keep the base (deleting a pinned base wedges the item).
+          if (fromQueen(e2).code === "UNAVAILABLE") keepBase = true;
+          throw e2;
+        }
       }
       baseRepo = b.repo;
       baseSha = b.baseSha;
     } catch (e) {
       // A base that was forked but not pinned is unknown to the Queen: delete it here or it leaks.
-      if (b) await deleteRepoQuietly(ports.fork, b.repo);
+      if (b && !keepBase) await deleteRepoQuietly(ports.fork, b.repo);
       await queen.attemptBaseFailed({ hive, itemId: d.itemId, baseRepo: b?.repo ?? d.base.baseRepo, attemptId: d.attemptId, reason: clip(messageOf(e)) }).catch(() => undefined);
       await identity.closeAttempt(d.attemptId);
       if (e instanceof RepoNotFoundError) throw new ToolError("NOT_FOUND", `hive repo ${hive} not found`);

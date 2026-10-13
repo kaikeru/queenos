@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { McpAgentIdentity } from "@queenos/queen-types";
+import { configCommand, setupCommand } from "../src/commands";
 import { TOOLS, callTool, type ToolOutcome } from "../src/tools";
 import { ATT, ATT_REPO, BASE_REPO, FakeSession, FakeWorld, HIVE, MAIN_SHA, OTHER, OWNER, REMOTE, acceptCreate, viewOf } from "./fakes";
 
@@ -99,16 +100,16 @@ describe("start_attempt", () => {
     expect(r).not.toHaveProperty("cloneCommand");
     expect(r).not.toHaveProperty("configCommand");
     expect(r.expiresAt).toEqual(expect.any(Number));
-    const token = /Bearer (art_v1_\S+)"/.exec(String(r.setupCommand))![1]!;
+    const token = /Bearer (art_v1_[^']+)'/.exec(String(r.setupCommand))![1]!;
     expect(String(r.remote)).not.toContain("art_v1");
     const dir = `.queenos/attempts/${ATT}`;
     expect(r.setupCommand).toBe(
       [
-        `git init ${dir}`,
-        `git -C ${dir} config --local --replace-all http.${REMOTE(ATT_REPO)}.extraHeader "Authorization: Bearer ${token}"`,
-        `git -C ${dir} remote add origin ${REMOTE(ATT_REPO)}`,
-        `git -C ${dir} fetch origin main`,
-        `git -C ${dir} checkout -b main FETCH_HEAD`,
+        `git init '${dir}'`,
+        `git -C '${dir}' config --local --replace-all 'http.${REMOTE(ATT_REPO)}.extraHeader' 'Authorization: Bearer ${token}'`,
+        `git -C '${dir}' remote add origin '${REMOTE(ATT_REPO)}'`,
+        `git -C '${dir}' fetch origin main`,
+        `git -C '${dir}' checkout -b main FETCH_HEAD`,
       ].join(" && "),
     );
     // The token appears exactly once in the whole result, and never in a URL.
@@ -214,8 +215,8 @@ describe("own-attempt tools", () => {
     expect(after[0]).not.toBe(before[0]);
     expect(r).not.toHaveProperty("token");
     expect(r.expiresAt).toEqual(expect.any(Number));
-    const token = /Bearer (art_v1_\S+)"/.exec(r.configCommand)![1]!;
-    expect(r.configCommand).toBe(`git -C .queenos/attempts/${ATT} config --local --replace-all http.${REMOTE(ATT_REPO)}.extraHeader "Authorization: Bearer ${token}"`);
+    const token = /Bearer (art_v1_[^']+)'/.exec(r.configCommand)![1]!;
+    expect(r.configCommand).toBe(`git -C '.queenos/attempts/${ATT}' config --local --replace-all 'http.${REMOTE(ATT_REPO)}.extraHeader' 'Authorization: Bearer ${token}'`);
     expect(JSON.stringify(r).split(token)).toHaveLength(2);
   });
 
@@ -276,6 +277,8 @@ describe("fix round 1", () => {
     expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "CONFLICT" });
     expect(w.artifacts.deleted).toContain(BASE_REPO);
     expect(w.artifacts.repos.has(BASE_REPO)).toBe(false);
+    expect(w.queen.inputs("attemptBaseReady")).toHaveLength(1);
+    expect(w.queen.methods()).not.toContain("attemptsForItem");
     expect((await w.identity(agent.agentId).attempts())[0]).toMatchObject({ open: false });
   });
 
@@ -442,6 +445,8 @@ describe("batch B: retry_gates", () => {
     expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toEqual({ code: "CAP_EXCEEDED", message: "one a minute", retryable: true, retryAfterMs: 42_000 });
     w.queen.regate = () => ({ ok: false, code: "CONFLICT", message: "push a fix" });
     expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toMatchObject({ code: "CONFLICT", retryable: false });
+    w.queen.regate = () => ({ ok: false, code: "ITEM_NOT_ACCEPTING", message: "decided without this head" });
+    expect(errOf(await run(w, s, "retry_gates", { attemptId: ATT }))).toEqual({ code: "ITEM_NOT_ACCEPTING", message: "decided without this head", retryable: false });
   });
 
   it("someone else's attempt is FORBIDDEN_OWNER; a Queen without the RPC is UNAVAILABLE, not retryable", async () => {
@@ -501,24 +506,58 @@ describe("batch B: happy-path reads", () => {
 });
 
 describe("batch B: I4 base pin after a transport throw", () => {
-  it("attemptBaseReady commits then throws: the pinned base is kept and the attempt continues", async () => {
+  it("attemptBaseReady throws once, the retry answers (duplicate): the pinned base is kept and the attempt continues", async () => {
     const w = new FakeWorld();
-    w.queen.errors.set("attemptBaseReady", new Error("Network connection lost"));
-    w.queen.attemptsForItem = async (itemId: string) => ({ itemId, baseSha: MAIN_SHA, basePending: false, attempts: [] });
+    const real = w.queen.attemptBaseReady.bind(w.queen);
+    let n = 0;
+    w.queen.attemptBaseReady = async (i) => {
+      await real(i);
+      if (++n === 1) throw new Error("Network connection lost");
+      return { outcome: "ignored:duplicate" };
+    };
     const { s } = await worker(w);
     expect((await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" })).ok).toBe(true);
+    expect(n).toBe(2);
     expect(w.artifacts.deleted).not.toContain(BASE_REPO);
     expect(w.queen.methods()).not.toContain("attemptBaseFailed");
     expect(w.artifacts.forks.map((f) => f.name)).toEqual([BASE_REPO, ATT_REPO]);
   });
 
-  it("a transport throw where the Queen did not pin still deletes the base and fails retryably", async () => {
+  it("a definite Queen refusal on the retry deletes the base", async () => {
+    const w = new FakeWorld();
+    let n = 0;
+    w.queen.attemptBaseReady = async () => {
+      throw new Error(++n === 1 ? "Network connection lost" : "CONFLICT: base watchdog cleared");
+    };
+    const { s } = await worker(w);
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "CONFLICT" });
+    expect(w.artifacts.deleted).toContain(BASE_REPO);
+  });
+
+  it("two transport throws: the base is NOT deleted, the attempt is closed, the error is UNAVAILABLE and retryable", async () => {
     const w = new FakeWorld();
     w.queen.errors.set("attemptBaseReady", new Error("Network connection lost"));
-    w.queen.attemptsForItem = async (itemId: string) => ({ itemId, baseSha: null, basePending: true, attempts: [] });
-    const { s } = await worker(w);
+    const { s, agent } = await worker(w);
     expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "UNAVAILABLE", retryable: true });
-    expect(w.artifacts.deleted).toContain(BASE_REPO);
+    expect(w.queen.inputs("attemptBaseReady")).toHaveLength(2);
+    expect(w.artifacts.deleted).not.toContain(BASE_REPO);
     expect(w.queen.methods()).toContain("attemptBaseFailed");
+    expect((await w.identity(agent.agentId).attempts())[0]).toMatchObject({ open: false });
+  });
+});
+
+describe("batch B: shell-safe commands", () => {
+  it("a hostile remote or token is refused (ARTIFACTS_UNAVAILABLE), never interpolated", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    const real = w.artifacts.get.bind(w.artifacts);
+    w.artifacts.get = async (name: string) => ({ ...(await real(name)), info: async () => ({ remote: "https://x.test/a'; rm -rf ~ #" }) });
+    expect(errOf(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }))).toMatchObject({ code: "ARTIFACTS_UNAVAILABLE", retryable: true });
+    expect(w.artifacts.deleted).toContain(ATT_REPO);
+  });
+
+  it("a hostile token is refused too", () => {
+    expect(() => setupCommand(REMOTE(ATT_REPO), "tok'; rm -rf ~ #", "d")).toThrow(/unexpected remote or token/);
+    expect(() => configCommand(REMOTE(ATT_REPO), "ok_token?expires=1", "d")).not.toThrow();
   });
 });
