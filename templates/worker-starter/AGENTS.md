@@ -5,7 +5,7 @@ You are in a QueenOS hive: a no-build Cloudflare Worker app that QueenOS deploys
 ## The app
 
 - `src/index.js` is a tiny router. Each feature is `src/features/<slug>.js` exporting `slug` (`[a-z0-9-]+`) and `handle(request)` returning a `Response`. Optional: `path` (a top-level route such as `"/status"`; `/`, `/health` and `/features/*` are reserved) and `guard(request)`.
-- Register a feature in `src/features/index.js` (one `import * as fN from "./<module>.js"` plus an entry in the exported `features` array).
+- Register a feature by adding one line `import * as fN from "./<slug>.js";` (next free N) to `src/features/index.js` and `fN` to its `features` array. Keep the file in exactly this shape (no other code); QueenOS merges it line by line across concurrent features.
 - No npm, no bundler, no `node_modules`, no Node built-ins. Relative imports only, always with the `.js` extension.
 - Caps: 100 modules, 256 KiB per module, 1 MiB total. Only `src/**/*.js` is deployed.
 - Details: `README.md`.
@@ -70,7 +70,8 @@ The `queenos-inbox` skill (plugin `plugins/queenos` in the QueenOS repo) automat
 If your human connected you to the QueenOS MCP server, you do not need this clone's `origin` or a git token:
 
 1. `init_agent(name, model, role)` once; keep the `agentId`. After a reconnect: `resume_agent(agentId)`.
-2. `start_attempt({hive, itemId})` gives you your own fork of the item's frozen base, a 2 h token for that fork only, and two commands. Run `cloneCommand`, then `configCommand`. Never set a global credential helper or a global `http.extraHeader`.
+2. `start_attempt({hive, itemId})` gives you your own fork of the item's frozen base and one `setupCommand`. Run it once, exactly (it carries a 2 h token for that fork only, in the clone's local git config). If it fails midway, delete the folder and run it again. Never set a global credential helper or a global `http.extraHeader`, and never paste the token anywhere else.
 3. Work in that folder under the same rules as above (small change, nothing in `.queen/**`, `wrangler.*`, `package.json`). Commit, then `git push origin main`: in your own fork `main` is yours.
-4. `wait({attemptId, until: "verdict"})` until `changed: true`. On REJECTED: `get_verdict`, fix, push `main` again (`refresh_attempt` first if the token is near expiry).
+4. `wait({attemptId, until: "verdict"})` until `changed: true`. On REJECTED: `get_verdict` and read `kind`. `findings`: fix and push `main` again. `infra` (the gate could not run, not a verdict on your change): call `retry_gates({attemptId})` and wait again; do not push empty commits. If the token is near expiry, `refresh_attempt` and run its `configCommand` first.
 5. When the attempt is terminal, or you stop: `end_attempt`, then delete the folder (`cleanup` says which).
+6. Every tool error has `retryable`: if `true`, wait `retryAfterMs` (default 2 s) and call again; if `false`, stop and report.

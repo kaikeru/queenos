@@ -127,7 +127,7 @@ Every tool compares the request's `props.owner` with the identity's `owner` and 
 
 ## 6. Tools
 
-All tools take and return JSON. "Own" means attempts whose `agentId` is the session's agent.
+17 tools. All take and return JSON. "Own" means attempts whose `agentId` is the session's agent. Every tool error carries `retryable` (and, where the cause clears on its own, `retryAfterMs`), see §11.
 
 | Tool | Role | Input | Output | Backing route / RPC |
 |---|---|---|---|---|
@@ -138,13 +138,14 @@ All tools take and return JSON. "Own" means attempts whose `agentId` is the sess
 | `create_goal` | orchestrator | `hive, title, description, judge?: "auto"\|"pick", entryWindowMs?` | `{goalId, itemId}` | Queen `submitWork` (= `POST /hives/:hive/prompts` with `decompose:true`), then `getItemDetail(goalId).children[0]` |
 | `list_items` | both | `hive, state?` | `[{itemId, title, kind, status, waitReason, parentId}]` | Queen `getSnapshot` (= `GET /snapshot`) |
 | `get_item` | both | `hive, itemId` | `{item, race: {raceId, state, baseSha, entryClosesAt, candidates: [{attemptId, agent, claimedModel, verdict, previewUrl}]} \| null}` | Queen `getItemDetail` (= `GET /items/:id`) + attempts join |
-| `start_attempt` | both | `hive` + exactly one of `itemId`, `goalId` | `{attemptId, remote, token, expiresAt, baseSha (the item's shared base), dir, cloneCommand, configCommand}` | Queen `attemptIntent` → (first attempt only: base fork → `attemptBaseReady`) → fork of the base + `createToken` → `attemptReady` |
-| `refresh_attempt` | both (own) | `attemptId` | `{token, expiresAt, configCommand}` | Queen `attemptRefresh` → `createToken` + revoke others |
-| `end_attempt` | both (own) | `attemptId` | `{state, cleanup: "remove <dir>"}` | Queen `attemptEnd` |
+| `start_attempt` | both | `hive` + exactly one of `itemId`, `goalId` | `{attemptId, itemId, remote, expiresAt, baseSha (the item's shared base), dir, setupCommand, note}` | Queen `attemptIntent` → (first attempt only: base fork → `attemptBaseReady`) → fork of the base + `createToken` → `attemptReady` |
+| `refresh_attempt` | both (own) | `attemptId` | `{expiresAt, configCommand}` | Queen `attemptRefresh` → `createToken` + revoke others |
+| `end_attempt` | both (own) | `attemptId` | `{state, cleanup: "remove <dir>"}` (idempotent: on a terminal attempt it reports the state, §11) | Queen `attemptEnd` |
 | `get_attempt` | both (own) | `attemptId` | `Attempt` (§8) + current verdict summary | Queen `getAttempt` |
 | `list_attempts` | both | none | own `Attempt[]`, all hives | `AgentIdentity` list + `getAttempt` each |
 | `wait` | both | exactly one of `attemptId`, `itemId` (+ `hive`); `until: "verdict"\|"decided"\|"landed"`; `timeoutMs ≤ 50000` | `{changed, state, attempt?, item?}` | Long-poll in the session DO, polling the Queen every ~2 s |
-| `get_verdict` | both (own) | `attemptId` | `{headSha, verdict, findings[], note, previewUrl}` | Queen `getAttempt` + `notesFor(hive, "refs/notes/verdict")` for the head |
+| `get_verdict` | both (own) | `attemptId` | `{headSha, verdict, kind, findings[], summary, note, previewUrl, regating, next}` | Queen `getAttempt` + `notesFor(hive, "refs/notes/verdict")` for the head |
+| `retry_gates` | both (own) | `attemptId` | `{changed, state, trainId, race}` | Queen `attemptRegate` |
 | `close_entries` | both | `hive, raceId` | `{outcome, race}` | Queen `closeRaceEntries` (= `POST /races/:raceId/close-entries`), `user` = owner |
 | `pick` | both | `hive, raceId, attemptId` | `{outcome, race}` | Queen `pick` (= `POST /races/:raceId/pick`) with the attempt's current `trainId`, `user` = owner |
 
@@ -153,9 +154,11 @@ Tool notes:
 - **`create_goal`.** `POST /items` cannot file goals (`FileWorkItemSchema.kind` excludes `goal`). Goals go through `submitWork` with `decompose: true`; `promptText` = `title` + blank line + `description`. In an external hive the goal files exactly one inbox child synchronously (ledger `filePrompt` → `decompose(goal, [], null, true)`), returned as `itemId`. `judge: "pick"` maps to the Queen's `"human"`. `entryWindowMs` (0..1 h) is new: `SubmitPromptSchema` gains an optional `entryWindowMs`, stored on the inbox item; when its race opens, `entryClosesAt` uses it instead of `settings.race.entryWindowMs`. A hive whose `executors` is not `"external"` fails `HIVE_NOT_EXTERNAL`.
 - **`start_attempt` with `goalId`** resolves to the goal's single open child. None or several: `GOAL_AMBIGUOUS` with the children's `{itemId, title, status}`.
 - **`start_attempt` and `BASE_PENDING`.** If another first attempt is still creating the item's base, `attemptIntent` answers `BASE_PENDING`. The MCP Worker does not return that to the agent at once: it re-calls `attemptIntent` every 2 s for up to 30 s, then fails the tool with retryable `BASE_PENDING`. (Chosen over a bare retry error so two agents starting together both succeed in one call.)
-- **`cloneCommand`** = `git -c http.extraHeader="Authorization: Bearer <token>" clone <remote> <dir>`. **`configCommand`** = `git -C <dir> config --local --replace-all http.<remote>.extraHeader "Authorization: Bearer <token>"`. The response tells the agent to run both and never to set a global credential helper or global `http.extraHeader`.
+- **`setupCommand`** (`start_attempt`) is one `&&` chain, run once: `git init <dir>`, `git -C <dir> config --local --replace-all http.<remote>.extraHeader 'Authorization: Bearer <token>'`, `git -C <dir> remote add origin <remote>`, `git -C <dir> fetch origin main`, `git -C <dir> checkout -b main FETCH_HEAD`. Every argument is POSIX single-quoted, and the remote and token are format-checked before they are built into the command. The token therefore appears exactly once, in the command, and `start_attempt` returns no separate `token`. If it fails midway, delete `<dir>` and run it again. **`refresh_attempt`** returns `{expiresAt, configCommand}`; `configCommand` is only the `config --local --replace-all` line and rotates the clone's header (older tokens of the fork are revoked). Never set a global credential helper or a global `http.extraHeader`. The token is fork-scoped and short-lived (2 h): never paste it anywhere else.
 - **`wait`** never blocks longer than `timeoutMs` (max 50 000). On timeout it returns the current state with `changed:false`; the agent calls again. `verdict` = the attempt's current head has PASSED or REJECTED; `decided` = its race is DECIDED (WON or LOST); `landed` = LANDED, or any terminal state.
-- **`get_verdict`** returns the v1 verdict note text for the attempt's head (the same text `apps/git` serves on `refs/notes/verdict`) and the gate findings. No `remote:` lines on this path.
+- **`get_verdict`** returns the v1 verdict note text for the attempt's head (the same text `apps/git` serves on `refs/notes/verdict`) and the gate findings. No `remote:` lines on this path. `kind` is `"findings"` (the gates judged the change: fix and push), `"infra"` (the gate could not run, which is not a verdict on the change: call `retry_gates`, never push an empty commit) or `null` (not rejected). `findings` is the note's `Queen-Finding` lines (each clipped to 300 chars), else `[train.reason]`, and empty for `infra`. `next` is `"retry_gates"`, `"fix and push"` or `null`. `regating` (`{round, of, notBefore}`) is set while the Queen is automatically re-gating after an infra failure; the verdict then stays `pending`. `get_attempt`, `list_attempts` and `wait` views carry `verdictKind` and `regating` too, and `get_item` candidates carry `kind`.
+- **`retry_gates`** asks the Queen to re-run the gates on the attempt's current head after an infra verdict. Idempotent (a gate already running or a re-gate in flight answers `changed:false`). Refused with `CONFLICT` when the head passed, when the last verdict was `findings`, or when nothing was pushed yet; `ITEM_NOT_ACCEPTING` when the item was decided without this head. At most 3 per attempt (`CAP_EXCEEDED`, not retryable) and at least 60 s apart (`CAP_EXCEEDED` with `retryAfterMs`, retryable). Against a Queen that predates it the tool answers `UNAVAILABLE` "retry_gates needs a newer Queen" (not retryable).
+- **`wait`**, `get_item`, `close_entries` and `pick` check the hive first (`NOT_FOUND` for an unknown one). After a re-push `wait` can still return the stale verdict until the Queen marks the attempt PUSHED: confirm with `get_attempt` (`state` PUSHED or `headSha` changed). While an infra re-gate is pending the attempt stays PUSHED with `verdict: pending`, so `until: "verdict"` keeps waiting.
 
 ## 7. Attempt lifecycle
 
@@ -310,25 +313,26 @@ Refusal: `CAP_EXCEEDED` with the cap name, the limit and when it frees up. For a
 
 ## 11. Error handling
 
-Tool errors are MCP results with `isError: true` and a JSON body `{code, message}` (message ≤ 200 chars, safe to show).
+Tool errors are MCP results with `isError: true` and a JSON body `{code, message, retryable, retryAfterMs?, items?}` (message ≤ 200 chars, safe to show). `retryable` is always present: when it is `true`, wait `retryAfterMs` (2 s when absent) and call the same tool again; when `false`, stop and report to your human (or change the input). `retryAfterMs` is set where the cause clears on a known schedule. A `CAP_EXCEEDED` that carries `retryAfterMs` (the hourly push cap, or the `retry_gates` interval) is retryable; the other caps are not. The `retryable` column below is the default per code.
 
-| Code | When |
-|---|---|
-| `NOT_INITIALIZED` | Any tool except `whoami`, `init_agent`, `resume_agent` before identity is bound ("call init_agent first") |
-| `ALREADY_INITIALIZED` | `init_agent` on a bound session |
-| `FORBIDDEN_ROLE` | `create_goal` from a worker |
-| `FORBIDDEN_OWNER` | `resume_agent` or a session request from another owner; an own-only tool (§6) on an attempt that is not the session agent's (`pick` may name any candidate) |
-| `HIVE_NOT_EXTERNAL` | `create_goal` or `start_attempt` on a swarm hive |
-| `NOT_FOUND` | Unknown hive, item, goal, race or attempt |
-| `INVALID_INPUT` | Schema failure (field names only, never values) |
-| `ITEM_NOT_ACCEPTING` | Item not READY-awaiting-submissions and no open race entry window |
-| `GOAL_AMBIGUOUS` | `goalId` with zero or several open children (lists them) |
-| `CAP_EXCEEDED` | §10 |
-| `BASE_PENDING` | Another first attempt is still creating the item's base. Retryable. The MCP Worker polls `attemptIntent` every 2 s for up to 30 s before returning it |
-| `BASE_MOVED` | Fallback only (P5 failed): hive main moved past the item's `base_sha`, so no new attempt can share the base; the race closes entries early |
-| `ARTIFACTS_UNAVAILABLE` | Base fork, attempt fork, readiness or token mint failed after retries; includes `cf-ray` when Artifacts returned one. The attempt is ABORTED and its fork deleted |
-| `ATTEMPT_EXPIRED` | `refresh_attempt` / `end_attempt` / `pick` on a terminal attempt |
-| `CONFLICT` | Queen 409s passed through (`pick` outside PICKING, `close_entries` already closed) |
+| Code | Retryable | When |
+|---|---|---|
+| `NOT_INITIALIZED` | no | Any tool except `whoami`, `init_agent`, `resume_agent` before identity is bound ("call init_agent first") |
+| `ALREADY_INITIALIZED` | no | `init_agent` on a bound session |
+| `FORBIDDEN_ROLE` | no | `create_goal` from a worker |
+| `FORBIDDEN_OWNER` | no | `resume_agent` or a session request from another owner; an own-only tool (§6) on an attempt that is not the session agent's (`pick` may name any candidate) |
+| `HIVE_NOT_EXTERNAL` | no | `create_goal` or `start_attempt` on a swarm hive |
+| `NOT_FOUND` | no | Unknown hive, item, goal, race or attempt |
+| `INVALID_INPUT` | no | Schema failure (field names only, never values) |
+| `ITEM_NOT_ACCEPTING` | no | Item not READY-awaiting-submissions and no open race entry window |
+| `GOAL_AMBIGUOUS` | no | `goalId` with zero or several open children (lists them) |
+| `CAP_EXCEEDED` | only with `retryAfterMs` | §10 |
+| `BASE_PENDING` | yes | Another first attempt is still creating the item's base. Retryable. The MCP Worker polls `attemptIntent` every 2 s for up to 30 s before returning it. After the poll it carries `retryAfterMs` 2 s |
+| `BASE_MOVED` | yes | Fallback only (P5 failed): hive main moved past the item's `base_sha`, so no new attempt can share the base; the race closes entries early |
+| `ARTIFACTS_UNAVAILABLE` | yes (`retryAfterMs` 5 s) | Base fork, attempt fork, readiness or token mint failed after retries; includes `cf-ray` when Artifacts returned one. The attempt is ABORTED and its fork deleted |
+| `ATTEMPT_EXPIRED` | no | `refresh_attempt`, `retry_gates` or `pick` on a terminal attempt. **Not `end_attempt`**: ending an attempt that is already terminal is an idempotent success (`{state, cleanup}`, no change) |
+| `CONFLICT` | no | Queen 409s passed through (`pick` outside PICKING, `close_entries` already closed); `retry_gates` on a head that passed, that has no push yet, or whose last verdict was `findings` |
+| `UNAVAILABLE` | yes (`retryAfterMs` 2 s) | A transient or unrecognised Queen/DO error (a deploy, an overload). Never reported as `CONFLICT`. Exception: `retry_gates` against a Queen without the RPC is `UNAVAILABLE` with `retryable:false` |
 
 Artifacts 503 handling reuses the existing code, for both the base fork and the attempt fork: `forkTrain` (fork with timeout, `get()` backoff on `FORK_IN_PROGRESS`, receive-pack readiness probe, up to 3 names `-r2`, `-r3`) and the read retry delays (2 / 4 / 6 s). `start_attempt` may take 5–40 s (first attempt of an item: two forks in sequence, up to ~80 s; a second concurrent caller waits on `BASE_PENDING`); the tool returns only when the fork is pushable or the attempt is aborted.
 
@@ -392,10 +396,10 @@ The template `templates/worker-starter/AGENTS.md` and the plugin skill (`plugins
 1. Connect: `claude mcp add --transport http queenos https://queenos.kaikeru.com/mcp --header "Authorization: Bearer $QUEENOS_TOKEN"` (the human mints the token on the Push code page; never paste it into chat).
 2. `init_agent(name, model, role)`. Keep the `agentId`; after a reconnect, `resume_agent(agentId)`.
 3. Orchestrator: `create_goal`, hand `goalId`/`itemId` to workers.
-4. Worker: `start_attempt({hive, itemId})`, run `cloneCommand` then `configCommand`.
+4. Worker: `start_attempt({hive, itemId})`, run `setupCommand` once (if it fails midway, delete the folder and run it again).
 5. Commit, `git push origin main`.
-6. `wait({attemptId, until:"verdict"})` in a loop until `changed:true`; `get_verdict` on REJECTED.
-7. Rework: commit, push `main` again (`refresh_attempt` first if the token is near expiry).
+6. `wait({attemptId, until:"verdict"})` in a loop until `changed:true`; `get_verdict` on REJECTED: `kind: "findings"` means fix and push, `kind: "infra"` means `retry_gates` (no empty commit).
+7. Rework: commit, push `main` again (`refresh_attempt` first if the token is near expiry, then run its `configCommand`).
 8. On a terminal state or when done: `end_attempt`, then `rm -rf <dir>`. Add `.queenos/` to the global gitignore.
 
 These docs, `docs/agent-protocol.md` (new "MCP path" section) and the README must be updated in the docs task (§16).
@@ -430,3 +434,15 @@ The user's rule holds: **one task at a time**; finish (verify, full gate, commit
 | 8 | Deploy (USER): `queen`, `queenos-gatekeepers`, `queenos-mcp`, `queenos-edge`, in that order; then the Access Bypass app for `/mcp` | wrangler | User |
 
 Deploy order reason: the Queen must understand `attemptPushed` before gatekeepers routes to it; `queenos-mcp` must exist before the edge binds it; the Bypass app last, so `/mcp` is never open before the edge enforces tokens.
+
+## Amendments (Oct 13, fix wave)
+
+Found in the first live runs (a two-agent "you pick" race, a four-goal train test, a Claude Code client check) and in the final whole-branch review. Code and `packages/queen-types` are the source of truth; this spec follows them.
+
+- **Infra failures are not rejections.** A gate that could not run (the reviewer LLM returned empty output three times) used to end as REJECTED and abandon the race, with a note that claimed the Queen re-gates. Now: the Queen v18 re-gates the same head on its own, up to 3 times with a 15-180 s backoff and no re-deploy (`GateCommand.notBefore`, honoured by the gatekeeper with a durable `step.sleep`), on a budget separate from preview-deploy retries. When it is spent the verdict is `kind: "infra"` with an honest note ("not a verdict on your change"), and the agent calls the new `retry_gates` tool instead of pushing an empty commit. The reviewer itself got 8000 output tokens and 3 tries (2 s / 4 s backoff) for empty answers.
+- **Verdict `kind`** (`findings` | `infra`) on `get_verdict`, the attempt views and `get_item` candidates; `regating` shows an automatic re-gate in flight.
+- **Errors carry `retryable` / `retryAfterMs`**; new `UNAVAILABLE` code; unknown Queen errors no longer read as `CONFLICT` (§11).
+- **`end_attempt` is idempotent** on a terminal attempt (live finding: ending a LANDED attempt returned `ATTEMPT_EXPIRED`).
+- **One `setupCommand`**, no separate `token`, no `cloneCommand` (the token showed up twice in the transcript); `refresh_attempt` returns `{expiresAt, configCommand}`. Commands single-quote every argument.
+- **Smaller:** `start_attempt` keeps a base the Queen already pinned when the pin RPC throws after committing; an unknown hive is `NOT_FOUND` before a Queen DO is opened; open attempt refs are never pruned from the identity; a wrong-owner request on an existing session answers 403 JSON; `BASE_PENDING` (not `BASE_MOVED`) while a base is being created; new hives may not end in `-att-<12 hex>` or `-base-<12 hex>` (their pushes would be misrouted); the race panel tells you when the pick buttons appear; the template's feature-registry header says the file is meant to be edited in its exact shape.
+- **Still open:** the 2 h token re-check (§13.1 P4) has not been run.

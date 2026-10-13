@@ -1,6 +1,6 @@
 # QueenOS: session handoff
 
-Last updated **2026-10-12** (Claude Code coordinator session). Read this, then `CLAUDE.md`, `README.md`, `docs/human-push-design.md` (rev 2; §13 is the plan) and `docs/agent-protocol.md`, before doing anything. `docs/v2-design.md` (§1 principles, §10 decisions) is the older swarm design.
+Last updated **2026-10-13** (Claude Code coordinator session). Read this, then `CLAUDE.md`, `README.md`, `docs/human-push-design.md` (rev 2; §13 is the plan) and `docs/agent-protocol.md`, before doing anything. `docs/v2-design.md` (§1 principles, §10 decisions) is the older swarm design.
 
 ## 1. Read first: direction, memory, rules
 
@@ -88,6 +88,13 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 ## 3. Proven live (queenos.kaikeru.com, hive `demo`)
 
+**Oct 13: the MCP path, live (before the fix wave below was deployed):**
+1. **Two-agent "you pick" haiku race on `demo`:** both agents started from the shared race base, both passed, the human picked w1 (sonnet), it shipped.
+2. **4-goal train test, 2 workers holding 2 attempts each:** moon, bmi and countdown landed; morse hit the infra-reject bug (the reviewer LLM returned empty output, so the attempt went REJECTED and the race ABANDONED with a note that said the Queen re-gates), then landed after a re-push (an empty commit).
+3. **P3 Claude Code client check: PASS.** **P4 (2 h token re-check, spec §13.1) is still outstanding.**
+4. The infra bug, the misleading verdict and the other live findings are fixed in the fix wave (Queen v18 gate-infra re-gates with `notBefore`, `retry_gates`, verdict `kind`, `retryable` errors, idempotent `end_attempt`, one `setupCommand`, reviewer hardening). See the spec's "Amendments (Oct 13, fix wave)". Not yet deployed or re-tested live.
+5. Folder-trust note: Herdr-started Claude workers in a new directory hit Claude Code's trust prompt. The user trusted `~/queen-race`; whether trusting the parent folder covers new subdirectories is untested.
+
 **Oct 7:**
 1. **12-item "final proof" swarm:** all 12 shipped autonomously in about 14 min, infra noise absorbed.
 2. **4-item infra-check swarm** after the infra deploy: all landed. It exposed the createBatch bug (fixed 34ac6aa, deployed 15:24).
@@ -99,14 +106,15 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 **Last production deploys (UTC):** Oct 12: queenos-git 14:13 (steps b, d and efcccea now live). Oct 9: queen 20:41 and edge 20:42 (after eab6a7b). Oct 8: queen 18:12 and edge 18:14 (T9a/T9d), gatekeepers 16:33 (T4), **queenos-git 16:33 (T2n)**, edge 17:01 (T7 dashboard). Oct 7: queen 21:17, herald 21:18. provisioner/drones Oct 7 14:49-14:51.
 
-**Pending (user runs this): the MCP deploy, in this order** (same env setup as below):
+**Pending (user runs this): the MCP fix-wave deploy, in this order** (same env setup as below):
 ```
 ./scripts/deploy.sh --only queen
 ./scripts/deploy.sh --only gatekeepers --force
 (cd apps/mcp && pnpm exec wrangler deploy)
 ./scripts/deploy.sh --only edge
+./scripts/deploy.sh --only provisioner
 ```
-Then create the Access Bypass app for `queenos.kaikeru.com/mcp` (the edge checks the Bearer `qgt_` token itself), then the live check (spec §13.1; P3 Claude Code client sub-check and P4 2 h token re-check are outstanding). `queenos-mcp` is NOT in `deploy.sh`; deploy it before the edge (the edge's `MCP` binding needs it). The provisioner redeploy below is also still pending (its templates now carry the "Through MCP" section too).
+1. `queen` ships schema **v18** (gate-infra rounds, `attemptRegate`, verdict kinds). 2. `gatekeepers` honours `GateCommand.notBefore` and the hardened reviewer (an old Queen never sends `notBefore`, so either order is safe). 3. `queenos-mcp` is NOT in `deploy.sh` (17 tools; `retry_gates` degrades to `UNAVAILABLE` on an old Queen; deploy it before the edge, whose `MCP` binding needs it). 4. `edge` also ships the dashboard (pick hint, short attempt chip). 5. `provisioner` ships the regenerated templates (new registry header and AGENTS.md for new hives). The **Access Bypass for `/mcp` is DONE** (Access app "QueenOS MCP (edge checks tokens)").
 
 **Pending (user runs this): the provisioner, for step (e)** (new hives get `AGENTS.md`). Same env setup as before (keep the export line):
 ```
@@ -163,7 +171,7 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 Build order (Opus for the planner part, Sonnet for UI/template): (a) **DONE Oct 9 (efcccea, see above)**: per-hive `executors: "external"` mode; code + sim stay as the fallback recording; (d) **DONE Oct 9 (step (d), see item 1)**; (b) **DONE Oct 9 (step (b), see item 1)**: agent identity on git tokens (`agent:<name>`, declared model) shown in the origin badge; (e) DONE Oct 12; (b3) and (f) skipped unless time remains; (b2) **QueenOS agent API keys (deferred: bigger, needs a user-configured Access Bypass path)**: non-human principals, minted by a human in the dashboard (the Push code page grows an "Agent keys" section), hive-scoped, shown once, stored hashed (extend the edge `HiveRegistry` `git_tokens` table with kind + scopes, or add a sibling table), revocable, with scopes like `goals:create`, `inbox:submit`, `worker:register`, `races:read`; an agent can never mint keys. Optional per-key rate/race caps so a runaway agent can't burn credits. Edge: new `/api/agent/*` (and reuse `/git/*`) routes authenticated by the key and forwarded with `x-queen-user: agent:<name>`; this needs another Access Bypass path, which the USER configures. A key may register itself as a worker (name + claimed model) and create goals/inboxes; all of it is audited in the event log and shown via the origin badge. (b3) **Notes/trailers for the inbox target**: the item is the inbox; correlation today is branch `item/<id>` or commit trailer `Queen-Item` (docs/agent-protocol.md), and Queen's synthesized notes already carry `Queen-Item/Train/Trace/Model`. Add: `Queen-Goal: <goalId|slug>` commit trailer so a registered worker can push to a goal without knowing the item id (proxy resolves it); agents also set `Queen-Model` (claimed) next to `Queen-Origin`; proxy refuses a push whose branch item and `Queen-Item` trailer disagree (verify what it does today); agents never write verdict/review notes (synthesized, trusted), an optional untrusted `refs/notes/agent` self-report is shown as such. Update `docs/agent-protocol.md`, the plugin skill and the template `AGENTS.md`. (c) route that files an item/race without the Oracle (`FileWorkItem` already has bestOf/judge; mostly covered by (a): external goals file one inbox child and the dashboard composer files an item); (d) dynamic race entry so pushes by distinct agents to a RACING item become candidates (design 2.5, `entryClosesAt`; DONE Oct 9, 35d851c); (e) **DONE Oct 12 (927c875)**: hive template with AGENTS.md + skills; (f) SSE/long-poll "picked or landed" endpoint for `queen-wait.sh`; (g) rehearse with 3 real Claude Code sessions. Target before the Oct 12 recording cutoff, else cut.
 **Dogfooding QueenOS on itself** (post Oct 14): needs an external gate (verdict webhook, "bring your CI") because gatekeepers can't run pnpm/turbo; a release-off hive mode (job ends at landed on main); a history import path (the proxy refuses main); a GitHub mirror; a separate hive on the prod Queen so a bad Queen deploy can't strand the train.
 
-1. **Next: live MCP probe** (after the §4 deploys): two Claude Code sessions race on hive `demo` (external), the human picks. Replaces the Herdr 3-session rehearsal.
+1. **Next: retest the MCP path live** (after the §4 deploys): force an infra failure if feasible (for example make the reviewer unavailable for one gate), else just rerun a race on `demo`, and check the new behaviour: automatic re-gate, `kind: "infra"` plus `retry_gates`, `retryable` errors, `setupCommand`. Also run the P4 2 h token re-check (spec §13.1). Then write a short spec for **"reject all with reason" in you-pick races** (the human can say none of the candidates is acceptable and give the reason back to the agents). Ask the user before starting.
 
    **Done Oct 9: step (b) agent identity on git tokens** (eab6a7b, pushed, LIVE; Queen 751 (+1 skipped), git 101, edge 85, queen-types 126, dashboard 208; full gate 46/46):
    - **Mint:** `POST /api/git-tokens` takes `agent: {name, model?}`; the Push code page has name and model fields. The edge registry `git_tokens` gains `agent_name`, `agent_model`.
