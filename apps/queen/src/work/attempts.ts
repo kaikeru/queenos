@@ -1,8 +1,8 @@
 /**
  * MCP attempt rules (docs/superpowers/specs/2026-10-12-queenos-mcp-design.md §7, §8.3, §10). Pure: no SQL, no clock.
  */
-import { ATTEMPT_TOKEN_TTL_S, type AttemptState, type AttemptVerdict, type RaceState } from "@queenos/queen-types";
-import type { TrainRecord } from "../train/planner";
+import { ATTEMPT_TOKEN_TTL_S, isInfraStopped, type AttemptState, type AttemptVerdict, type AttemptVerdictKind, type AttemptView, type RaceState } from "@queenos/queen-types";
+import { MAX_GATE_INFRA_ROUNDS, gateOutstanding, type TrainRecord } from "../train/planner";
 
 export const OPEN_ATTEMPT_STATES: readonly AttemptState[] = ["INTENT", "READY", "PUSHED", "PASSED", "REJECTED", "WON"];
 export const OPEN_ATTEMPTS_SQL = OPEN_ATTEMPT_STATES.map((s) => `'${s}'`).join(", ");
@@ -44,17 +44,26 @@ export interface CapInput {
   ownerOpenItems: ReadonlySet<string>;
   /** The owner's attempt starts plus applied / pending pushes in the last hour. */
   ownerStartsLastHour: number;
+  /** When the oldest of those counted starts / pushes happened (null: none); with `now`, when the hourly cap frees up. */
+  oldestCountedAt?: number | null;
+  now?: number;
   maxPerAgent: number;
   maxOpenPerContributor: number;
   maxPushesPerHour: number;
 }
 
-export function checkAttemptCaps(c: CapInput): { ok: true } | { ok: false; message: string } {
+const HOUR_MS = 3_600_000;
+
+/** `retryAfterMs`: only the hourly cap frees up at a known time (its oldest counted start ages out of the hour). */
+export function checkAttemptCaps(c: CapInput): { ok: true } | { ok: false; message: string; retryAfterMs?: number } {
   if (c.agentOpen >= c.maxPerAgent) return { ok: false, message: `open attempts per agent: ${c.maxPerAgent} reached; end_attempt one or wait for one to resolve` };
   if (!c.ownerOpenItems.has(c.itemId) && c.ownerOpenItems.size >= c.maxOpenPerContributor) {
     return { ok: false, message: `maxInboxOpenPerContributor ${c.maxOpenPerContributor} reached; frees up when one of your items resolves` };
   }
-  if (c.ownerStartsLastHour >= c.maxPushesPerHour) return { ok: false, message: `maxInboxPushesPerHour ${c.maxPushesPerHour} reached; frees up within the hour` };
+  if (c.ownerStartsLastHour >= c.maxPushesPerHour) {
+    const at = c.oldestCountedAt !== null && c.oldestCountedAt !== undefined && c.now !== undefined ? Math.min(HOUR_MS, Math.max(0, c.oldestCountedAt + HOUR_MS - c.now)) : undefined;
+    return { ok: false, message: `maxInboxPushesPerHour ${c.maxPushesPerHour} reached; frees up within the hour`, ...(at !== undefined ? { retryAfterMs: at } : {}) };
+  }
   return { ok: true };
 }
 
@@ -66,6 +75,21 @@ export function attemptVerdict(t: Pick<TrainRecord, "phase" | "raceOutcome"> | n
   if (t.phase === "PASSED" || t.phase === "LANDING" || t.phase === "MERGED") return "passed";
   if (t.phase === "EJECTED") return "rejected";
   return "pending";
+}
+
+/**
+ * Why a rejected train was rejected: `infra` when it stopped on infrastructure (its summary carries
+ * INFRA_SUMMARY_PREFIX: the gate could not run after its re-gates), else `findings`. Null unless rejected.
+ */
+export function attemptVerdictKind(t: Pick<TrainRecord, "phase" | "raceOutcome" | "summary"> | null): AttemptVerdictKind | null {
+  if (attemptVerdict(t) !== "rejected") return null;
+  return isInfraStopped({ summary: t!.summary }) ? "infra" : "findings";
+}
+
+/** An automatic gate-infra re-gate in flight on the train (its verdict still pending), else null. */
+export function attemptRegating(t: TrainRecord | null): NonNullable<AttemptView["regating"]> | null {
+  if (!t || !(t.gateInfraRounds ?? 0) || !gateOutstanding(t) || attemptVerdict(t) !== "pending") return null;
+  return { round: t.gateInfraRounds!, of: MAX_GATE_INFRA_ROUNDS, notBefore: t.gateNotBefore ?? null };
 }
 
 /** `bytes` random bytes as lowercase hex (`crypto.getRandomValues`). */

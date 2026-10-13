@@ -130,6 +130,29 @@ describe("notes projection", () => {
     expect(rejected(SIB).findings!.map((f) => f.path)).toEqual(["src/sibling.js", "acceptance"]);
   });
 
+  it("infra: re-gating rounds say so; INFRA_EXHAUSTED (or an infra-stopped EJECTED row without one) is an INFRA verdict, never REJECTED", () => {
+    const infraSummary = "Infrastructure: gate could not run after 4 tries: gate could not run: Reviewer unavailable";
+    const regate = ev("gate.verdict", { trainId: "t1", summary: "gate could not run (infrastructure; re-gate 1/3 in 20 s): empty", data: { outcome: "INFRA", applied: "applied", gateInfraRound: 1, of: 3 } });
+    const ejected = ev("train.phase", { trainId: "t1", data: { to: "EJECTED", reason: `failed in race: ${infraSummary}` } });
+    const exhausted = ev("gate.verdict", { trainId: "t1", summary: "gate could not run after 4 tries (infrastructure); not a verdict on the change: empty", data: { outcome: "INFRA_EXHAUSTED", applied: "applied", tries: 4 } });
+    const pushed = train({ phase: "EJECTED", landedSha: null, raceOutcome: "FAILED", summary: infraSummary });
+    const verdicts = (events: QueenEvent[], t: NotesTrain = pushed) => parseNotes(projectNotes({ trains: [t], events, releases: [] }, "refs/notes/verdict")[0]!.text);
+
+    const full = verdicts([regate, ejected, exhausted]);
+    expect(full.map((e) => e.verdict)).toEqual(["INFRA", "INFRA"]);
+    expect(currentVerdict(full)).toBe("INFRA");
+    expect(full[1]!.summary).toBe("INFRA: the gate could not run after 4 tries; this is not a verdict on your change. Call retry_gates (MCP) or push again.");
+    // An older row: the EJECTED event alone (no INFRA_EXHAUSTED) still reads as infra.
+    const old = verdicts([regate, ejected]);
+    expect(old.map((e) => e.verdict)).toEqual(["INFRA", "INFRA"]);
+    expect(old[1]!.summary).toBe("INFRA: the gate could not run; this is not a verdict on your change. Call retry_gates (MCP) or push again.");
+    // A drone train: no MCP advice; a stale INFRA_EXHAUSTED (not applied) is no verdict.
+    const drone = verdicts([exhausted], train({ phase: "EJECTED", landedSha: null, origin: null, ref: null, summary: null }));
+    expect(drone.find((e) => e.verdict === "INFRA")!.summary).toBe("INFRA: the gate could not run after 4 tries; this is not a verdict on the change.");
+    const stale = projectNotes({ trains: [train({ phase: "EJECTED", landedSha: null, summary: null })], events: [ev("gate.verdict", { trainId: "t1", summary: "x", data: { outcome: "INFRA_EXHAUSTED", applied: "ignored:stale", tries: 4 } })], releases: [] }, "refs/notes/verdict");
+    expect(stale.flatMap((n) => parseNotes(n.text)).filter((e) => e.verdict)).toEqual([]);
+  });
+
   it("superseded, lost races and conflicts become verdicts; a seeded REWORK replies to the contributor's head", () => {
     const events = [
       ev("train.phase", { trainId: "t1", data: { to: "EJECTED", reason: "superseded by push ccccccc" } }),

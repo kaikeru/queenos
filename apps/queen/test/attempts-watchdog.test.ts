@@ -76,7 +76,7 @@ describe("base cleanup", () => {
     const own = { hive: ns, attemptId: r.attemptId, owner: OWNER, agentId: r.agent.agentId };
     await stub.attemptEnd(own);
     expect(deletesOf((await look(ns)).provisions, baseRepo)).toHaveLength(1);
-    expect(await stub.attemptEnd(own)).toMatchObject({ ok: false, code: "ATTEMPT_EXPIRED" });
+    expect(await stub.attemptEnd(own)).toMatchObject({ ok: true, changed: false, attempt: { state: "ABANDONED" } });
     expect(deletesOf((await look(ns)).provisions, baseRepo)).toHaveLength(1);
   });
 

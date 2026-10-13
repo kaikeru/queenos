@@ -546,6 +546,16 @@ const MIGRATIONS: readonly Migration[] = [
   CREATE INDEX repo_deletes_key ON repo_deletes(key);
   CREATE INDEX repo_deletes_open ON repo_deletes(state, issued_at);
   `,
+  `
+  -- v18: gate-infra re-gates (MCP fix wave). A contributed train whose gate could not run is re-gated on the same
+  -- head with its own budget (gate_infra_rounds, cap MAX_GATE_INFRA_ROUNDS), not re-deployed; the re-gate's
+  -- GateCommand.notBefore (epoch ms) is stored so a reconcile re-emit sends the same one. NULL: start at once.
+  ALTER TABLE merge_trains ADD COLUMN gate_infra_rounds INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE merge_trains ADD COLUMN gate_not_before INTEGER;
+  -- attemptRegate (MCP retry_gates): manual re-gates of an attempt's head and when the last one was asked for.
+  ALTER TABLE attempts ADD COLUMN regates INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE attempts ADD COLUMN last_regate_at INTEGER;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -680,6 +690,9 @@ export function rowToTrain(r: Row): TrainRecord {
     ...withValue("gateIssuedAt", num(r.gate_issued_at)),
     // v17: the MCP attempt whose fork this train is (absent = none).
     ...withValue("attemptId", str(r.attempt_id ?? null)),
+    // v18: automatic gate-infra re-gates (absent = 0) and the current re-gate's notBefore (absent = none).
+    ...(Number(r.gate_infra_rounds ?? 0) > 0 ? { gateInfraRounds: Number(r.gate_infra_rounds) } : {}),
+    ...withValue("gateNotBefore", num(r.gate_not_before)),
   };
 }
 
@@ -868,9 +881,9 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        model, model_reason, model_choice, model_choice_attempt, model_outcome, model_probe, memories,
        trace_id, race_id, candidate, race_outcome, gate_score, credits,
        lane, members, car_id, passed_seq, conflict, changed_paths, wait_for_car_seq, bisect_of, verified, passed_at, origin_json,
-       gate_command_id, gate_issued_at, attempt_id)
+       gate_command_id, gate_issued_at, attempt_id, gate_infra_rounds, gate_not_before)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(train_id) DO UPDATE SET base_sha = excluded.base_sha, artifact_repo = excluded.artifact_repo,
        status = excluded.status, phase = excluded.phase,
        fork_state = excluded.fork_state, fork_source = excluded.fork_source, head_sha = excluded.head_sha,
@@ -890,7 +903,8 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
        conflict = excluded.conflict, changed_paths = excluded.changed_paths,
        wait_for_car_seq = excluded.wait_for_car_seq, bisect_of = excluded.bisect_of, verified = excluded.verified,
        passed_at = excluded.passed_at, origin_json = excluded.origin_json,
-       gate_command_id = excluded.gate_command_id, gate_issued_at = excluded.gate_issued_at, attempt_id = excluded.attempt_id`,
+       gate_command_id = excluded.gate_command_id, gate_issued_at = excluded.gate_issued_at, attempt_id = excluded.attempt_id,
+       gate_infra_rounds = excluded.gate_infra_rounds, gate_not_before = excluded.gate_not_before`,
     t.trainId,
     t.baseSha,
     JSON.stringify(t.includedPrompts),
@@ -947,6 +961,8 @@ export function upsertTrain(sql: SqlStorage, t: TrainRecord): void {
     t.gateCommandId ?? null,
     t.gateIssuedAt ?? null,
     t.attemptId ?? null,
+    t.gateInfraRounds ?? 0,
+    t.gateNotBefore ?? null,
   );
 }
 
@@ -1758,15 +1774,20 @@ export function rowToAttempt(r: Row): Attempt {
     headSha: str(r.head_sha ?? null),
     createdAt: Number(r.created_at),
     expiresAt: Number(r.expires_at),
+    // v18: manual re-gates (absent = 0 / never, so pre-v18 rows compare equal).
+    ...(Number(r.regates ?? 0) > 0 ? { regates: Number(r.regates) } : {}),
+    ...withValue("lastRegateAt", num(r.last_regate_at)),
   });
 }
 
 export function upsertAttempt(sql: SqlStorage, a: Attempt): void {
   sql.exec(
-    `INSERT INTO attempts (attempt_id, hive, item_id, race_id, train_id, repo, base_sha, agent_id, agent_name, model, role, owner, state, head_sha, created_at, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO attempts (attempt_id, hive, item_id, race_id, train_id, repo, base_sha, agent_id, agent_name, model, role, owner, state, head_sha, created_at, expires_at,
+       regates, last_regate_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(attempt_id) DO UPDATE SET item_id = excluded.item_id, race_id = excluded.race_id, train_id = excluded.train_id,
-       repo = excluded.repo, base_sha = excluded.base_sha, state = excluded.state, head_sha = excluded.head_sha, expires_at = excluded.expires_at`,
+       repo = excluded.repo, base_sha = excluded.base_sha, state = excluded.state, head_sha = excluded.head_sha, expires_at = excluded.expires_at,
+       regates = excluded.regates, last_regate_at = excluded.last_regate_at`,
     a.attemptId,
     a.hive,
     a.itemId,
@@ -1783,6 +1804,8 @@ export function upsertAttempt(sql: SqlStorage, a: Attempt): void {
     a.headSha,
     a.createdAt,
     a.expiresAt,
+    a.regates ?? 0,
+    a.lastRegateAt ?? null,
   );
 }
 

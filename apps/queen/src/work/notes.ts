@@ -8,7 +8,8 @@
  * to what `git log --notes=verdict` shows on the rejected commit.
  *
  * Per submission head (a BUILD train's `headSha`, drone or pushed), in ledger order (event seq):
- * - verdict: PASSED / REJECTED by <ROLE> (with its findings) / INFRA from `gate.verdict` events;
+ * - verdict: PASSED / REJECTED by <ROLE> (with its findings) / INFRA (re-gating) / INFRA (the re-gates are spent:
+ *   not a verdict on the change) from `gate.verdict` events, or INFRA from the EJECTED event of an infra-stopped train;
  *   SUPERSEDED, REJECTED (lost race, conflict) from the train's EJECTED event; LANDED main@<sha> from MERGED;
  *   then SHIPPED / ROLLED BACK from its release (milestones with no `Queen-Verdict`: the last verdict stays
  *   LANDED, so clients that wait for LANDED stop there). A REWORK seeded from a contributor's head carries
@@ -23,6 +24,7 @@ import {
   NOTES_REF_VERDICT,
   NoteEntrySchema,
   NoteFindingSchema,
+  isInfraStopped,
   renderNotes,
   type NoteEntryInput,
   type NoteFinding,
@@ -53,6 +55,8 @@ export interface NotesTrain {
   origin?: SubmissionOrigin | null;
   /** The branch a pushed submission came from (`refs/heads/...`), when known. */
   ref?: string | null;
+  /** The train's summary (an infra-stopped train's starts with INFRA_SUMMARY_PREFIX). */
+  summary?: string | null;
 }
 
 export interface NotesRelease {
@@ -165,6 +169,20 @@ function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<stri
   const next = contributed(t)
     ? `Push a fix to ${branch ?? "your branch"}, or hand off: a "Queen: rework" trailer, or "Let the swarm fix it" on item ${t.promptId}.`
     : "The swarm reworks it.";
+  /** The re-gates are spent: an infra verdict, never a rejection. */
+  const infraExhausted = (seq: number, tries: number | null): Dated => ({
+    seq,
+    entry: {
+      ...common,
+      kind: "verdict",
+      verdict: "INFRA",
+      summary: oneLine(
+        `INFRA: the gate could not run${tries ? ` after ${tries} tries` : ""}; this is not a verdict on ${contributed(t) ? "your" : "the"} change.${contributed(t) ? " Call retry_gates (MCP) or push again." : ""}`,
+        300,
+      ),
+    },
+  });
+  const exhaustedEvent = mine.some((e) => e.type === "gate.verdict" && e.data?.outcome === "INFRA_EXHAUSTED" && (e.data?.applied === undefined || e.data?.applied === "applied"));
 
   for (const e of mine) {
     if (e.type === "gate.verdict") {
@@ -175,6 +193,8 @@ function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<stri
         out[NOTES_REF_VERDICT].push({ seq: e.seq, entry: { ...common, kind: "verdict", verdict: "PASSED", summary: oneLine(`PASSED: ${text || "every gate passed"}`, 300) } });
       } else if (data.outcome === "INFRA") {
         out[NOTES_REF_VERDICT].push({ seq: e.seq, entry: { ...common, kind: "verdict", verdict: "INFRA", summary: oneLine(`INFRA: the gate could not run; the Queen re-gates it (${text})`, 300) } });
+      } else if (data.outcome === "INFRA_EXHAUSTED") {
+        out[NOTES_REF_VERDICT].push(infraExhausted(e.seq, typeof data.tries === "number" ? data.tries : null));
       } else if (data.outcome === "FAILED") {
         const audits = gateAudits(t, input.events, Math.max(start, lastVerdictBefore(mine, e.seq)), e.seq);
         const roles = [...new Set(audits.map((a) => a.droneRole ?? "GATE"))];
@@ -200,6 +220,9 @@ function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<stri
         const reason = String(e.data?.reason ?? t.reason ?? "");
         if (/^superseded/i.test(reason)) {
           out[NOTES_REF_VERDICT].push({ seq: e.seq, entry: { ...common, kind: "verdict", verdict: "SUPERSEDED", summary: oneLine(`SUPERSEDED: ${reason}`, 300) } });
+        } else if (!exhaustedEvent && isInfraStopped({ summary: t.summary ?? null })) {
+          // An infra-stopped train from before INFRA_EXHAUSTED events (or whose event was pruned).
+          out[NOTES_REF_VERDICT].push(infraExhausted(e.seq, null));
         } else if (/^lost race/i.test(reason)) {
           out[NOTES_REF_VERDICT].push({ seq: e.seq, entry: { ...common, kind: "verdict", verdict: "REJECTED", summary: oneLine(`REJECTED (lost the race): ${reason}`, 300) } });
         } else if (t.conflict) {

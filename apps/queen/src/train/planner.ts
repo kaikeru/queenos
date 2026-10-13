@@ -88,7 +88,7 @@ import type {
   TrainState,
   WorkStatus,
 } from "@queenos/queen-types";
-import { MAX_GATE_COMMAND_ID, MAX_RECALL_QUERY, RACE_GRACE_MS, memoryToRagSnippet, spanIdFor, traceIdFromUuid, traceparent } from "@queenos/queen-types";
+import { INFRA_SUMMARY_PREFIX, MAX_GATE_COMMAND_ID, MAX_RECALL_QUERY, RACE_GRACE_MS, memoryToRagSnippet, spanIdFor, traceIdFromUuid, traceparent } from "@queenos/queen-types";
 import { droneInstanceId } from "../drones";
 import {
   DEFAULT_POLICY,
@@ -186,6 +186,38 @@ export function infraRetryDelayMs(t: Pick<TrainRecord, "trainId" | "deployComman
   return Math.round(Math.min(INFRA_RETRY_MAX_MS, INFRA_RETRY_BASE_MS * 2 ** (n - 1)) * jitter(`${t.trainId}:${n}`));
 }
 
+/**
+ * Automatic gate-infra re-gates of a CONTRIBUTED train (MCP fix wave): when its gate could not run (`cause: "infra"`
+ * in TESTING on a live preview), the same head is re-gated, without a re-deploy, up to this many times after the
+ * first gate, with its own budget (`gateInfraRounds`, not the preview deploy's). Past it: gateInfraExhausted (an infra
+ * verdict, never a plain rejection). Drone trains keep the re-deploy path (infraRetry).
+ */
+export const MAX_GATE_INFRA_ROUNDS = 3;
+
+/** Backoff before gate-infra re-gate k (1-based): 30 s, 60 s, 120 s … (cap 5 min), ±50% jitter per train and round. */
+export function gateInfraBackoffMs(t: Pick<TrainRecord, "trainId">, k: number): number {
+  return Math.round(Math.min(INFRA_RETRY_MAX_MS, INFRA_RETRY_BASE_MS * 2 ** (Math.max(1, k) - 1)) * jitter(`${t.trainId}:g:${k}`));
+}
+
+/**
+ * n of the next gate ROUND after gate id `id`: the next odd n (a round's first gate is odd, its one watchdog
+ * re-dispatch the following even n; the watchdog relies on that parity). 1 when none was issued.
+ */
+export function nextGateRound(id: string | null | undefined): number {
+  const n = gateAttempt(id);
+  return n % 2 === 1 ? n + 2 : n + 1;
+}
+
+/** n of the gate a (re-)deployed preview starts: round d of TESTING, but never an id a re-gate already used. */
+function deployGateRound(t: TrainRecord): number {
+  return Math.max(2 * Math.max(1, commandAttempt(t.deployCommandId)) - 1, nextGateRound(t.gateCommandId));
+}
+
+/** The gate watchdog's clock: the gate's issue time, or its notBefore when that is later (an infra re-gate's backoff). */
+export function gateClock(t: TrainRecord, now: number): number {
+  return Math.max(t.gateIssuedAt ?? now, t.gateNotBefore ?? 0);
+}
+
 /** A train parked for an infra retry: DEPLOYING with its last deploy FAILED (the clock is the failure time). */
 function awaitingInfraRetry(t: TrainRecord): boolean {
   return isActive(t) && t.phase === "DEPLOYING" && t.deployState === "FAILED";
@@ -241,6 +273,10 @@ export interface TrainRecord extends MergeTrain {
    */
   gateCommandId?: string | null;
   gateIssuedAt?: number | null;
+  /** v18: automatic gate-infra re-gates of this train so far (MAX_GATE_INFRA_ROUNDS; absent = 0). */
+  gateInfraRounds?: number;
+  /** v18: the current gate's GateCommand.notBefore (epoch ms; an infra re-gate's backoff), null / absent = at once. */
+  gateNotBefore?: number | null;
   /** Attempt number of the current phase's drone (instance id suffix when > 1). */
   droneAttempt: number;
   /** Router's choice, or (after the build) the model that actually built the head. */
@@ -686,7 +722,7 @@ export function watchdogDeadline(trains: readonly TrainRecord[], timeoutMs: numb
     if (forkOverdue(t, trains)) all.push(now + UNDISPATCHED_RETRY_MS);
     if ((keptFork(t) || keptLoser(t)) && t.deleteIssuedAt !== null) all.push(t.deleteIssuedAt);
     // BUILD gates (cars keep their retire watchdog, from the preview deploy: outstandingSince).
-    if (gateOutstanding(t) && !isCar(t)) all.push((t.gateIssuedAt ?? now) + GATE_TIMEOUT_FACTOR * timeoutMs);
+    if (gateOutstanding(t) && !isCar(t)) all.push(gateClock(t, now) + GATE_TIMEOUT_FACTOR * timeoutMs);
     if (ungated(t)) all.push(now + UNDISPATCHED_RETRY_MS);
   }
   for (const r of races) {
@@ -1283,7 +1319,7 @@ export class TrainPlanner {
     }
     this.setTrain(t, { deployState: "LIVE", previewUrl: r.url, phase: "TESTING" });
     this.setDeployment(t, { status: "LIVE", url: r.url, versionId: r.versionId ?? null, commitSha, summary: r.summary ?? null });
-    this.dispatchGate(t, 2 * Math.max(1, commandAttempt(t.deployCommandId)) - 1);
+    this.dispatchGate(t, deployGateRound(t));
     return this.finish("applied");
   }
 
@@ -1372,9 +1408,11 @@ export class TrainPlanner {
     // A pass must come from testing the live preview; a failure (e.g. the
     // builder giving up) is honoured in any phase.
     if (r.passed && t.phase !== "TESTING") return this.finish("ignored:premature");
-    // The gate itself could not run (gatekeepers report in TESTING, without a drone commandId): re-deploy, re-gate.
+    // The gate itself could not run (gatekeepers report in TESTING, without a drone commandId). Contributed code on a
+    // live preview: re-gate the same head (its own budget); anything else: re-deploy, re-gate.
     if (!r.passed && r.cause === "infra" && t.phase === "TESTING" && !r.commandId) {
-      this.infraRetry(t, `gate could not run: ${r.summary}`);
+      if (!isCar(t) && isContributed(t) && t.deployState === "LIVE") this.regateInfra(t, `gate could not run: ${r.summary}`);
+      else this.infraRetry(t, `gate could not run: ${r.summary}`);
       return this.finish("applied");
     }
     if (!r.passed && r.cause === "infra" && !isCar(t)) return this.builderInfraFailure(t, r);
@@ -1515,7 +1553,7 @@ export class TrainPlanner {
         this.emitGate(t);
       } else if (ungated(t)) {
         // In TESTING from before Queen-started gates (v15): its push-event gate may have given up long ago.
-        this.dispatchGate(t, 2 * Math.max(1, commandAttempt(t.deployCommandId)) - 1);
+        this.dispatchGate(t, deployGateRound(t));
       }
     }
     for (const race of [...this.races.values()]) {
@@ -1594,7 +1632,7 @@ export class TrainPlanner {
       } else if (t.phase === "DEPLOYING" && t.deployState === "PENDING" && expired(t.deployIssuedAt)) {
         if (commandAttempt(t.deployCommandId) < MAX_COMMAND_ATTEMPTS) this.deployPreview(t);
         else this.previewFailed(t, late("Herald DEPLOY", t.deployCommandId), t.headSha, null, true);
-      } else if (gateOutstanding(t) && !isCar(t) && now - (t.gateIssuedAt ?? now) >= GATE_TIMEOUT_FACTOR * this.timeoutMs) {
+      } else if (gateOutstanding(t) && !isCar(t) && now - gateClock(t, now) >= GATE_TIMEOUT_FACTOR * this.timeoutMs) {
         const n = gateAttempt(t.gateCommandId);
         const mins = Math.round((GATE_TIMEOUT_FACTOR * this.timeoutMs) / 60_000);
         // Once per TESTING round (odd n: the round's first gate): a fresh gate instance; then the infra path.
@@ -1829,9 +1867,9 @@ export class TrainPlanner {
    * Start the n-th Queen-started gate of the train's head (GateCommand). The gatekeeper's GateTarget names it
    * (`gateId`), so the push-triggered gate and any replaced gate stand down; its report carries `gateId`.
    */
-  private dispatchGate(t: TrainRecord, n: number, why?: string): void {
+  private dispatchGate(t: TrainRecord, n: number, why?: string, notBefore: number | null = null): void {
     if (!t.headSha) return;
-    this.setTrain(t, { gateCommandId: gateCommandId(t.artifactRepo, t.headSha, n) }, false);
+    this.setTrain(t, { gateCommandId: gateCommandId(t.artifactRepo, t.headSha, n), gateNotBefore: notBefore }, false);
     if (why) this.event(t, { type: "command.result", severity: "warn", summary: clip500(`train ${t.trainId}: ${why}`), data: { kind: "gate", outcome: "lost", next: t.gateCommandId } });
     this.emitGate(t);
   }
@@ -1850,6 +1888,7 @@ export class TrainPlanner {
         branch: "main",
         after: t.headSha,
         trace: traceFor(t, t.gateCommandId),
+        ...(t.gateNotBefore ? { notBefore: t.gateNotBefore } : {}),
       },
     });
   }
@@ -1980,6 +2019,40 @@ export class TrainPlanner {
   }
 
   /**
+   * A contributed train's gate could not run: re-gate the same head (no re-deploy) after gateInfraBackoffMs, under the
+   * next gate round's id with GateCommand.notBefore, up to MAX_GATE_INFRA_ROUNDS times; then gateInfraExhausted.
+   */
+  private regateInfra(t: TrainRecord, summary: string): void {
+    const k = (t.gateInfraRounds ?? 0) + 1;
+    if (k > MAX_GATE_INFRA_ROUNDS) {
+      this.gateInfraExhausted(t, summary, k - 1);
+      return;
+    }
+    const delay = gateInfraBackoffMs(t, k);
+    const previous = t.gateCommandId ?? null;
+    this.setTrain(t, { gateInfraRounds: k }, false);
+    this.dispatchGate(t, nextGateRound(previous), undefined, this.ctx.now + delay);
+    this.event(t, {
+      type: "command.result",
+      severity: "warn",
+      summary: clip500(`train ${t.trainId} gate infra: re-gate ${k}/${MAX_GATE_INFRA_ROUNDS} of the same head in ${Math.round(delay / 1000)} s: ${summary}`),
+      data: { kind: "gate", outcome: "infra", previous, next: t.gateCommandId, gateInfraRound: k, of: MAX_GATE_INFRA_ROUNDS, delayMs: delay },
+    });
+  }
+
+  /**
+   * The re-gates are spent: an INFRA verdict, not a rejection. The summary carries INFRA_SUMMARY_PREFIX (the durable
+   * marker, `isInfraStopped`); the train then fails like any candidate (ejected, the race decides or abandons, the item
+   * awaits its contributor). The item is not reopened: the agent decides (`attemptRegate`, or a new push).
+   */
+  private gateInfraExhausted(t: TrainRecord, summary: string, rounds: number): void {
+    const s = clip500(`${INFRA_SUMMARY_PREFIX}gate could not run after ${rounds + 1} tries: ${summary}`);
+    this.setTrain(t, { summary: s, gateNotBefore: null }, false);
+    this.promptSummary(t, s);
+    this.fail(t, s);
+  }
+
+  /**
    * An executor kept failing on infrastructure (infra retries or command attempts spent). A car:
    * the queue's infra path (members return to the pool; 3 in a row → EXECUTOR_LOST on the hive).
    * A race candidate: ejected alone, as any failed candidate. A build: EJECTED and its prompt
@@ -1987,8 +2060,13 @@ export class TrainPlanner {
    */
   private infraExhausted(t: TrainRecord, summary: string): void {
     if (!isActive(t)) return;
-    if (isCar(t) || this.racingRaceOf(t)) {
+    if (isCar(t)) {
       this.fail(t, summary, { carCause: "infra" });
+      return;
+    }
+    if (this.racingRaceOf(t)) {
+      // A race candidate is ejected alone; its summary marks it infra-stopped (never read as a rejection).
+      this.fail(t, summary.startsWith(INFRA_SUMMARY_PREFIX) ? summary : `${INFRA_SUMMARY_PREFIX}${summary}`, { carCause: "infra" });
       return;
     }
     this.eject(t, `failed on infrastructure: ${summary}`);

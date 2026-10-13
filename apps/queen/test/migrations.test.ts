@@ -72,8 +72,16 @@ const columns = (sql: SqlStorage, table: string) =>
   new Set(sql.exec(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((r) => String(r.name)));
 const version = (sql: SqlStorage) => Number(sql.exec("SELECT MAX(version) AS v FROM _migrations").one().v);
 
-/** Undo v17 (a test that rebuilds an older version first). */
+/** Undo v18 (a test that rebuilds an older version first). */
+function dropV18(sql: SqlStorage): void {
+  sql.exec(`ALTER TABLE merge_trains DROP COLUMN gate_infra_rounds; ALTER TABLE merge_trains DROP COLUMN gate_not_before;
+    ALTER TABLE attempts DROP COLUMN regates; ALTER TABLE attempts DROP COLUMN last_regate_at;
+    DELETE FROM _migrations WHERE version = 18;`);
+}
+
+/** Undo v18 and v17 (a test that rebuilds an older version first). */
 function dropV17(sql: SqlStorage): void {
+  dropV18(sql);
   sql.exec(`DROP TABLE attempts; DROP TABLE repo_deletes; DROP INDEX submissions_attempt;
     ALTER TABLE submissions DROP COLUMN attempt_id; ALTER TABLE submissions DROP COLUMN before_sha; ALTER TABLE merge_trains DROP COLUMN attempt_id;
     ALTER TABLE work_items DROP COLUMN base_repo; ALTER TABLE work_items DROP COLUMN base_sha;
@@ -82,15 +90,15 @@ function dropV17(sql: SqlStorage): void {
 }
 
 describe("migrations", () => {
-  it("a fresh DO migrates to v17", async () => {
-    expect(SCHEMA_VERSION).toBe(17);
+  it("a fresh DO migrates to v18", async () => {
+    expect(SCHEMA_VERSION).toBe(18);
     await runInDurableObject(stubFor(newHive()), (q: QueenNode, state) => {
-      expect(version(q.sql)).toBe(17);
+      expect(version(q.sql)).toBe(18);
       const t = tables(q.sql);
       for (const name of ["work_items", "races", "hive_settings", "escalations", "event_log", "metrics_hourly", "path_claims", "inboxes", "submissions", "model_preference", "attempts", "repo_deletes"]) {
         expect(t.has(name), name).toBe(true);
       }
-      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at", "origin_json", "gate_command_id", "gate_issued_at", "attempt_id"]) {
+      for (const c of ["trace_id", "race_id", "candidate", "race_outcome", "gate_score", "credits", "lane", "members", "car_id", "passed_seq", "conflict", "changed_paths", "wait_for_car_seq", "bisect_of", "verified", "passed_at", "origin_json", "gate_command_id", "gate_issued_at", "attempt_id", "gate_infra_rounds", "gate_not_before"]) {
         expect(columns(q.sql, "merge_trains").has(c), c).toBe(true);
       }
       for (const c of ["entry_closes_at", "pick_deadline_at", "recommended_train_id", "recommend_reason", "decided_by", "rejections"]) expect(columns(q.sql, "races").has(c), c).toBe(true);
@@ -105,8 +113,9 @@ describe("migrations", () => {
       // A new hive has no settings row yet (it gets one, autonomous, at its first v2 filing).
       expect(loadHiveSettings(q.sql)).toBeNull();
       // Idempotent: re-running is a no-op.
-      expect(migrate(state.storage)).toBe(17);
-      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(17);
+      for (const c of ["regates", "last_regate_at"]) expect(columns(q.sql, "attempts").has(c), c).toBe(true);
+      expect(migrate(state.storage)).toBe(18);
+      expect(Number(q.sql.exec("SELECT COUNT(*) AS n FROM _migrations").one().n)).toBe(18);
     });
   });
 
@@ -553,7 +562,7 @@ describe("v16: agent identity on submissions", () => {
       sql.exec("ALTER TABLE submissions DROP COLUMN agent; DELETE FROM _migrations WHERE version = 16;");
       expect(columns(sql, "submissions").has("agent")).toBe(false);
       sql.exec("INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, outcome, disposition, created_at) VALUES ('demo-in-kyle', ?, 'refs/heads/x', 'human', 'kyle@example.com', 'applied', 'filed', 1)", A);
-      expect(migrate(state.storage)).toBe(17);
+      expect(migrate(state.storage)).toBe(SCHEMA_VERSION);
       expect(getSubmission(sql, base.repo, A)).toEqual({ ...base, headSha: A, agent: null });
       expect(insertSubmission(sql, { ...base, headSha: B, originKind: "agent", agent: "opus" })).toBe(true);
       expect(getSubmission(sql, base.repo, B)).toMatchObject({ originKind: "agent", originId: "kyle@example.com", agent: "opus" });
@@ -569,7 +578,7 @@ describe("v17: MCP attempts", () => {
       expect(migrate(state.storage, 16)).toBe(16);
       const A = "a".repeat(40);
       sql.exec("INSERT INTO submissions (repo, head_sha, ref, origin_kind, origin_id, outcome, disposition, created_at) VALUES ('demo-in-kyle', ?, 'refs/heads/x', 'human', 'kyle@example.com', 'applied', 'filed', 1)", A);
-      expect(migrate(state.storage)).toBe(17);
+      expect(migrate(state.storage)).toBe(SCHEMA_VERSION);
       expect(tables(sql).has("attempts")).toBe(true);
       expect(tables(sql).has("repo_deletes")).toBe(true);
       for (const c of ["base_repo", "base_sha", "base_pending_at", "entry_window_ms"]) expect(columns(sql, "work_items").has(c), c).toBe(true);
@@ -587,6 +596,43 @@ describe("v17: MCP attempts", () => {
       upsertAttempt(sql, { ...att, state: "READY", baseSha: "b".repeat(40), repo: `${att.repo}-r2` });
       expect(getAttemptRow(sql, att.attemptId)).toMatchObject({ state: "READY", repo: `${att.repo}-r2`, baseSha: "b".repeat(40) });
       expect(attemptsOfItem(sql, "i1").map((a) => a.attemptId)).toEqual([att.attemptId]);
+    });
+  });
+});
+
+describe("v18: gate-infra re-gates and manual re-gates", () => {
+  it("a v17 hive migrates to v18: trains and attempts keep their rows (absent = 0 / none); the new columns round-trip", async () => {
+    const hive = newHive();
+    const stub = stubFor(hive);
+    await stub.submitPrompt({ namespace: hive, promptText: "Add a /health endpoint" });
+    await runInDurableObject(stub, (q: QueenNode, state) => {
+      const sql = q.sql;
+      const att = {
+        attemptId: "att_0123456789ab", hive, itemId: "i1", raceId: null, trainId: "t1", repo: `${hive}-att-0123456789ab`, baseSha: null,
+        agentId: `ag_${"a".repeat(32)}`, agentName: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "kyle@example.com",
+        state: "PUSHED" as const, headSha: null, createdAt: 1, expiresAt: 2,
+      };
+      upsertAttempt(sql, att);
+      dropV18(sql);
+      expect(version(sql)).toBe(17);
+      const before = sql.exec("SELECT * FROM merge_trains ORDER BY train_id").toArray().map(rowToTrain);
+      expect(before.length).toBeGreaterThan(0);
+      expect(migrate(state.storage)).toBe(18);
+      const after = sql.exec("SELECT * FROM merge_trains ORDER BY train_id").toArray().map(rowToTrain);
+      expect(after).toEqual(before);
+      for (const t of after) {
+        expect(t).not.toHaveProperty("gateInfraRounds");
+        expect(t).not.toHaveProperty("gateNotBefore");
+      }
+      expect(getAttemptRow(sql, att.attemptId)).toEqual(att);
+
+      const t = after[0]!;
+      upsertTrain(sql, { ...t, gateInfraRounds: 2, gateNotBefore: 1234 });
+      expect(rowToTrain(sql.exec("SELECT * FROM merge_trains WHERE train_id = ?", t.trainId).one())).toMatchObject({ gateInfraRounds: 2, gateNotBefore: 1234 });
+      upsertTrain(sql, { ...t, gateInfraRounds: 0, gateNotBefore: null });
+      expect(rowToTrain(sql.exec("SELECT * FROM merge_trains WHERE train_id = ?", t.trainId).one())).toEqual(t);
+      upsertAttempt(sql, { ...att, regates: 2, lastRegateAt: 99 });
+      expect(getAttemptRow(sql, att.attemptId)).toEqual({ ...att, regates: 2, lastRegateAt: 99 });
     });
   });
 });

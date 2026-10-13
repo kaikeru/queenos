@@ -155,7 +155,7 @@ describe("attemptPushed", () => {
 });
 
 describe("attemptRefresh / attemptEnd", () => {
-  it("check owner and agent; refresh extends expiry; a terminal attempt is ATTEMPT_EXPIRED", async () => {
+  it("check owner and agent; refresh extends expiry; refresh on a terminal attempt is ATTEMPT_EXPIRED, end is a no-op", async () => {
     const { ns, stub } = await externalHive();
     const r = await readyAttempt(ns, await fileItem(ns));
     const own = { hive: ns, attemptId: r.attemptId, owner: OWNER, agentId: r.agent.agentId };
@@ -167,7 +167,8 @@ describe("attemptRefresh / attemptEnd", () => {
     if (ok.ok) expect(ok.attempt.expiresAt).toBeGreaterThanOrEqual(before);
     expect(await stub.attemptEnd(own)).toMatchObject({ ok: true, changed: true, attempt: { state: "ABANDONED" } });
     expect(await stub.attemptRefresh(own)).toMatchObject({ ok: false, code: "ATTEMPT_EXPIRED" });
-    expect(await stub.attemptEnd(own)).toMatchObject({ ok: false, code: "ATTEMPT_EXPIRED" });
+    // M1: ending a terminal attempt is idempotent (its own agent gets the terminal view back).
+    expect(await stub.attemptEnd(own)).toMatchObject({ ok: true, changed: false, attempt: { state: "ABANDONED" } });
   });
 
   it("ending a READY attempt deletes its fork with a repo DELETE keyed by the attempt; the provisioner's report is acknowledged", async () => {

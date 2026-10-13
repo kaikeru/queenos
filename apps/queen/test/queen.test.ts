@@ -952,7 +952,7 @@ describe("hibernation-ish", () => {
     expect(state.count).toBe(1);
     expect(state.tags).toEqual(["role:drone", `hive:${ns}`]);
     expect(state.attachment).toMatchObject({ role: "drone", hive: ns, subscribed: true });
-    expect([state.before, state.after, state.version]).toEqual([17, 17, 17]);
+    expect([state.before, state.after, state.version]).toEqual([18, 18, 18]);
     expect(state.tables).toEqual([
       "attempts", "audit_trail", "deployments", "escalations", "event_log", "hive_settings", "inboxes", "merge_trains", "metrics_hourly", "model_preference", "model_router",
       "model_stats", "path_claims", "prompt_runs", "races", "releases", "repo_deletes", "sentinel_verdicts", "sqlite_sequence", "submissions", "work_items",

@@ -2,9 +2,9 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
-import type { AttemptIntentDecision, DeployCommand, McpAgentIdentity, ProvisionCommand } from "@queenos/queen-types";
+import type { AttemptIntentDecision, DeployCommand, GateCommand, McpAgentIdentity, ProvisionCommand } from "@queenos/queen-types";
 import type { QueenNode } from "../src/queen-node";
-import type { RecordingHerald, RecordingProvisioner } from "./fakes";
+import type { RecordingGatekeeper, RecordingHerald, RecordingProvisioner } from "./fakes";
 
 export const OWNER = "ada@example.com";
 export const OTHER = "bob@example.com";
@@ -62,9 +62,10 @@ export const look = (ns: string) =>
   runInDurableObject(stubFor(ns), (q: QueenNode) => ({
     provisions: (q.ports.provisioner as RecordingProvisioner).commands.map((c) => ({ ...c })) as ProvisionCommand[],
     deploys: (q.ports.herald as RecordingHerald).commands.map((c) => ({ ...c })) as DeployCommand[],
+    gates: (q.ports.gatekeeper as RecordingGatekeeper).commands.map((c) => ({ ...c })) as GateCommand[],
     attempts: q.sql.exec("SELECT * FROM attempts ORDER BY created_at, attempt_id").toArray() as Row[],
     items: q.sql.exec("SELECT item_id, kind, status, wait_reason, parent_id, base_repo, base_sha, base_pending_at, entry_window_ms FROM work_items ORDER BY seq").toArray() as Row[],
-    trains: q.sql.exec("SELECT train_id, prompt_id, phase, fork_state, artifact_repo, race_id, race_outcome, car_id, attempt_id, origin_json, delete_command_id FROM merge_trains ORDER BY seq").toArray() as Row[],
+    trains: q.sql.exec("SELECT train_id, prompt_id, phase, fork_state, artifact_repo, race_id, race_outcome, car_id, attempt_id, origin_json, delete_command_id, summary, reason, deploy_command_id, gate_command_id, gate_infra_rounds, gate_not_before FROM merge_trains ORDER BY seq").toArray() as Row[],
     races: q.sql.exec("SELECT race_id, item_id, state, train_ids, entry_closes_at, winner_train_id FROM races ORDER BY created_at").toArray() as Row[],
     submissions: q.sql.exec("SELECT * FROM submissions ORDER BY created_at").toArray() as Row[],
     events: q.sql.exec("SELECT type, summary, data FROM event_log ORDER BY seq").toArray() as { type: string; summary: string; data: string }[],
@@ -72,11 +73,22 @@ export const look = (ns: string) =>
 
 export const deletesOf = (provisions: ProvisionCommand[], repo: string) => provisions.filter((c) => c.op === "DELETE" && c.repo === repo);
 
-/** Report the newest preview DEPLOY of `trainId` as live, then its gate as passed. */
-export async function gatePass(ns: string, trainId: string) {
+/** Report the newest preview DEPLOY of `trainId` as live (→ TESTING, a Queen-started gate). */
+export async function goLive(ns: string, trainId: string) {
   const c = (await look(ns)).deploys.filter((d): d is Extract<DeployCommand, { op: "DEPLOY" }> => d.op === "DEPLOY" && d.trainId === trainId).at(-1)!;
   await stubFor(ns).reportDeployResult({ commandId: c.commandId, op: "DEPLOY", environment: "preview", trainId, ok: true, url: `https://${trainId}.test.dev`, commitSha: c.commitSha });
+}
+
+/** Report the newest preview DEPLOY of `trainId` as live, then its gate as passed. */
+export async function gatePass(ns: string, trainId: string) {
+  await goLive(ns, trainId);
   return stubFor(ns).reportTrainResult({ trainId, passed: true, summary: "green" });
+}
+
+/** The gatekeeper of the train's current Queen-started gate reports that the gate could not run (cause infra). */
+export async function gateInfra(ns: string, trainId: string, summary = "Reviewer unavailable: empty answer") {
+  const gateId = String((await trainOf(ns, trainId)).gate_command_id);
+  return stubFor(ns).reportTrainResult({ trainId, passed: false, cause: "infra", summary, gateId });
 }
 
 export const gateFail = (ns: string, trainId: string, summary = "security: nope") => stubFor(ns).reportTrainResult({ trainId, passed: false, summary });

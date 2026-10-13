@@ -51,6 +51,10 @@ import {
   AttemptPushedSchema,
   AttemptReadySchema,
   AttemptRefreshSchema,
+  AttemptRegateSchema,
+  BASE_PENDING_POLL_MS,
+  MAX_MANUAL_REGATES,
+  REGATE_MIN_INTERVAL_MS,
   isTerminalAttemptState,
   traceparent,
   MAX_OPEN_ATTEMPTS_PER_AGENT,
@@ -139,6 +143,7 @@ import {
   type SentinelVerdict,
   type SubmitPrompt,
   type SubmissionOrigin,
+  type SubmitDisposition,
   type TraceView,
   type TrainResult,
   type UpdateHiveSettings,
@@ -216,6 +221,7 @@ import {
   isActive,
   isCar,
   isContributed,
+  MAX_GATE_INFRA_ROUNDS,
   isParked,
   keptFork,
   isForkOf,
@@ -270,7 +276,20 @@ import {
 } from "./work/inbox";
 import { MAX_NOTES, projectNotes, type NotesInput, type NotesTrain } from "./work/notes";
 import { composePrompt } from "./work/compose";
-import { ATTEMPT_TTL_MS, BASE_PENDING_TTL_MS, INTENT_TTL_MS, OPEN_ATTEMPTS_SQL, PUSHABLE_STATES, acceptsEntries, attemptStateOf, attemptVerdict, checkAttemptCaps, randomHex } from "./work/attempts";
+import {
+  ATTEMPT_TTL_MS,
+  BASE_PENDING_TTL_MS,
+  INTENT_TTL_MS,
+  OPEN_ATTEMPTS_SQL,
+  PUSHABLE_STATES,
+  acceptsEntries,
+  attemptRegating,
+  attemptStateOf,
+  attemptVerdict,
+  attemptVerdictKind,
+  checkAttemptCaps,
+  randomHex,
+} from "./work/attempts";
 import { queryMetrics, recordMetrics } from "./obs/rollup";
 import { AnalyticsSink } from "./obs/metrics-sink";
 import { logEvents } from "./obs/log";
@@ -1016,7 +1035,13 @@ export class QueenNode extends DurableObject<Env> {
     const i = parseOrThrow(AttemptIntentSchema, input, "attempt intent");
     const hive = this.hiveFor(i.hive);
     const owner = i.owner.toLowerCase();
-    const refuse = (code: AttemptRefusalCode, message: string, items?: GoalChild[]): AttemptIntentDecision => ({ verdict: "refuse", code, message: clip(message, 200), ...(items ? { items } : {}) });
+    const refuse = (code: AttemptRefusalCode, message: string, items?: GoalChild[], retryAfterMs?: number): AttemptIntentDecision => ({
+      verdict: "refuse",
+      code,
+      message: clip(message, 200),
+      ...(items ? { items } : {}),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+    });
     if (i.agent.owner.toLowerCase() !== owner) return refuse("FORBIDDEN_OWNER", "the agent belongs to another owner");
     const attemptId = `att_${randomHex(6)}`;
     const trainId = crypto.randomUUID();
@@ -1051,17 +1076,19 @@ export class QueenNode extends DurableObject<Env> {
         agentOpen: Number(this.sql.exec(`SELECT COUNT(*) AS n FROM attempts WHERE agent_id = ? AND state IN (${OPEN_ATTEMPTS_SQL})`, i.agent.agentId).one().n),
         ownerOpenItems: this.ownerOpenItems(owner),
         ownerStartsLastHour: this.ownerStartsSince(owner, d.now - HOUR_MS),
+        oldestCountedAt: this.ownerOldestStartSince(owner, d.now - HOUR_MS),
+        now: d.now,
         maxPerAgent: MAX_OPEN_ATTEMPTS_PER_AGENT,
         maxOpenPerContributor: g.maxInboxOpenPerContributor,
         maxPushesPerHour: g.maxInboxPushesPerHour,
       });
-      if (!caps.ok) return refuse("CAP_EXCEEDED", caps.message);
+      if (!caps.ok) return refuse("CAP_EXCEEDED", caps.message, undefined, caps.retryAfterMs);
       const b = this.baseOf(itemId, d.acc) ?? { itemId, baseRepo: null, baseSha: null, pendingAt: null };
       let base: AttemptBase;
       if (b.baseRepo && b.baseSha) {
         base = { kind: "existing", baseRepo: b.baseRepo, baseSha: b.baseSha };
       } else if (b.baseRepo) {
-        return refuse("BASE_PENDING", `item ${itemId}'s base repo is being created; retry in 2 s`);
+        return refuse("BASE_PENDING", `item ${itemId}'s base repo is being created; retry in 2 s`, undefined, BASE_PENDING_POLL_MS);
       } else {
         base = { kind: "create", baseRepo: baseRepoName(hive, baseId) };
         d.acc.itemBases.set(itemId, { itemId, baseRepo: base.baseRepo, baseSha: null, pendingAt: d.now });
@@ -1152,6 +1179,8 @@ export class QueenNode extends DurableObject<Env> {
     if (a.state !== "INTENT") return { ok: false, code: "ATTEMPT_EXPIRED", message: `attempt ${a.attemptId} is ${a.state}` };
     if (!isForkOf(a.repo, r.repo)) throw new QueenError("INVALID_INPUT", `repo ${r.repo} is not attempt ${a.attemptId}'s fork`);
     const b = getItemBase(this.sql, a.itemId);
+    // The base was cleared and is being created again (watchdog, baseFailed): not moved, just not pinned yet (M11).
+    if (b?.baseRepo && !b.baseSha) return { ok: false, code: "BASE_PENDING", message: `item ${a.itemId}'s base repo is being created; retry in 2 s`, retryAfterMs: BASE_PENDING_POLL_MS };
     if (!b?.baseSha || b.baseSha !== r.baseSha) {
       return { ok: false, code: "BASE_MOVED", message: `fork head ${short(r.baseSha)} is not item ${a.itemId}'s base ${short(b?.baseSha ?? null)}` };
     }
@@ -1225,6 +1254,22 @@ export class QueenNode extends DurableObject<Env> {
     }
     if (!PUSHABLE_STATES.has(a.state)) return res("ignored:state");
     if (p.after === a.baseSha) return res("ignored:base");
+    const entered = await this.enterAttemptHead(hive, a, { after: p.after, before: p.before ?? null, title: p.title, message: p.message }, "push");
+    return { outcome: "applied", attemptId: a.attemptId, state: entered.attempt.state, itemId: entered.attempt.itemId, trainId: entered.trainId, disposition: entered.disposition };
+  }
+
+  /**
+   * The attempt's head enters the item as a submission (the body of `attemptPushed`; `attemptRegate` re-submits the
+   * current head the same way). `push`: a new submission row. `regate`: the head's existing submission row is
+   * re-pointed at the new train (its PK is (repo, head_sha)), and the regate counters are bumped. Either way a new
+   * train is allocated through the same intake (race entry, follow-up when late, a FAILED item reopened).
+   */
+  private async enterAttemptHead(
+    hive: string,
+    a: Attempt,
+    head: { after: string; before: string | null; title: string; message: string },
+    mode: "push" | "regate",
+  ): Promise<{ attempt: Attempt; trainId: string; disposition: SubmitDisposition }> {
     const ref = `refs/heads/item/${a.itemId}`;
     const prevRow = this.sql.exec("SELECT * FROM submissions WHERE attempt_id = ? AND outcome = 'applied' ORDER BY created_at DESC, rowid DESC LIMIT 1", a.attemptId).toArray()[0];
     const prevSub = prevRow ? rowToSubmission(prevRow) : null;
@@ -1237,7 +1282,7 @@ export class QueenNode extends DurableObject<Env> {
     const actor = `agent:${origin.id}`;
     const now = this.now();
     const plan = decideIntake(
-      { ref, headSha: p.after, title: p.title, message: p.message, trailers: trailersOf(p.message, {}), newItemId: crypto.randomUUID() },
+      { ref, headSha: head.after, title: head.title, message: head.message, trailers: trailersOf(head.message, {}), newItemId: crypto.randomUUID() },
       { now, lookup: this.intakeLookup({ state: this.activeState() }), previousOnRef: previous },
     );
     const parent = plan.file?.parentId ?? null;
@@ -1245,7 +1290,7 @@ export class QueenNode extends DurableObject<Env> {
     const { acc } = this.decide(
       hive,
       (d) => {
-        const inbox = { repo: a.repo, ref, handle: handleFor(a.owner), headSha: p.after, handoff: false };
+        const inbox = { repo: a.repo, ref, handle: handleFor(a.owner), headSha: head.after, handoff: false };
         if (plan.file) d.acc.work(d.wp.fileSubmission({ ...plan.file, source: { kind: "agent" as const, actor }, inbox, disposition: plan.disposition }));
         else d.acc.work(d.wp.adoptSubmission(plan.itemId, { inbox, reopen: plan.reopen, actor }));
         const item = d.acc.items.get(plan.itemId) ?? d.state.items.find((i) => i.itemId === plan.itemId) ?? this.loadItem(plan.itemId);
@@ -1255,8 +1300,8 @@ export class QueenNode extends DurableObject<Env> {
           d.tp.pushed({
             trainId,
             repo: a.repo,
-            headSha: p.after,
-            baseSha: a.baseSha ?? p.before ?? p.after,
+            headSha: head.after,
+            baseSha: a.baseSha ?? head.before ?? head.after,
             origin,
             promptId: item.itemId,
             promptText: composePrompt(item),
@@ -1266,52 +1311,103 @@ export class QueenNode extends DurableObject<Env> {
             resume: item.status === "ACTIVE",
           }),
         );
-        if (plan.supersedeTrainId) d.acc.train(d.tp.supersede(plan.supersedeTrainId, p.after));
-        d.acc.submissions.push({
-          repo: a.repo,
-          headSha: p.after,
-          ref,
-          originKind: "agent",
-          originId: a.owner,
-          itemId: item.itemId,
+        if (plan.supersedeTrainId) d.acc.train(d.tp.supersede(plan.supersedeTrainId, head.after));
+        if (mode === "push") {
+          d.acc.submissions.push({
+            repo: a.repo,
+            headSha: head.after,
+            ref,
+            originKind: "agent",
+            originId: a.owner,
+            itemId: item.itemId,
+            trainId,
+            outcome: "applied",
+            disposition: plan.disposition,
+            target: { kind: "item", itemId: a.itemId },
+            agent: a.agentName,
+            attemptId: a.attemptId,
+            beforeSha: head.before,
+            createdAt: now,
+          });
+        } else {
+          d.acc.submissionUpdates.push({ key: { repo: a.repo, headSha: head.after }, patch: { itemId: item.itemId, trainId, disposition: plan.disposition } });
+        }
+        const regates = (a.regates ?? 0) + (mode === "regate" ? 1 : 0);
+        entered = {
+          ...a,
+          state: "PUSHED",
           trainId,
-          outcome: "applied",
-          disposition: plan.disposition,
-          target: { kind: "item", itemId: a.itemId },
-          agent: a.agentName,
-          attemptId: a.attemptId,
-          beforeSha: p.before ?? null,
-          createdAt: now,
-        });
-        entered = { ...a, state: "PUSHED", trainId, headSha: p.after, itemId: item.itemId, raceId: d.acc.trains.get(trainId)?.raceId ?? null };
+          headSha: head.after,
+          itemId: item.itemId,
+          raceId: d.acc.trains.get(trainId)?.raceId ?? null,
+          ...(mode === "regate" ? { regates, lastRegateAt: now } : {}),
+        };
         d.acc.attempts.set(a.attemptId, entered);
+        const what = mode === "regate" ? `re-gate requested (${regates}/${MAX_MANUAL_REGATES}): ` : "";
         d.acc.events.push(
-          this.attemptEvent("attempt.state", item.itemId, a.attemptId, `attempt ${a.attemptId}: ${a.state} → PUSHED ${short(p.after)} (${plan.disposition}; train ${trainId})`, {
+          this.attemptEvent("attempt.state", item.itemId, a.attemptId, `attempt ${a.attemptId}: ${what}${a.state} → PUSHED ${short(head.after)} (${plan.disposition}; train ${trainId})`, {
             from: a.state,
             to: "PUSHED",
-            headSha: p.after,
+            headSha: head.after,
             trainId,
             disposition: plan.disposition,
             ...(plan.supersedeTrainId ? { superseded: plan.supersedeTrainId } : {}),
+            ...(mode === "regate" ? { regate: regates, of: MAX_MANUAL_REGATES } : {}),
           }, actor),
         );
         d.acc.events.push(
-          this.submissionEvent(item.itemId, trainId, `submission received (${plan.disposition}) from ${actor} (claims ${a.model}): ${p.title}`, {
+          this.submissionEvent(item.itemId, trainId, `submission ${mode === "regate" ? "re-gated" : "received"} (${plan.disposition}) from ${actor} (claims ${a.model}): ${head.title}`, {
             outcome: "applied",
             disposition: plan.disposition,
             ref,
-            headSha: p.after,
+            headSha: head.after,
             repo: a.repo,
             origin,
             attemptId: a.attemptId,
+            ...(mode === "regate" ? { regate: true } : {}),
           }, actor),
         );
       },
       { trains: [trainId, ...(plan.supersedeTrainId ? [plan.supersedeTrainId] : [])], items: [plan.itemId, ...(parent ? [parent] : [])] },
     );
     await this.commit(hive, acc);
-    const now2 = getAttemptRow(this.sql, a.attemptId) ?? entered;
-    return { outcome: "applied", attemptId: a.attemptId, state: now2.state, itemId: now2.itemId, trainId, disposition: plan.disposition };
+    return { attempt: getAttemptRow(this.sql, a.attemptId) ?? entered, trainId, disposition: plan.disposition };
+  }
+
+  /**
+   * `retry_gates`: re-run the gates on the attempt's current head after an INFRA verdict (the gate could not run after
+   * its automatic re-gates). Idempotent: a head still being gated or re-gated answers `changed: false`. CONFLICT when
+   * there is nothing to re-gate (no push yet, the head passed, or the last verdict found problems in the change).
+   * At most MAX_MANUAL_REGATES per attempt, one per REGATE_MIN_INTERVAL_MS (CAP_EXCEEDED, with `retryAfterMs` for the
+   * interval). The head is re-submitted as a new train exactly like a push of it (no new submission row).
+   */
+  async attemptRegate(input: AttemptOwnerAction): Promise<AttemptResult> {
+    const r = parseOrThrow(AttemptRegateSchema, input, "attempt regate");
+    const hive = this.hiveFor(r.hive);
+    const a = getAttemptRow(this.sql, r.attemptId);
+    const refused = this.ownerRefusal(a, r);
+    if (refused) return refused;
+    const att = a!;
+    const t = this.trainExists(att.trainId) ? this.loadTrain(att.trainId) : null;
+    const conflict = (message: string): AttemptResult => ({ ok: false, code: "CONFLICT", message: clip(message, 200) });
+    if (!t || !att.headSha || att.state === "READY" || att.state === "INTENT") return conflict(`attempt ${att.attemptId} has no pushed head; push first`);
+    const verdict = attemptVerdict(t);
+    if (verdict === "pending") return { ok: true, attempt: this.attemptView(att), changed: false };
+    if (verdict === "passed") return conflict(`attempt ${att.attemptId}'s head ${short(att.headSha)} passed; nothing to re-gate`);
+    if (attemptVerdictKind(t) !== "infra") return conflict(`the last verdict found problems in the change (${short(att.headSha)}); push a fix`);
+    const regates = att.regates ?? 0;
+    if (regates >= MAX_MANUAL_REGATES) return { ok: false, code: "CAP_EXCEEDED", message: `re-gates per attempt: ${MAX_MANUAL_REGATES} reached; push again to start over` };
+    const now = this.now();
+    if (att.lastRegateAt !== undefined && now - att.lastRegateAt < REGATE_MIN_INTERVAL_MS) {
+      const wait = Math.max(0, att.lastRegateAt + REGATE_MIN_INTERVAL_MS - now);
+      return { ok: false, code: "CAP_EXCEEDED", message: `one re-gate per ${REGATE_MIN_INTERVAL_MS / 1000} s; retry in ${Math.ceil(wait / 1000)} s`, retryAfterMs: wait };
+    }
+    const sub = getSubmission(this.sql, att.repo, att.headSha);
+    if (!sub || sub.outcome !== "applied") return conflict(`attempt ${att.attemptId}'s head ${short(att.headSha)} has no submission; push again`);
+    const item = this.loadItem(att.itemId);
+    const title = clip(item?.title ?? `attempt ${att.attemptId}`, 120);
+    const entered = await this.enterAttemptHead(hive, att, { after: att.headSha, before: sub.beforeSha ?? null, title, message: title }, "regate");
+    return { ok: true, attempt: this.attemptView(entered.attempt), changed: true };
   }
 
   /** `refresh_attempt`: the attempt's own owner and agent, a non-terminal attempt: expires_at = now + 2 h (queenos-mcp mints the token). */
@@ -1340,6 +1436,8 @@ export class QueenNode extends DurableObject<Env> {
     const r = parseOrThrow(AttemptEndSchema, input, "attempt end");
     const hive = this.hiveFor(r.hive);
     const a = getAttemptRow(this.sql, r.attemptId);
+    // M1: ending an attempt that already ended (its own agent asking) is a no-op, not ATTEMPT_EXPIRED.
+    if (a && this.ownsAttempt(a, r) && isTerminalAttemptState(a.state)) return { ok: true, attempt: this.attemptView(a), changed: false };
     const refused = this.ownerRefusal(a, r);
     if (refused) return refused;
     const att = a!;
@@ -1384,10 +1482,14 @@ export class QueenNode extends DurableObject<Env> {
     return acc?.attempts.get(attemptId) ?? getAttemptRow(this.sql, attemptId);
   }
 
-  /** refresh / end: the attempt must exist, belong to this owner and agent, and not be terminal. */
+  private ownsAttempt(a: Attempt, r: AttemptOwnerAction): boolean {
+    return a.owner === r.owner.toLowerCase() && a.agentId === r.agentId;
+  }
+
+  /** refresh / end / regate: the attempt must exist, belong to this owner and agent, and not be terminal. */
   private ownerRefusal(a: Attempt | null, r: AttemptOwnerAction): AttemptResult | null {
     if (!a) return { ok: false, code: "NOT_FOUND", message: `attempt ${r.attemptId} not found` };
-    if (a.owner !== r.owner.toLowerCase() || a.agentId !== r.agentId) return { ok: false, code: "FORBIDDEN_OWNER", message: `attempt ${a.attemptId} belongs to another agent` };
+    if (!this.ownsAttempt(a, r)) return { ok: false, code: "FORBIDDEN_OWNER", message: `attempt ${a.attemptId} belongs to another agent` };
     if (isTerminalAttemptState(a.state)) return { ok: false, code: "ATTEMPT_EXPIRED", message: `attempt ${a.attemptId} is ${a.state}` };
     return null;
   }
@@ -1588,10 +1690,22 @@ export class QueenNode extends DurableObject<Env> {
     return {
       ...a,
       train: t
-        ? { trainId: t.trainId, phase: t.phase, raceOutcome: t.raceOutcome ?? null, headSha: t.headSha, previewUrl: t.previewUrl, summary: t.summary, reason: t.reason, score: t.score ?? null }
+        ? {
+            trainId: t.trainId,
+            phase: t.phase,
+            raceOutcome: t.raceOutcome ?? null,
+            headSha: t.headSha,
+            previewUrl: t.previewUrl,
+            summary: t.summary,
+            reason: t.reason,
+            score: t.score ?? null,
+            gateInfraRounds: t.gateInfraRounds ?? 0,
+          }
         : null,
       race: race ? { raceId: race.raceId, state: race.state, entryClosesAt: race.entryClosesAt ?? null, winnerTrainId: race.winnerTrainId } : null,
       verdict: attemptVerdict(t),
+      verdictKind: attemptVerdictKind(t),
+      regating: attemptRegating(t),
     };
   }
 
@@ -1605,6 +1719,21 @@ export class QueenNode extends DurableObject<Env> {
       ids.add(String(r.item_id));
     }
     return ids;
+  }
+
+  /** The oldest attempt start or applied / pending push counted by ownerStartsSince (null: none). */
+  private ownerOldestStartSince(owner: string, since: number): number | null {
+    const v = this.sql
+      .exec(
+        `SELECT MIN(at) AS at FROM (SELECT MIN(created_at) AS at FROM submissions WHERE origin_id = ? AND created_at >= ? AND outcome IN ('applied', 'pending')
+           UNION ALL SELECT MIN(created_at) AS at FROM attempts WHERE owner = ? AND created_at >= ?)`,
+        owner,
+        since,
+        owner,
+        since,
+      )
+      .one().at;
+    return v === null || v === undefined ? null : Number(v);
   }
 
   /** maxInboxPushesPerHour: each attempt start and each applied / pending push counts one. */
@@ -1686,6 +1815,7 @@ export class QueenNode extends DurableObject<Env> {
       conflict: t.conflict ?? null,
       origin: t.origin ?? null,
       ref: refOf.get(t.trainId) ?? null,
+      summary: t.summary,
     }));
     const releases = this.sql
       .exec("SELECT * FROM releases WHERE phase IN ('SHIPPED', 'ROLLED_BACK') ORDER BY seq DESC LIMIT 200")
@@ -1840,20 +1970,40 @@ export class QueenNode extends DurableObject<Env> {
       }
       const sha = r.commitSha ?? t.headSha ?? "";
       const prompt = d.state.prompts.find((p) => p.promptId === t.promptId);
+      // gateInfra is not a verdict. The label follows what the planner did, not the input: still active = it re-gates
+      // (a contributed train: the same head, re-gate k/N after a backoff; a drone train: re-deploy, then re-gate);
+      // no longer active = the re-gates are spent (INFRA_EXHAUSTED); not applied (stale) = no claim at all.
+      const post = d.acc.trains.get(t.trainId) ?? t;
+      const applied = res.outcome === "applied";
+      const regating = gateInfra && applied && isActive(post);
+      const exhausted = gateInfra && applied && !isActive(post);
+      const round = (post.gateInfraRounds ?? 0) > (t.gateInfraRounds ?? 0) ? (post.gateInfraRounds ?? 0) : 0;
+      const delayS = round && post.gateNotBefore ? Math.max(0, Math.round((post.gateNotBefore - d.now) / 1000)) : null;
+      // The planner's same-head re-gate path (TrainPlanner.trainResult): its tries are the gate rounds, else the deploys.
+      const sameHead = !isCar(t) && isContributed(t) && t.deployState === "LIVE";
+      const tries = sameHead ? (post.gateInfraRounds ?? 0) + 1 : Math.max(1, commandAttempt(post.deployCommandId));
+      const infraText = regating
+        ? round
+          ? `could not run (infrastructure; re-gate ${round}/${MAX_GATE_INFRA_ROUNDS} in ${delayS ?? 0} s)`
+          : "could not run (infrastructure; re-deploying, then re-gating)"
+        : exhausted
+          ? `could not run after ${tries} tries (infrastructure); not a verdict on the change`
+          : "could not run (infrastructure)";
       d.acc.events.push({
         type: "gate.verdict",
         severity: r.passed ? "info" : "warn",
         actor: "gatekeeper",
-        // (gateInfra: not a verdict; the planner re-deploys and re-gates, no attempt charged.)
         traceId: traceOfTrain(t),
         spanId: spanIdFor(`gate:${t.trainId}:${sha}`),
         parentSpanId: spanIdFor(t.trainId),
         itemId: isCar(t) ? null : t.promptId,
         trainId: t.trainId,
-        summary: clip(`gate ${r.passed ? "passed" : gateInfra ? "could not run (infrastructure; re-gating)" : "failed"}: ${r.summary}`, 500),
+        summary: clip(`gate ${r.passed ? "passed" : gateInfra ? infraText : "failed"}: ${r.summary}`, 500),
         data: {
-          outcome: r.passed ? "PASSED" : gateInfra ? "INFRA" : "FAILED",
+          outcome: r.passed ? "PASSED" : exhausted ? "INFRA_EXHAUSTED" : gateInfra ? "INFRA" : "FAILED",
           ...(gateInfra ? { cause: "infra" } : {}),
+          ...(regating && round ? { gateInfraRound: round, of: MAX_GATE_INFRA_ROUNDS, notBefore: post.gateNotBefore ?? null } : {}),
+          ...(exhausted ? { tries } : {}),
           attempt: (prompt?.attempts ?? 0) + 1,
           lane: t.lane ?? "BUILD",
           applied: res.outcome,

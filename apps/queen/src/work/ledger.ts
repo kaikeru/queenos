@@ -282,6 +282,8 @@ export interface FileGoalInput {
 export interface FileItemInput extends FileWorkItem {
   actor: string;
   itemId?: string;
+  /** `submitWork` without decompose (MCP create_goal): the race entry window of this item. */
+  entryWindowMs?: number;
 }
 
 export interface FilePromptInput {
@@ -506,6 +508,7 @@ export class WorkPlanner {
       paths: [],
       ...(input.bestOf !== undefined ? { bestOf: input.bestOf } : {}),
       ...(input.judge !== undefined ? { judge: input.judge } : {}),
+      ...(input.entryWindowMs !== undefined ? { entryWindowMs: input.entryWindowMs } : {}),
       actor: input.actor,
       ...(input.itemId !== undefined ? { itemId: input.itemId } : {}),
     });
@@ -584,6 +587,7 @@ export class WorkPlanner {
       bestOf: input.bestOf ?? null,
       paths: normalizePaths(input.paths),
       ...(input.judge !== undefined ? { judge: input.judge } : {}),
+      ...(input.entryWindowMs !== undefined ? { entryWindowMs: input.entryWindowMs } : {}),
     });
     this.settleNew(item);
     this.event("item.filed", item, `${item.kind} filed: ${item.title}`, { kind: item.kind, source: "user", status: item.status }, input.actor);
