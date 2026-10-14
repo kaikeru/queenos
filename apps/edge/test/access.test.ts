@@ -23,13 +23,13 @@ async function reject(p: Promise<unknown>): Promise<AccessError> {
 describe("Access JWT verification", () => {
   it("accepts a valid token and lowercases the email", async () => {
     const { key, verifier } = await setup();
-    const t = await sign(key, goodClaims({ email: "Kyle@Kaikeru.com" }));
-    expect(await verifier.verify(t, cfg)).toEqual({ email: "kyle@kaikeru.com" });
+    const t = await sign(key, goodClaims({ email: "Owner@Kaikeru.com" }));
+    expect(await verifier.verify(t, cfg)).toEqual({ email: "owner@kaikeru.com" });
   });
 
   it("accepts aud as a plain string", async () => {
     const { key, verifier } = await setup();
-    expect((await verifier.verify(await sign(key, goodClaims({ aud: AUD })), cfg)).email).toBe("kyle@kaikeru.com");
+    expect((await verifier.verify(await sign(key, goodClaims({ aud: AUD })), cfg)).email).toBe("owner@kaikeru.com");
   });
 
   it("rejects an expired token (beyond skew)", async () => {

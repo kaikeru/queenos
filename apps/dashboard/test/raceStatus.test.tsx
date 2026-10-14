@@ -16,13 +16,13 @@ const SHA = "0".repeat(40);
 
 const item = (over: Partial<WorkItem> = {}): WorkItem => ({
   itemId: "i1", hive: "demo", kind: "feature", title: "Rename morse key", body: "", acceptance: [], priority: 2, status: "ACTIVE", parentId: null, rootId: over.itemId ?? "i1", depth: 0,
-  dependsOn: [], source: { kind: "user", actor: "kyle@kaikeru.com" }, traceId: "a".repeat(32), spanId: "b".repeat(16), difficulty: "normal", bestOf: null, attempts: 0, conflicts: 0,
+  dependsOn: [], source: { kind: "user", actor: "kyle@example.com" }, traceId: "a".repeat(32), spanId: "b".repeat(16), difficulty: "normal", bestOf: null, attempts: 0, conflicts: 0,
   paths: [], waitReason: null, duplicateOf: null, blockedReason: null, releaseId: null, escalationId: null, createdAt: NOW - 600_000, updatedAt: NOW - 600_000, ...over,
 });
 const race = (over: Partial<Race> = {}): Race => ({
   raceId: "r1", itemId: "i1", width: 1, state: "RACING", trainIds: [], winnerTrainId: null, reason: null, deadlineAt: null, createdAt: NOW - 300_000, decidedAt: null, ...over,
 });
-const agent = (name: string, model = "sonnet") => ({ kind: "agent" as const, id: `${name}@kyle@kaikeru.com`, model });
+const agent = (name: string, model = "sonnet") => ({ kind: "agent" as const, id: `${name}@kyle@example.com`, model });
 const train = (id: string, over: Partial<MergeTrain> = {}): MergeTrain => ({
   trainId: id, baseSha: SHA, includedPrompts: ["i1"], artifactRepo: "demo", status: "TESTING", phase: "TESTING", lane: "BUILD", createdAt: NOW - 200_000, raceId: "r1", candidate: 0,
   raceOutcome: "RACING", origin: agent("w1"), previewUrl: `https://${id}.example.dev`, ...over,
@@ -159,7 +159,7 @@ describe("currentCandidates: one head per contributor", () => {
     const d2 = train("d2", { origin: { kind: "drone", id: "wf-2" }, model: "glm" });
     const other = train("o", { raceId: "r2" });
     expect(currentCandidates(race(), [x, y, d1, d2, other]).heads.map((t) => t.trainId).sort()).toEqual(["d1", "d2", "x", "y"]);
-    expect(contributorKey(x)).toBe("agent:w1@kyle@kaikeru.com#att_1");
+    expect(contributorKey(x)).toBe("agent:w1@kyle@example.com#att_1");
     expect(contributorKey(d1)).toBe("train:d1");
   });
   test("superseded heads never reach the rows, and rejected / reworking heads get no preview link", () => {
@@ -199,7 +199,7 @@ describe("who", () => {
   test("agent name@owner with its claim, a human's local part, a drone's model or tag", () => {
     expect(whoOf({ origin: agent("w1", "opus"), model: null, candidate: 0 })).toEqual({ who: "w1@kyle", claim: "opus" });
     expect(whoOf({ origin: { kind: "agent", id: "solo" }, model: null, candidate: 0 })).toEqual({ who: "solo", claim: null });
-    expect(whoOf({ origin: { kind: "human", id: "kyle@kaikeru.com" }, model: null, candidate: 0 })).toEqual({ who: "kyle", claim: null });
+    expect(whoOf({ origin: { kind: "human", id: "kyle@example.com" }, model: null, candidate: 0 })).toEqual({ who: "kyle", claim: null });
     expect(whoOf({ origin: null, model: "kimi-k2", candidate: 0 })).toEqual({ who: "kimi-k2", claim: null });
     expect(whoOf({ origin: undefined, model: null, candidate: 1 })).toEqual({ who: "c2", claim: null });
     expect(whoOf({ origin: { kind: "agent", id: "" }, model: null, candidate: 1 })).toEqual({ who: "c2", claim: null });

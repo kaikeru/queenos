@@ -701,7 +701,7 @@ The push path **ships without T1b**. If the drone adapter slips, cut it: drones 
 
 ---
 
-## 14. Demo shot (for `docs/demo-script.md`)
+## 14. Demo shot
 
 **"Agent-native git."** About 75 s, recorded after the swarm shot while the 12-item swarm is still landing.
 

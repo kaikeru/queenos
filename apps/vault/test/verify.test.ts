@@ -12,7 +12,7 @@ describe("verifyCloudflare", () => {
     expect(r.checks).toEqual([
       { name: CHECK_TOKEN, ok: true, detail: `account token is active for account ${ACCOUNT}` },
       { name: CHECK_WRITE, ok: true, detail: "created Worker acme-app" },
-      { name: CHECK_SUBDOMAIN, ok: true, detail: "kaikeru.workers.dev" },
+      { name: CHECK_SUBDOMAIN, ok: true, detail: "example.workers.dev" },
     ]);
     expect(cf.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
       `GET /accounts/${ACCOUNT}/tokens/verify`,

@@ -1,1 +1,0 @@
-{ "name": "size-aionly", "main": "aionly.ts", "compatibility_date": "2026-10-02",  "ai": {"binding":"AI"}, "worker_loaders": [{"binding":"LOADER"}], "artifacts": [{"binding":"ARTIFACTS","namespace":"queenos"}] }

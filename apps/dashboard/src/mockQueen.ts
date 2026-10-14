@@ -27,7 +27,7 @@ import { initialState, reducer, type Action, type State } from "./reducer";
 import { itemIdOf } from "./swarm";
 
 const STEP_MS = 2500;
-const USER = "kyle@kaikeru.com";
+const USER = "kyle@example.com";
 
 const prompts = ["Add rate limiting middleware to the public API", "Add a dark mode toggle to the settings page", "Write a migration that indexes audit_trail by prompt", "Fix the flaky retry logic in the webhook sender"];
 
@@ -215,7 +215,7 @@ export function buildSwarmFixture(hive: string, now: number): SwarmFixture {
       status: "TESTING",
       phase: "TESTING",
       model: m as string,
-      previewUrl: `https://pk1-${i}-${hive}.kaikeru.workers.dev`,
+      previewUrl: `https://pk1-${i}-${hive}.example.workers.dev`,
       summary: ["Adds a three-tier grid with a monthly/yearly toggle.", "Single-column cards, tier data in one array.", "Table layout with a sticky header; one criterion partly met."][i]!,
       score: { review: "approved", satisfied: sat as number, missing: 3 - (sat as number), changedFiles: 2 + (i % 2), changedBytes: b as number, checks: 3 },
     }),
@@ -230,7 +230,7 @@ export function buildSwarmFixture(hive: string, now: number): SwarmFixture {
   };
   for (let i = 0; i < 12; i++) swarm("BUILDING", "BUILDING");
   for (let i = 0; i < 2; i++) swarm("BUILDING", "DEPLOYING");
-  for (let i = 0; i < 5; i++) swarm("TESTING", "TESTING", { previewUrl: `https://pr-${k + 1}-${hive}.kaikeru.workers.dev` });
+  for (let i = 0; i < 5; i++) swarm("TESTING", "TESTING", { previewUrl: `https://pr-${k + 1}-${hive}.example.workers.dev` });
   // Boarded builds (passed, on a car).
   const boarded = (carId: string, seq: number) => swarm("TESTING", "PASSED", { carId, passedSeq: seq, score });
   const k41 = [boarded("c-k41", 1).trainId, boarded("c-k41", 2).trainId, boarded("c-k41", 3).trainId, boarded("c-k41", 4).trainId];
@@ -250,7 +250,7 @@ export function buildSwarmFixture(hive: string, now: number): SwarmFixture {
   // The cars. K41 forks main and is landing; K42 stacks on it; K43 is merging.
   const car = (id: string, members: string[], over: Partial<MergeTrain>) =>
     train(id, id, { lane: "QUEUE", members, includedPrompts: members.map((m) => m.replace(/^t-/, "")), model: null, ...over });
-  car("c-k41", k41, { status: "TESTING", phase: "LANDING", createdAt: now - 60_000, previewUrl: `https://pr-41-${hive}.kaikeru.workers.dev`, score: { ...score, review: "skipped" } });
+  car("c-k41", k41, { status: "TESTING", phase: "LANDING", createdAt: now - 60_000, previewUrl: `https://pr-41-${hive}.example.workers.dev`, score: { ...score, review: "skipped" } });
   car("c-k42", k42, { status: "TESTING", phase: "TESTING", createdAt: now - 40_000, score: null });
   car("c-k43", k43, { status: "BUILDING", phase: "BUILDING", createdAt: now - 15_000 });
   // The bisected car K39 and its halves are ancient history (EJECTED / MERGED).
@@ -673,7 +673,7 @@ export class MockQueen {
     };
     this.emit({ type: "release.updated", release: this.releases[id]! });
     this.later(STEP_MS, () => {
-      this.set(id, { phase: "VALIDATING", stagingUrl: `https://${this.hive}-staging.kaikeru.workers.dev`, candidateVersionId: candidate });
+      this.set(id, { phase: "VALIDATING", stagingUrl: `https://${this.hive}-staging.example.workers.dev`, candidateVersionId: candidate });
       this.later(STEP_MS * 1.4, () => {
         this.verdict(id, "staging", true, "Staging: 0/60 errors; p99 71ms → promote");
         this.set(id, { phase: "AWAITING_TAP", summary: "Staging is healthy. Tap to ship." });
@@ -706,7 +706,7 @@ export class MockQueen {
       }
       this.verdict(id, "canary", true, `Canary ${pct}%: 0/${100 + (pct ?? 0)} errors vs baseline 0/108; p99 84ms vs 80ms → promote`);
       if (rest.length === 0) {
-        this.set(id, { phase: "SHIPPED", canaryPercent: 100, prodUrl: `https://${this.hive}.kaikeru.workers.dev`, summary: null });
+        this.set(id, { phase: "SHIPPED", canaryPercent: 100, prodUrl: `https://${this.hive}.example.workers.dev`, summary: null });
         if (id === "rel-1") this.later(5000, () => this.cut("rel-2", ["t1", "t2", "t3", "t4"], "f00dbabef00dbabef00dbabef00dbabef00dbabe", "ver-bbbb2222", "ver-aaaa1111", true));
         return;
       }

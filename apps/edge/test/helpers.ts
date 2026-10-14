@@ -43,7 +43,7 @@ export async function sign(
 
 export function goodClaims(over: Record<string, unknown> = {}, nowMs = Date.now()): Record<string, unknown> {
   const now = Math.floor(nowMs / 1000);
-  return { iss: ISS, aud: [AUD], email: "kyle@kaikeru.com", sub: "u1", iat: now, nbf: now - 5, exp: now + 3600, ...over };
+  return { iss: ISS, aud: [AUD], email: "owner@kaikeru.com", sub: "u1", iat: now, nbf: now - 5, exp: now + 3600, ...over };
 }
 
 /** A fetcher serving a fake JWKS; counts calls. */

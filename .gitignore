@@ -9,3 +9,9 @@ coverage
 .deploy-dryrun/
 .claude/settings.local.json
 .claude/worktrees/
+
+# Internal working notes (kept locally, not published)
+docs/HANDOFF.md
+docs/demo-script.md
+docs/harness-build-brief.md
+docs/superpowers/plans/

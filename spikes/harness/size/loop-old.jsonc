@@ -1,1 +1,0 @@
-{ "name": "size-loop", "main": "loop.ts", "compatibility_date": "2025-06-01",  "ai": {"binding":"AI"}, "worker_loaders": [{"binding":"LOADER"}], "artifacts": [{"binding":"ARTIFACTS","namespace":"queenos"}] }

@@ -17,7 +17,7 @@ import {
 import { activeMockQueen } from "./mockQueen";
 
 const KEY = "queenos-mock-v1";
-const EMAIL = "kyle@kaikeru.com";
+const EMAIL = "kyle@example.com";
 const CREATE_MS = 3500;
 const FLIGHT_MS = 7000;
 
@@ -40,7 +40,7 @@ function seed(): Db {
         createdBy: EMAIL,
         createdAt: t - 86_400_000 * 3,
         updatedAt: t - 3_600_000,
-        urls: { prod: "https://demo.kaikeru.workers.dev", staging: "https://demo-staging.kaikeru.workers.dev", preview: "https://pr-4-demo.kaikeru.workers.dev" },
+        urls: { prod: "https://demo.example.workers.dev", staging: "https://demo-staging.example.workers.dev", preview: "https://pr-4-demo.example.workers.dev" },
       },
       {
         hive: "pixel-pulse",
@@ -156,7 +156,7 @@ function tick(w: W, hive: string): void {
   const el = now() - w.launchedAt;
   if (el >= CREATE_MS + FLIGHT_MS) {
     w.step = "ACTIVE";
-    w.previewUrl = `https://pr-1-${hive}.kaikeru.workers.dev`;
+    w.previewUrl = `https://pr-1-${hive}.example.workers.dev`;
     const p = db.projects.find((x) => x.hive === hive);
     if (p) {
       p.status = "ACTIVE";
@@ -285,7 +285,7 @@ function activeWizard(hive: string): W {
     step: "ACTIVE",
     charterDraft: fullCharter(hive, hive),
     vault: connectedVault(hive),
-    previewUrl: `https://pr-4-${hive}.kaikeru.workers.dev`,
+    previewUrl: `https://pr-4-${hive}.example.workers.dev`,
   };
 }
 

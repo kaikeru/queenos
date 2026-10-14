@@ -10,7 +10,7 @@ import {
 } from "../src/autonomy/escalation";
 
 const ctx = { hive: "hive", now: 1000 };
-const USER = "kyle@kaikeru.com";
+const USER = "kyle@example.com";
 
 function opened(reason: EscalationReason, subject: EscalationSubject): Escalation {
   return newEscalation("hive", 500, { reason, subject, summary: `${reason} happened` });

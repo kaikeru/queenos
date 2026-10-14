@@ -132,7 +132,7 @@ export function countdownLine(view: RaceView, now: number): string | null {
 }
 
 export interface DecidedSummary {
-  /** "human:kyle@kaikeru.com" | "queen:deadline" | null (older Queens). */
+  /** "human:kyle@example.com" | "queen:deadline" | null (older Queens). */
   by: string | null;
   human: boolean;
   /** Whether the winner was the recommendation; null when unknown. */

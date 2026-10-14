@@ -84,7 +84,7 @@ describe("connect + reveal", () => {
     const hive = newHive();
     expect(await writer.status(hive)).toMatchObject({ hive, connected: false, accountId: null, checks: [] });
 
-    const status = await writer.connectCloudflare(hive, creds, "kyle@kaikeru.com");
+    const status = await writer.connectCloudflare(hive, creds, "kyle@example.com");
     expect(VaultStatusSchema.parse(status)).toMatchObject({ hive, secret: "cloudflare", connected: true, accountId: ACCOUNT });
     expect(status.verifiedAt).toBeTypeOf("number");
     expect(status.checks.map((c) => [c.name, c.ok])).toEqual([
@@ -108,7 +108,7 @@ describe("connect + reveal", () => {
     expect(rows.secrets![0]).toMatchObject({ hive, name: "cloudflare", version: 1, account_id: ACCOUNT });
     expect((rows.secrets![0]!.iv as ArrayBuffer).byteLength).toBe(12);
     expect(rows.audit!.map((a) => [a.action, a.actor, a.purpose, a.ok])).toEqual([
-      ["connect", "kyle@kaikeru.com", "connect cloudflare", 1],
+      ["connect", "kyle@example.com", "connect cloudflare", 1],
       ["reveal", READER_CALLER, "deploy cmd-1", 1],
       ["reveal", READER_CALLER, "unspecified", 1],
     ]);

@@ -607,7 +607,7 @@ describe("command watchdog (alarm)", () => {
 async function mergedRelease(ns: string, mainSha = "main-1") {
   const sup = await worker.fetch(`http://queen.test/hives/${ns}/settings`, {
     method: "PATCH",
-    headers: { "content-type": "application/json", "x-queen-user": "kyle@kaikeru.com" },
+    headers: { "content-type": "application/json", "x-queen-user": "kyle@example.com" },
     body: JSON.stringify({ autonomy: "supervised" }),
   });
   expect(sup.status).toBe(200);
@@ -653,7 +653,7 @@ describe("release train", () => {
     expect(validate).toMatchObject({ commandId: `${releaseId}-validate-1`, environment: "staging", scriptName: `${ns}-staging`, windowSeconds: 60, minRequests: 100 });
 
     // Not tappable yet.
-    expect((await tap(ns, releaseId, "kyle@kaikeru.com")).status).toBe(409);
+    expect((await tap(ns, releaseId, "kyle@example.com")).status).toBe(409);
 
     const v = await post(ns, "/internal/webhook/sentinel-verdict", verdict(validate!));
     expect(await v.json()).toMatchObject({ outcome: "applied", release: { phase: "AWAITING_TAP" } });
@@ -664,14 +664,14 @@ describe("release train", () => {
     expect(anon.status).toBe(401);
     expect(await anon.json()).toMatchObject({ error: { code: "UNAUTHORIZED" } });
     expect((await tap(ns, releaseId, "   ", AUTH)).status).toBe(401);
-    const ok = await tap(ns, releaseId, "kyle@kaikeru.com");
+    const ok = await tap(ns, releaseId, "kyle@example.com");
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toMatchObject({ outcome: "applied", release: { phase: "CANARY", tappedBy: "kyle@kaikeru.com" } });
-    expect((await tap(ns, releaseId, "kyle@kaikeru.com")).status).toBe(409);
-    expect((await tap(ns, "no-such-release", "kyle@kaikeru.com")).status).toBe(404);
+    expect(await ok.json()).toMatchObject({ outcome: "applied", release: { phase: "CANARY", tappedBy: "kyle@example.com" } });
+    expect((await tap(ns, releaseId, "kyle@example.com")).status).toBe(409);
+    expect((await tap(ns, "no-such-release", "kyle@example.com")).status).toBe(404);
     const mismatch = await worker.fetch(`http://queen.test/hives/${ns}/releases/${releaseId}/tap`, {
       method: "POST",
-      headers: { "x-queen-user": "kyle@kaikeru.com" },
+      headers: { "x-queen-user": "kyle@example.com" },
       body: JSON.stringify({ releaseId: "other" }),
     });
     expect(mismatch.status).toBe(400);
@@ -679,7 +679,7 @@ describe("release train", () => {
     const s = await inspect(ns);
     expect(s.deploys.at(-1)).toEqual({ op: "DEPLOY", commandId: `${releaseId}-canary1-1`, hive: ns, environment: "canary", releaseId, artifactRepo: ns, commitSha: "main-1", percent: 1 });
     snap = await snapshotOf(ns);
-    expect(snap.releases?.[0]).toMatchObject({ phase: "CANARY", tappedBy: "kyle@kaikeru.com" });
+    expect(snap.releases?.[0]).toMatchObject({ phase: "CANARY", tappedBy: "kyle@example.com" });
     expect(snap.deployments?.find((d) => d.environment === "staging")).toMatchObject({ status: "LIVE", url: `https://${ns}-staging.test.dev` });
     expect(snap.deployments?.find((d) => d.environment === "canary")).toMatchObject({ status: "PENDING", percent: 1 });
   });
@@ -689,7 +689,7 @@ describe("release train", () => {
     const { staging } = await mergedRelease(ns);
     const res = await worker.fetch(`http://queen.test/releases/${staging.releaseId}/tap`, {
       method: "POST",
-      headers: { "x-queen-hive": ns, "x-queen-user": "kyle@kaikeru.com" },
+      headers: { "x-queen-hive": ns, "x-queen-user": "kyle@example.com" },
     });
     expect(res.status).toBe(409); // STAGING: wrong phase, but routed to the right hive
   });
@@ -1063,7 +1063,7 @@ describe("appendAudits (batched ledger entries)", () => {
 });
 
 describe("v2 surface (routes and RPCs, §3.6)", () => {
-  const user = { "x-queen-user": "kyle@kaikeru.com" };
+  const user = { "x-queen-user": "kyle@example.com" };
   const req = (ns: string, method: string, path: string, body?: unknown, headers: Record<string, string> = {}) =>
     worker.fetch(`http://queen.test/hives/${ns}${path}`, {
       method,
@@ -1149,7 +1149,7 @@ describe("v2 surface (routes and RPCs, §3.6)", () => {
     const a = await req(ns, "POST", "/items", { kind: "feature", title: "Add /a" }, user);
     expect(a.status).toBe(201);
     const { item } = await a.json<{ item: { itemId: string; status: string; source: { actor: string } } }>();
-    expect(item).toMatchObject({ status: "ACTIVE", source: { actor: "user:kyle@kaikeru.com" } });
+    expect(item).toMatchObject({ status: "ACTIVE", source: { actor: "user:kyle@example.com" } });
     expect((await req(ns, "POST", "/items", { kind: "feature", title: "Add /b", dependsOn: ["nope"] }, user)).status).toBe(400);
     const b = await (await req(ns, "POST", "/items", { kind: "feature", title: "Add /b", dependsOn: [item.itemId] }, user)).json<{ item: { itemId: string; status: string } }>();
     expect(b.item.status).toBe("BLOCKED");

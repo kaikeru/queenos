@@ -10,7 +10,7 @@ afterEach(() => setWorld(null));
 let n = 0;
 const slug = () => `hive-${++n}-${Math.random().toString(36).slice(2, 6)}`;
 
-async function call(method: string, path: string, body?: unknown, user: string | null = "kyle@kaikeru.com") {
+async function call(method: string, path: string, body?: unknown, user: string | null = "kyle@example.com") {
   const res = await SELF.fetch(`https://genesis.internal${path}`, {
     method,
     headers: { ...(user ? { "x-queen-user": user } : {}), ...(body ? { "content-type": "application/json" } : {}) },
@@ -92,7 +92,7 @@ describe("wizard happy path (scripted)", () => {
   it("DESCRIBE -> CHARTER_READY -> DEPLOY_CONNECTED -> HIVE_CREATING -> FIRST_FLIGHT -> ACTIVE", async () => {
     const w = new FakeWorld();
     const { hive } = await startHive(w);
-    expect(w.registry.projects.get(hive)).toMatchObject({ status: "ONBOARDING", createdBy: "kyle@kaikeru.com" });
+    expect(w.registry.projects.get(hive)).toMatchObject({ status: "ONBOARDING", createdBy: "kyle@example.com" });
 
     const s0 = await call("GET", `/api/genesis/${hive}`);
     expect(WizardStateSchema.parse(s0.json)).toMatchObject({ step: "DESCRIBE", vault: { connected: false } });

@@ -164,7 +164,7 @@ export function currentCandidates(race: Pick<Race, "raceId">, trains: readonly M
   return { heads: ordered.map((g) => g.at(-1)!), old: ordered.flatMap((g) => g.slice(0, -1)).sort(byAge) };
 }
 
-/** "w1@kyle" for agent `w1@kyle@kaikeru.com` (claim: its model), "kyle" for a human push, the model (or "c2") for drones. */
+/** "w1@kyle" for agent `w1@kyle@example.com` (claim: its model), "kyle" for a human push, the model (or "c2") for drones. */
 export function whoOf(t: Pick<MergeTrain, "origin" | "model" | "candidate">): { who: string; claim: string | null } {
   const o = t.origin;
   const tag = `c${(t.candidate ?? 0) + 1}`;

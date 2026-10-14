@@ -52,7 +52,7 @@ describe("git auth", () => {
     const b = await git(REFS, { headers: { authorization: `Bearer ${json.token}` } });
     expect(b.status).toBe(200);
     for (const s of seen.git) {
-      expect(s.req.headers.get("x-queen-user")).toBe("kyle@kaikeru.com");
+      expect(s.req.headers.get("x-queen-user")).toBe("owner@kaikeru.com");
       expect(s.req.headers.get("x-queen-scopes")).toBe("read");
     }
     expect(seen.git).toHaveLength(2);
@@ -98,7 +98,7 @@ describe("git auth", () => {
       },
     });
     const h = seen.git[0]!.req.headers;
-    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
     expect(h.get("x-queen-scopes")).toBe("read");
     expect(h.get("authorization")).toBeNull();
     expect(h.get("cookie")).toBeNull();
@@ -133,7 +133,7 @@ describe("git auth", () => {
     const { git, access, seen, key } = await ctx();
     const ok = await git(REFS, { headers: { "cf-access-token": access } });
     expect(ok.status).toBe(200);
-    expect(seen.git[0]!.req.headers.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(seen.git[0]!.req.headers.get("x-queen-user")).toBe("owner@kaikeru.com");
     expect(seen.git[0]!.req.headers.get("cf-access-token")).toBeNull();
     expect((await git(REFS, { headers: { "cf-access-token": "a.b.c" } })).status).toBe(401);
     const foreign = await sign(key, goodClaims({ email: "x@evil.com" }));
@@ -171,7 +171,7 @@ describe("git tokens API", () => {
     const { status, json } = await mint({ label: "laptop" });
     expect(status).toBe(201);
     expect(json.token).toMatch(/^qgt_[a-z2-7]{52}$/);
-    expect(json).toMatchObject({ email: "kyle@kaikeru.com", scopes: ["read", "push"], label: "laptop", lastUsedAt: null, revokedAt: null });
+    expect(json).toMatchObject({ email: "owner@kaikeru.com", scopes: ["read", "push"], label: "laptop", lastUsedAt: null, revokedAt: null });
     expect((json.expiresAt as number) - (json.createdAt as number)).toBe(30 * 86_400_000);
 
     const list = (await (await api("/api/git-tokens")).json()) as Record<string, unknown>[];
@@ -261,7 +261,7 @@ describe("agent identity on git tokens", () => {
     const h = seen.git[0]!.req.headers;
     expect(h.get("x-queen-agent")).toBe("claude-code");
     expect(h.get("x-queen-agent-model")).toBe("claude-opus-4");
-    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
   });
 
   it("omits the model header when the agent token has no model", async () => {
@@ -299,7 +299,7 @@ describe("agent identity on git tokens", () => {
     const { git, access, seen } = await ctx();
     await git(REFS, { headers: { "cf-access-token": access, "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" } });
     const h = seen.git[0]!.req.headers;
-    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
     expect(h.has("x-queen-agent")).toBe(false);
     expect(h.has("x-queen-agent-model")).toBe(false);
   });
@@ -316,7 +316,7 @@ describe("agent identity on git tokens", () => {
     const { api, seen } = await ctx();
     await api("/hives/demo/items", { headers: { "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" } });
     const h = seen.queen[0]!.headers;
-    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
     expect(h.has("x-queen-agent")).toBe(false);
     expect(h.has("x-queen-agent-model")).toBe(false);
   });
@@ -325,7 +325,7 @@ describe("agent identity on git tokens", () => {
     const { reg, mint, api } = await ctx();
     const a = await mint({ agent: AGENT });
     const h = await hashToken(a.json.token);
-    expect(await reg.authGitToken(h)).toMatchObject({ email: "kyle@kaikeru.com", agent: AGENT });
+    expect(await reg.authGitToken(h)).toMatchObject({ email: "owner@kaikeru.com", agent: AGENT });
     await api(`/api/git-tokens/${a.json.id}`, { method: "DELETE" });
     expect(await reg.authGitToken(h)).toBeNull();
   });

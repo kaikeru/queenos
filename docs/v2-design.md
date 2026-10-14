@@ -1,7 +1,7 @@
 # QueenOS v2: an army of virtual engineers (work ledger, parallel builds, merge queue, best-of-N, SRE observability)
 
 Status: design, revised 2026-10-05 after the user's decisions (D1–D11 decided, §10). Build ends 2026-10-11; Oct 12–13 are for recording; the video is due 2026-10-14. Author: architect session.
-Read with `docs/HANDOFF.md`, `apps/queen/README.md` and `packages/queen-types/src/*`.
+Read with `apps/queen/README.md` and `packages/queen-types/src/*`.
 **Addendum (2026-10-07):** `docs/human-push-design.md` covers the inbox (human and agent `git push`), the unified `Submission` intake and human-judged races (D12).
 
 ---
@@ -1352,7 +1352,7 @@ The fake reports these as `BuildResult.changedPaths`.
 
 ## 8. Implementation plan (parallel subagents)
 
-The rules from `docs/HANDOFF.md` apply:
+The rules:
 - the coordinator never edits;
 - the contracts come first;
 - file ownership is disjoint within a phase;

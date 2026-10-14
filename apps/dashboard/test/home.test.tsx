@@ -10,11 +10,11 @@ import { initialState, type State } from "../src/reducer";
 const NOW = 1_800_000_000_000;
 const item = (over: Partial<WorkItem> = {}): WorkItem => ({
   itemId: "i1", hive: "demo", kind: "feature", title: "Item", body: "", acceptance: [], priority: 2, status: "ACTIVE", parentId: null, rootId: over.itemId ?? "i1", depth: 0,
-  dependsOn: [], source: { kind: "user", actor: "kyle@kaikeru.com" }, traceId: "a".repeat(32), spanId: "b".repeat(16), difficulty: "normal", bestOf: null, attempts: 0, conflicts: 0,
+  dependsOn: [], source: { kind: "user", actor: "kyle@example.com" }, traceId: "a".repeat(32), spanId: "b".repeat(16), difficulty: "normal", bestOf: null, attempts: 0, conflicts: 0,
   paths: [], waitReason: null, duplicateOf: null, blockedReason: null, releaseId: null, escalationId: null, createdAt: NOW - 600_000, updatedAt: NOW - 600_000, ...over,
 });
 const race = (over: Partial<Race>): Race => ({ raceId: "r", itemId: "i1", width: 1, state: "RACING", trainIds: [], winnerTrainId: null, reason: null, deadlineAt: null, createdAt: NOW - 300_000, decidedAt: null, ...over });
-const agent = (name: string, model: string) => ({ kind: "agent" as const, id: `${name}@kyle@kaikeru.com`, model });
+const agent = (name: string, model: string) => ({ kind: "agent" as const, id: `${name}@kyle@example.com`, model });
 const train = (id: string, over: Partial<MergeTrain>): MergeTrain => ({
   trainId: id, baseSha: "0".repeat(40), includedPrompts: ["i1"], artifactRepo: "demo", status: "TESTING", phase: "TESTING", lane: "BUILD", createdAt: NOW - 200_000, candidate: 0, raceOutcome: "RACING",
   previewUrl: `https://${id}.example.dev`, ...over,

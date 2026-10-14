@@ -341,10 +341,10 @@ describe("(i) supervised hive", () => {
     const [rel] = await rows(stub, "SELECT release_id, phase FROM releases WHERE phase = 'AWAITING_TAP'");
     expect(rel).toBeDefined();
     const id = String((await approval())!.escalation_id);
-    const res = (await stub.resolveEscalation({ hive, escalationId: id, user: "kyle@kaikeru.com", action: { action: "ship" } })) as { outcome: string; escalation: Escalation };
-    expect(res).toMatchObject({ outcome: "applied", escalation: { status: "RESOLVED", resolvedBy: "kyle@kaikeru.com" } });
+    const res = (await stub.resolveEscalation({ hive, escalationId: id, user: "kyle@example.com", action: { action: "ship" } })) as { outcome: string; escalation: Escalation };
+    expect(res).toMatchObject({ outcome: "applied", escalation: { status: "RESOLVED", resolvedBy: "kyle@example.com" } });
     const [after] = await rows(stub, "SELECT phase, tapped_by FROM releases WHERE release_id = ?", String(rel!.release_id));
-    expect(after).toMatchObject({ phase: "CANARY", tapped_by: "kyle@kaikeru.com" });
+    expect(after).toMatchObject({ phase: "CANARY", tapped_by: "kyle@example.com" });
     await pump(stub, async () => (await rows(stub, "SELECT 1 FROM releases WHERE release_id = ? AND phase = 'SHIPPED'", String(rel!.release_id))).length === 1, 30_000, "SHIPPED");
   });
 });
@@ -363,7 +363,7 @@ describe("(j) budget", () => {
     expect(esc).toBeDefined();
     expect(((await stub.getSnapshot()) as unknown as Snapshot).hive).toMatchObject({ headline: "NEEDS_YOU" });
 
-    await stub.resolveEscalation({ hive, escalationId: String(esc!.escalation_id), user: "kyle@kaikeru.com", action: { action: "raise_budget" } });
+    await stub.resolveEscalation({ hive, escalationId: String(esc!.escalation_id), user: "kyle@example.com", action: { action: "raise_budget" } });
     expect(await itemStatus(stub, b.itemId)).toBe("ACTIVE");
     expect((await buildTrains(stub, b.itemId)).length).toBeGreaterThan(0);
   });

@@ -241,7 +241,7 @@ describe("pick hint (human judge, race still RACING)", () => {
 });
 
 describe("attempt id reaches the chips through the callers", () => {
-  const att = (id: string, i: number, attemptId: string) => train(id, i, { origin: { kind: "agent", id: "opus@kyle@kaikeru.com" }, attemptId } as Partial<MergeTrain>);
+  const att = (id: string, i: number, attemptId: string) => train(id, i, { origin: { kind: "agent", id: "opus@kyle@example.com" }, attemptId } as Partial<MergeTrain>);
   test("raceLogic pickCards forward attemptId to the origin badge", () => {
     const ts = [att("a", 0, "att_0123456789ab"), train("b", 1)];
     const cards = pickCards(raceView(state(race(), ts), "r1", NOW)!);

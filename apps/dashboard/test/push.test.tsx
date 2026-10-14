@@ -114,19 +114,19 @@ describe("origin badges", () => {
   test("drone (absent / null), human:<email>, agent:<name> with the owner in the tooltip", () => {
     expect(originBadge(undefined).text).toBe("drone");
     expect(originBadge(null).kind).toBe("drone");
-    expect(originBadge({ kind: "human", id: "kyle@kaikeru.com" })).toMatchObject({ kind: "human", text: "human:kyle@kaikeru.com" });
-    const a = originBadge({ kind: "agent", id: "claude-code@kyle@kaikeru.com" });
+    expect(originBadge({ kind: "human", id: "kyle@example.com" })).toMatchObject({ kind: "human", text: "human:kyle@example.com" });
+    const a = originBadge({ kind: "agent", id: "claude-code@kyle@example.com" });
     expect(a).toMatchObject({ kind: "agent", text: "agent:claude-code" });
-    expect(a.title).toContain("kyle@kaikeru.com");
+    expect(a.title).toContain("kyle@example.com");
     expect(a.claim).toBeNull();
     expect(a.title).not.toContain("claims");
   });
 
   test("an agent's claimed model rides on the badge (self-reported tooltip); human and drone have none", () => {
-    const a = originBadge({ kind: "agent", id: "claude-code@kyle@kaikeru.com", model: "claude-opus-4-5" });
+    const a = originBadge({ kind: "agent", id: "claude-code@kyle@example.com", model: "claude-opus-4-5" });
     expect(a.claim).toBe("claude-opus-4-5");
     expect(a.title).toContain("claims claude-opus-4-5 (self-reported)");
-    expect(originBadge({ kind: "human", id: "kyle@kaikeru.com" }).claim).toBeNull();
+    expect(originBadge({ kind: "human", id: "kyle@example.com" }).claim).toBeNull();
     expect(originBadge({ kind: "drone", id: "wf-1" }).claim).toBeNull();
     expect(originBadge(null).claim).toBeNull();
     const inbox = { repo: "r", ref: "refs/heads/x", handle: "kyle", headSha: "a".repeat(40), handoff: false };
@@ -141,18 +141,18 @@ describe("origin badges", () => {
   });
 
   test("an MCP attempt's candidate chip shows the attempt id next to 'claims <model>'", () => {
-    const b = originBadge({ kind: "agent", id: "opus@kyle@kaikeru.com", model: "claude-opus-5-5" }, "att_0123456789ab");
+    const b = originBadge({ kind: "agent", id: "opus@kyle@example.com", model: "claude-opus-5-5" }, "att_0123456789ab");
     expect(b).toMatchObject({ kind: "agent", text: "agent:opus", claim: "claude-opus-5-5", attempt: "att_0123456789ab" });
     expect(b.title).toContain("attempt att_0123456789ab");
     const html = renderToString(<OriginChip badge={b} />);
     expect(html).toContain("claims claude-opus-5-5");
     expect(html).toContain("att_…6789ab"); // short chip text: the last 6 characters
     expect(html).not.toContain(">att_0123456789ab<");
-    expect(html).toContain('title="pushed by agent opus for kyle@kaikeru.com; claims claude-opus-5-5 (self-reported); attempt att_0123456789ab"'); // the tooltip keeps the full id
+    expect(html).toContain('title="pushed by agent opus for kyle@example.com; claims claude-opus-5-5 (self-reported); attempt att_0123456789ab"'); // the tooltip keeps the full id
     expect(attemptChipText("att_0123456789ab")).toBe("att_…6789ab");
-    expect(originBadge({ kind: "human", id: "kyle@kaikeru.com" }).attempt).toBeNull();
+    expect(originBadge({ kind: "human", id: "kyle@example.com" }).attempt).toBeNull();
     expect(renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@kaikeru.com" })} />)).not.toContain("att_");
-    const t = { trainId: "t9", origin: { kind: "agent" as const, id: "opus@kyle@kaikeru.com" }, createdAt: NOW, attemptId: "att_0123456789ab" };
+    const t = { trainId: "t9", origin: { kind: "agent" as const, id: "opus@kyle@example.com" }, createdAt: NOW, attemptId: "att_0123456789ab" };
     expect(itemOrigin(null, [t]).attempt).toBe("att_0123456789ab");
   });
 

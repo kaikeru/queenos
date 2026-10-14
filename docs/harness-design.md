@@ -1,6 +1,6 @@
 # Drone coding harness: design (2026-10-05)
 
-Implements `docs/harness-build-brief.md`, following the hybrid layout in `docs/harness-spike.md` §5. In short, the drone
+Follows the hybrid layout in `docs/harness-spike.md` §5. In short, the drone
 Workflow is unchanged except for one step. `generate change set` becomes **`agent: build`**, which runs a
 `@cloudflare/think` coding agent (`BuilderAgent`, one DO per attempt and model) against a workspace seeded from the train
 branch. The step returns a capped **file overlay**. Commit, notes, push, report and audit then run exactly as they do today.

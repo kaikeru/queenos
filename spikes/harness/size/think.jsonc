@@ -1,1 +1,0 @@
-{ "name": "size-think", "main": "think.ts", "compatibility_date": "2026-10-02", "durable_objects":{"bindings":[{"name":"SPIKE_THINK","class_name":"SpikeThink"}]},"migrations":[{"tag":"v1","new_sqlite_classes":["SpikeThink"]}], "ai": {"binding":"AI"}, "worker_loaders": [{"binding":"LOADER"}], "artifacts": [{"binding":"ARTIFACTS","namespace":"queenos"}] }

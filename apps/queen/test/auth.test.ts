@@ -109,7 +109,7 @@ describe("safeEqual", () => {
 describe("resolveUser (tap-to-ship identity)", () => {
   const local = "http://localhost:8787/hives/h/releases/r/tap";
   it("always prefers the edge-provided header", () => {
-    expect(resolveUser({}, local, " kyle@kaikeru.com ")).toBe("kyle@kaikeru.com");
+    expect(resolveUser({}, local, " kyle@example.com ")).toBe("kyle@example.com");
   });
   it("defaults to the sim user only for the sim env on localhost", () => {
     expect(resolveUser({ QUEEN_INTERNAL_AUTH: "disabled" }, local, undefined)).toBe(SIM_USER);

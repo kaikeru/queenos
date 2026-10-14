@@ -54,7 +54,7 @@ export class FakeCloudflare {
       return s === 200 ? ok({ id: "w1", name: JSON.parse(String(init.body)).name }) : err(s, 10000, "Authentication error");
     }
     if (method === "GET" && path === `/accounts/${ACCOUNT}/workers/subdomain`) {
-      return o.subdomain === null ? err(404, 10007, "no subdomain") : ok({ subdomain: o.subdomain ?? "kaikeru" });
+      return o.subdomain === null ? err(404, 10007, "no subdomain") : ok({ subdomain: o.subdomain ?? "example" });
     }
     return err(404, 7003, `no route for ${method} ${path}`);
   };

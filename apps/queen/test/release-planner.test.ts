@@ -135,7 +135,7 @@ class RSim {
   /** ...then tap and bring the 1% canary up (candidate v-cand, stable v-stable unless `stable` is null). */
   static canary1(stable: string | null = "v-stable"): RSim {
     const s = RSim.awaitingTap();
-    s.run((p) => p.tap("r1", "kyle@kaikeru.com"));
+    s.run((p) => p.tap("r1", "kyle@example.com"));
     const [d] = s.deploys();
     s.deployResult(d!, { environment: "canary", url: PROD_URL, versionId: "v-cand", ...(stable ? { stableVersionId: stable } : {}) });
     return s;
@@ -234,7 +234,7 @@ describe("release planner: superseding and queueing", () => {
       // Cancelled logically: whatever r1's executors report now is stale.
       expect(s.deployResult(staging, { url: STAGING_URL }).outcome).toBe("ignored:stale");
       if (validate) expect(s.verdict(validate, "PROMOTE").outcome).toBe("ignored:stale");
-      expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("conflict");
+      expect(s.run((p) => p.tap("r1", "kyle@example.com")).outcome).toBe("conflict");
       expect(s.rel("r2").phase).toBe("STAGING");
     });
   }
@@ -275,19 +275,19 @@ describe("release planner: tap to ship", () => {
   it("only AWAITING_TAP can be tapped; the tap records who/when and starts the 1% canary", () => {
     const s = new RSim();
     s.land("t1");
-    expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("conflict");
-    expect(s.run((p) => p.tap("nope", "kyle@kaikeru.com")).outcome).toBe("ignored:unknown");
+    expect(s.run((p) => p.tap("r1", "kyle@example.com")).outcome).toBe("conflict");
+    expect(s.run((p) => p.tap("nope", "kyle@example.com")).outcome).toBe("ignored:unknown");
 
     const t = RSim.awaitingTap();
     t.now = 5000;
-    expect(t.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("applied");
-    expect(t.rel("r1")).toMatchObject({ phase: "CANARY", tappedBy: "kyle@kaikeru.com", tappedAt: 5000, step: 0, pending: "DEPLOY" });
+    expect(t.run((p) => p.tap("r1", "kyle@example.com")).outcome).toBe("applied");
+    expect(t.rel("r1")).toMatchObject({ phase: "CANARY", tappedBy: "kyle@example.com", tappedAt: 5000, step: 0, pending: "DEPLOY" });
     expect(t.deploys()).toEqual([
       { op: "DEPLOY", commandId: "r1-canary1-1", hive: "hive", environment: "canary", releaseId: "r1", artifactRepo: "hive", commitSha: "sha-t1", percent: 1 },
     ]);
     expect(t.deployments.get("canary")).toMatchObject({ status: "PENDING", percent: 1 });
     expect(t.run((p) => p.tap("r1", "someone@kaikeru.com")).outcome).toBe("conflict");
-    expect(t.rel("r1").tappedBy).toBe("kyle@kaikeru.com");
+    expect(t.rel("r1").tappedBy).toBe("kyle@example.com");
   });
 });
 
@@ -410,7 +410,7 @@ describe("release planner: canary", () => {
 
   it("first prod deploy whose upload failed: nothing is live, so the summary says nothing was rolled back", () => {
     const s = RSim.awaitingTap();
-    s.run((p) => p.tap("r1", "kyle@kaikeru.com"));
+    s.run((p) => p.tap("r1", "kyle@example.com"));
     s.deployResult(s.deploys()[0]!, { environment: "canary", ok: false, summary: "upload 500" });
     expect(s.rel("r1")).toMatchObject({ phase: "FAILED" });
     expect(s.rel("r1").summary).toMatch(/No stable version to roll back to \(first prod deploy\), so nothing was rolled back\.$/);
@@ -419,7 +419,7 @@ describe("release planner: canary", () => {
 
   it("a canary step-1 deploy without a version id fails into a rollback when Herald named the stable version", () => {
     const s = RSim.awaitingTap();
-    s.run((p) => p.tap("r1", "kyle@kaikeru.com"));
+    s.run((p) => p.tap("r1", "kyle@example.com"));
     s.deployResult(s.deploys()[0]!, { environment: "canary", url: PROD_URL, stableVersionId: "v-stable" });
     expect(s.rel("r1").summary).toBe("Canary deploy at 1% failed: Herald reported a canary deploy without a version id.");
     expect(s.herald()).toEqual([expect.objectContaining({ op: "ROLLBACK", toVersionId: "v-stable" })]);
@@ -590,7 +590,7 @@ function cycle(s: RSim, train: string, how: "ship" | "rollback" | "rollback-fail
   const v = toValidating(s, train);
   s.verdict(v, "PROMOTE");
   const id = v.releaseId;
-  if (s.rel(id).phase === "AWAITING_TAP") s.run((p) => p.tap(id, "kyle@kaikeru.com"));
+  if (s.rel(id).phase === "AWAITING_TAP") s.run((p) => p.tap(id, "kyle@example.com"));
   s.deployResult(s.deploys().at(-1)!, { environment: "canary", url: PROD_URL, versionId: "v-cand", stableVersionId: "v-stable" });
   endCanary(s, how);
   return id;
@@ -636,16 +636,16 @@ describe("release planner: autonomy levels × staging verdicts", () => {
     const s = RSim.awaitingTap();
     const [e] = [...s.escalations.values()];
     expect(e).toMatchObject({ reason: "APPROVAL_REQUIRED", status: "OPEN", subject: { type: "release", id: "r1" }, actions: ["ship", "hold"], hive: "hive" });
-    expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("applied");
-    expect(s.escalations.get(e!.escalationId)).toMatchObject({ status: "RESOLVED", resolvedBy: "kyle@kaikeru.com", resolution: "ship", resolvedAt: 1000 });
+    expect(s.run((p) => p.tap("r1", "kyle@example.com")).outcome).toBe("applied");
+    expect(s.escalations.get(e!.escalationId)).toMatchObject({ status: "RESOLVED", resolvedBy: "kyle@example.com", resolution: "ship", resolvedAt: 1000 });
   });
 
   it("paused: a tap is refused (no new canary) and works once unpaused", () => {
     const s = RSim.awaitingTap({ paused: true });
-    expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("conflict");
+    expect(s.run((p) => p.tap("r1", "kyle@example.com")).outcome).toBe("conflict");
     expect(s.rel("r1").phase).toBe("AWAITING_TAP");
     s.paused = false;
-    expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("applied");
+    expect(s.run((p) => p.tap("r1", "kyle@example.com")).outcome).toBe("applied");
     expect(s.rel("r1").phase).toBe("CANARY");
   });
 
@@ -688,11 +688,11 @@ describe("release planner: reconcile auto-tap", () => {
     expect(s.rel("r1").phase).toBe("AWAITING_TAP");
     // A human holds it: still parked.
     const [e] = [...s.escalations.values()];
-    s.escalations.set(e!.escalationId, { ...e!, status: "RESOLVED", resolution: "hold", resolvedBy: "kyle@kaikeru.com", resolvedAt: 1000 });
+    s.escalations.set(e!.escalationId, { ...e!, status: "RESOLVED", resolution: "hold", resolvedBy: "kyle@example.com", resolvedAt: 1000 });
     s.run((p) => p.reconcile());
     expect(s.rel("r1").phase).toBe("AWAITING_TAP");
     // ...but a human can still ship it.
-    expect(s.run((p) => p.tap("r1", "kyle@kaikeru.com")).outcome).toBe("applied");
+    expect(s.run((p) => p.tap("r1", "kyle@example.com")).outcome).toBe("applied");
   });
 
   it("no auto-tap while paused", () => {
@@ -737,7 +737,7 @@ describe("release planner: rollback streak and escalations", () => {
 
   it("a canary FAILED with no stable version counts toward the streak; a staging failure does not", () => {
     const s = RSim.awaitingTap();
-    s.run((p) => p.tap("r1", "kyle@kaikeru.com"));
+    s.run((p) => p.tap("r1", "kyle@example.com"));
     s.deployResult(s.deploys()[0]!, { environment: "canary", ok: false, summary: "upload 500" });
     expect(s.rel("r1").phase).toBe("FAILED");
     expect(s.streak).toBe(1);
@@ -799,8 +799,8 @@ describe("release planner: infrastructure failures are never the change's fault"
     expect(s.rel("r1").phase).toBe("AWAITING_TAP");
     expect(s.deploys()).toEqual([]);
     // retry (the EXECUTOR_LOST action) restarts the canary at 1%.
-    expect(s.run((p) => p.retry("r1", "kyle@kaikeru.com")).outcome).toBe("applied");
-    expect(s.rel("r1")).toMatchObject({ phase: "CANARY", tappedBy: "kyle@kaikeru.com" });
+    expect(s.run((p) => p.retry("r1", "kyle@example.com")).outcome).toBe("applied");
+    expect(s.rel("r1")).toMatchObject({ phase: "CANARY", tappedBy: "kyle@example.com" });
     expect(s.deploys().map((c) => c.commandId)).toEqual(["r1-canary1-4"]);
   });
 
@@ -838,7 +838,7 @@ describe("release planner: infrastructure failures are never the change's fault"
     expect(s.rel("r1")).toMatchObject({ phase: "STAGING", pending: null });
     expect(s.open()).toEqual(["EXECUTOR_LOST:r1"]);
     // retry re-deploys staging.
-    s.run((p) => p.retry("r1", "kyle@kaikeru.com"));
+    s.run((p) => p.retry("r1", "kyle@example.com"));
     expect(s.deploys().map((c) => c.commandId)).toEqual(["r1-staging-4"]);
     // A newer head supersedes it as any STAGING release.
     s.land("t2");

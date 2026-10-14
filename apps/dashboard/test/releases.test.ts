@@ -141,7 +141,7 @@ test("tap errors: 401 hints re-sign-in, 409 says stale", () => {
 test("sites view: staging, canary and prod rows come from releases and verdicts", () => {
   const rels = [
     release({ releaseId: "r2", phase: "CANARY", canaryPercent: 50, stagingUrl: "https://stg", candidateVersionId: "cand2222-xxxx", stableVersionId: "stab1111-xxxx", createdAt: 200 }),
-    release({ releaseId: "r1", phase: "SHIPPED", canaryPercent: 100, stagingUrl: "https://stg", prodUrl: "https://prod", candidateVersionId: "stab1111-xxxx", stableVersionId: "old00000-xxxx", tappedBy: "kyle@kaikeru.com", createdAt: 100 }),
+    release({ releaseId: "r1", phase: "SHIPPED", canaryPercent: 100, stagingUrl: "https://stg", prodUrl: "https://prod", candidateVersionId: "stab1111-xxxx", stableVersionId: "old00000-xxxx", tappedBy: "kyle@example.com", createdAt: 100 }),
   ];
   let s = run(base, server({ type: "snapshot", promptRuns: [], trains: [], recentAudit: [], releases: rels }));
   s = reducer(s, server({ type: "sentinel.verdict", verdict: verdict({ releaseId: "r2", environment: "canary", summary: "ok" }) }));
@@ -149,7 +149,7 @@ test("sites view: staging, canary and prod rows come from releases and verdicts"
   expect(v.staging).toMatchObject({ url: "https://stg", phase: "CANARY", verdict: null });
   expect(v.canary).toMatchObject({ percent: 50, candidate: "cand2222", stable: "stab1111", live: true });
   expect(v.canary!.verdict!.summary).toBe("ok");
-  expect(v.prod).toEqual({ url: "https://prod", stable: "stab1111", tappedBy: "kyle@kaikeru.com", releaseId: "r1" });
+  expect(v.prod).toEqual({ url: "https://prod", stable: "stab1111", tappedBy: "kyle@example.com", releaseId: "r1" });
 });
 
 test("sites view is empty before any release", () => {

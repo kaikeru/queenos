@@ -3,7 +3,7 @@ import type { MergeTrain, SubmissionOrigin, SubmissionOriginKind, WorkItem } fro
 
 export interface OriginBadge {
   kind: SubmissionOriginKind;
-  /** Short label: "drone", "human:kyle@kaikeru.com", "agent:claude-code". */
+  /** Short label: "drone", "human:kyle@example.com", "agent:claude-code". */
   text: string;
   /** Tooltip: the full origin id. */
   title: string;

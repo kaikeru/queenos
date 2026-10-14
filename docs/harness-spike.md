@@ -16,7 +16,7 @@ loaded in a sandbox. This held even with the **old** routing rules in the prompt
 router before editing, and that alone avoids the `/features/<slug>` mistake. There were 3 failures: 2 Workers AI
 timeouts on Qwen 3.8 and 1 Think DO reset caused by a deploy mid-run.
 
-Prototype: `spikes/harness/` (throwaway Worker `queenos-day1-harness`, now deleted). Raw outputs:
+Prototype: `spikes/harness/` (throwaway Worker `queenos-day1-harness`, now deleted; the code was removed from the repo, see commit 459d26a). Raw outputs:
 `spikes/harness/results/*.json`.
 
 ---

@@ -71,7 +71,7 @@ describe("/mcp", () => {
     expect(new URL(s.req.url).pathname).toBe("/mcp");
     expect(s.body).toBe(INIT);
     const h = s.req.headers;
-    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
     expect(h.get("x-queen-token-id")).toBe(id);
     for (const gone of ["authorization", "cookie", "x-queen-agent", "x-queen-agent-model", "x-queen-scopes"]) expect(h.get(gone), gone).toBeNull();
     expect(h.get("accept")).toBe("application/json, text/event-stream");
@@ -146,7 +146,7 @@ describe("/git header hygiene", () => {
     expect(r.status).toBe(200);
     const h = seen.git[0]!.req.headers;
     expect(h.get("x-queen-token-id")).toBeNull();
-    expect(h.get("x-queen-user")).toBe("kyle@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
     expect(h.get("authorization")).toBeNull();
   });
 });
@@ -156,7 +156,7 @@ describe("HiveRegistry.authGitToken", () => {
     const { mint, reg } = await ctx();
     const { token, id } = await mint();
     const found = await reg.authGitToken(await hashToken(token));
-    expect(found).toMatchObject({ id, email: "kyle@kaikeru.com", scopes: ["read", "push"], agent: null });
+    expect(found).toMatchObject({ id, email: "owner@kaikeru.com", scopes: ["read", "push"], agent: null });
     expect(JSON.stringify(found)).not.toContain(token);
   });
 });
