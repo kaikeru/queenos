@@ -1,7 +1,8 @@
 import { Home } from "./Home";
 import { NewProject } from "./NewProject";
 import { Wizard } from "./Wizard";
-import { WarRoom, useRoom } from "./WarRoom";
+import { WarRoom } from "./WarRoom";
+import { useRoom } from "./room";
 import { StatusHome } from "./StatusHome";
 import { ItemView } from "./ItemView";
 import { QueuePage } from "./QueuePage";

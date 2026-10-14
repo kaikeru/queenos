@@ -11,7 +11,7 @@ import { HiveFooter, HiveHeader, ItemChip, OriginChip } from "./shell";
 import { blockedOrFailed, goalTrees, headline, openEscalations, pipelineCounts, statusTiles, type GoalNode, type ItemRow } from "./status";
 import { composerRace, YOU_PICK_WIDTH, type BestOfChoice } from "./raceLogic";
 import { SwarmFloor } from "./SwarmFloor";
-import type { Room } from "./WarRoom";
+import type { Room } from "./room";
 
 const SHOW_DEMO = import.meta.env.DEV || import.meta.env.VITE_MOCK_API === "1";
 

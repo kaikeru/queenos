@@ -126,7 +126,7 @@ describe("render", () => {
     expect(html).toContain("recommended");
     expect(html.match(/Pick this one/g)).toHaveLength(3);
     expect(html).toContain("https://a.example.dev");
-    expect(html).toContain("<iframe");
+    expect(html).not.toContain("<iframe");
     expect(html).toContain("3 satisfied");
     expect(html).toContain("2.0 KB");
     expect(html).toContain("n/a");

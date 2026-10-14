@@ -1,23 +1,11 @@
-import { useCallback, useMemo, useReducer, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { HiveFooter } from "./shell";
 import { DEMO_PROMPTS } from "./demo";
 import { Composer, Lanes, LedgerPanel, MainTrack, ModelBoard, ReleaseTimeline, Sites, Ticker, TopBar } from "./components";
 import { isExternal } from "./homeLogic";
 import { currentRelease, siteReleaseView } from "./releases";
-import { useMockQueen } from "./useMockQueen";
-import { buildLanes, buildSites, initialState, reducer, type AuditCard, type Lane } from "./reducer";
-import { useQueenSocket } from "./useQueenSocket";
-
-// A build-time constant (replaced by Vite), so the mock is tree-shaken from production bundles.
-const useRoomSocket = import.meta.env.VITE_MOCK_API === "1" ? useMockQueen : useQueenSocket;
-
-/** The live link to one hive: reducer state plus the socket. Owned by the hive root so it survives page changes. */
-export function useRoom(hive: string) {
-  const [state, dispatch] = useReducer(reducer, initialState);
-  const link = useRoomSocket(hive, dispatch);
-  return { state, dispatch, ...link };
-}
-export type Room = ReturnType<typeof useRoom>;
+import { buildLanes, buildSites, type AuditCard, type Lane } from "./reducer";
+import type { Room } from "./room";
 
 /** The lanes drill-down (today's War Room): lanes, release timeline, Sites, Model Board, ticker. */
 export function WarRoom({ hive, room, backTo }: { hive: string; room: Room; backTo?: string }) {
