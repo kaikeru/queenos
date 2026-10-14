@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "repo-graph": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "mcp-repo-graph",
+        "--repo",
+        "."
+      ]
+    }
+  }
+}
