@@ -108,7 +108,23 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 **Last production deploys (UTC):** Oct 12: queenos-git 14:13 (steps b, d and efcccea now live). Oct 9: queen 20:41 and edge 20:42 (after eab6a7b). Oct 8: queen 18:12 and edge 18:14 (T9a/T9d), gatekeepers 16:33 (T4), **queenos-git 16:33 (T2n)**, edge 17:01 (T7 dashboard). Oct 7: queen 21:17, herald 21:18. provisioner/drones Oct 7 14:49-14:51.
 
-**Pending (user runs this): the MCP fix-wave deploy, in this order:**
+**Pending deploy: rework loop (Tasks 1-11).** Order matters (spec §10): the Queen first (migration v19, it produces the new values), then `queenos-mcp` (19 tools), then the edge (the dashboard assets). Older MCP / dashboard builds never see REWORKING / REWORK / the new kinds until the Queen produces them, so deploy all three in one window.
+
+```
+cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
+./scripts/deploy.sh --only queen
+(cd apps/mcp && pnpm exec wrangler deploy)
+./scripts/deploy.sh --only edge
+```
+
+**Live checks after the rework-loop deploy** (Herdr workers, hive `demo`, external executors):
+1. **Conflict → sync_base → rebase → land.** An orchestrator files two goals editing the same file (`src/features.js`). Two workers each take one. The second winner reads REJECTED `kind: "conflict"` with `rework.dueAt`, calls `sync_base`, runs `syncCommand`, rebases onto `queen/main`, pushes `--force-with-lease`, and lands as the same candidate (same race id, no follow-up item). Check: `get_item` shows one race; the dashboard shows "Reworking · ... due in mm:ss" while it is fixed.
+2. **Mid-race fix after entry close.** A goal with `entryWindowMs: 120000` and two workers; one pushes a deliberate lint failure. After the window closes it pushes the fix. The fix rejoins the race (no "(follow-up)" item) and the race decides with both.
+3. **Reject all with a reason.** A `judge: "pick"` goal with two passing candidates. Click **Reject all**, type a reason, Send. The race goes back to RACING with entries open; both agents' `get_verdict` read `kind: "human"` with the reason; their fixes come back, and the race picks again.
+
+Record the results (pass / fail, race ids, anything odd) in HANDOFF §3.
+
+**Older pending (user runs this): the MCP fix-wave deploy, in this order:**
 ```
 cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
 ./scripts/deploy.sh --only queen
