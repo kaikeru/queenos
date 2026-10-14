@@ -314,7 +314,13 @@ function serverMessage(state: State, msg: QueenServerMessage, at: number): State
       if (prev?.state !== r.state && r.state !== "RACING") {
         const item = state.items[r.itemId];
         const what = item ? `"${excerpt(item.title, 40)}"` : r.itemId;
-        next = pushTicker(next, "status", r.state === "DECIDED" ? `Race for ${what} decided${r.reason ? `: ${excerpt(r.reason, 80)}` : ""}` : `Race for ${what} abandoned`, at);
+        const text =
+          r.state === "DECIDED"
+            ? `Race for ${what} decided${r.reason ? `: ${excerpt(r.reason, 80)}` : ""}`
+            : r.state === "REWORKING"
+              ? `Race for ${what} reworking: winner ${r.winnerTrainId ?? "(none)"} is fixing a conflict`
+              : `Race for ${what} abandoned`;
+        next = pushTicker(next, "status", text, at);
       }
       return next;
     }

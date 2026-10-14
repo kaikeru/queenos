@@ -115,7 +115,10 @@ cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH
 ./scripts/deploy.sh --only queen
 (cd apps/mcp && pnpm exec wrangler deploy)
 ./scripts/deploy.sh --only edge
+./scripts/deploy.sh --only provisioner
 ```
+
+The `provisioner` line ships the regenerated worker-starter template (AGENTS.md with `sync_base` and rework-loop guidance); without it new hives keep the old AGENTS.md. Its order relative to the others does not matter, and the live checks below use the existing hive `demo`, so they do not depend on it.
 
 **Live checks after the rework-loop deploy** (Herdr workers, hive `demo`, external executors):
 1. **Conflict → sync_base → rebase → land.** An orchestrator files two goals editing the same file (`src/features.js`). Two workers each take one. The second winner reads REJECTED `kind: "conflict"` with `rework.dueAt`, calls `sync_base`, runs `syncCommand`, rebases onto `queen/main`, pushes `--force-with-lease`, and lands as the same candidate (same race id, no follow-up item). Check: `get_item` shows one race; the dashboard shows "Reworking · ... due in mm:ss" while it is fixed.
@@ -124,18 +127,7 @@ cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH
 
 Record the results (pass / fail, race ids, anything odd) in HANDOFF §3.
 
-**Older pending (user runs this): the MCP fix-wave deploy, in this order:**
-```
-cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
-./scripts/deploy.sh --only queen
-./scripts/deploy.sh --only gatekeepers --force
-(cd apps/mcp && pnpm exec wrangler deploy)
-./scripts/deploy.sh --only edge
-./scripts/deploy.sh --only provisioner
-./scripts/deploy.sh --only genesis
-./scripts/deploy.sh --only drones
-```
-All these Workers already exist, so single `--only` deploys need no bootstrap pass. 1. `queen` ships schema **v18** (gate-infra rounds, `attemptRegate`, verdict kinds). 2. `gatekeepers` honours `GateCommand.notBefore` and the hardened reviewer (an old Queen never sends `notBefore`, so either order is safe). 3. `queenos-mcp` is NOT in `deploy.sh` (19 tools after the rework loop; `retry_gates` degrades to `UNAVAILABLE` on an old Queen; deploy it before the edge, whose `MCP` binding needs it). 4. `edge` also ships the dashboard (pick hint, short attempt chip). 5. `provisioner` ships the regenerated templates (new registry header and AGENTS.md for new hives). 6. `genesis` refuses new hive slugs ending in `-att-<12hex>` / `-base-<12hex>`. 7. `drones` carries the new registry header in the builder prompt. The **Access Bypass for `/mcp` is DONE** (Access app "QueenOS MCP (edge checks tokens)").
+**MCP fix-wave deploy: DONE (confirmed via the deployments API, Oct 13 UTC).** queen, queenos-gatekeepers, queenos-mcp, queenos-edge and queenos-provisioner 14:10-14:12; queenos-genesis and queenos-drones 14:17-14:18. That wave shipped schema v18, `GateCommand.notBefore`, the 19-tool MCP, the registry header and the `-att-`/`-base-` slug guard. The **Access Bypass for `/mcp` is DONE** (Access app "QueenOS MCP (edge checks tokens)").
 
 External mode is live on the Queen. Switch hive `demo` (or a new hive) to external with the dashboard "workers" select, or `PATCH /hives/<hive>/settings {"executors":"external"}`.
 Verify with the Cloudflare deployments API before assuming it is or isn't done.

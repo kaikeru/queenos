@@ -170,6 +170,10 @@ describe("attemptVerdict / attemptVerdictKind (§6.2)", () => {
     expect(attemptVerdict({ phase: "EJECTED", raceOutcome: "REWORK", reason: "x" })).toBe("rejected");
     expect(attemptVerdict({ phase: "EJECTED", raceOutcome: "LOST", reason: human })).toBe("rejected");
     expect(attemptVerdict({ phase: "EJECTED", raceOutcome: "LOST", reason: "lost race r: ranked lower" })).toBe("passed");
+    // N3: a human-rejected candidate that ended LOST for want of a slot reads rejected / human, not passed
+    const lostRejected = { phase: "EJECTED", raceOutcome: "LOST", reason: "lost race r1: rejected by k@kaikeru.com: ugly", summary: null, conflict: null } as const;
+    expect(attemptVerdict(lostRejected)).toBe("rejected");
+    expect(attemptVerdictKind(lostRejected)).toBe("human");
     expect(attemptVerdictKind({ phase: "EJECTED", raceOutcome: "REWORK", reason: human, summary: null, conflict: null })).toBe("human");
     expect(attemptVerdictKind({ phase: "EJECTED", raceOutcome: "REWORK", reason: "x", summary: null, conflict: null }, { reason: "human", dueAt: 5, round: 1 })).toBe("human");
     expect(attemptVerdictKind({ phase: "EJECTED", raceOutcome: "FAILED", reason: "x", summary: `${INFRA_SUMMARY_PREFIX}gate`, conflict: null })).toBe("infra");

@@ -67,6 +67,12 @@ export function checkAttemptCaps(c: CapInput): { ok: true } | { ok: false; messa
   return { ok: true };
 }
 
+/** A human-rejected candidate that ended LOST for want of a slot: `loseRejected` writes `lost race <id>: rejected by <who>: <text>`. */
+const LOST_REJECTED = /^lost race \S+: rejected by /;
+function isLostRejected(reason: string | null | undefined): boolean {
+  return LOST_REJECTED.test(reason ?? "");
+}
+
 /**
  * The gate's word on a train: none (no train yet), pending, passed (incl. a race loser that passed) or rejected.
  * Rework loop §6.2: an ejected train is rejected even when it had won (a merge conflict or an integration failure in its
@@ -75,7 +81,7 @@ export function checkAttemptCaps(c: CapInput): { ok: true } | { ok: false; messa
 export function attemptVerdict(t: Pick<TrainRecord, "phase" | "raceOutcome" | "reason"> | null): AttemptVerdict {
   if (!t) return "none";
   if (t.raceOutcome === "FAILED" || t.raceOutcome === "REWORK") return "rejected";
-  if (t.raceOutcome === "LOST") return parseReworkReason(t.reason) ? "rejected" : "passed";
+  if (t.raceOutcome === "LOST") return parseReworkReason(t.reason) || isLostRejected(t.reason) ? "rejected" : "passed";
   if (t.phase === "EJECTED") return "rejected";
   if (t.raceOutcome === "PASSED" || t.raceOutcome === "WON") return "passed";
   if (t.phase === "PASSED" || t.phase === "LANDING" || t.phase === "MERGED") return "passed";
@@ -91,7 +97,7 @@ export function attemptVerdictKind(t: Pick<TrainRecord, "phase" | "raceOutcome" 
   if (attemptVerdict(t) !== "rejected") return null;
   if (isInfraStopped({ summary: t!.summary })) return "infra";
   if (t!.conflict) return "conflict";
-  if (rework?.reason === "human" || parseReworkReason(t!.reason)?.reason === "human") return "human";
+  if (rework?.reason === "human" || parseReworkReason(t!.reason)?.reason === "human" || isLostRejected(t!.reason)) return "human";
   return "findings";
 }
 

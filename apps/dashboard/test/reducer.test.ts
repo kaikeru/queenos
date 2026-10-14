@@ -384,3 +384,13 @@ test("memory presentation helpers", () => {
   expect(OUTCOME_META.REJECTED_BY_REVIEW.label).toBe("rejected by review");
   expect(OUTCOME_META.PASSED.cls).toBe("passed");
 });
+
+test("a race going REWORKING says the winner is fixing a conflict, not abandoned", () => {
+  const race = { raceId: "r1", itemId: "i1", width: 2, state: "RACING", trainIds: ["t-abc12345-0"], winnerTrainId: "t-abc12345-0", reason: null, deadlineAt: null, createdAt: 1, decidedAt: null };
+  const s = run(
+    server({ type: "race.updated", race }),
+    server({ type: "race.updated", race: { ...race, state: "REWORKING" } }),
+  );
+  expect(s.ticker[0]!.text).toBe("Race for i1 reworking: winner t-abc12345-0 is fixing a conflict");
+  expect(s.ticker[0]!.text).not.toMatch(/abandoned/);
+});
