@@ -60,6 +60,7 @@ import type {
   GitNotesPayload,
   LandResultInput,
   MergeResultInput,
+  MergeConflict,
   MergeTrain,
   OracleCommand,
   OracleResultInput,
@@ -77,6 +78,8 @@ import {
   BATCH_FAIL_KEY,
   BATCH_FAIL_MARKER,
   CAR_KEY,
+  CONFLICT_ONCE_KEY,
+  CONFLICT_ONCE_MARKER,
   DECOMPOSE_FAIL_MARKER,
   FORK_KEY,
   GATE_SPOT_MARKER,
@@ -86,6 +89,7 @@ import {
   findSimilar,
   gateSpotFollowUp,
   hashInt,
+  isGeneratedPath,
   jitteredBuildMs,
   isMergeConflictRework,
   loadMain,
@@ -94,6 +98,7 @@ import {
   simDecompose,
   simLand,
   simMerge,
+  touchPaths,
   spotBugFollowUp,
   SIM_BUILD_JITTER_MS,
   type SimCarRecord,
@@ -756,9 +761,21 @@ export class SimExecutors {
       const p = await this.store.get<string[]>(PATHS_KEY(m.trainId));
       if (p) paths.set(m.trainId, p);
     }
+    // `[conflict-once]`: the item's first merge conflicts (the rework demo), whatever the sim main says.
+    const forced: MergeConflict[] = [];
+    const rest: typeof members = [];
+    for (const m of members) {
+      if (m.title.includes(CONFLICT_ONCE_MARKER) && !(await this.store.get<boolean>(CONFLICT_ONCE_KEY(m.promptId)))) {
+        await this.store.put(CONFLICT_ONCE_KEY(m.promptId), true);
+        const clash = touchPaths(m.title).filter((p) => !isGeneratedPath(p));
+        forced.push({ trainId: m.trainId, kind: "content", paths: clash.slice(0, 50), summary: `Merge conflict in ${clash.join(", ")}: changed by an earlier merge (sim [conflict-once]).`.slice(0, 500) });
+      } else {
+        rest.push(m);
+      }
+    }
     const out = simMerge(main, {
       carId: task.trainId,
-      members: members.map((m) => ({ trainId: m.trainId, promptId: m.promptId, title: m.title })),
+      members: rest.map((m) => ({ trainId: m.trainId, promptId: m.promptId, title: m.title })),
       forkSeq: (id) => forks.get(id),
       paths: (id) => paths.get(id),
       ejectedCars,
@@ -767,17 +784,18 @@ export class SimExecutors {
     await this.store.put(CAR_KEY(task.trainId), out.car);
     const headSha = fakeSha(`head:${task.trainId}`);
     const n = out.merged.length;
+    const conflicts = [...forced, ...out.conflicts];
     await this.mergeReport({
       trainId: task.trainId,
       ok: true,
       headSha,
       baseSha: fakeSha(`base:${task.baseRef}`),
       merged: out.merged,
-      conflicts: out.conflicts,
+      conflicts,
       fastForward: out.fastForward,
       mergeMs: this.delays.merge ?? 1500,
-      summary: out.conflicts.length
-        ? `Merged ${n} of ${members.length} members; ${out.conflicts.length} conflicted (${out.conflicts.map((c) => c.trainId).join(", ")}).`
+      summary: conflicts.length
+        ? `Merged ${n} of ${members.length} members; ${conflicts.length} conflicted (${conflicts.map((c) => c.trainId).join(", ")}).`
         : out.fastForward
           ? "Fast-forwarded one member: its tree was already gated."
           : `Merged ${n} member${n === 1 ? "" : "s"} onto the speculative tip.`,

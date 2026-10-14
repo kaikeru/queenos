@@ -9,6 +9,7 @@
  * bundle (src/index.ts) never imports it.
  */
 import { QueenNode as ProdQueenNode, type QueenPorts } from "../queen-node";
+import { reworkDemo, type DemoQueen } from "./rework-demo";
 import { SimExecutors } from "./sim-ports";
 import { simFilingHints } from "./sim-v2";
 
@@ -23,9 +24,18 @@ const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
  * internal auth, so an accidental `wrangler deploy --env sim` must refuse real traffic.
  */
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    if (!LOCAL_HOSTS.has(new URL(request.url).hostname)) {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(request.url);
+    if (!LOCAL_HOSTS.has(url.hostname)) {
       return Response.json({ error: "sim mode is localhost-only" }, { status: 403 });
+    }
+    // Rework demo (rework-loop spec §11): POST /sim/rework-demo?hive=<slug> plays two agents to a conflict, a rework and a landing.
+    if (url.pathname === "/sim/rework-demo" && request.method === "POST") {
+      const hive = url.searchParams.get("hive") ?? "";
+      if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(hive)) return Response.json({ error: "hive=<slug> required" }, { status: 400 });
+      const q = env.QUEEN_NODE.get(env.QUEEN_NODE.idFromName(hive)) as unknown as DemoQueen;
+      const log = await reworkDemo(q, hive, { tick: () => new Promise((r) => setTimeout(r, 1000)), maxTicks: 300 });
+      return Response.json({ hive, log });
     }
     return app.fetch(request, env, ctx);
   },

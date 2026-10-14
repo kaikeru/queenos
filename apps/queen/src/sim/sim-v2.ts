@@ -246,6 +246,9 @@ export interface LogStore {
 const MAIN_KEY = (hive: string) => `sim:main:${hive}`;
 export const FORK_KEY = (trainId: string) => `sim:fork:${trainId}`;
 export const PATHS_KEY = (trainId: string) => `sim:paths:${trainId}`;
+/** `[conflict-once]` (rework demo): an item's first merge in a car conflicts on its `[touch:]` paths; later merges are clean. */
+export const CONFLICT_ONCE_MARKER = "[conflict-once]";
+export const CONFLICT_ONCE_KEY = (promptId: string) => `sim:conflict-once:${promptId}`;
 export const CAR_KEY = (carId: string) => `sim:car:${carId}`;
 export const BATCH_FAIL_KEY = (promptId: string) => `sim:bf:${promptId}`;
 const MAIN_LIMIT = 4000;
