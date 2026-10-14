@@ -11,7 +11,7 @@ async function setup() {
   const call = (path: string, init: RequestInit = {}) => {
     const headers = new Headers(init.headers);
     headers.set("cf-access-jwt-assertion", token);
-    return app.request(`https://queenos.kaikeru.com${path}`, { ...init, headers }, env);
+    return app.request(`https://queenos.example.com${path}`, { ...init, headers }, env);
   };
   return { call, seen };
 }
@@ -35,11 +35,11 @@ describe("v2 Queen routes through the edge", () => {
       body: JSON.stringify({ x: 1 }),
     });
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ from: "queen", path, user: "owner@kaikeru.com" });
+    expect(await res.json()).toMatchObject({ from: "queen", path, user: "owner@example.org" });
     expect(seen.queen).toHaveLength(1);
     const fwd = seen.queen[0]!;
     expect(fwd.method).toBe(method);
-    expect(fwd.headers.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(fwd.headers.get("x-queen-user")).toBe("owner@example.org");
     expect(fwd.headers.get("cookie")).toBeNull();
     expect(fwd.headers.get("cf-access-jwt-assertion")).toBeNull();
     expect(await fwd.json()).toEqual({ x: 1 });
@@ -51,7 +51,7 @@ describe("v2 Queen routes through the edge", () => {
     h.append("x-queen-user", "a@x.com");
     h.append("X-Queen-User", "b@x.com");
     await call("/hives/demo/items", { method: "POST", headers: h, body: "{}" });
-    expect(seen.queen[0]!.headers.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(seen.queen[0]!.headers.get("x-queen-user")).toBe("owner@example.org");
   });
 
   it.each([
@@ -67,7 +67,7 @@ describe("v2 Queen routes through the edge", () => {
     expect(seen.queen).toHaveLength(1);
     const u = new URL(seen.queen[0]!.url);
     expect(u.pathname + u.search).toBe(path);
-    expect(seen.queen[0]!.headers.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(seen.queen[0]!.headers.get("x-queen-user")).toBe("owner@example.org");
   });
 
   it("routes the merge-result webhook like build-result, keeping the bearer token", async () => {

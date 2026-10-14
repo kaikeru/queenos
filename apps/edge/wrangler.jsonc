@@ -1,6 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  // The single public front door: queenos.kaikeru.com, behind Cloudflare Access.
+  // The single public front door: your custom domain, behind Cloudflare Access.
+  // Site-specific values (custom domain, Access team, email domains, AUD, account id) are left
+  // empty here: scripts/deploy.sh fills them in from deploy.env (see deploy.env.example).
   // Every other Worker has workers_dev:false and is reachable only through here.
   "name": "queenos-edge",
   "main": "src/index.ts",
@@ -12,7 +14,8 @@
   // To opt into Workers Traces (beta), uncomment and redeploy:
   // "observability": {"enabled": true, "head_sampling_rate": 1, "traces": {"enabled": true}}
   "observability": {"enabled": true, "head_sampling_rate": 1},
-  "routes": [{ "pattern": "queenos.kaikeru.com", "custom_domain": true }],
+  // scripts/deploy.sh adds { "pattern": QUEENOS_HOST, "custom_domain": true }.
+  "routes": [],
   "assets": {
     // The War Room SPA. Build it first: pnpm --filter @queenos/dashboard build.
     "directory": "../dashboard/dist",
@@ -31,13 +34,14 @@
     { "binding": "MCP", "service": "queenos-mcp" }
   ],
   "vars": {
-    "ACCESS_TEAM": "kaikeru",
-    "ALLOWED_EMAIL_DOMAINS": "kaikeru.com",
+    // Set by scripts/deploy.sh from deploy.env. Empty values fail closed.
+    "ACCESS_TEAM": "",
+    "ALLOWED_EMAIL_DOMAINS": "",
     // Application Audience (AUD) tag of the Access app. Empty fails closed (503).
-    "ACCESS_AUD": "1fc3935ae323fe3c704a8d98d8d1951edde4cd6c56e54f8249ebebf8feaf544a",
+    "ACCESS_AUD": "",
     // For GET /api/metrics (Analytics Engine SQL API). Secret ANALYTICS_API_TOKEN (Account
     // Analytics Read): wrangler secret put ANALYTICS_API_TOKEN. Unset => 503, dashboard uses rollups.
-    "ACCOUNT_ID": "4773fbabdff038e3b907b14cd212c062"
+    "ACCOUNT_ID": ""
   },
   "env": {
     // Local dev (`wrangler dev --env dev`): skips Access verification. Never deploy.
@@ -63,12 +67,12 @@
         { "binding": "MCP", "service": "queenos-mcp" }
       ],
       "vars": {
-        "ACCESS_TEAM": "kaikeru",
-        "ALLOWED_EMAIL_DOMAINS": "kaikeru.com",
-        "ACCESS_AUD": "1fc3935ae323fe3c704a8d98d8d1951edde4cd6c56e54f8249ebebf8feaf544a",
-        "ACCOUNT_ID": "4773fbabdff038e3b907b14cd212c062",
+        "ACCESS_TEAM": "example",
+        "ALLOWED_EMAIL_DOMAINS": "example.com",
+        "ACCESS_AUD": "dev-aud",
+        "ACCOUNT_ID": "",
         "ACCESS_MODE": "dev",
-        "DEV_USER_EMAIL": "dev@kaikeru.com"
+        "DEV_USER_EMAIL": "dev@example.com"
       }
     },
     // Used only by vitest. No service bindings or assets: tests inject fakes.
@@ -77,8 +81,8 @@
       "durable_objects": { "bindings": [{ "name": "REGISTRY", "class_name": "HiveRegistry" }] },
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HiveRegistry"] }],
       "vars": {
-        "ACCESS_TEAM": "kaikeru",
-        "ALLOWED_EMAIL_DOMAINS": "kaikeru.com",
+        "ACCESS_TEAM": "example",
+        "ALLOWED_EMAIL_DOMAINS": "example.org",
         "ACCESS_AUD": "test-aud"
       }
     }

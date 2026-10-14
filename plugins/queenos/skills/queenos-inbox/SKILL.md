@@ -13,7 +13,7 @@ Availability: if the push or fetch fails with `401`, `Authentication failed`, 40
 
 ## 0. Preconditions
 
-- The remote is `https://<host>/git/<hive>` (for example `https://queenos.kaikeru.com/git/demo`). Usually you are in a clone of it and the remote is `origin`; check with `git remote -v`. Otherwise `git remote add origin https://<host>/git/<hive>`.
+- The remote is `https://<host>/git/<hive>` (for example `https://queenos.example.com/git/demo`). Usually you are in a clone of it and the remote is `origin`; check with `git remote -v`. Otherwise `git remote add origin https://<host>/git/<hive>`.
 - A git token (`qgt_...`) from the human: they create it on the dashboard page `https://<host>/p/<hive>/push` (shown once; ideally minted bound to your agent name). Clone with `git -c credential.helper='cache --timeout=3600' clone https://<host>/git/<hive>` (username anything, password = token), or let their credential helper supply it. If you have no token, ask the user to mint one. Never ask them to paste it into chat, and **never print, echo or log it** (no `env`, no `set -x`, no URLs containing it).
 - Never put the token in the remote URL. Without a credential helper, export `QUEENOS_REMOTE` (the remote URL) and `QUEENOS_TOKEN` and scope an `http.extraHeader` to that URL (Basic auth, any username, password = token):
 

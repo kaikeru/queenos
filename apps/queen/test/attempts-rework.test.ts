@@ -164,14 +164,14 @@ describe("a winner rejected in the train (§5.3)", () => {
 describe("attemptVerdict / attemptVerdictKind (§6.2)", () => {
   it("an ejected winner reads rejected (conflict); REWORK is rejected; a REWORK that lost stays rejected; human from the slot or the reason", () => {
     const conflict = { trainId: "t", kind: "content" as const, paths: ["src/a.js"], summary: "Merge conflict in src/a.js" };
-    const human = reworkReasonText("human", 5, "rejected by k@kaikeru.com: ugly");
+    const human = reworkReasonText("human", 5, "rejected by k@example.org: ugly");
     expect(attemptVerdict({ phase: "EJECTED", raceOutcome: "WON", reason: "failed: Merge conflict" })).toBe("rejected");
     expect(attemptVerdictKind({ phase: "EJECTED", raceOutcome: "WON", reason: "x", summary: null, conflict })).toBe("conflict");
     expect(attemptVerdict({ phase: "EJECTED", raceOutcome: "REWORK", reason: "x" })).toBe("rejected");
     expect(attemptVerdict({ phase: "EJECTED", raceOutcome: "LOST", reason: human })).toBe("rejected");
     expect(attemptVerdict({ phase: "EJECTED", raceOutcome: "LOST", reason: "lost race r: ranked lower" })).toBe("passed");
     // N3: a human-rejected candidate that ended LOST for want of a slot reads rejected / human, not passed
-    const lostRejected = { phase: "EJECTED", raceOutcome: "LOST", reason: "lost race r1: rejected by k@kaikeru.com: ugly", summary: null, conflict: null } as const;
+    const lostRejected = { phase: "EJECTED", raceOutcome: "LOST", reason: "lost race r1: rejected by k@example.org: ugly", summary: null, conflict: null } as const;
     expect(attemptVerdict(lostRejected)).toBe("rejected");
     expect(attemptVerdictKind(lostRejected)).toBe("human");
     expect(attemptVerdictKind({ phase: "EJECTED", raceOutcome: "REWORK", reason: human, summary: null, conflict: null })).toBe("human");

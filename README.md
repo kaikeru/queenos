@@ -350,7 +350,7 @@ Open http://localhost:8787. Any 32-hex account id and any fake token work. The e
 
 ## Deploy your own
 
-The reference deployment runs at queenos.kaikeru.com; nothing below assumes that account. Placeholders: `<host>` is your custom domain, `<team>` is your Zero Trust team name.
+Placeholders: `<host>` is your custom domain, `<team>` is your Zero Trust team name.
 
 ### Prerequisites
 
@@ -360,17 +360,19 @@ The reference deployment runs at queenos.kaikeru.com; nothing below assumes that
 - A Zero Trust (Access) plan on the account; the free plan works.
 - The account's workers.dev subdomain must exist: each hive's staging and production apps are deployed as `<hive>-app` and `<hive>-staging` on `workers.dev`.
 
-### Values to change
+### Site settings
 
-Only the top-level config is deployed (`scripts/deploy.sh` passes `--env=""`); the `dev` and `test` env blocks in the same file repeat these values but are never deployed.
+The repo carries no deployment-specific values. Copy `deploy.env.example` to `deploy.env` (gitignored) and fill it in; `scripts/deploy.sh` reads it and deploys the edge from a temporary copy of `apps/edge/wrangler.jsonc` with them filled in.
 
-| File | Key | Set it to |
-|---|---|---|
-| `apps/edge/wrangler.jsonc` | `routes[0].pattern` (line 15) | Your custom domain, `<host>`. It must be a zone on your account. |
-| `apps/edge/wrangler.jsonc` | `vars.ACCESS_TEAM` (line 34) | Your Zero Trust team name (`<team>.cloudflareaccess.com`). |
-| `apps/edge/wrangler.jsonc` | `vars.ALLOWED_EMAIL_DOMAINS` (line 35) | Comma-separated email domains allowed to sign in. |
-| `apps/edge/wrangler.jsonc` | `vars.ACCESS_AUD` (line 37) | The AUD tag of your main Access app (see below). Empty fails closed with 503. |
-| `apps/edge/wrangler.jsonc` | `vars.ACCOUNT_ID` (line 40) | Your account id. Only used by the optional Metrics page. |
+| Variable | Set it to |
+|---|---|
+| `QUEENOS_HOST` | Your custom domain, `<host>`. It must be a zone on your account. |
+| `QUEENOS_ACCESS_TEAM` | Your Zero Trust team name (`<team>.cloudflareaccess.com`). |
+| `QUEENOS_ALLOWED_EMAIL_DOMAINS` | Comma-separated email domains allowed to sign in. |
+| `QUEENOS_ACCESS_AUD` | The AUD tag of your main Access app (see below). Empty for the first deploy; empty fails closed with 503. |
+| `CLOUDFLARE_ACCOUNT_ID` | Your account id. wrangler deploys to it; the optional Metrics page reads with it. |
+
+Deploy the edge only through `scripts/deploy.sh` (`pnpm --filter @queenos/edge deploy` calls it): a plain `wrangler deploy` of the committed config has no custom domain and empty Access settings.
 
 Nothing else under `apps/*/wrangler.jsonc` or `apps/*/src` is account-specific. Names that every deployer shares and that you create yourself are listed next; keep the names, or change them everywhere they appear.
 
@@ -413,7 +415,7 @@ Until the next section is done the edge answers 503 on every route except `/heal
    1. Main app: domain `<host>`, all paths. Policy: Allow, your emails or email domain. This guards the dashboard and `/api`.
    2. `<host>/git` with a **Bypass** policy. The edge checks `qgt_` git tokens itself on `/git/*`.
    3. `<host>/mcp` with a **Bypass** policy. The edge checks the Bearer `qgt_` token itself on `/mcp`.
-2. **AUD.** Copy the main app's "Application Audience (AUD) Tag" into `ACCESS_AUD` in `apps/edge/wrangler.jsonc` and redeploy: `scripts/deploy.sh --only edge` (or `pnpm --filter @queenos/edge deploy`).
+2. **AUD.** Copy the main app's "Application Audience (AUD) Tag" into `QUEENOS_ACCESS_AUD` in `deploy.env` and redeploy: `scripts/deploy.sh --only edge`.
 3. **Secrets:**
    ```bash
    openssl rand -base64 32 | pnpm --filter @queenos/vault exec wrangler secret put VAULT_KEK --env=""

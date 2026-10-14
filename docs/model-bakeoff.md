@@ -1,6 +1,6 @@
 # Builder model bake-off (2026-10-05)
 
-Real run on account `4773fbab...` through AI Gateway `queenos`, using the **actual drone code**
+Real run on account `<account-id>` through AI Gateway `queenos`, using the **actual drone code**
 (`apps/drones/src/{prompt,generate,change-set,build}.ts`) in a throwaway Worker `queenos-day1-models`
 (deleted afterwards; `wrangler delete` succeeded, the workers.dev URL returns 404, and it is absent from
 the account's script list). Each model got one request, no fallbacks, `response_format: json_schema`

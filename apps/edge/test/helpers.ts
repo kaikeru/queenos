@@ -2,7 +2,7 @@ import { env } from "cloudflare:test";
 import type { Bindings, VaultPort } from "../src/app";
 import { createVerifier } from "../src/access";
 
-export const TEAM = "kaikeru";
+export const TEAM = "example";
 export const AUD = "test-aud";
 export const ISS = `https://${TEAM}.cloudflareaccess.com`;
 
@@ -43,7 +43,7 @@ export async function sign(
 
 export function goodClaims(over: Record<string, unknown> = {}, nowMs = Date.now()): Record<string, unknown> {
   const now = Math.floor(nowMs / 1000);
-  return { iss: ISS, aud: [AUD], email: "owner@kaikeru.com", sub: "u1", iat: now, nbf: now - 5, exp: now + 3600, ...over };
+  return { iss: ISS, aud: [AUD], email: "owner@example.org", sub: "u1", iat: now, nbf: now - 5, exp: now + 3600, ...over };
 }
 
 /** A fetcher serving a fake JWKS; counts calls. */
@@ -87,7 +87,7 @@ export function fakeBindings(overrides: Partial<Bindings> = {}): { env: Bindings
   };
   const env: Bindings = {
     ACCESS_TEAM: TEAM,
-    ALLOWED_EMAIL_DOMAINS: "kaikeru.com",
+    ALLOWED_EMAIL_DOMAINS: "example.org",
     ACCESS_AUD: AUD,
     REGISTRY: (env_ as unknown as Bindings).REGISTRY,
     VAULT: vault,

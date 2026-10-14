@@ -2,7 +2,7 @@ import { z } from "zod";
 
 /**
  * Onboarding contracts (P2): Hive Charter, Registry, Vault status, Genesis wizard.
- * Every browser call goes through the edge Worker at queenos.kaikeru.com, behind
+ * Every browser call goes through the edge Worker at queenos.example.com, behind
  * Cloudflare Access. The edge verifies the Access JWT and forwards the caller's
  * email to internal Workers over service bindings in `x-queen-user`.
  */

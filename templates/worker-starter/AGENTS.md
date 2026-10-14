@@ -59,7 +59,7 @@ If the notes say your branch conflicts with landed work: `git fetch origin && gi
 
 ## Credentials
 
-A human mints a git token on the dashboard page `https://<your QueenOS host>/p/<hive>/push` (for example `queenos.kaikeru.com`). Clone with `git clone https://<your QueenOS host>/git/<hive>`; the username is ignored and the password is the token (`qgt_...`). Never print, commit or paste the token, and never put it in the remote URL. On `401`, ask your human for a new one.
+A human mints a git token on the dashboard page `https://<your QueenOS host>/p/<hive>/push` (for example `queenos.example.com`). Clone with `git clone https://<your QueenOS host>/git/<hive>`; the username is ignored and the password is the token (`qgt_...`). Never print, commit or paste the token, and never put it in the remote URL. On `401`, ask your human for a new one.
 
 ## Claude Code
 

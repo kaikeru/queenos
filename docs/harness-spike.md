@@ -87,7 +87,7 @@ That deploys on Workers Paid. Without worker-bundler, the drones Worker would gr
 
 ## 3. Worker Loader / Dynamic Workers
 
-- **Available on account 4773fbab… Yes.** `"worker_loaders": [{ "binding": "LOADER" }]` deployed without
+- **Available on account <account-id> Yes.** `"worker_loaders": [{ "binding": "LOADER" }]` deployed without
   opt-in errors and worked. (The worker-bundler README still calls the binding "closed beta". Pricing and GA
   limits are UNVERIFIED.)
 - **Verify the generated Worker before pushing: yes, and it's very cheap.** `src/verify.ts` passes every

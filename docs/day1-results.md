@@ -1,6 +1,6 @@
 # QueenOS Day-1 verification results (2026-10-02, real account)
 
-Account `4773fbab...`, workers.dev `kyle-477`, wrangler 4.147.0, compat date 2026-10-02. All probes ran from throwaway Workers (`queenos-day1-artifacts`, `queenos-day1-do`, `queenos-day1-wf`), using hive-kit's built `dist` (`initRepo`/`cloneRepo`/`GitRepo.push`/`pushNotes`/`addNote`) for git. Everything created was deleted afterwards, except the Artifacts namespace `queenos`. The token was never logged.
+Account `<account-id>`, workers.dev `<subdomain>`, wrangler 4.147.0, compat date 2026-10-02. All probes ran from throwaway Workers (`queenos-day1-artifacts`, `queenos-day1-do`, `queenos-day1-wf`), using hive-kit's built `dist` (`initRepo`/`cloneRepo`/`GitRepo.push`/`pushNotes`/`addNote`) for git. Everything created was deleted afterwards, except the Artifacts namespace `queenos`. The token was never logged.
 
 Timings are single-run wall clock from inside a Worker unless stated.
 

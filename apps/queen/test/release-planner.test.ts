@@ -286,7 +286,7 @@ describe("release planner: tap to ship", () => {
       { op: "DEPLOY", commandId: "r1-canary1-1", hive: "hive", environment: "canary", releaseId: "r1", artifactRepo: "hive", commitSha: "sha-t1", percent: 1 },
     ]);
     expect(t.deployments.get("canary")).toMatchObject({ status: "PENDING", percent: 1 });
-    expect(t.run((p) => p.tap("r1", "someone@kaikeru.com")).outcome).toBe("conflict");
+    expect(t.run((p) => p.tap("r1", "someone@example.org")).outcome).toBe("conflict");
     expect(t.rel("r1").tappedBy).toBe("kyle@example.com");
   });
 });

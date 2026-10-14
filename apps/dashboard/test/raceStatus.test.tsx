@@ -109,7 +109,7 @@ describe("candidateStatus: every race state by candidate outcome", () => {
     expect(candidateStatus(t, race({ state: "REWORKING", winnerTrainId: "a" }), NOW).kind).toBe("reworking");
   });
   test("a human-rejected candidate shows the reason", () => {
-    const r = race({ state: "PICKING", rejections: [{ trainId: "a", by: "human:k@kaikeru.com", reason: "ugly" }] });
+    const r = race({ state: "PICKING", rejections: [{ trainId: "a", by: "human:k@example.org", reason: "ugly" }] });
     expect(candidateStatus(train("a", { raceOutcome: "LOST" }), r, NOW)).toEqual({ kind: "lost", text: "rejected: ugly", tone: "muted" });
   });
   test("EJECTED with no outcome is failed; no finding text is plain failed", () => {

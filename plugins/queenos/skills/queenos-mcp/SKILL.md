@@ -10,7 +10,7 @@ Each **attempt** (you on one item) gets its own Artifacts repo: a fork of the it
 ## 0. Connect (the human, once)
 
 ```sh
-claude mcp add --transport http queenos https://queenos.kaikeru.com/mcp --header "Authorization: Bearer $QUEENOS_TOKEN"
+claude mcp add --transport http queenos https://queenos.example.com/mcp --header "Authorization: Bearer $QUEENOS_TOKEN"
 ```
 
 The human mints the token (scope `push`) on the dashboard page `/p/<hive>/push`. Never ask for it in chat; never print it. `401`: the token is wrong or revoked. `403 token lacks push scope`: ask for a push token.

@@ -436,7 +436,7 @@ describe("planner: the grace start is fixed (review fix 1: R3 never moves it)", 
 });
 
 describe("planner: reject with a reason (§7)", () => {
-  const BY = "human:k@kaikeru.com";
+  const BY = "human:k@example.org";
   /** Judge human: A, B, C all pass → PICKING. */
   function picking() {
     const h = new ReworkHive();
@@ -475,7 +475,7 @@ describe("planner: reject with a reason (§7)", () => {
     const { h, b } = picking();
     const r = reject(h, b);
     expect(r.rejected).toEqual({ fallback: false });
-    expect(h.t(b)).toMatchObject({ phase: "EJECTED", raceOutcome: "REWORK", summary: "rejected by k@kaikeru.com: the button is unreadable" });
+    expect(h.t(b)).toMatchObject({ phase: "EJECTED", raceOutcome: "REWORK", summary: "rejected by k@example.org: the button is unreadable" });
     expect(parseReworkReason(h.t(b).reason)).toEqual({ reason: "human", dueAt: h.now + 30 * MIN });
     expect(h.slot(B1)!.rework).toMatchObject({ reason: "human", round: 1 });
     expect(h.race()).toMatchObject({ state: "RACING", reopens: 1, pickDeadlineAt: null, recommendedTrainId: null, deadlineAt: h.now + h.graceMs });

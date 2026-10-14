@@ -12,12 +12,12 @@ import { itemIdOf } from "../src/swarm";
 
 const NOW = 1_800_000_000_000;
 const tok = (id: string, over: Partial<GitToken> = {}): GitToken => ({
-  id, email: "a@kaikeru.com", scopes: ["read", "push"], label: null, createdAt: NOW - 1000, expiresAt: NOW + 86_400_000, lastUsedAt: null, revokedAt: null, ...over,
+  id, email: "a@example.org", scopes: ["read", "push"], label: null, createdAt: NOW - 1000, expiresAt: NOW + 86_400_000, lastUsedAt: null, revokedAt: null, ...over,
 });
 
 describe("push instructions", () => {
   test("the remote is the edge's /git/<hive> on the current origin", () => {
-    expect(gitRemote("https://queenos.kaikeru.com", "demo")).toBe("https://queenos.kaikeru.com/git/demo");
+    expect(gitRemote("https://queenos.example.com", "demo")).toBe("https://queenos.example.com/git/demo");
     expect(gitRemote("http://localhost:5191/", "demo")).toBe("http://localhost:5191/git/demo");
   });
 
@@ -98,9 +98,9 @@ describe("tokens", () => {
   });
 
   test("the page renders instructions for the hive and the token panel", () => {
-    const html = renderToString(<PushCode hive="demo" origin="https://queenos.kaikeru.com" />);
+    const html = renderToString(<PushCode hive="demo" origin="https://queenos.example.com" />);
     expect(html).toContain("PUSH CODE");
-    expect(html).toContain("https://queenos.kaikeru.com/git/demo");
+    expect(html).toContain("https://queenos.example.com/git/demo");
     expect(html).toContain("GIT TOKENS");
     expect(html).toContain("Mint token");
     expect(html).not.toContain("qgt_");
@@ -134,10 +134,10 @@ describe("origin badges", () => {
   });
 
   test("the chip shows a muted claim next to an agent badge only", () => {
-    const html = renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@kaikeru.com", model: "claude-opus-4-5" })} />);
+    const html = renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@example.org", model: "claude-opus-4-5" })} />);
     expect(html).toContain("agent:bot");
     expect(html).toContain("claims claude-opus-4-5");
-    expect(renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@kaikeru.com" })} />)).not.toContain("claims");
+    expect(renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@example.org" })} />)).not.toContain("claims");
   });
 
   test("an MCP attempt's candidate chip shows the attempt id next to 'claims <model>'", () => {
@@ -151,14 +151,14 @@ describe("origin badges", () => {
     expect(html).toContain('title="pushed by agent opus for kyle@example.com; claims claude-opus-5-5 (self-reported); attempt att_0123456789ab"'); // the tooltip keeps the full id
     expect(attemptChipText("att_0123456789ab")).toBe("att_…6789ab");
     expect(originBadge({ kind: "human", id: "kyle@example.com" }).attempt).toBeNull();
-    expect(renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@kaikeru.com" })} />)).not.toContain("att_");
+    expect(renderToString(<OriginChip badge={originBadge({ kind: "agent", id: "bot@a@example.org" })} />)).not.toContain("att_");
     const t = { trainId: "t9", origin: { kind: "agent" as const, id: "opus@kyle@example.com" }, createdAt: NOW, attemptId: "att_0123456789ab" };
     expect(itemOrigin(null, [t]).attempt).toBe("att_0123456789ab");
   });
 
   test("an item takes its newest pushed train's origin, else its inbox handle, else drone", () => {
-    const human = train("t1", { kind: "human", id: "a@kaikeru.com" }, NOW - 10);
-    const agent = train("t2", { kind: "agent", id: "bot@a@kaikeru.com" }, NOW);
+    const human = train("t1", { kind: "human", id: "a@example.org" }, NOW - 10);
+    const agent = train("t2", { kind: "agent", id: "bot@a@example.org" }, NOW);
     expect(itemOrigin(null, [train("t0", undefined), human, agent]).text).toBe("agent:bot");
     expect(itemOrigin(null, [train("t0", null)]).text).toBe("drone");
     const inbox = { repo: "demo-in-kyle", ref: "refs/heads/feat/x", handle: "kyle", headSha: "a".repeat(40), handoff: false };
@@ -166,16 +166,16 @@ describe("origin badges", () => {
   });
 
   test("status rows badge pushed items only", () => {
-    const human = train("t1", { kind: "human", id: "a@kaikeru.com" });
+    const human = train("t1", { kind: "human", id: "a@example.org" });
     const state = { trains: { t1: human, t0: { ...train("t0", undefined), includedPrompts: ["item-2"] } }, trainOrder: ["t0", "t1"] };
-    expect(pushedItemOrigin(state, { itemId: itemIdOf(human)!, inbox: null }, itemIdOf)?.text).toBe("human:a@kaikeru.com");
+    expect(pushedItemOrigin(state, { itemId: itemIdOf(human)!, inbox: null }, itemIdOf)?.text).toBe("human:a@example.org");
     expect(pushedItemOrigin(state, { itemId: "item-2", inbox: null }, itemIdOf)).toBeNull();
   });
 
   test("the chip renders the label with a tooltip and nothing for null", () => {
-    const html = renderToString(<OriginChip badge={originBadge({ kind: "human", id: "a@kaikeru.com" })} />);
+    const html = renderToString(<OriginChip badge={originBadge({ kind: "human", id: "a@example.org" })} />);
     expect(html).toContain("origin--human");
-    expect(html).toContain("human:a@kaikeru.com");
+    expect(html).toContain("human:a@example.org");
     expect(renderToString(<OriginChip badge={null} />)).toBe("");
   });
 });

@@ -140,7 +140,7 @@ describe("agent identity (edge x-queen-agent*)", () => {
 
   it("logs the agent name", async () => {
     await push([[ZERO, NEW_SHA, REF]], 2048, { agent: "codex", model: "gpt-5" });
-    expect(logs.join("\n")).toMatch(/user=ada@kaikeru\.com agent=codex /);
+    expect(logs.join("\n")).toMatch(/user=ada@example\.org agent=codex /);
   });
 
   it.each([

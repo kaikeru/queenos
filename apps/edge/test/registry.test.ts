@@ -16,7 +16,7 @@ async function failure(p: Promise<unknown>): Promise<string> {
   );
 }
 
-const base = { hive: "demo-hive", name: "Demo", description: "A demo", createdBy: "a@kaikeru.com" };
+const base = { hive: "demo-hive", name: "Demo", description: "A demo", createdBy: "a@example.org" };
 
 describe("HiveRegistry", () => {
   it("registers a project in ONBOARDING with empty urls", async () => {
@@ -38,7 +38,7 @@ describe("HiveRegistry", () => {
   it("rejects a different creator with CONFLICT", async () => {
     const r = registry();
     await r.register(base);
-    expect(await failure(r.register({ ...base, createdBy: "b@kaikeru.com" }))).toMatch(/^CONFLICT/);
+    expect(await failure(r.register({ ...base, createdBy: "b@example.org" }))).toMatch(/^CONFLICT/);
   });
 
   it("rejects an invalid slug", async () => {

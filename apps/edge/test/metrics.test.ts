@@ -16,7 +16,7 @@ async function setup(upstream: (url: string, init: RequestInit) => Promise<Respo
   const call = (path: string, init: RequestInit = {}) => {
     const headers = new Headers(init.headers);
     headers.set("cf-access-jwt-assertion", token);
-    return app.request(`https://queenos.kaikeru.com${path}`, { ...init, headers }, env);
+    return app.request(`https://queenos.example.com${path}`, { ...init, headers }, env);
   };
   return { call, calls, seen };
 }
@@ -114,7 +114,7 @@ describe("GET /api/metrics/:hive", () => {
   it("still requires Access auth", async () => {
     const { call } = await setup(ok);
     const app = createApp();
-    const res = await app.request("https://queenos.kaikeru.com/api/metrics/demo?q=concurrency", {}, fakeBindings().env);
+    const res = await app.request("https://queenos.example.com/api/metrics/demo?q=concurrency", {}, fakeBindings().env);
     expect(res.status).toBe(401);
     expect(call).toBeTypeOf("function");
   });

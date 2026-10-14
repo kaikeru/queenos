@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { AccessError, extractToken } from "../src/access";
 import { AUD, ISS, TEAM, freshVerifier, goodClaims, makeKey, sign } from "./helpers";
 
-const cfg = { team: TEAM, aud: AUD, allowedEmailDomains: ["kaikeru.com"] };
+const cfg = { team: TEAM, aud: AUD, allowedEmailDomains: ["example.org"] };
 
 async function setup() {
   const key = await makeKey("k1");
@@ -23,13 +23,13 @@ async function reject(p: Promise<unknown>): Promise<AccessError> {
 describe("Access JWT verification", () => {
   it("accepts a valid token and lowercases the email", async () => {
     const { key, verifier } = await setup();
-    const t = await sign(key, goodClaims({ email: "Owner@Kaikeru.com" }));
-    expect(await verifier.verify(t, cfg)).toEqual({ email: "owner@kaikeru.com" });
+    const t = await sign(key, goodClaims({ email: "Owner@Example.org" }));
+    expect(await verifier.verify(t, cfg)).toEqual({ email: "owner@example.org" });
   });
 
   it("accepts aud as a plain string", async () => {
     const { key, verifier } = await setup();
-    expect((await verifier.verify(await sign(key, goodClaims({ aud: AUD })), cfg)).email).toBe("owner@kaikeru.com");
+    expect((await verifier.verify(await sign(key, goodClaims({ aud: AUD })), cfg)).email).toBe("owner@example.org");
   });
 
   it("rejects an expired token (beyond skew)", async () => {
@@ -68,7 +68,7 @@ describe("Access JWT verification", () => {
     const { key, verifier } = await setup();
     const e = await reject(verifier.verify(await sign(key, goodClaims({ email: "a@evil.com" })), cfg));
     expect(e.status).toBe(403);
-    const e2 = await reject(verifier.verify(await sign(key, goodClaims({ email: "a@sub.kaikeru.com" })), cfg));
+    const e2 = await reject(verifier.verify(await sign(key, goodClaims({ email: "a@sub.example.org" })), cfg));
     expect(e2.status).toBe(403);
     const e3 = await reject(verifier.verify(await sign(key, goodClaims({ email: undefined })), cfg));
     expect(e3.status).toBe(403);
@@ -113,7 +113,7 @@ describe("Access JWT verification", () => {
     t += 60_000;
     await verifier.verify(await sign(k2, c()), cfg);
     expect(calls).toHaveLength(2);
-    expect(calls[0]).toBe("https://kaikeru.cloudflareaccess.com/cdn-cgi/access/certs");
+    expect(calls[0]).toBe("https://example.cloudflareaccess.com/cdn-cgi/access/certs");
   });
 
   it("refetches after the TTL", async () => {

@@ -12,7 +12,7 @@ async function ctx() {
   const call = (path: string, init: RequestInit = {}, e = env, tok: string | null = token) => {
     const headers = new Headers(init.headers);
     if (tok) headers.set("cf-access-jwt-assertion", tok);
-    return app.request(`https://queenos.kaikeru.com${path}`, { ...init, headers }, e);
+    return app.request(`https://queenos.example.com${path}`, { ...init, headers }, e);
   };
   return { app, env, seen, key, token, call };
 }
@@ -50,7 +50,7 @@ describe("auth", () => {
   it("accepts the CF_Authorization cookie", async () => {
     const { app, env, token } = await ctx();
     const r = await app.request("https://x/api/me", { headers: { cookie: `CF_Authorization=${token}` } }, env);
-    expect(await r.json()).toEqual({ email: "owner@kaikeru.com" });
+    expect(await r.json()).toEqual({ email: "owner@example.org" });
   });
 
   it("returns 403 for a foreign email domain", async () => {
@@ -67,9 +67,9 @@ describe("auth", () => {
 
   it("dev mode bypasses verification with DEV_USER_EMAIL, on localhost only", async () => {
     const { app, env, call } = await ctx();
-    const dev = { ...env, ACCESS_MODE: "dev", DEV_USER_EMAIL: "Dev@kaikeru.com" };
+    const dev = { ...env, ACCESS_MODE: "dev", DEV_USER_EMAIL: "Dev@example.org" };
     const local = (e: Partial<typeof dev> & typeof env) => app.request("http://localhost:8787/api/me", {}, e);
-    expect(await (await local(dev)).json()).toEqual({ email: "dev@kaikeru.com" });
+    expect(await (await local(dev)).json()).toEqual({ email: "dev@example.org" });
     expect((await local({ ...dev, DEV_USER_EMAIL: undefined })).status).toBe(503);
     // An accidentally deployed dev build must not bypass Access on the real domain.
     expect((await call("/api/me", {}, dev, null)).status).toBe(403);
@@ -79,14 +79,14 @@ describe("auth", () => {
 describe("routes", () => {
   it("GET /api/me", async () => {
     const { call } = await ctx();
-    expect(await (await call("/api/me")).json()).toEqual({ email: "owner@kaikeru.com" });
+    expect(await (await call("/api/me")).json()).toEqual({ email: "owner@example.org" });
   });
 
   it("GET /api/projects lists the registry", async () => {
     const { call, env } = await ctx();
     expect(await (await call("/api/projects")).json()).toEqual([]);
     const reg = (env as unknown as Bindings).REGISTRY.get((env as unknown as Bindings).REGISTRY.idFromName("registry"));
-    await reg.register({ hive: "my-hive", name: "My", description: "d", createdBy: "owner@kaikeru.com" });
+    await reg.register({ hive: "my-hive", name: "My", description: "d", createdBy: "owner@example.org" });
     const list = (await (await call("/api/projects")).json()) as { hive: string; status: string }[];
     expect(list.map((p) => [p.hive, p.status])).toEqual([["my-hive", "ONBOARDING"]]);
   });
@@ -113,7 +113,7 @@ describe("vault routes", () => {
     const text = await r.text();
     expect(text).not.toContain(GOOD_BODY.apiToken);
     expect(JSON.parse(text)).toMatchObject({ hive: "demo-hive", connected: true });
-    expect(seen.vault[0]).toEqual(["connect", "demo-hive", GOOD_BODY, "owner@kaikeru.com"]);
+    expect(seen.vault[0]).toEqual(["connect", "demo-hive", GOOD_BODY, "owner@example.org"]);
   });
 
   it("validates the body and never echoes the token", async () => {
@@ -158,15 +158,15 @@ describe("forwarding", () => {
     const { call, seen } = await ctx();
     const r = await call("/api/genesis/demo-hive/messages?x=1", {
       method: "POST",
-      headers: { "x-queen-user": "admin@kaikeru.com", cookie: "CF_Authorization=zzz", "content-type": "application/json" },
+      headers: { "x-queen-user": "admin@example.org", cookie: "CF_Authorization=zzz", "content-type": "application/json" },
       body: JSON.stringify({ text: "hello" }),
     });
-    expect(await r.json()).toEqual({ from: "genesis", path: "/api/genesis/demo-hive/messages", user: "owner@kaikeru.com" });
+    expect(await r.json()).toEqual({ from: "genesis", path: "/api/genesis/demo-hive/messages", user: "owner@example.org" });
     const fwd = seen.genesis[0]!;
     expect(fwd.method).toBe("POST");
     expect(new URL(fwd.url).search).toBe("?x=1");
     expect(await fwd.json()).toEqual({ text: "hello" });
-    expect(fwd.headers.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(fwd.headers.get("x-queen-user")).toBe("owner@example.org");
     expect(fwd.headers.get("cookie")).toBeNull();
     expect(fwd.headers.get("cf-access-jwt-assertion")).toBeNull();
     const r2 = await call("/api/genesis", { method: "POST", body: "{}" });
@@ -176,7 +176,7 @@ describe("forwarding", () => {
   it("forwards /hives/* to the Queen with x-queen-user and no spoofing", async () => {
     const { call, seen } = await ctx();
     const r = await call("/hives/demo/room", { headers: { "x-queen-user": "evil@x.com", upgrade: "websocket" } });
-    expect(await r.json()).toEqual({ from: "queen", path: "/hives/demo/room", user: "owner@kaikeru.com" });
+    expect(await r.json()).toEqual({ from: "queen", path: "/hives/demo/room", user: "owner@example.org" });
     expect(seen.queen[0]!.headers.get("upgrade")).toBe("websocket");
     expect(seen.genesis).toHaveLength(0);
   });

@@ -1,5 +1,5 @@
 /**
- * queenos-edge: the single public front door (queenos.kaikeru.com, behind
+ * queenos-edge: the single public front door (queenos.example.com, behind
  * Cloudflare Access). Verifies the Access JWT, hosts the project registry,
  * serves the dashboard, and forwards to Vault, Genesis and the Queen.
  */

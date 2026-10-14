@@ -39,10 +39,10 @@ import {
 const AG = `ag_${"a".repeat(32)}`;
 const ATT = "att_0123456789ab";
 const SHA = "c".repeat(40);
-const identity = { agentId: AG, name: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "ada@kaikeru.com" };
+const identity = { agentId: AG, name: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "ada@example.org" };
 const attempt = {
   attemptId: ATT, hive: "demo", itemId: "i1", raceId: null, trainId: "t1", repo: "demo-att-0123456789ab", baseSha: SHA,
-  agentId: AG, agentName: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "ada@kaikeru.com",
+  agentId: AG, agentName: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "ada@example.org",
   state: "READY" as const, headSha: null, createdAt: 1, expiresAt: 2,
 };
 
@@ -92,7 +92,7 @@ describe("attempt schemas", () => {
     expect(McpAgentIdentitySchema.parse(identity)).toEqual(identity);
     expect(McpAgentIdentitySchema.safeParse({ ...identity, role: "boss" }).success).toBe(false);
     expect(McpAgentIdentitySchema.safeParse({ ...identity, name: "../x" }).success).toBe(false);
-    const intent = { hive: "demo", owner: "ada@kaikeru.com", agent: identity };
+    const intent = { hive: "demo", owner: "ada@example.org", agent: identity };
     expect(AttemptIntentSchema.safeParse({ ...intent, target: { itemId: "i1" } }).success).toBe(true);
     expect(AttemptIntentSchema.safeParse({ ...intent, target: { goalId: "g1" } }).success).toBe(true);
     expect(AttemptIntentSchema.safeParse({ ...intent, target: { itemId: "i1", goalId: "g1" } }).success).toBe(false);
@@ -170,7 +170,7 @@ describe("fix wave: the retryable contract, verdict kind, regate, gate notBefore
     expect(AttemptIntentDecisionSchema.parse({ verdict: "refuse", code: "CAP_EXCEEDED", message: "hourly" })).not.toHaveProperty("retryAfterMs");
     expect(AttemptResultSchema.parse({ ok: false, code: "CONFLICT", message: "push first", retryAfterMs: 1 })).toMatchObject({ code: "CONFLICT", retryAfterMs: 1 });
     expect(AttemptResultSchema.safeParse({ ok: false, code: "CAP_EXCEEDED", message: "x", retryAfterMs: -1 }).success).toBe(false);
-    expect(AttemptRegateSchema.parse({ hive: "demo", attemptId: ATT, owner: "ada@kaikeru.com", agentId: AG })).toMatchObject({ attemptId: ATT });
+    expect(AttemptRegateSchema.parse({ hive: "demo", attemptId: ATT, owner: "ada@example.org", agentId: AG })).toMatchObject({ attemptId: ATT });
   });
 
   it("the view carries verdictKind, regating and the train's gateInfraRounds (optional for older peers)", () => {
@@ -220,8 +220,8 @@ describe("rework loop contracts (rework-loop spec §5, §6, §10)", () => {
     expect(AttemptReworkSchema.parse({ reason: "conflict", dueAt: 5, round: 1 })).toEqual({ reason: "conflict", dueAt: 5, round: 1 });
     expect(AttemptReworkSchema.safeParse({ reason: "infra", dueAt: 5, round: 1 }).success).toBe(false);
     const due = Date.UTC(2026, 9, 13, 12, 30);
-    const text = reworkReasonText("human", due, "rejected by k@kaikeru.com: the button is unreadable");
-    expect(text).toBe("in rework (human) until 2026-10-13T12:30:00.000Z: rejected by k@kaikeru.com: the button is unreadable");
+    const text = reworkReasonText("human", due, "rejected by k@example.org: the button is unreadable");
+    expect(text).toBe("in rework (human) until 2026-10-13T12:30:00.000Z: rejected by k@example.org: the button is unreadable");
     expect(parseReworkReason(text)).toEqual({ reason: "human", dueAt: due });
     expect(parseReworkReason("failed in race: lint")).toBeNull();
     expect(parseReworkReason(null)).toBeNull();

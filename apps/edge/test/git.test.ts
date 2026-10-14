@@ -6,7 +6,7 @@ import { hashToken } from "../src/gittokens";
 import { migrateGitTokens } from "../src/registry";
 import { fakeBindings, freshVerifier, goodClaims, makeKey, sign } from "./helpers";
 
-const HOST = "https://queenos.kaikeru.com";
+const HOST = "https://queenos.example.com";
 
 async function ctx(overrides: Partial<Bindings> = {}) {
   const key = await makeKey("k1");
@@ -52,7 +52,7 @@ describe("git auth", () => {
     const b = await git(REFS, { headers: { authorization: `Bearer ${json.token}` } });
     expect(b.status).toBe(200);
     for (const s of seen.git) {
-      expect(s.req.headers.get("x-queen-user")).toBe("owner@kaikeru.com");
+      expect(s.req.headers.get("x-queen-user")).toBe("owner@example.org");
       expect(s.req.headers.get("x-queen-scopes")).toBe("read");
     }
     expect(seen.git).toHaveLength(2);
@@ -92,13 +92,13 @@ describe("git auth", () => {
     await git(REFS, {
       headers: {
         authorization: basic(json.token),
-        "x-queen-user": "evil@kaikeru.com",
+        "x-queen-user": "evil@example.org",
         "x-queen-scopes": "read,push",
         cookie: "CF_Authorization=abc",
       },
     });
     const h = seen.git[0]!.req.headers;
-    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@example.org");
     expect(h.get("x-queen-scopes")).toBe("read");
     expect(h.get("authorization")).toBeNull();
     expect(h.get("cookie")).toBeNull();
@@ -125,7 +125,7 @@ describe("git auth", () => {
   it("rejects an expired token", async () => {
     const { git, reg } = await ctx();
     const token = "qgt_expiredexpiredexpiredexpired";
-    await reg.mintGitToken({ id: "x1", hash: await hashToken(token), email: "a@kaikeru.com", scopes: ["read"], label: null, ttlMs: -1000 });
+    await reg.mintGitToken({ id: "x1", hash: await hashToken(token), email: "a@example.org", scopes: ["read"], label: null, ttlMs: -1000 });
     expect((await git(REFS, { headers: { authorization: basic(token) } })).status).toBe(401);
   });
 
@@ -133,7 +133,7 @@ describe("git auth", () => {
     const { git, access, seen, key } = await ctx();
     const ok = await git(REFS, { headers: { "cf-access-token": access } });
     expect(ok.status).toBe(200);
-    expect(seen.git[0]!.req.headers.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(seen.git[0]!.req.headers.get("x-queen-user")).toBe("owner@example.org");
     expect(seen.git[0]!.req.headers.get("cf-access-token")).toBeNull();
     expect((await git(REFS, { headers: { "cf-access-token": "a.b.c" } })).status).toBe(401);
     const foreign = await sign(key, goodClaims({ email: "x@evil.com" }));
@@ -171,7 +171,7 @@ describe("git tokens API", () => {
     const { status, json } = await mint({ label: "laptop" });
     expect(status).toBe(201);
     expect(json.token).toMatch(/^qgt_[a-z2-7]{52}$/);
-    expect(json).toMatchObject({ email: "owner@kaikeru.com", scopes: ["read", "push"], label: "laptop", lastUsedAt: null, revokedAt: null });
+    expect(json).toMatchObject({ email: "owner@example.org", scopes: ["read", "push"], label: "laptop", lastUsedAt: null, revokedAt: null });
     expect((json.expiresAt as number) - (json.createdAt as number)).toBe(30 * 86_400_000);
 
     const list = (await (await api("/api/git-tokens")).json()) as Record<string, unknown>[];
@@ -185,7 +185,7 @@ describe("git tokens API", () => {
     const stub = ns.get(ns.newUniqueId());
     const token = "qgt_storagechecktoken";
     const hash = await hashToken(token);
-    await stub.mintGitToken({ id: "s1", hash, email: "a@kaikeru.com", scopes: ["read"], label: null, ttlMs: 1000 });
+    await stub.mintGitToken({ id: "s1", hash, email: "a@example.org", scopes: ["read"], label: null, ttlMs: 1000 });
     await runInDurableObject(stub, (_i, state) => {
       const rows = state.storage.sql.exec("SELECT * FROM git_tokens").toArray();
       expect(JSON.stringify(rows)).not.toContain(token);
@@ -196,7 +196,7 @@ describe("git tokens API", () => {
   it("lists and revokes only the caller's own tokens, and validates input", async () => {
     const { mint, api, reg } = await ctx();
     const { json } = await mint();
-    await reg.mintGitToken({ id: "other", hash: "h", email: "other@kaikeru.com", scopes: ["read"], label: null, ttlMs: 1000 });
+    await reg.mintGitToken({ id: "other", hash: "h", email: "other@example.org", scopes: ["read"], label: null, ttlMs: 1000 });
     expect(((await (await api("/api/git-tokens")).json()) as unknown[]).length).toBe(1);
     expect((await api("/api/git-tokens/other", { method: "DELETE" })).status).toBe(404);
     expect((await api(`/api/git-tokens/${json.id}`, { method: "DELETE" })).status).toBe(200);
@@ -261,7 +261,7 @@ describe("agent identity on git tokens", () => {
     const h = seen.git[0]!.req.headers;
     expect(h.get("x-queen-agent")).toBe("claude-code");
     expect(h.get("x-queen-agent-model")).toBe("claude-opus-4");
-    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@example.org");
   });
 
   it("omits the model header when the agent token has no model", async () => {
@@ -299,13 +299,13 @@ describe("agent identity on git tokens", () => {
     const { git, access, seen } = await ctx();
     await git(REFS, { headers: { "cf-access-token": access, "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" } });
     const h = seen.git[0]!.req.headers;
-    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@example.org");
     expect(h.has("x-queen-agent")).toBe(false);
     expect(h.has("x-queen-agent-model")).toBe(false);
   });
 
   it("strips client-supplied agent headers in dev mode", async () => {
-    const { app, env, seen } = await ctx({ ACCESS_MODE: "dev", DEV_USER_EMAIL: "dev@kaikeru.com" });
+    const { app, env, seen } = await ctx({ ACCESS_MODE: "dev", DEV_USER_EMAIL: "dev@example.org" });
     await app.request("http://localhost:8787" + REFS, { headers: { "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" } }, env);
     const h = seen.git[0]!.req.headers;
     expect(h.has("x-queen-agent")).toBe(false);
@@ -316,7 +316,7 @@ describe("agent identity on git tokens", () => {
     const { api, seen } = await ctx();
     await api("/hives/demo/items", { headers: { "x-queen-agent": "evil", "x-queen-agent-model": "gpt-9" } });
     const h = seen.queen[0]!.headers;
-    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@example.org");
     expect(h.has("x-queen-agent")).toBe(false);
     expect(h.has("x-queen-agent-model")).toBe(false);
   });
@@ -325,7 +325,7 @@ describe("agent identity on git tokens", () => {
     const { reg, mint, api } = await ctx();
     const a = await mint({ agent: AGENT });
     const h = await hashToken(a.json.token);
-    expect(await reg.authGitToken(h)).toMatchObject({ email: "owner@kaikeru.com", agent: AGENT });
+    expect(await reg.authGitToken(h)).toMatchObject({ email: "owner@example.org", agent: AGENT });
     await api(`/api/git-tokens/${a.json.id}`, { method: "DELETE" });
     expect(await reg.authGitToken(h)).toBeNull();
   });
@@ -341,7 +341,7 @@ describe("agent identity on git tokens", () => {
       sql.exec(`CREATE TABLE git_tokens (
         id TEXT PRIMARY KEY, email TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL, label TEXT,
         created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER)`);
-      sql.exec("INSERT INTO git_tokens (id, email, hash, scopes, label, created_at, expires_at) VALUES ('old1', 'a@kaikeru.com', 'oldhash', 'read', NULL, 1, ?)", Date.now() + 1e9);
+      sql.exec("INSERT INTO git_tokens (id, email, hash, scopes, label, created_at, expires_at) VALUES ('old1', 'a@example.org', 'oldhash', 'read', NULL, 1, ?)", Date.now() + 1e9);
       expect(sql.exec("PRAGMA table_info(git_tokens)").toArray().map((c) => c.name)).not.toContain("agent_name");
       migrateGitTokens(sql);
       migrateGitTokens(sql); // idempotent
@@ -349,21 +349,21 @@ describe("agent identity on git tokens", () => {
       expect(cols).toContain("agent_name");
       expect(cols).toContain("agent_model");
     });
-    const list = await stub.listGitTokens("a@kaikeru.com");
+    const list = await stub.listGitTokens("a@example.org");
     expect(list).toHaveLength(1);
     expect(list[0]).toMatchObject({ id: "old1", agent: null });
-    expect(await stub.authGitToken("oldhash")).toMatchObject({ email: "a@kaikeru.com", agent: null });
-    const minted = await stub.mintGitToken({ id: "n1", hash: "h2", email: "a@kaikeru.com", scopes: ["push"], label: null, ttlMs: 1000, agent: { name: "codex", model: null } });
+    expect(await stub.authGitToken("oldhash")).toMatchObject({ email: "a@example.org", agent: null });
+    const minted = await stub.mintGitToken({ id: "n1", hash: "h2", email: "a@example.org", scopes: ["push"], label: null, ttlMs: 1000, agent: { name: "codex", model: null } });
     expect(minted.agent).toEqual({ name: "codex", model: null });
   });
 });
 
 describe("git in dev mode", () => {
   it("bypasses auth on localhost only", async () => {
-    const { app, env, seen } = await ctx({ ACCESS_MODE: "dev", DEV_USER_EMAIL: "Dev@kaikeru.com" });
+    const { app, env, seen } = await ctx({ ACCESS_MODE: "dev", DEV_USER_EMAIL: "Dev@example.org" });
     const ok = await app.request("http://localhost:8787" + REFS, {}, env);
     expect(ok.status).toBe(200);
-    expect(seen.git[0]!.req.headers.get("x-queen-user")).toBe("dev@kaikeru.com");
+    expect(seen.git[0]!.req.headers.get("x-queen-user")).toBe("dev@example.org");
     expect(seen.git[0]!.req.headers.get("x-queen-scopes")).toBe("read,push");
     expect((await app.request(HOST + REFS, {}, env)).status).toBe(403);
   });

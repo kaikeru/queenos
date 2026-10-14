@@ -284,34 +284,34 @@ Revisit `AIChatAgent` (resumable streams) after the deadline.
 
 **Open risks:** LLM charters may name unsupported stacks. Gate them to a template allowlist (no-build JS, Hono + wrangler).
 
-## 8. Access, domain and site URLs (`queenos.kaikeru.com`, team `kaikeru`)
+## 8. Access, domain and site URLs (`queenos.example.com`, team `example`)
 
-**One origin, one Access app.** `queenos.kaikeru.com` serves both the dashboard and the API from **one Worker** (the Queen's edge Worker).
+**One origin, one Access app.** `queenos.example.com` serves both the dashboard and the API from **one Worker** (the Queen's edge Worker).
 - The dashboard is Workers Static Assets: `assets:{directory:"../dashboard/dist", not_found_handling:"single-page-application", run_worker_first:["/hives/*","/registry/*","/vault/*","/genesis/*","/internal/*"]}` (WS:4206-4245: `not_found_handling` enum, `run_worker_first` string[]).
-- Same-origin `wss://queenos.kaikeru.com/hives/:ns/room` means no CORS and no cross-site cookies.
+- Same-origin `wss://queenos.example.com/hives/:ns/room` means no CORS and no cross-site cookies.
 - Vault and Genesis are reached through **fetch service bindings** to their Workers (write-only Vault HTTP API, never the Vault DO). Access identity is **not propagated** over service bindings or RPC (CF:workers/configuration/cloudflare-access l.245). The edge therefore forwards the verified email in a header that only it can set.
 - **Reject a separate `api.` host.** It brings CORS plus a cookie on a second hostname. Access *can* protect several domains in one app (CF:cloudflare-one/…/authorization-cookie l.28-32), but one origin is simpler.
 
 **WebSockets.** "Worker-level Access policies do not currently support WebSocket connections … will fail with a `403`". The fix is to "protect it with a **hostname-based** Access application instead" (CF:workers/configuration/cloudflare-access l.85-89).
 - So: create a **self-hosted app on the hostname**, not the Workers "protect this Worker" toggle.
 - The browser sends the app-domain `CF_Authorization` cookie on the same-origin `wss` upgrade, as standard cookie behaviour on the handshake GET. That Access validates it on the upgrade is implied by l.89 but **UNVERIFIED**. Day-1 test.
-- The app cookie lives on the protected domain, and a separate global session cookie lives on `kaikeru.cloudflareaccess.com` (authorization-cookie l.23-26).
+- The app cookie lives on the protected domain, and a separate global session cookie lives on `example.cloudflareaccess.com` (authorization-cookie l.23-26).
 
 **Defense in depth (edge Worker, Web Crypto only).**
 - Read `Cf-Access-Jwt-Assertion`; prefer it over the cookie, which "is not guaranteed to be passed" (validating-json l.17-19).
-- Fetch the JWKS from `https://kaikeru.cloudflareaccess.com/cdn-cgi/access/certs`. Cache it about 10 min by `kid`; the endpoint lists the current and the previous key (l.23-29).
+- Fetch the JWKS from `https://example.cloudflareaccess.com/cdn-cgi/access/certs`. Cache it about 10 min by `kid`; the endpoint lists the current and the previous key (l.23-29).
 - Verify RS256 with `crypto.subtle.importKey("jwk", …, {name:"RSASSA-PKCS1-v1_5", hash:"SHA-256"})` (header `alg:"RS256"`, `kid`; application-token l.33-34, l.146).
 - Checks:
   - `aud` includes `ACCESS_AUD`;
-  - `iss === "https://kaikeru.cloudflareaccess.com"`;
+  - `iss === "https://example.cloudflareaccess.com"`;
   - `exp`/`nbf`/`iat` with 60 s skew;
   - `type === "app"`.
-- **Users:** `email` must end with `@${ACCESS_EMAIL_DOMAIN}` (default `kaikeru.com`). This is a second layer behind the Access policy.
+- **Users:** `email` must end with `@${ACCESS_EMAIL_DOMAIN}` (default `example.com`). This is a second layer behind the Access policy.
 - **Service tokens:** `sub === ""` and `common_name` (= `CF-Access-Client-Id`) is in `ACCESS_SERVICE_CLIENT_IDS` (application-token l.51-60 user claims, l.120-142 service-token claims).
-- Vars: `ACCESS_TEAM_DOMAIN=https://kaikeru.cloudflareaccess.com`, `ACCESS_AUD=<tag>`, `ACCESS_EMAIL_DOMAIN=kaikeru.com`, `ACCESS_SERVICE_CLIENT_IDS=""`.
+- Vars: `ACCESS_TEAM_DOMAIN=https://example.cloudflareaccess.com`, `ACCESS_AUD=<tag>`, `ACCESS_EMAIL_DOMAIN=example.com`, `ACCESS_SERVICE_CLIENT_IDS=""`.
 - `ctx.access` (WT:502, 613-616) is documented for authenticated *direct* invocations (l.205-209). Treat it as a convenience, not the check.
 - Local dev uses the `access.dev` mock (WS:347).
-- ⚠ Checked 2026-10-02: `https://kaikeru.cloudflareaccess.com/cdn-cgi/access/certs` returned an **Access error page**, not a JWKS. Confirm the team name and that Zero Trust is initialized.
+- ⚠ Checked 2026-10-02: `https://example.cloudflareaccess.com/cdn-cgi/access/certs` returned an **Access error page**, not a JWKS. Confirm the team name and that Zero Trust is initialized.
 
 **Machine callers.**
 - Drones, gatekeepers, Provisioner, Herald and Sentinel reach the Queen over **DO RPC**, and Access does not sit on RPC (no hostname; l.245).
@@ -320,30 +320,30 @@ Revisit `AIChatAgent` (resumable streams) after the deadline.
 - `/sentinel/ingest` (from the user's account tail Worker) lives on the **herald Worker's own host**, outside Access, authenticated by HMAC.
 - **Set `workers_dev:false` and `preview_urls:false`** (WS:67-78; workers_dev defaults to true) on queen, vault and genesis. Otherwise `*.workers.dev` bypasses the Access app.
 
-**Project site URLs** (Custom Domains need the zone in the deploy account, CF:workers/configuration/routing/custom-domains l.42, so these names apply only to hives deployed into the kaikeru account; other users get workers.dev or their own zone).
-- **Universal SSL** covers only the apex and first-level names. `x.queenos.kaikeru.com` "will not serve a valid certificate" without ACM/Total TLS or a custom cert (CF:ssl/edge-certificates/universal-ssl/limitations l.27-31).
+**Project site URLs** (Custom Domains need the zone in the deploy account, CF:workers/configuration/routing/custom-domains l.42, so these names apply only to hives deployed into the deploy account; other users get workers.dev or their own zone).
+- **Universal SSL** covers only the apex and first-level names. `x.queenos.example.com` "will not serve a valid certificate" without ACM/Total TLS or a custom cert (CF:ssl/edge-certificates/universal-ssl/limitations l.27-31).
 - **However**, creating a Worker **Custom Domain** "generate[s] an Advanced Certificate … includ[ing] multi-level subdomains … no separate Advanced Certificate Manager subscription is required" (custom-domains l.171-173). The certs are **not** deleted with the domain (l.179), so the Herald must clean them up. Custom Domains do **not** support wildcards (l.138). The account limit is 100 custom domains per zone (CF:workers/platform/limits).
-- **Prod:** `<project>.queenos.kaikeru.com` as a Custom Domain on `<project>` (Herald `PUT /workers/domains`, §3).
-- **Staging:** `<project>-staging.queenos.kaikeru.com` on `<project>-staging`.
+- **Prod:** `<project>.queenos.example.com` as a Custom Domain on `<project>` (Herald `PUT /workers/domains`, §3).
+- **Staging:** `<project>-staging.queenos.example.com` on `<project>-staging`.
 - **Canary:** the prod hostname.
 - **Previews:** default to **workers.dev Preview URLs** (`t-<id>-<project>.<sub>.workers.dev`), which need no certificates.
-  - Optional custom preview host: `<project>-preview.kaikeru.com` (a first-level name) with `previews_enabled:true, enabled:false`. That yields `t-<id>.<project>-preview.kaikeru.com`.
+  - Optional custom preview host: `<project>-preview.example.com` (a first-level name) with `previews_enabled:true, enabled:false`. That yields `t-<id>.<project>-preview.example.com`.
   - Cloudflare "creates a wildcard DNS record and SSL certificate", but "for deeper hostnames, you may need ACM" (CF:workers/previews/custom-domains). Whether second-level preview wildcards are free is **UNVERIFIED**.
-  - Avoid `*.queenos.kaikeru.com` previews, which would be third-level.
-- **WfP** would need a wildcard route `*.queenos.kaikeru.com/*` to a dispatcher, plus a wildcard cert at second level, so ACM/Total TLS. That is one more reason to reject it (§2).
+  - Avoid `*.queenos.example.com` previews, which would be third-level.
+- **WfP** would need a wildcard route `*.queenos.example.com/*` to a dispatcher, plus a wildcard cert at second level, so ACM/Total TLS. That is one more reason to reject it (§2).
 - Project sites are **outside** the QueenOS Access app, whose hostname is exact. To protect previews only, put a separate Access app (or the Worker-level "previews only" option, l.83) on the preview host. Gatekeepers then need a service token, and app WebSockets will 403 under Worker-level Access (l.87).
 
 **One-time setup (user):**
-1. **Zero Trust:** confirm team `kaikeru` (team domain `kaikeru.cloudflareaccess.com`) and an identity provider. One-time PIN is fine. (UNVERIFIED: the certs URL currently errors.)
-2. **Access app:** Access → Applications → Add → **Self-hosted**, domain `queenos.kaikeru.com`, all paths, session 24 h.
-   - Policy "kaikeru staff": Allow, Include → *Emails ending in* `@kaikeru.com`.
+1. **Zero Trust:** confirm team `example` (team domain `example.cloudflareaccess.com`) and an identity provider. One-time PIN is fine. (UNVERIFIED: the certs URL currently errors.)
+2. **Access app:** Access → Applications → Add → **Self-hosted**, domain `queenos.example.com`, all paths, session 24 h.
+   - Policy "Staff": Allow, Include → *Emails ending in* `@example.com`.
    - Policy "ops machines": **Service Auth**, Include → Service Token `queenos-ops`. Create that token first and store its secret in a password manager.
 3. **AUD tag:** copy it from the app's settings ("Application Audience (AUD) Tag", validating-json l.94-102) into `ACCESS_AUD` in `apps/queen/wrangler.jsonc` vars.
-4. **Custom Domain for the edge Worker:** `routes:[{pattern:"queenos.kaikeru.com", custom_domain:true}]`, then `wrangler deploy`. DNS and cert are created automatically (custom-domains l.19, l.54). There must be **no existing CNAME** at that name (l.42).
+4. **Custom Domain for the edge Worker:** `routes:[{pattern:"queenos.example.com", custom_domain:true}]`, then `wrangler deploy`. DNS and cert are created automatically (custom-domains l.19, l.54). There must be **no existing CNAME** at that name (l.42).
 5. Add `workers_dev:false`, `preview_urls:false` and the four `ACCESS_*` vars. Deploy, then open the site, sign in and confirm `/hives/demo/room` connects.
-6. **Project custom domains** (later): the hive's deploy token needs zone permission on `kaikeru.com` (`workers_routes` edit; full set for `/workers/domains` UNVERIFIED).
+6. **Project custom domains** (later): the hive's deploy token needs zone permission on `example.com` (`workers_routes` edit; full set for `/workers/domains` UNVERIFIED).
 
-**Decision/Recommendation:** single host `queenos.kaikeru.com`, a hostname-based self-hosted Access app, and RS256 JWT checks plus the email-domain check in the edge Worker. Bearer plus service token for `/internal/*`. Project prod and staging on per-host Custom Domains under `queenos.kaikeru.com`; previews on workers.dev.
+**Decision/Recommendation:** single host `queenos.example.com`, a hostname-based self-hosted Access app, and RS256 JWT checks plus the email-domain check in the edge Worker. Bearer plus service token for `/internal/*`. Project prod and staging on per-host Custom Domains under `queenos.example.com`; previews on workers.dev.
 
 **Open risks:**
 - WebSocket upgrade through hostname Access is UNVERIFIED.
@@ -421,7 +421,7 @@ releases(id PK, hive, base_prod_sha, head_sha, train_ids_json, phase /*COLLECTIN
 
 Each step stores `{step, attempt, lastError}`, and reopening the wizard resumes there. UI: a Projects home (Registry list) and a Sites panel driven by `environments`.
 
-**Auth:** Cloudflare Access on the one origin `queenos.kaikeru.com`, plus JWT checks in the edge Worker. See §8.
+**Auth:** Cloudflare Access on the one origin `queenos.example.com`, plus JWT checks in the edge Worker. See §8.
 - Audit rows and `releases.tapped_by` take `email` from the verified JWT.
 
 ## (b) Phased plan (today 10-02 → due 10-14)
@@ -430,8 +430,8 @@ Each step stores `{step, attempt, lastError}`, and reopening the wizard resumes 
 |---|---|---|---|
 | P0 | 10-03 | Day-1 verification (d) on a real account | Table filled |
 | **P1: smallest demo** | 10-03 → 10-05 | Queen refactor (Provisioner). Herald `preview` for the **no-build template**: Artifacts tree → Worker Preview via REST → URL on the train card. Gatekeeper smoke `GET url → 200`. Token kept as a wrangler secret for now. | A train card shows a live URL; a `[fail]` train fails on a real 500 |
-| P2 | 10-05 → 10-07 | §8 setup: Access app plus `queenos.kaikeru.com` one-origin edge (assets + `/hives/*` + WS) with JWT/email checks and `workers_dev:false`. Registry and Projects home, wizard, Vault (form → DO), token verify, write probe and deep link, minimal Genesis → charter → `createHive` → first flight | A signed-in @kaikeru.com user takes a new hive from chat to preview URL with no CLI; anonymous requests and workers.dev get 403/404 |
-| P3 | 10-07 → 10-10 | Release planner (pure, tested), staging script, tap-to-ship, canary steps, rollback. Sentinel (synthetic + tail) with SLO checks. Sites panel (prod/staging Custom Domains under `queenos.kaikeru.com`). | 1→10→50→100 promotion and an auto-rollback demo |
+| P2 | 10-05 → 10-07 | §8 setup: Access app plus `queenos.example.com` one-origin edge (assets + `/hives/*` + WS) with JWT/email checks and `workers_dev:false`. Registry and Projects home, wizard, Vault (form → DO), token verify, write probe and deep link, minimal Genesis → charter → `createHive` → first flight | A signed-in @example.com user takes a new hive from chat to preview URL with no CLI; anonymous requests and workers.dev get 403/404 |
+| P3 | 10-07 → 10-10 | Release planner (pure, tested), staging script, tap-to-ship, canary steps, rollback. Sentinel (synthetic + tail) with SLO checks. Sites panel (prod/staging Custom Domains under `queenos.example.com`). | 1→10→50→100 promotion and an auto-rollback demo |
 | P4 | 10-10 → 10-12 | Foundry (Containers): real `pnpm install/test/build` → R2 bundle; gatekeepers on real tests | A Hono project with deps passes the ladder |
 | P5 | 10-12 → 10-13 | Bisect plus Reverter drone, demo video, docs | A bad train is found and reverted automatically |
 | buffer | 10-14 | Artifacts billing starts today (discovery.md l.3) | Ship |
@@ -454,7 +454,7 @@ If P4 slips, demo P1-P3 on the no-build template.
 | 6 | Vault DO | AES-GCM + AES-KW envelope; only herald and vault bind it | Design |
 | 6 | Tokens | Template deep link, verify endpoints, write probe; OAuth clients later; no OIDC federation | Verified (docs + WC) |
 | 7 | Genesis | Own DO + hive-kit; agents@0.26 viable but heavy | npm + design |
-| 8 | Auth | One origin `queenos.kaikeru.com`, hostname-based self-hosted Access app (Worker-level Access breaks WS), RS256 JWT + `aud`/`iss` + `@kaikeru.com` checks in the edge | Docs verified; WS through Access UNVERIFIED |
+| 8 | Auth | One origin `queenos.example.com`, hostname-based self-hosted Access app (Worker-level Access breaks WS), RS256 JWT + `aud`/`iss` + `@example.com` checks in the edge | Docs verified; WS through Access UNVERIFIED |
 | 8 | Site URLs | Prod/staging = per-host Custom Domains (free multi-level cert); previews = workers.dev; avoid wildcard (ACM) | Verified (docs); second-level preview wildcard UNVERIFIED |
 
 ## (d) Day-1 verification addendum (real account; fold into docs/day1-verification.md)
@@ -477,9 +477,9 @@ If P4 slips, demo P1-P3 on the no-build template.
    - writing a 5 MB bundle to R2.
 9. **Provisioner latency:** Workflow `create()` → first step → DO RPC callback, median of 20 runs. This decides the fork-in-drone mitigation.
 10. **Access:**
-   - `https://kaikeru.cloudflareaccess.com/cdn-cgi/access/certs` returns a JWKS (it errored on 10-02);
-   - `wss://queenos.kaikeru.com/hives/demo/room` upgrades through the hostname app with only the cookie;
-   - the JWT carries `email`/`aud`/`iss` as documented; a non-@kaikeru.com JWT and a service-token JWT behave as designed;
+   - `https://example.cloudflareaccess.com/cdn-cgi/access/certs` returns a JWKS (it errored on 10-02);
+   - `wss://queenos.example.com/hives/demo/room` upgrades through the hostname app with only the cookie;
+   - the JWT carries `email`/`aud`/`iss` as documented; a non-@example.com JWT and a service-token JWT behave as designed;
    - `*.workers.dev` for queen is disabled;
    - `ctx.access` is present or absent under hostname Access.
-11. **Custom Domain** `demo.queenos.kaikeru.com`: certificate issuance time, the `PUT /workers/domains` permission set, and cert cleanup on delete. Also a preview host `demo-preview.kaikeru.com`: does `t-x.demo-preview.kaikeru.com` get a cert without ACM?
+11. **Custom Domain** `demo.queenos.example.com`: certificate issuance time, the `PUT /workers/domains` permission set, and cert cleanup on delete. Also a preview host `demo-preview.example.com`: does `t-x.demo-preview.example.com` get a cert without ACM?

@@ -7,7 +7,7 @@ const stub = (agentId: string) => (env as unknown as { AGENT_IDENTITY: DurableOb
 describe("AgentIdentity DO", () => {
   it("create is idempotent; attempts are added, closed and listed", async () => {
     const agentId = `ag_${crypto.randomUUID().replace(/-/g, "")}`;
-    const id = { agentId, name: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "ada@kaikeru.com" };
+    const id = { agentId, name: "opus", model: "claude-opus-5-5", role: "worker" as const, owner: "ada@example.org" };
     const s = stub(agentId);
     expect(await s.get()).toBeNull();
     expect(await s.create(id)).toEqual(id);

@@ -151,12 +151,12 @@ describe("CloudflareClient", () => {
   });
 
   it("enableSubdomain posts enabled:true; workerUrl composes the workers.dev URL", async () => {
-    const a = harness(ok({ enabled: true, previews_enabled: true }), ok({ subdomain: "kyle-477" }));
+    const a = harness(ok({ enabled: true, previews_enabled: true }), ok({ subdomain: "example" }));
     await a.client.enableSubdomain("hive-app");
     expect(a.calls[0]!.url).toBe(`${base}/workers/scripts/hive-app/subdomain`);
     expect(a.calls[0]!.init.method).toBe("POST");
     expect(JSON.parse(a.calls[0]!.init.body as string)).toEqual({ enabled: true, previews_enabled: true });
-    expect(await a.client.workerUrl("hive-app")).toBe("https://hive-app.kyle-477.workers.dev");
+    expect(await a.client.workerUrl("hive-app")).toBe("https://hive-app.example.workers.dev");
   });
 
   it("createDeployment force sends ?force=true; secretsMismatch classifies the refusal", async () => {

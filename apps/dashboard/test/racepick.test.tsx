@@ -67,8 +67,8 @@ describe("cards", () => {
 
 describe("decided result", () => {
   test("human pick against the recommendation", () => {
-    const d = decidedSummary(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "human:k@kaikeru.com" }))!;
-    expect(d).toMatchObject({ human: true, agreed: false, text: "picked by k@kaikeru.com" });
+    const d = decidedSummary(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "human:k@example.org" }))!;
+    expect(d).toMatchObject({ human: true, agreed: false, text: "picked by k@example.org" });
   });
   test("deadline fallback agrees with the recommendation", () => {
     expect(decidedSummary(race({ state: "DECIDED", winnerTrainId: "b", decidedBy: "queen:deadline" }))).toMatchObject({ human: false, agreed: true });
@@ -132,8 +132,8 @@ describe("render", () => {
     expect(html).toContain("n/a");
   });
   test("DECIDED by a human: result shown, no pick buttons", () => {
-    const html = renderToString(<RacePick hive="demo" view={view(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "human:k@kaikeru.com" }))} now={NOW} />);
-    expect(html).toContain("picked by k@kaikeru.com");
+    const html = renderToString(<RacePick hive="demo" view={view(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "human:k@example.org" }))} now={NOW} />);
+    expect(html).toContain("picked by k@example.org");
     expect(html).toContain("overrode the Queen");
     expect(html).not.toContain("Pick this one");
     expect(html).not.toContain("<iframe");
@@ -284,7 +284,7 @@ describe("reject (rework loop §7.4)", () => {
     const html = renderToString(<RacePick hive="demo" view={view(race())} now={NOW} />);
     expect(html.match(/>Reject</g)).toHaveLength(3);
     expect(html).toContain("Reject all");
-    const done = renderToString(<RacePick hive="demo" view={view(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "human:k@kaikeru.com" }))} now={NOW} />);
+    const done = renderToString(<RacePick hive="demo" view={view(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "human:k@example.org" }))} now={NOW} />);
     expect(done).not.toContain("Reject");
   });
 

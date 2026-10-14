@@ -4,8 +4,8 @@ import { forkDepsFor } from "../src/fork";
 import type { AttemptRef, IdentityPort, McpArtifacts, McpPorts, McpRepoHandle, QueenPort, RegistryPort, Snapshot } from "../src/ports";
 import type { SessionPort } from "../src/tools";
 
-export const OWNER = "ada@kaikeru.com";
-export const OTHER = "eve@kaikeru.com";
+export const OWNER = "ada@example.org";
+export const OTHER = "eve@example.org";
 export const HIVE = "demo";
 export const MAIN_SHA = "a".repeat(40);
 export const ATT = "att_0123456789ab";

@@ -10,7 +10,7 @@ import type { QueenRpc } from "../src/receive";
 import { TokenCache, type ArtifactsLike, type ArtifactsRepoLike } from "../src/tokens";
 
 export const HIVE = "demo";
-export const USER = "ada@kaikeru.com";
+export const USER = "ada@example.org";
 export const MAIN_SHA = "a".repeat(40);
 export const OTHER_SHA = "b".repeat(40);
 export const NEW_SHA = "c".repeat(40);

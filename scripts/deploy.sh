@@ -7,6 +7,11 @@
 #   scripts/deploy.sh --only edge     run only the named Worker (apps/ dir name) in the full pass
 #   scripts/deploy.sh --force         skip the in-flight v1 train check before deploying the Queen
 #
+# Site settings live in deploy.env at the repo root (gitignored; copy deploy.env.example):
+#   QUEENOS_HOST, QUEENOS_ACCESS_TEAM, QUEENOS_ALLOWED_EMAIL_DOMAINS, QUEENOS_ACCESS_AUD and
+#   CLOUDFLARE_ACCOUNT_ID. The edge's wrangler.jsonc ships with these empty; the script
+#   deploys the edge from a temp copy with them filled in (custom domain route + vars).
+#
 # v2 safety check (design §7, R16): the Queen's v11 migration must not run while
 # v1 trains are in flight (v1 successors chain on their predecessors; v2 builds
 # fork from main). Before deploying the Queen, the script reads every hive's
@@ -57,14 +62,23 @@ while [ $# -gt 0 ]; do
     --bootstrap) BOOTSTRAP=1 ;;
     --only) shift; ONLY="${1:?--only needs a value}" ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n "2,30p" "$0"; exit 0 ;;
+    -h|--help) sed -n "2,35p" "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
+if [ -f "$ROOT/deploy.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/deploy.env"
+  set +a
+fi
+QUEENOS_URL="${QUEENOS_URL:-${QUEENOS_HOST:+https://$QUEENOS_HOST}}"
+
 OUTROOT="${DEPLOY_DRYRUN_DIR:-$ROOT/.deploy-dryrun}"
 TMP_CFG_NAME=".wrangler.bootstrap.jsonc"
+SITE_CFG_NAME=".wrangler.site.jsonc"
 
 # dir:script-name. The edge is last: it needs the dashboard bundle, and its GIT and
 # MCP service bindings need queenos-git and queenos-mcp to exist (so those go just
@@ -86,10 +100,22 @@ WORKERS=(
   "edge:queenos-edge"
 )
 
-cleanup() { for w in "${WORKERS[@]}"; do rm -f "$ROOT/apps/${w%%:*}/$TMP_CFG_NAME"; done; }
+cleanup() { for w in "${WORKERS[@]}"; do rm -f "$ROOT/apps/${w%%:*}/$TMP_CFG_NAME" "$ROOT/apps/${w%%:*}/$SITE_CFG_NAME"; done; }
 trap cleanup EXIT
 
 want() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
+
+# The edge needs the site settings; refuse before deploying anything if they are missing.
+if [ "$DRY_RUN" = 0 ] && want edge; then
+  missing=""
+  for v in QUEENOS_HOST QUEENOS_ACCESS_TEAM QUEENOS_ALLOWED_EMAIL_DOMAINS; do
+    [ -n "${!v:-}" ] || missing="$missing $v"
+  done
+  if [ -n "$missing" ]; then
+    echo "Missing site settings:$missing. Copy deploy.env.example to deploy.env and fill it in." >&2
+    exit 1
+  fi
+fi
 
 prepare() {
   case "$1" in
@@ -113,12 +139,13 @@ deploy_app() {
   (cd "$ROOT/apps/$app" && pnpm exec wrangler "${args[@]}" "$@")
 }
 
-# Write a copy of apps/<dir>/wrangler.jsonc with cross-script bindings removed.
-write_stripped_config() {
-  local dir="$1"
-  node - "$ROOT/apps/$dir/wrangler.jsonc" "$ROOT/apps/$dir/$TMP_CFG_NAME" <<'NODE'
+# write_config <dir> <out name> <strip: 0|1>: a copy of apps/<dir>/wrangler.jsonc, with
+# cross-script bindings removed when strip=1, and the site settings filled in for the edge.
+write_config() {
+  local dir="$1" name="$2" strip="$3"
+  node - "$ROOT/apps/$dir/wrangler.jsonc" "$ROOT/apps/$dir/$name" "$dir" "$strip" <<'NODE'
 const fs = require("node:fs");
-const [src, dst] = process.argv.slice(2);
+const [src, dst, dir, strip] = process.argv.slice(2);
 // Strip // and /* */ comments and trailing commas, outside of strings.
 function parseJsonc(text) {
   let out = "", inStr = false;
@@ -136,11 +163,23 @@ function parseJsonc(text) {
   return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
 }
 const cfg = parseJsonc(fs.readFileSync(src, "utf8"));
-if (cfg.durable_objects?.bindings) {
-  cfg.durable_objects.bindings = cfg.durable_objects.bindings.filter((b) => !b.script_name);
+if (strip === "1") {
+  if (cfg.durable_objects?.bindings) {
+    cfg.durable_objects.bindings = cfg.durable_objects.bindings.filter((b) => !b.script_name);
+  }
+  if (cfg.workflows) cfg.workflows = cfg.workflows.filter((w) => !w.script_name);
+  delete cfg.services;
 }
-if (cfg.workflows) cfg.workflows = cfg.workflows.filter((w) => !w.script_name);
-delete cfg.services;
+if (dir === "edge") {
+  const e = process.env;
+  if (e.QUEENOS_HOST) cfg.routes = [{ pattern: e.QUEENOS_HOST, custom_domain: true }];
+  Object.assign((cfg.vars ??= {}), {
+    ACCESS_TEAM: e.QUEENOS_ACCESS_TEAM ?? "",
+    ALLOWED_EMAIL_DOMAINS: e.QUEENOS_ALLOWED_EMAIL_DOMAINS ?? "",
+    ACCESS_AUD: e.QUEENOS_ACCESS_AUD ?? "",
+    ACCOUNT_ID: e.CLOUDFLARE_ACCOUNT_ID ?? "",
+  });
+}
 fs.writeFileSync(dst, JSON.stringify(cfg, null, 2));
 NODE
 }
@@ -218,7 +257,7 @@ if [ "$BOOTSTRAP" = 1 ]; then
     dir="${w%%:*}"
     if want "$dir"; then
       prepare "$dir"
-      write_stripped_config "$dir"
+      write_config "$dir" "$TMP_CFG_NAME" 1
       deploy_app "$dir" bootstrap --config "$ROOT/apps/$dir/$TMP_CFG_NAME"
       rm -f "$ROOT/apps/$dir/$TMP_CFG_NAME"
     fi
@@ -231,7 +270,13 @@ for w in "${WORKERS[@]}"; do
   dir="${w%%:*}"
   if want "$dir"; then
     prepare "$dir"
-    deploy_app "$dir" full
+    if [ "$dir" = edge ]; then
+      write_config edge "$SITE_CFG_NAME" 0
+      deploy_app edge full --config "$ROOT/apps/edge/$SITE_CFG_NAME"
+      rm -f "$ROOT/apps/edge/$SITE_CFG_NAME"
+    else
+      deploy_app "$dir" full
+    fi
   fi
 done
 
@@ -242,8 +287,8 @@ fi
 
 cat <<'MSG'
 
-Deploy finished. One-time manual steps (first deploy only). <host> is the custom domain
-in apps/edge/wrangler.jsonc "routes"; <team> is your Zero Trust team name.
+Deploy finished. One-time manual steps (first deploy only). <host> is QUEENOS_HOST and
+<team> is QUEENOS_ACCESS_TEAM from deploy.env.
 
   1. Cloudflare Zero Trust (team: <team>) > Access > Applications > Add > Self-hosted.
      Create THREE applications:
@@ -254,9 +299,9 @@ in apps/edge/wrangler.jsonc "routes"; <team> is your Zero Trust team name.
        c. <host>/mcp with a Bypass policy (Everyone). The edge checks the Bearer `qgt_`
           token itself on /mcp.
      Without (b) and (c), git clients and MCP clients are stopped by the Access login page.
-  2. Copy the main app's "Application Audience (AUD) Tag" into "ACCESS_AUD" in
-     apps/edge/wrangler.jsonc, then redeploy the edge:
-       pnpm --filter @queenos/edge deploy
+  2. Copy the main app's "Application Audience (AUD) Tag" into QUEENOS_ACCESS_AUD in
+     deploy.env, then redeploy the edge:
+       scripts/deploy.sh --only edge
      (until then the edge fails closed with 503 on every route except /health).
   3. Vault key-encryption key (once):
        openssl rand -base64 32 | pnpm --filter @queenos/vault exec wrangler secret put VAULT_KEK --env=""

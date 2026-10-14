@@ -1,6 +1,6 @@
 # QueenOS: agent-native git. Every change is a Submission, and the front door is a git proxy
 
-Status: design, rev 2, 2026-10-07. **Rev 2 (user direction, 2026-10-07): "agent-native git".** The git layer is the product, and the swarm, merge queue, deploy pipeline and SRE are the supporting products that prove it. The front door is a **git proxy** at `https://queenos.kaikeru.com/git/<hive>`. It looks like GitHub, but it isn't: no Artifacts token ever leaves our side. Rev 2 replaces rev 1's per-person inbox forks, `InboxKeys` tokens, the PIN drone and the provisioner `NOTE` op (§16 lists what went away). Builds Oct 8–11; live by Oct 11 and in the demo. Human-judged races (§10) ship separately. Decision D12 in `docs/v2-design.md` §10 (amended by rev 2; record the amendment there in T8).
+Status: design, rev 2, 2026-10-07. **Rev 2 (user direction, 2026-10-07): "agent-native git".** The git layer is the product, and the swarm, merge queue, deploy pipeline and SRE are the supporting products that prove it. The front door is a **git proxy** at `https://queenos.example.com/git/<hive>`. It looks like GitHub, but it isn't: no Artifacts token ever leaves our side. Rev 2 replaces rev 1's per-person inbox forks, `InboxKeys` tokens, the PIN drone and the provisioner `NOTE` op (§16 lists what went away). Builds Oct 8–11; live by Oct 11 and in the demo. Human-judged races (§10) ship separately. Decision D12 in `docs/v2-design.md` §10 (amended by rev 2; record the amendment there in T8).
 Read with `docs/v2-design.md` (§1.2 principles, §2.3 lanes and queue), `apps/queen/README.md`, `docs/day1-results.md` (rows 1, 3, 5, 8, 8b, 8c) and the proxy probes (§3.6). Spike code (not in the repo): `scratchpad/proxy-spike/src/index.ts` of the 2026-10-07 session; T2 starts from a copy of it.
 
 Anything marked **UNVERIFIED** has not been checked against the real account or the code.
@@ -11,7 +11,7 @@ Anything marked **UNVERIFIED** has not been checked against the real account or 
 
 QueenOS lands code only when the Queen asks for it. Today a change exists only because the Queen dispatched a BUILDER drone into a fork it made. People and outside agents (Claude Code, Codex) have no way in. A hackathon judge's first question is "can I push to it?", and the honest answer today is no.
 
-**Agent-native git.** `git clone https://queenos.kaikeru.com/git/demo`, `git push origin HEAD:item/14`. The remote speaks plain git smart-HTTP, so every git client and every coding agent works unchanged. Behind it, the push is not a branch on a shared repo: it is a **Submission**. The proxy checks the rules at push time and answers in the push output (`remote: QueenOS: submission received → item 14`). The swarm vets the code, and the verdict comes back as git notes on the commit.
+**Agent-native git.** `git clone https://queenos.example.com/git/demo`, `git push origin HEAD:item/14`. The remote speaks plain git smart-HTTP, so every git client and every coding agent works unchanged. Behind it, the push is not a branch on a shared repo: it is a **Submission**. The proxy checks the rules at push time and answers in the push output (`remote: QueenOS: submission received → item 14`). The swarm vets the code, and the verdict comes back as git notes on the commit.
 
 **A push is a different paradigm from a pull request.**
 
@@ -126,13 +126,13 @@ The train therefore enters the pipeline exactly where a drone's build result doe
 On the dashboard, **Push code** (project header) → **Create git token**. It is shown once, with copy buttons for:
 
 ```bash
-git clone https://queenos.kaikeru.com/git/demo
+git clone https://queenos.example.com/git/demo
 # Username: your email (any value works)   Password: <git token>
 ```
 
-- The token is a **QueenOS git token** (`qgt_…`), minted by the edge behind Access, bound to your Access email, stored only as a hash, valid 30 days by default, revocable at once from the same panel. It is **not** an Artifacts token; it opens nothing but `https://queenos.kaikeru.com/git/*`.
+- The token is a **QueenOS git token** (`qgt_…`), minted by the edge behind Access, bound to your Access email, stored only as a hash, valid 30 days by default, revocable at once from the same panel. It is **not** an Artifacts token; it opens nothing but `https://queenos.example.com/git/*`.
 - Git's normal credential flow stores it (macOS keychain, `git credential-manager`, `credential.helper store`). After that, `git clone`, `fetch` and `push` just work, like GitHub with a PAT.
-- If you already use `cloudflared`: `git -c http.extraHeader="cf-access-token: $(cloudflared access token -app=https://queenos.kaikeru.com)" clone …` also works (§8.1). No git token needed, but it expires with your Access session.
+- If you already use `cloudflared`: `git -c http.extraHeader="cf-access-token: $(cloudflared access token -app=https://queenos.example.com)" clone …` also works (§8.1). No git token needed, but it expires with your Access session.
 
 ### 3.2 Push
 
@@ -148,7 +148,7 @@ git push origin HEAD:item/14           # join item 14's race
 remote: QueenOS: submission received → item 3c1e… "Add a tip jar at /features/tip-jar" (new item, fully gated)
 remote: QueenOS: train 7a90… · verdict in ~2 min
 remote: QueenOS: git fetch origin '+refs/notes/*:refs/notes/*' && git log --notes=verdict -1
-To https://queenos.kaikeru.com/git/demo
+To https://queenos.example.com/git/demo
  * [new branch]      HEAD -> tip-jar
 ```
 
@@ -172,7 +172,7 @@ git log --notes=verdict --notes=review -1
 ```
 ```
 Notes (verdict):
-    REJECTED by SECURITY: fetch to a non-allowlisted host. Push a fix to tip-jar, or hand off: https://queenos.kaikeru.com/p/demo/items/3c1e…
+    REJECTED by SECURITY: fetch to a non-allowlisted host. Push a fix to tip-jar, or hand off: https://queenos.example.com/p/demo/items/3c1e…
 
     Queen-Note: v1
     Queen-Kind: verdict
@@ -193,7 +193,7 @@ Notes (review):
 - **Fix:** commit and `git push origin HEAD:tip-jar` again. Intake reopens the same item (§6.2). Put `Queen-Replies-To: <rejected sha>` in the commit to link the chain.
 - **Hand off:** press **Let the swarm fix it** on the item page (`workAction: handoff`), or put `Queen: rework` in the commit message up front. A REWORK drone starts from *your* head (its train fork is forked from your rejected submission's fork), applies the findings and goes through the gate. To get its fix before it lands:
   ```bash
-  git pull https://queenos.kaikeru.com/git/demo/t/<trainId> main     # read-only view of one train fork
+  git pull https://queenos.example.com/git/demo/t/<trainId> main     # read-only view of one train fork
   ```
   The REWORK's verdict note names the train. After it lands, the fix is on `origin/main` anyway.
 - **Addressing** (user decision 2026-10-07). Branch `item/<id>` targets that item. Branch `goal/<slug>` resolves to the goal's single item when it has exactly one; otherwise it files a new item under that goal (no guessing). Any other branch is uncorrelated. **Resolution now happens at push time**, so an unknown item is refused in the push output (§4.3).
@@ -217,7 +217,7 @@ Exactly the same commands. The agent gets the git token through the environment 
 | 4 | `remote:` messages on success | **WORKS** | Sideband-2 packets injected before the final flush render as `remote: QueenOS: submission received -> item 14 (joined its race)` in stock git. (The spike buffers the upstream report, which is under 1 KB, then re-emits it.) |
 | 5 | Redirect a push into a fresh fork B of A, ref rewritten | **WORKS** | Advertisement from A, POST to new fork B: `refs/heads/item/77` → B `refs/heads/main` (old = B's main) accepted; B's log shows the commit on main. Also accepted: a commit built on a branch that exists **only in A** (not in B's refs; `defaultBranchOnly` fork), and B's full clone passes `git fsck` (forks carry all of A's objects); a branch based on an **older** main (non-fast-forward rewrite onto B main); a rewrite to a new ref `refs/heads/submission` (zero old). Fork on the push path took 3.3–6.4 s (day 1: ~2 s). The report-status is rewritten back to the client's ref name, so git shows `* [new branch] HEAD -> item/77`. |
 | 6 | Notes fetch | **WORKS (option c)** | The proxy answered v2 `ls-refs` (prefix `refs/notes/`) and `fetch` itself with a pack it built (blobs, a notes tree, a parentless commit; zlib via `CompressionStream("deflate")`, SHA-1 via Web Crypto). Stock git: `* [new ref] refs/notes/verdict`, `git log --notes=verdict --notes=review` shows the notes on commits that live only in forks; `git fsck` clean. A changed ledger gives a new commit: `+` refspec → `(forced update)`; without `+` → `! [rejected] (non-fast-forward)`. A mixed refspec (heads + notes in one fetch) gets heads only (by design, §7.5). |
-| 7 | Limits and Access | **Partly verified** | Stock git against the live host: `302` to `kaikeru.cloudflareaccess.com/cdn-cgi/access/login/…` → `fatal: unable to update url base from redirection` (Basic auth ignored). So git cannot pass Access as configured. Limits from docs: Workers request body 100 MB (Free/Pro), 200 MB (Business); Paid CPU 30 s default, 5 min max; **no wall-clock limit for HTTP while the client is connected**; 128 MB memory. `cloudflared access token -app=…` + `cf-access-token` header is documented for CLI clients (UNVERIFIED here: cloudflared not installed). Access path rules: the most specific path wins, so a `/git` app with its own policy overrides the host app (docs; UNVERIFIED on this account). |
+| 7 | Limits and Access | **Partly verified** | Stock git against the live host: `302` to `example.cloudflareaccess.com/cdn-cgi/access/login/…` → `fatal: unable to update url base from redirection` (Basic auth ignored). So git cannot pass Access as configured. Limits from docs: Workers request body 100 MB (Free/Pro), 200 MB (Business); Paid CPU 30 s default, 5 min max; **no wall-clock limit for HTTP while the client is connected**; 128 MB memory. `cloudflared access token -app=…` + `cf-access-token` header is documented for CLI clients (UNVERIFIED here: cloudflared not installed). Access path rules: the most specific path wins, so a `/git` app with its own policy overrides the host app (docs; UNVERIFIED on this account). |
 
 ---
 
@@ -478,7 +478,7 @@ Stock git cannot pass Cloudflare Access: probe 7 shows a `302` to the Access log
 | Access service token (`CF-Access-Client-Id/Secret` headers) | Per-agent secret pair; Access-team admin work; no person attached | Post-Oct 14 (Q9) |
 | **QueenOS git token** minted on the dashboard (behind Access), sent as the Basic password | Copy once; git's credential helper remembers it, exactly like a GitHub PAT | **Chosen** |
 
-- **Access configuration (T8, manual):** add a second self-hosted Access app for `queenos.kaikeru.com/git` with a **Bypass** policy. The most specific path wins (Access app-path docs), so `/git/*` reaches the edge without the Access login while everything else stays behind Access. The edge's `/git/*` handler is the only gate there. Deploy the edge's git-token check **before** adding the bypass.
+- **Access configuration (T8, manual):** add a second self-hosted Access app for `queenos.example.com/git` with a **Bypass** policy. The most specific path wins (Access app-path docs), so `/git/*` reaches the edge without the Access login while everything else stays behind Access. The edge's `/git/*` handler is the only gate there. Deploy the edge's git-token check **before** adding the bypass.
 - **Token:** `qgt_<32 random bytes, base32>`, minted only by `POST /api/git-tokens` behind Access, bound to the Access email, stored as SHA-256 (lookup by hash, so no timing oracle), scopes `read` / `push`, TTL 30 days (max 90), `last_used_at` updated at most once per minute, revocation immediate (checked on every request). The plaintext is shown once and never logged.
 - **Rate limits:** failed git auth per IP and per token id (Workers rate-limit binding, or a counter in the registry DO), plus per-user caps at `gitIntent`.
 
@@ -493,7 +493,7 @@ Stock git cannot pass Cloudflare Access: probe 7 shows a `302` to the Access log
 | Reviewer fails open | For drones it fails open on infra (orchestrate.ts:406). For human or agent origin it **fails closed** (`cause: "infra"`, re-gated, never passed unreviewed). |
 | Abuse | Caps checked in `gitIntent` **before** the fork (so a flood costs no Artifacts operations); `(hive, headSha)` dedupe; 50 MB pack cap enforced while streaming; Workers body limit 100 MB (Free/Pro zone); global `maxOpenItems` and budget. Artifacts limits: 32 MB per blob, 1 GB per repo. |
 | Forged notes | Impossible outward: notes are synthesized from the ledger and `refs/notes/*` pushes are refused. |
-| Read exposure | Any valid token (scope `read`) can clone hive main and read every verdict in that hive. The same population can already read the dashboard (`@kaikeru.com` behind Access). Per-hive scoping of tokens is post-Oct 14. |
+| Read exposure | Any valid token (scope `read`) can clone hive main and read every verdict in that hive. The same population can already read the dashboard (`@example.com` behind Access). Per-hive scoping of tokens is post-Oct 14. |
 | Proxy as a confused deputy | The git Worker has no public route (`workers_dev:false`, no routes); it is reachable only through the edge's service binding, and it trusts `x-queen-user` only from there. Repo names come from the Queen (`gitIntent`) or the hive registry, never from the URL beyond the hive slug and a `trainId` it validates against the Queen. |
 
 ---
@@ -706,7 +706,7 @@ The push path **ships without T1b**. If the drone adapter slips, cut it: drones 
 **"Agent-native git."** About 75 s, recorded after the swarm shot while the 12-item swarm is still landing.
 
 1. Split screen: the dashboard swarm floor (12 drone tiles) and a terminal. Voice-over: *"This looks like GitHub. It isn't. The git layer is the product: a push is a submission, the swarm vets it under the same rules as the agents, and the verdict comes back as git notes."*
-2. `git clone https://queenos.kaikeru.com/git/demo`. Then `git push origin HEAD:main`: refused in the push output, `remote: QueenOS: pushes to main are refused (the lander owns main)`.
+2. `git clone https://queenos.example.com/git/demo`. Then `git push origin HEAD:main`: refused in the push output, `remote: QueenOS: pushes to main are refused (the lander owns main)`.
 3. `git push origin HEAD:item/<id>`: `remote: QueenOS: submission received → item … (joined its race)`. Within seconds a tile with a **human** badge joins the floor, racing the drones' candidates.
 4. The change deliberately calls a non-allowlisted host (a deterministic SECURITY reject). The tile goes red. `git fetch origin '+refs/notes/*:refs/notes/*' && git log --notes=verdict --notes=review -1` shows the REJECTED note with the finding, in a plain terminal. Then the **notes beat**: Claude Code with the QueenOS plugin reads the same note, fixes the problem and re-pushes.
 5. Or click **Let the swarm fix it**: a REWORK drone starts from the human's commit, passes and boards a car **next to drone members** in the merge-train graph.
@@ -732,7 +732,7 @@ The push path **ships without T1b**. If the drone adapter slips, cut it: drones 
 | Q12 | `judge: human` default for `[hard]` items in a `supervised` hive? | No. Opt-in. |
 | Q13 | Live previews of 3 candidates for up to 15 min: quota and cost | UNVERIFIED. `maxPickingRaces` 2 bounds it at 6 previews. |
 | Q14 | Should the proxy advertise the user's open submissions as virtual branches (`refs/heads/item/14` → its fork's head)? | Not by Oct 14: a fetch of those refs needs routing by want to many forks (the same mixed-source problem as notes). The read-only `/t/<trainId>` URL covers handoff. |
-| Q15 | Is the `kaikeru.com` zone plan Free/Pro (100 MB request body) or higher? | UNVERIFIED; the 50 MB cap fits all plans. |
+| Q15 | Is the `example.com` zone plan Free/Pro (100 MB request body) or higher? | UNVERIFIED; the 50 MB cap fits all plans. |
 | Q16 | The Access `/git` path Bypass app on this account | UNVERIFIED (docs: the most specific path wins). Test in T8 before the demo; fallback: `cloudflared access token` as `cf-access-token`. |
 
 ---

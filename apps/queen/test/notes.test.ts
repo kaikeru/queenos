@@ -202,7 +202,7 @@ describe("rework loop notes (rework-loop spec §6.2, R19)", () => {
   });
 
   it("a human reject is a REJECTED verdict with the reason as a finding", () => {
-    const reason = reworkReasonText("human", DUE, "rejected by k@kaikeru.com: the jar overlaps the footer");
+    const reason = reworkReasonText("human", DUE, "rejected by k@example.org: the jar overlaps the footer");
     const events = [
       ev("gate.verdict", { trainId: "t1", summary: "gate passed: ok", data: { outcome: "PASSED", applied: "applied" } }),
       ev("train.phase", { trainId: "t1", data: { to: "EJECTED", reason } }),
@@ -210,7 +210,7 @@ describe("rework loop notes (rework-loop spec §6.2, R19)", () => {
     const t = train({ phase: "EJECTED", landedSha: null, origin: AGENT, attemptId: "att_0123456789ab", raceOutcome: "REWORK", reason });
     const entries = parseNotes(projectNotes({ trains: [t], events, releases: [] }, "refs/notes/verdict")[0]!.text);
     expect(currentVerdict(entries)).toBe("REJECTED");
-    expect(entries.at(-1)).toMatchObject({ summary: "REJECTED by human: the jar overlaps the footer", findings: [{ severity: "error", path: "review", message: "rejected by k@kaikeru.com: the jar overlaps the footer" }] });
+    expect(entries.at(-1)).toMatchObject({ summary: "REJECTED by human: the jar overlaps the footer", findings: [{ severity: "error", path: "review", message: "rejected by k@example.org: the jar overlaps the footer" }] });
     expect(entries.at(-1)!.body).toBe("Address the reviewer's reason and push again before 2026-10-13T12:30:00.000Z.");
   });
 

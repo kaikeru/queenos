@@ -5,7 +5,7 @@ import { createApp } from "../src/app";
 import { hashToken } from "../src/gittokens";
 import { fakeBindings, freshVerifier, goodClaims, makeKey, sign } from "./helpers";
 
-const HOST = "https://queenos.kaikeru.com";
+const HOST = "https://queenos.example.com";
 
 async function ctx(overrides: Partial<Bindings> = {}, host = HOST) {
   const key = await makeKey("k1");
@@ -55,7 +55,7 @@ describe("/mcp", () => {
     const { token, id } = await mint({ agent: { name: "claude-code", model: "claude-opus-4" } });
     const r = await mcp("/mcp", post({
       authorization: `Bearer ${token}`,
-      "x-queen-user": "evil@kaikeru.com",
+      "x-queen-user": "evil@example.org",
       "x-queen-token-id": "forged",
       "x-queen-agent": "forged",
       "x-queen-agent-model": "forged",
@@ -71,7 +71,7 @@ describe("/mcp", () => {
     expect(new URL(s.req.url).pathname).toBe("/mcp");
     expect(s.body).toBe(INIT);
     const h = s.req.headers;
-    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@example.org");
     expect(h.get("x-queen-token-id")).toBe(id);
     for (const gone of ["authorization", "cookie", "x-queen-agent", "x-queen-agent-model", "x-queen-scopes"]) expect(h.get(gone), gone).toBeNull();
     expect(h.get("accept")).toBe("application/json, text/event-stream");
@@ -114,22 +114,22 @@ describe("/mcp", () => {
   });
 
   it("dev mode: localhost only, owner DEV_USER_EMAIL, token id dev", async () => {
-    const dev = { ACCESS_MODE: "dev", DEV_USER_EMAIL: "Dev@Kaikeru.com" } as Partial<Bindings>;
+    const dev = { ACCESS_MODE: "dev", DEV_USER_EMAIL: "Dev@Example.org" } as Partial<Bindings>;
     const local = await ctx(dev, "http://localhost:8787");
     expect((await local.mcp("/mcp", post({}))).status).toBe(200);
-    expect(local.seen.mcp[0]!.req.headers.get("x-queen-user")).toBe("dev@kaikeru.com");
+    expect(local.seen.mcp[0]!.req.headers.get("x-queen-user")).toBe("dev@example.org");
     expect(local.seen.mcp[0]!.req.headers.get("x-queen-token-id")).toBe("dev");
     const remote = await ctx(dev);
     expect((await remote.mcp("/mcp", post({}))).status).toBe(403);
   });
 
   it("dev mode ignores a forged x-queen-user and x-queen-token-id from the client", async () => {
-    const dev = { ACCESS_MODE: "dev", DEV_USER_EMAIL: "dev@kaikeru.com" } as Partial<Bindings>;
+    const dev = { ACCESS_MODE: "dev", DEV_USER_EMAIL: "dev@example.org" } as Partial<Bindings>;
     const local = await ctx(dev, "http://localhost:8787");
-    const r = await local.mcp("/mcp", post({ "x-queen-user": "evil@kaikeru.com", "x-queen-token-id": "forged", "x-queen-agent": "forged" }));
+    const r = await local.mcp("/mcp", post({ "x-queen-user": "evil@example.org", "x-queen-token-id": "forged", "x-queen-agent": "forged" }));
     expect(r.status).toBe(200);
     const h = local.seen.mcp[0]!.req.headers;
-    expect(h.get("x-queen-user")).toBe("dev@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("dev@example.org");
     expect(h.get("x-queen-token-id")).toBe("dev");
     expect(h.get("x-queen-agent")).toBeNull();
   });
@@ -141,12 +141,12 @@ describe("/git header hygiene", () => {
     const { token } = await mint();
     const r = await mcp("/git/demo-hive.git/info/refs?service=git-upload-pack", {
       method: "GET",
-      headers: { authorization: `Bearer ${token}`, "x-queen-token-id": "forged", "x-queen-user": "evil@kaikeru.com" },
+      headers: { authorization: `Bearer ${token}`, "x-queen-token-id": "forged", "x-queen-user": "evil@example.org" },
     });
     expect(r.status).toBe(200);
     const h = seen.git[0]!.req.headers;
     expect(h.get("x-queen-token-id")).toBeNull();
-    expect(h.get("x-queen-user")).toBe("owner@kaikeru.com");
+    expect(h.get("x-queen-user")).toBe("owner@example.org");
     expect(h.get("authorization")).toBeNull();
   });
 });
@@ -156,7 +156,7 @@ describe("HiveRegistry.authGitToken", () => {
     const { mint, reg } = await ctx();
     const { token, id } = await mint();
     const found = await reg.authGitToken(await hashToken(token));
-    expect(found).toMatchObject({ id, email: "owner@kaikeru.com", scopes: ["read", "push"], agent: null });
+    expect(found).toMatchObject({ id, email: "owner@example.org", scopes: ["read", "push"], agent: null });
     expect(JSON.stringify(found)).not.toContain(token);
   });
 });

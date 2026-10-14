@@ -15,3 +15,6 @@ docs/HANDOFF.md
 docs/demo-script.md
 docs/harness-build-brief.md
 docs/superpowers/plans/
+
+# Site settings for scripts/deploy.sh (see deploy.env.example)
+deploy.env

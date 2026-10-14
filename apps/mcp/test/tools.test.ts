@@ -728,8 +728,8 @@ describe("rework loop: verdicts (§6.2, §7.4)", () => {
     const { w, s } = await withAttempt();
     const head = "c".repeat(40);
     w.queen.views.set(ATT, REJ({ verdictKind: "human", rework: { reason: "human", dueAt: DUE, round: 1 }, train: train() }));
-    w.queen.notes.set(head, "Queen-Verdict: REJECTED\nQueen-Finding: error review rejected by k@kaikeru.com: ugly");
-    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({ kind: "human", findings: ["error review rejected by k@kaikeru.com: ugly"], next: "address the reviewer's reason, push again before 2026-10-13T12:30:00.000Z" });
+    w.queen.notes.set(head, "Queen-Verdict: REJECTED\nQueen-Finding: error review rejected by k@example.org: ugly");
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({ kind: "human", findings: ["error review rejected by k@example.org: ugly"], next: "address the reviewer's reason, push again before 2026-10-13T12:30:00.000Z" });
     w.queen.views.set(ATT, REJ({ verdictKind: "findings", rework: { reason: "findings", dueAt: DUE, round: 2 }, train: train() }));
     expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({ kind: "findings", next: "fix and push before 2026-10-13T12:30:00.000Z" });
     w.queen.views.set(ATT, REJ({ verdictKind: "findings", rework: null, train: train({ raceOutcome: "FAILED" }) }));
