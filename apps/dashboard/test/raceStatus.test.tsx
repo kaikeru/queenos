@@ -6,7 +6,7 @@ import { reworkReasonText, type HiveStatus, type MergeTrain, type Race, type Rac
 import { CandidateActions, RacePick, RejectAll } from "../src/RacePick";
 import {
   agentTiles, candChipClass, candidateRows, candidateStatus, cardItems, cardSummary, contributorKey, currentCandidates, firstFinding, goalRow, goalRows, goalStatus, goalSummary,
-  homeHeadline, isFollowUp, pickingRows, pushCommand, raceChipClass, raceStatus, racesForItem, rootOf, titleSlug, trackFresh, whoOf, withDetail, type StatusSlice,
+  attemptLabel, homeHeadline, isFollowUp, pickingRows, pushCommand, raceChipClass, raceStatus, racesForItem, rootOf, titleSlug, trackFresh, whoOf, withDetail, type StatusSlice,
 } from "../src/raceStatus";
 import { initialState } from "../src/reducer";
 import { raceView } from "../src/swarm";
@@ -75,13 +75,25 @@ describe("raceStatus: every race state", () => {
 describe("candidateStatus: every race state by candidate outcome", () => {
   const STATES: RaceState[] = ["RACING", "PICKING", "DECIDED", "ABANDONED", "REWORKING"];
   test("passed, failed with its first finding, lost, rework, gating", () => {
+    const OPEN: RaceState[] = ["RACING", "PICKING", "REWORKING"];
     for (const state of STATES) {
       const r = race({ state });
-      expect(candidateStatus(train("a", { raceOutcome: "PASSED" }), r, NOW).kind).toBe("passed");
+      const open = OPEN.includes(state);
+      expect(candidateStatus(train("a", { raceOutcome: "PASSED" }), r, NOW).kind).toBe(open ? "passed" : "lost");
       expect(candidateStatus(train("a", { raceOutcome: "FAILED", status: "EJECTED", summary: "lint: unexpected token\nmore" }), r, NOW).text).toBe("failed: lint: unexpected token");
       expect(candidateStatus(train("a", { raceOutcome: "LOST", status: "EJECTED" }), r, NOW).kind).toBe("lost");
-      expect(candidateStatus(train("a", { raceOutcome: "REWORK", status: "EJECTED", reason: reworkReasonText("human", NOW + 60_000, "x") }), r, NOW).text).toBe("reworking · human · due in 1:00");
+      const rework = candidateStatus(train("a", { raceOutcome: "REWORK", status: "EJECTED", reason: reworkReasonText("human", NOW + 60_000, "x") }), r, NOW);
+      if (open) expect(rework.text).toBe("reworking · human · due in 1:00");
+      else expect(rework.kind).toBe("lost");
     }
+  });
+  test("a closed race reads lost for a non-winner still running or reworking", () => {
+    const running = train("a", { raceOutcome: null, status: "TESTING" });
+    expect(candidateStatus(running, race({ state: "RACING" }), NOW).kind).toBe("gating");
+    expect(candidateStatus(running, race({ state: "DECIDED", winnerTrainId: "w" }), NOW).kind).toBe("lost");
+    const rw = candidateStatus(train("a", { raceOutcome: "REWORK", status: "EJECTED", reason: reworkReasonText("human", NOW + 60_000, "x") }), race({ state: "DECIDED", winnerTrainId: "w" }), NOW);
+    expect(rw.kind).toBe("lost");
+    expect(rw.text).not.toContain("due in");
   });
   test("a passed candidate in PICKING reads as waiting for your pick", () => {
     expect(candidateStatus(train("a", { raceOutcome: "PASSED" }), race({ state: "PICKING" }), NOW).text).toBe("passed · waiting for your pick");
@@ -173,6 +185,16 @@ describe("currentCandidates: one head per contributor", () => {
   });
 });
 
+describe("attemptLabel", () => {
+  test("old heads are superseded; no race falls back to the outcome", () => {
+    const rw = train("a", { raceOutcome: "REWORK", status: "EJECTED", reason: reworkReasonText("human", NOW + 60_000, "x") });
+    expect(attemptLabel(rw, race({ state: "DECIDED", winnerTrainId: "w" }), NOW, true)).toBe("superseded");
+    expect(attemptLabel(train("a", { raceId: "gone", raceOutcome: "PASSED" }), null, NOW, false)).toBe("passed");
+    expect(attemptLabel(train("a", { status: "MERGED", raceOutcome: null }), undefined, NOW, false)).toBe("landed");
+    expect(attemptLabel(train("a", { status: "EJECTED", raceOutcome: null, summary: "lint: x" }), null, NOW, false)).toBe("failed: lint: x");
+  });
+});
+
 describe("who", () => {
   test("agent name@owner with its claim, a human's local part, a drone's model or tag", () => {
     expect(whoOf({ origin: agent("w1", "opus"), model: null, candidate: 0 })).toEqual({ who: "w1@kyle", claim: "opus" });
@@ -180,6 +202,9 @@ describe("who", () => {
     expect(whoOf({ origin: { kind: "human", id: "kyle@kaikeru.com" }, model: null, candidate: 0 })).toEqual({ who: "kyle", claim: null });
     expect(whoOf({ origin: null, model: "kimi-k2", candidate: 0 })).toEqual({ who: "kimi-k2", claim: null });
     expect(whoOf({ origin: undefined, model: null, candidate: 1 })).toEqual({ who: "c2", claim: null });
+    expect(whoOf({ origin: { kind: "agent", id: "" }, model: null, candidate: 1 })).toEqual({ who: "c2", claim: null });
+    expect(whoOf({ origin: null, model: "", candidate: 0 })).toEqual({ who: "c1", claim: null });
+    expect(whoOf({ origin: { kind: "human", id: "" }, model: null, candidate: 0 })).toEqual({ who: "human", claim: null });
   });
 });
 
@@ -266,6 +291,10 @@ describe("Needs you and the headline", () => {
   test("homeHeadline: counts and mood; calm says how much landed", () => {
     expect(homeHeadline(slice([item()], [race(), race({ raceId: "r2" }), race({ raceId: "r3", state: "PICKING" })], []))).toEqual({ mood: "needs-you", text: "2 races running, 1 waiting for your pick" });
     expect(homeHeadline(slice([item()], [race()], []))).toMatchObject({ mood: "racing", text: "1 race running" });
+    const g = item({ itemId: "g", kind: "goal" });
+    const k = item({ itemId: "g-c1", parentId: "g", rootId: "g", depth: 1 });
+    expect(homeHeadline(slice([g, k], [race({ itemId: "g-c1" })], [])).text).toBe("1 race running");
+    expect(homeHeadline(slice([item({ itemId: "g2", kind: "goal", status: "DECOMPOSING" })], [], [])).text).toBe("1 item in progress");
     expect(homeHeadline(slice([item({ status: "LANDED" })], [], [], EXTERNAL))).toEqual({ mood: "calm", text: "All quiet · landed 4 today" });
     const paused = { ...EXTERNAL, effectiveAutonomy: "paused", settings: { executors: "external", autonomy: "autonomous" } } as unknown as Partial<HiveStatus>;
     expect(homeHeadline(slice([], [], [], paused)).mood).toBe("degraded");

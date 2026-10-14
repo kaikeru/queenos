@@ -30,7 +30,7 @@ function HiveRoot({ route }: { route: HiveRoute }) {
   if (page === "status") return <StatusHome hive={hive} room={room} />;
   const crumbs: Record<string, { label: string }[]> = {
     queue: [{ label: "queue" }],
-    item: [{ label: "goal" }],
+    item: [],
     trace: [{ label: "trace" }, { label: id.slice(0, 8) }],
     events: [{ label: "events" }],
     metrics: [{ label: "metrics" }],

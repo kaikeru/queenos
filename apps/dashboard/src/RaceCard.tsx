@@ -8,7 +8,7 @@ import { attemptsOf, durationText, gateText, type Attempt } from "./homeLogic";
 import { relativeTime } from "./lanes";
 import { RaceEntries } from "./RaceEntries";
 import { CandidateActions, RejectAll } from "./RacePick";
-import { candChipClass, candidateStatus, raceChipClass, type CardSummary } from "./raceStatus";
+import { attemptLabel, candChipClass, raceChipClass, type CardSummary } from "./raceStatus";
 import type { RaceView } from "./swarm";
 
 const clock = (ms: number) => new Date(ms).toLocaleTimeString([], { hour12: false });
@@ -95,12 +95,11 @@ function CardDetails({ hive, card, now }: { hive: string; card: CardSummary; now
 /** One attempt. A race train's label comes from `candidateStatus`, never from the train status alone. */
 function AttemptRow({ a, old, now }: { a: Attempt; old: boolean; now: number }) {
   const t = a.train;
-  const label = a.race ? candidateStatus(t, a.race, now).text : (t.phase ?? t.status).toLowerCase();
+  const label = attemptLabel(t, a.race, now, old);
   const gate = gateText(t);
   return (
     <li className={`rc__attempt${old ? " rc__attempt--old" : ""}`}>
       <b>#{a.n} {a.kind.toLowerCase()}</b> <span>{label}</span>
-      {old && <span className="sh-muted"> · old head</span>}
       <span className="sh-muted">
         {gate ? ` · ${gate}` : ""}
         {t.landedSha ? ` · landed ${t.landedSha.slice(0, 7)}` : ""}

@@ -12,6 +12,7 @@ import { useNow } from "./components";
 import { durationText } from "./homeLogic";
 import { mergeGraph, type BranchView, type CarView, type GraphEdge, type GraphNode, type MergeGraphLayout } from "./mergeGraph";
 import { modelLabel } from "./models";
+import { trackFresh } from "./raceStatus";
 import type { State } from "./reducer";
 import { hrefFor } from "./route";
 import { Link } from "./router";
@@ -452,10 +453,16 @@ export const STRIP_SPAN_MS = 30 * 60_000;
  * talking point), the newest commit on main, and a CARS sub-section with the current train ("No cars in line" when empty).
  * "N landed" counts landings inside the same 30-minute window the graph draws (not the session's total).
  */
+const NO_FRESH: ReadonlySet<string> = new Set();
+
 export function MergeTreePanel({ state, hive, now }: { state: State; hive: string; now?: number }) {
   const rail = useMemo(() => queueRail(state), [state]);
   const bisected = useMemo(() => new Set(recentBisects(state, 5).map((b) => b.trainId)), [state]);
   const main = rail.main;
+  // Motion only on a change: the first loaded render is the baseline, so page load marks nothing fresh.
+  const memo = useRef({ seen: null as Set<string> | null, fresh: new Set<string>() });
+  const carKey = (c: { train: { trainId: string }; phase: string }) => `${c.train.trainId}:${c.phase}`;
+  const fresh = state.loaded ? trackFresh(memo.current, [main?.sha ?? "", ...rail.cars.map(carKey)]) : NO_FRESH;
   return (
     <section className="panel mtree" aria-label="Merge tree">
       <MergeGraph
@@ -467,7 +474,7 @@ export function MergeTreePanel({ state, hive, now }: { state: State; hive: strin
         head={(l) => (
           <div className="mtree__head">
             <h3 className="eyebrow">MERGE TREE</h3>
-            {main && <code key={main.sha} className="mtree__landed" title={`train ${main.trainId}`}>main ← {main.sha.slice(0, 7)}</code>}
+            {main && <code key={main.sha} className={`mtree__landed${fresh.has(main.sha) ? " mtree__landed--new" : ""}`} title={`train ${main.trainId}`}>main ← {main.sha.slice(0, 7)}</code>}
             <Link to={hrefFor.queue(hive)} className="mq__meta">{l.landedInWindow} landed in 30 min · queue page ▸</Link>
           </div>
         )}
@@ -479,7 +486,7 @@ export function MergeTreePanel({ state, hive, now }: { state: State; hive: strin
         ) : (
           <ul className="mtree__list">
             {rail.cars.map((c) => (
-              <li key={c.train.trainId} className={`mtree__car mtree__car--${c.phase.toLowerCase()}${bisected.has(c.train.trainId) ? " mtree__car--bisect" : ""}`}>
+              <li key={c.train.trainId} className={`mtree__car mtree__car--${c.phase.toLowerCase()}${fresh.has(carKey(c)) ? " mtree__car--changed" : ""}${bisected.has(c.train.trainId) ? " mtree__car--bisect" : ""}`}>
                 <b className="mtree__car-label">{c.label}</b>
                 <span className="chip chip--sm mtree__phase">{c.phase.toLowerCase()}</span>
                 <span className="mtree__members">

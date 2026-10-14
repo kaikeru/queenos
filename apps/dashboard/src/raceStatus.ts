@@ -96,7 +96,7 @@ export function firstFinding(t: Pick<MergeTrain, "summary" | "reason">): string 
 
 /** One candidate's verdict chip. Never "building" outside a RACING race, so PICKING never reads as a build. */
 export function candidateStatus(t: MergeTrain, race: Race, now: number): CandidateStatus {
-  if (t.raceOutcome === "REWORK") {
+  if (t.raceOutcome === "REWORK" && isOpenRace(race)) {
     const r = parseReworkReason(t.reason);
     return cs("reworking", r ? `reworking · ${r.reason} · due in ${countdownText(r.dueAt - now)}` : "reworking", "violet");
   }
@@ -105,13 +105,32 @@ export function candidateStatus(t: MergeTrain, race: Race, now: number): Candida
   if (rejected) return cs("lost", `rejected: ${rejected.reason}`, "muted");
   if (t.raceOutcome === "WON") return cs("won", "won ★", "gold");
   if (t.raceOutcome === "LOST") return cs("lost", "lost", "muted");
-  if (t.raceOutcome === "FAILED" || t.status === "EJECTED") {
+  if (t.raceOutcome === "FAILED" || (t.status === "EJECTED" && t.raceOutcome !== "REWORK")) {
     const f = firstFinding(t);
     return cs("failed", f ? `failed: ${f}` : "failed", "red");
   }
+  if (!isOpenRace(race) && race.winnerTrainId !== t.trainId) return cs("lost", "lost", "muted");
   if (t.raceOutcome === "PASSED") return cs("passed", race.state === "PICKING" ? "passed · waiting for your pick" : "passed", "green");
   if (race.state === "RACING" && !isPushed(t) && t.status === "BUILDING" && (t.phase == null || t.phase === "WAITING_PARENT" || t.phase === "BUILDING")) return cs("building", "building", "cyan");
   return cs("gating", "gating", "cyan");
+}
+
+/** An attempt's label in a card's details: a superseded head is just that; a race train reads from `candidateStatus`. */
+export function attemptLabel(t: MergeTrain, race: Race | null | undefined, now: number, old: boolean): string {
+  if (old) return "superseded";
+  if (race) return candidateStatus(t, race, now).text;
+  if (t.status === "MERGED") return "landed";
+  if (t.status === "EJECTED") {
+    const f = firstFinding(t);
+    return f ? `failed: ${f}` : "failed";
+  }
+  switch (t.raceOutcome) {
+    case "PASSED": return "passed";
+    case "FAILED": return "failed";
+    case "LOST": return "lost";
+    case "WON": return "won ★";
+  }
+  return (t.phase ?? t.status).toLowerCase();
 }
 
 /**
@@ -148,14 +167,15 @@ export function currentCandidates(race: Pick<Race, "raceId">, trains: readonly M
 /** "w1@kyle" for agent `w1@kyle@kaikeru.com` (claim: its model), "kyle" for a human push, the model (or "c2") for drones. */
 export function whoOf(t: Pick<MergeTrain, "origin" | "model" | "candidate">): { who: string; claim: string | null } {
   const o = t.origin;
+  const tag = `c${(t.candidate ?? 0) + 1}`;
   if (o?.kind === "agent") {
     const at = o.id.indexOf("@");
     const name = at > 0 ? o.id.slice(0, at) : o.id;
     const owner = at > 0 ? (o.id.slice(at + 1).split("@")[0] ?? "") : "";
-    return { who: owner ? `${name}@${owner}` : name, claim: o.model ?? null };
+    return { who: (owner ? `${name}@${owner}` : name) || tag, claim: o.model || null };
   }
-  if (o?.kind === "human") return { who: o.id.split("@")[0] || o.id, claim: null };
-  return { who: t.model ?? `c${(t.candidate ?? 0) + 1}`, claim: null };
+  if (o?.kind === "human") return { who: o.id.split("@")[0] || o.id || "human", claim: null };
+  return { who: t.model || tag, claim: null };
 }
 
 export interface CandidateRow {
@@ -386,7 +406,8 @@ export function homeHeadline(state: StatusSlice): HomeHeadline {
   const h = state.hive;
   const degraded = !!h && (h.effectiveAutonomy !== h.settings.autonomy || h.effectiveAutonomy === "paused");
   const raced = new Set(races.filter(isOpenRace).map((r) => r.itemId));
-  const busy = Object.values(state.items).filter((i) => (i.status === "ACTIVE" || i.status === "DECOMPOSING") && !raced.has(i.itemId)).length;
+  const parents = new Set(Object.values(state.items).map((i) => i.parentId).filter(Boolean));
+  const busy = Object.values(state.items).filter((i) => (i.status === "ACTIVE" || i.status === "DECOMPOSING") && !raced.has(i.itemId) && !parents.has(i.itemId)).length;
   const parts: string[] = [];
   if (racing) parts.push(`${plural(racing, "race")} running`);
   if (picking) parts.push(`${picking} waiting for your pick`);

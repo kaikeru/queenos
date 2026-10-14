@@ -31,3 +31,9 @@ test("cars: one row per live car with its label, phase and members, linking to t
   expect(html).toContain("/p/demo/items/");
   expect(html).toContain("queue page ▸");
 });
+
+test("a first loaded render marks nothing as new", () => {
+  const html = renderToString(<MergeTreePanel state={load()} hive="demo" now={NOW} />);
+  expect(html).not.toContain("mtree__landed--new");
+  expect(html).not.toContain("mtree__car--changed");
+});

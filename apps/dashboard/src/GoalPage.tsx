@@ -16,6 +16,8 @@ import { Link } from "./router";
 import { ErrorNotice, OriginChip } from "./shell";
 import { raceView } from "./swarm";
 
+const MOCK = import.meta.env.VITE_MOCK_API === "1";
+
 /**
  * The goal page (spec §4): `/items/<id>` resolves `<id>` to its root and shows the root's header, one race card per
  * child (one for a loose item), and the release line. A child id highlights and scrolls to its card.
@@ -60,7 +62,7 @@ export function GoalPage({ hive, itemId, state, now: nowProp }: { hive: string; 
     <div className="gp">
       <section className="panel gp__head">
         <p className="gp__crumbs">
-          <Link to={hrefFor.status(hive)}>◂ {hive}</Link> / {root.kind} “{root.title}”
+          <span>{root.kind === "goal" ? "goal" : `${root.kind} · loose item`}</span>
           <Link className="sh-link gp__trace" to={hrefFor.trace(hive, root.traceId)}>trace ▸</Link>
         </p>
         <h2 className="gp__title">{root.title}</h2>
@@ -129,7 +131,7 @@ function ItemActions({ hive, item, onDone }: { hive: string; item: WorkItem; onD
   return (
     <div className="gp__actions">
       {actions.map((a) => (
-        <button key={a} type="button" className={`btn${a === "cancel" ? " btn--danger" : " btn--primary"}`} disabled={busy !== null} onClick={() => void run(a)}>
+        <button key={a} type="button" className={`btn${a === "cancel" ? " btn--danger" : " btn--primary"}`} disabled={MOCK || busy !== null} title={MOCK ? "Mock mode: not available" : undefined} onClick={() => void run(a)}>
           {busy === a ? "…" : a === "not_duplicate" ? "Not a duplicate" : a === "retry" ? "Retry" : "Cancel"}
         </button>
       ))}

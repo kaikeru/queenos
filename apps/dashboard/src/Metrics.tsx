@@ -455,7 +455,7 @@ export function Metrics(props: { hive: string; state: State }) {
       <ErrorNotice error={res.error} onRetry={res.reload} />
       {!res.data && !res.error && <p className="obs__empty">Loading metrics…</p>}
       {res.data && <MetricsBoard data={res.data} window={win} events={state.events} now={now} />}
-      {!isExternal(state.hive) && (
+      {state.hive && !isExternal(state.hive) && (
         <section className="metrics-models" id="models" aria-label="Model board">
           <ModelBoard stats={state.modelStats} floor={state.routerFloor} />
         </section>

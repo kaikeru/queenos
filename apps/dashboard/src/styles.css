@@ -876,9 +876,9 @@ input, textarea { font: inherit; color: var(--text); }
 .goal-row__summary { font: 12px var(--mono); }
 .goal-row__tiles { display: flex; flex-wrap: wrap; gap: 6px; }
 .goal-row--celebrate { animation: flash-green 1.2s; }
-.celebrate-banner { flex-basis: 100%; margin: 4px 0 0; display: flex; align-items: center; gap: 8px; font: 700 14px var(--mono); color: var(--green); animation: land 0.5s ease, celebrate-out 0.6s ease 6s forwards; }
+.celebrate-banner { flex-basis: 100%; margin: 4px 0 0; display: flex; align-items: center; gap: 8px; font: 700 14px var(--mono); color: var(--green); max-height: 3em; overflow: hidden; animation: land 0.5s ease, celebrate-out 0.6s ease 6s forwards; }
 .celebrate-banner__crown { display: inline-block; color: var(--yellow); animation: crown 2.4s ease-in-out 2; }
-@keyframes celebrate-out { to { opacity: 0; height: 0; margin: 0; overflow: hidden; } }
+@keyframes celebrate-out { to { opacity: 0; max-height: 0; margin: 0; } }
 
 /* agent tiles: race-outlined per race, filled = passed, hollow = still working */
 .atiles { display: inline-flex; gap: 3px; padding: 3px; border: 1px dashed var(--violet); border-radius: 8px; background: rgba(167, 139, 250, 0.08); }
@@ -899,14 +899,17 @@ input, textarea { font: inherit; color: var(--text); }
 .mtree { display: flex; flex-direction: column; gap: 10px; }
 .mtree__head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; }
 .mtree__head .eyebrow { margin: 0; }
-.mtree__landed { font: 700 13px var(--mono); color: var(--green); padding: 2px 8px; border-radius: 6px; border: 1px solid rgba(53, 242, 160, 0.4); animation: land 0.6s ease, flash-green 1s; }
+.mtree__landed { font: 700 13px var(--mono); color: var(--green); padding: 2px 8px; border-radius: 6px; border: 1px solid rgba(53, 242, 160, 0.4); }
+.mtree__landed--new { animation: land 0.6s ease, flash-green 1s; }
 .mtree__cars { border-top: 1px solid var(--line); padding-top: 10px; }
 .mtree__list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
 .mtree__car { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line-2); background: var(--panel-2); font: 13px var(--mono); }
 .mtree__car-label { color: var(--violet); }
-.mtree__car--gating { border-color: rgba(60, 217, 255, 0.6); animation: step-pulse 1.6s 2; }
+.mtree__car--gating { border-color: rgba(60, 217, 255, 0.6); }
+.mtree__car--changed.mtree__car--gating { animation: step-pulse 1.6s 2; }
 .mtree__car--landing, .mtree__car--passed { border-color: rgba(53, 242, 160, 0.55); }
-.mtree__car--bisect { border-color: rgba(255, 77, 99, 0.6); animation: shake 0.5s 2; }
+.mtree__car--bisect { border-color: rgba(255, 77, 99, 0.6); }
+.mtree__car--changed.mtree__car--bisect { animation: shake 0.5s 2; }
 .mtree__members { display: inline-flex; flex-wrap: wrap; gap: 6px; }
 .mtree__empty { margin: 0; }
 
@@ -958,7 +961,7 @@ input, textarea { font: inherit; color: var(--text); }
 
 @media (prefers-reduced-motion: reduce) {
   .race-chip--pulse, .needs--pending, .goal-row, .goal-row--gold, .goal-row--celebrate, .atile--changed, .atiles--last-minute::after,
-  .mtree__landed, .mtree__car--gating, .mtree__car--bisect, .rc--highlight, .skel, .sh-hero__dot, .celebrate-banner__crown { animation: none !important; }
+  .mtree__landed, .mtree__landed--new, .mtree__car--gating, .mtree__car--bisect, .mtree__car--changed.mtree__car--gating, .mtree__car--changed.mtree__car--bisect, .rc--highlight, .skel, .sh-hero__dot, .celebrate-banner__crown { animation: none !important; }
   .celebrate-banner { animation: none !important; }
   .goal-row { transition: none; }
   .goal-row:hover, .goal-row:focus-within { transform: none; }

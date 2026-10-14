@@ -125,3 +125,15 @@ describe("race cards", () => {
     expect(html).toContain("skel skel--card");
   });
 });
+
+describe("breadcrumb", () => {
+  test("no hive link or quoted title; a goal says goal, a loose item says loose item", () => {
+    const g = render("g");
+    expect(g).not.toContain("◂ demo");
+    expect(g).toContain("<span>goal</span>");
+    const loose = item({ itemId: "l1", kind: "feature", title: "Loose thing" });
+    const html = render("l1", state({ items: { l1: loose }, itemOrder: ["l1"], races: {}, trains: {}, trainOrder: [] }));
+    expect(html).not.toContain("◂ demo");
+    expect(html).toContain("loose item");
+  });
+});
