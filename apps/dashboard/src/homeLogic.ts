@@ -195,3 +195,14 @@ export function showPushHint(hive: Parameters<typeof executorsMode>[0], item: Pi
   if (!isExternal(hive) || item.kind === "goal") return false;
   return item.status !== "LANDED" && !(TERMINAL_WORK_STATUSES as readonly string[]).includes(item.status);
 }
+
+/**
+ * The ADD A GOAL composer's prompt (dashboard redesign §3.3): always one decomposed goal; the title is the first line
+ * (the Queen's `titleFromText`), the work spec the rest. "you pick" only on external hives.
+ */
+export function goalPrompt(hive: string, title: string, spec: string, opts: { external: boolean; judge: ExternalJudgeChoice }): { namespace: string; promptText: string; decompose: true; judge?: "human" } {
+  const t = title.replace(/\s+/g, " ").trim();
+  const s = spec.trim();
+  const promptText = s ? `${t}\n\n${s}` : t;
+  return { namespace: hive, promptText, decompose: true, ...(opts.external && opts.judge === "pick" ? { judge: "human" as const } : {}) };
+}
