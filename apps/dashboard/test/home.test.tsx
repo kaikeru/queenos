@@ -4,7 +4,7 @@ import { describe, expect, test } from "vitest";
 import { type Escalation, type HiveStatus, type MergeTrain, type Race, type WorkItem } from "@queenos/queen-types";
 
 import { goalPrompt } from "../src/homeLogic";
-import { AddGoal, GoalList, NeedsYou } from "../src/HomePanels";
+import { AddGoal, GoalList, NeedsYou, freshWhenLoaded } from "../src/HomePanels";
 import { initialState, type State } from "../src/reducer";
 
 const NOW = 1_800_000_000_000;
@@ -54,6 +54,7 @@ describe("Needs you", () => {
     expect(html.match(/>Reject</g)).toHaveLength(2);
     expect(html.match(/Reject all/g)).toHaveLength(1);
     expect(html).toContain("w2@kyle");
+    expect(html).toContain("cand-chip cand-chip--passed");
     expect(html).not.toContain("<iframe");
   });
   test("RACING and decided races are not in Needs you; empty shows the bee", () => {
@@ -113,5 +114,20 @@ describe("Add a goal", () => {
     expect(goalPrompt("demo", "  Rename  morse ", " spec ", { external: true, judge: "pick" })).toEqual({ namespace: "demo", promptText: "Rename morse\n\nspec", decompose: true, judge: "human" });
     expect(goalPrompt("demo", "Rename", "", { external: true, judge: "auto" })).toEqual({ namespace: "demo", promptText: "Rename", decompose: true });
     expect(goalPrompt("demo", "Rename", "x", { external: false, judge: "pick" })).not.toHaveProperty("judge");
+  });
+});
+
+describe("fresh-state motion", () => {
+  test("page load is the baseline: unloaded then loaded marks nothing; a later new key is fresh", () => {
+    const memo = { seen: null as Set<string> | null, fresh: new Set<string>() };
+    expect(freshWhenLoaded(memo, false, []).size).toBe(0);
+    expect(freshWhenLoaded(memo, true, ["a:building", "x:landed"]).size).toBe(0);
+    expect(freshWhenLoaded(memo, true, ["a:building", "x:landed"]).size).toBe(0);
+    expect([...freshWhenLoaded(memo, true, ["a:building", "x:landed", "a:passed"])]).toEqual(["a:passed"]);
+  });
+  test("a loaded first render has no atile--changed and no celebrate banner", () => {
+    const html = renderToString(<GoalList hive="demo" state={state({ items: { b: bmi }, itemOrder: ["b"], races: {}, trains: {}, trainOrder: [] })} now={NOW} />);
+    expect(html).not.toContain("atile--changed");
+    expect(html).not.toContain("celebrate-banner");
   });
 });

@@ -3,7 +3,7 @@ import { GUARDRAIL_DEFAULTS, GUARDRAIL_MAX, RUNBOOK, type Escalation, type Escal
 import { api, errorMessage } from "./api";
 import { ACTION_LABEL, GUARDRAIL_FIELDS, escalationButtons, escalationSubjectLabel, goalPrompt, guardrailPatch, isExternal, parseGuardrail, reasonText, type ExternalJudgeChoice, type GuardrailKey } from "./homeLogic";
 import { CandidateActions, RejectAll } from "./RacePick";
-import { goalRows, pickingRows, raceChipClass, trackFresh, type GoalRow } from "./raceStatus";
+import { candChipClass, goalRows, pickingRows, raceChipClass, trackFresh, type GoalRow } from "./raceStatus";
 import { prodUrlOf, releaseStrip } from "./releases";
 import type { Room } from "./room";
 import { Link } from "./router";
@@ -196,8 +196,8 @@ export function NeedsYou({ hive, state, now }: { hive: string; state: State; now
                 {p.heads.map((h) => (
                   <li key={h.train.trainId} className="needs__row">
                     <span className="cand__who" title={h.origin.title}>{h.who}</span>
-                    {h.claim && <span className="cand__claim sh-muted">{h.claim}</span>}
-                    <span className="cand-chip cand-chip--passed">passed</span>
+                    {h.claim && <span className="cand__claim sh-muted">claims {h.claim}</span>}
+                    <span className={candChipClass(h.status)}>{h.status.text}</span>
                     {h.previewUrl && <a className="cand__preview sh-link" href={h.previewUrl} target="_blank" rel="noreferrer">preview ▸</a>}
                     <CandidateActions hive={hive} raceId={p.race.raceId} trainId={h.train.trainId} tag={h.tag} compact />
                   </li>
@@ -273,12 +273,19 @@ export function EscalationCard({ hive, e, items }: { hive: string; e: Escalation
 
 // ── goals ─────────────────────────────────────────────────────────────────
 
+const NO_FRESH: ReadonlySet<string> = new Set();
+
+/** trackFresh, but only once the snapshot is in: the first loaded render is the baseline, so page load marks nothing fresh. */
+export function freshWhenLoaded(memo: Parameters<typeof trackFresh>[0], loaded: boolean, keys: readonly string[]): ReadonlySet<string> {
+  return loaded ? trackFresh(memo, keys) : NO_FRESH;
+}
+
 /** GOALS (spec §3.2): one card per root, active before done, newest first, with a race chip, a summary and agent tiles. */
 export function GoalList({ hive, state, now }: { hive: string; state: State; now: number }) {
   const rows = useMemo(() => goalRows(state, now), [state, now]);
   // Motion marks state changes only: tiles and landings first seen after the page loaded.
   const memo = useRef({ seen: null as Set<string> | null, fresh: new Set<string>() });
-  const fresh = trackFresh(memo.current, rows.flatMap((r) => [...r.tiles.flatMap((g) => g.tiles.map((t) => t.key)), `${r.root.itemId}:${r.status.kind}`]));
+  const fresh = freshWhenLoaded(memo.current, state.loaded, rows.flatMap((r) => [...r.tiles.flatMap((g) => g.tiles.map((t) => t.key)), `${r.root.itemId}:${r.status.kind}`]));
   const prod = prodUrlOf(state);
   if (!state.loaded) {
     return (
