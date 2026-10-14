@@ -38,7 +38,7 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 |---|---|
 | **One task at a time** | Be credit-conscious. Run ONE task, finish it (verify, full gate, commit) before starting the next, and **ask before starting the next task**. |
 | Coordinator never edits | The coordinator NEVER edits code or docs. Right-sized subagents do: **Opus** for subtle logic and research, **Sonnet** for implementation, **Haiku** for trivial work. Disjoint file ownership per agent; contracts first in `packages/queen-types`; one lockfile writer (pre-install deps yourself). |
-| Coordinator verifies | Per package: its own tests AND `tsc -p test` (vitest alone isn't enough). Then the full gate: `pnpm turbo run build typecheck lint test --force --continue` (**46/46 tasks** green on `main`). Then commit AND push `main` (`origin` = github.com/kaikeru/queenos). |
+| Coordinator verifies | Per package: its own tests AND `tsc -p test` (vitest alone isn't enough). Then the full gate: `pnpm turbo run build typecheck lint test --force --continue` (**49/49 tasks** green on `main`). Then commit AND push `main` (`origin` = github.com/kaikeru/queenos). |
 | Token scan before every commit | `/usr/bin/grep -rlF --exclude-dir=node_modules --exclude-dir=.wrangler --exclude-dir=.git -e "$CLOUDFLARE_API_TOKEN" .` Exit 1 = clean. Use `/usr/bin/grep`: plain `grep` is aliased to ugrep here, and a `--` before the excludes makes grep read them as filenames. |
 | Commit messages | End with the attribution line your session's system reminder specifies. The user files GitHub issues: reference them (`Closes #n` / `Refs #n`); the roadmap outranks the issue backlog. |
 | Node 24 | `export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH` (wrangler needs 22+). Full gate is capped at **turbo concurrency 4** (workerd suites flake under CPU oversubscription; Queen tests have a 20 s timeout). |
@@ -50,9 +50,9 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 ## 2. State of the system
 
-- **2026-10-13: rework loop** (spec `docs/superpowers/specs/2026-10-13-queenos-rework-loop-design.md`, plan `docs/superpowers/plans/2026-10-13-queenos-rework-loop.md`). Implemented on `main`, **not yet deployed**. A rejected attempt gets a rework slot (findings, conflict, human) and re-pushes as the same candidate. `sync_base` and `reject` (MCP, 19 tools), dashboard Reject / Reject all, races `REWORKING`, migration v19, sim `POST /sim/rework-demo`. Deploy order: Queen, then `queenos-mcp`, then the edge (Task 12 has the commands).
+- **2026-10-13: rework loop** (spec `docs/superpowers/specs/2026-10-13-queenos-rework-loop-design.md`, plan `docs/superpowers/plans/2026-10-13-queenos-rework-loop.md`). Implemented on `main` and **deployed 2026-10-14** (§4); all three live checks pass (§3). A rejected attempt gets a rework slot (findings, conflict, human) and re-pushes as the same candidate. `sync_base` and `reject` (MCP, 19 tools), dashboard Reject / Reject all, races `REWORKING`, migration v19, sim `POST /sim/rework-demo`. Deploy order: Queen, then `queenos-mcp`, then the edge (Task 12 has the commands).
 
-`main` is green (46/46 turbo tasks; Queen 751 tests). v2 swarm (Phases 0-3) is complete; the git proxy path (T0-T4) is built and live. Swarm internals: `docs/v2-design.md` §8, `apps/queen/README.md`.
+`main` is green (49/49 turbo tasks; schema v19; Queen 919 passing + 1 skipped, mcp 63, dashboard 223). v2 swarm (Phases 0-3) is complete; the git proxy path (T0-T4) is built and live. Swarm internals: `docs/v2-design.md` §8, `apps/queen/README.md`.
 
 **v2 backend (built, tested):** work ledger (items, deps, state machine, path affinity, caps/dedupe); Oracle fan-out (one item per bullet); parallel builds with races; merge queue (cars, batching, 3-way merge, integration gate, LANDER fast-forward, bisect, conflict -> REWORK); autonomy and error budget; self-filed bugs; one trace id end to end, event log, rollups, Analytics Engine; scale plumbing (sim load test 500/500). **Dashboard:** status home, swarm floor, merge-train graph, item page, trace waterfall, event log, metrics, Model Board, SIM badge, release strip, guardrails panel. **Sim:** `pnpm dev:sim` runs the real Queen with fake executors.
 
@@ -90,11 +90,18 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 ## 3. Proven live (queenos.kaikeru.com, hive `demo`)
 
+**2026-10-14: rework loop, all three live checks PASS** (Herdr workers, external executors):
+1. **Conflict, sync_base, rebase, land: PASS.** The first attempt had no conflict: the features index is a generated file that the merge regenerates. The second attempt used two goals renaming the same morse key. The second winner was REJECTED with `kind: "conflict"` and a rework slot. It ran `sync_base`, rebased, force-pushed, and landed in the same race `9052c584` with no follow-up item. Oddities: the verdict note still began with the old PASSED text, and the item view kept the original train as winner/preview.
+2. **Mid-race fix after entry close: PASS** (race `1c63dc00`). A deliberate syntax error got a findings slot. The fix was pushed 41 s after entry close and rejoined the same race with no follow-up. The race held for it, then decided normally. The AI reviewer gave a false positive ("not registered in index"), which cost a round.
+3. **Reject all with a reason: PASS, on the retry.** The first try decided before PICKING (an infra regate plus the 90 s grace, so a single pass wins). The retry was race `de577d31`. The user did Reject all twice with reasons, which reopened the race twice, and the agents reworked per each reason. The orchestrator used `close_entries`. w4 hit gate infra failures twice. The user ended entries and w3 auto-won as the single pass and LANDED (train `061ac4df`).
+4. `maxInboxPushesPerHour` was hit during testing; the user raised demo's to 60.
+5. UI findings from these checks are the dashboard redesign in §6.
+
 **Oct 13: the MCP path, live (before the fix wave below was deployed):**
 1. **Two-agent "you pick" haiku race on `demo`:** both agents started from the shared race base, both passed, the human picked w1 (sonnet), it shipped.
 2. **4-goal train test, 2 workers holding 2 attempts each:** moon, bmi and countdown landed; morse hit the infra-reject bug (the reviewer LLM returned empty output, so the attempt went REJECTED and the race ABANDONED with a note that said the Queen re-gates), then landed after a re-push (an empty commit).
 3. **P3 Claude Code client check: PASS.** **P4 (2 h token re-check, spec §13.1) is still outstanding.**
-4. The infra bug, the misleading verdict and the other live findings are fixed in the fix wave (Queen v18 gate-infra re-gates with `notBefore`, `retry_gates`, verdict `kind`, `retryable` errors, idempotent `end_attempt`, one `setupCommand`, reviewer hardening). See the spec's "Amendments (Oct 13, fix wave)". Not yet deployed or re-tested live.
+4. The infra bug, the misleading verdict and the other live findings are fixed in the fix wave (Queen v18 gate-infra re-gates with `notBefore`, `retry_gates`, verdict `kind`, `retryable` errors, idempotent `end_attempt`, one `setupCommand`, reviewer hardening). See the spec's "Amendments (Oct 13, fix wave)". Deployed Oct 13 (§4 fix-wave deploy).
 5. Folder-trust note: Herdr-started Claude workers in a new directory hit Claude Code's trust prompt. The user trusted `~/queen-race`; whether trusting the parent folder covers new subdirectories is untested.
 
 **Oct 7:**
@@ -106,9 +113,9 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 ## 4. Deploy state (CRITICAL)
 
-**Last production deploys (UTC):** Oct 12: queenos-git 14:13 (steps b, d and efcccea now live). Oct 9: queen 20:41 and edge 20:42 (after eab6a7b). Oct 8: queen 18:12 and edge 18:14 (T9a/T9d), gatekeepers 16:33 (T4), **queenos-git 16:33 (T2n)**, edge 17:01 (T7 dashboard). Oct 7: queen 21:17, herald 21:18. provisioner/drones Oct 7 14:49-14:51.
+**Last production deploys (UTC):** Oct 14: queenos-mcp 02:31, edge 02:31, provisioner 02:32, queen 02:33 (rework loop). Oct 12: queenos-git 14:13 (steps b, d and efcccea now live). Oct 9: queen 20:41 and edge 20:42 (after eab6a7b). Oct 8: queen 18:12 and edge 18:14 (T9a/T9d), gatekeepers 16:33 (T4), **queenos-git 16:33 (T2n)**, edge 17:01 (T7 dashboard). Oct 7: queen 21:17, herald 21:18. provisioner/drones Oct 7 14:49-14:51.
 
-**Pending deploy: rework loop (Tasks 1-11).** Order matters (spec §10): the Queen first (migration v19, it produces the new values), then `queenos-mcp` (19 tools), then the edge (the dashboard assets). Older MCP / dashboard builds never see REWORKING / REWORK / the new kinds until the Queen produces them, so deploy all three in one window.
+**Rework loop deploy: DONE, 2026-10-14 (UTC).** queenos-mcp 02:31, queenos-edge 02:31, queenos-provisioner 02:32, queen 02:33. That shipped schema v19, the 19-tool MCP (`sync_base`, `reject`), the dashboard Reject / Reject all, and the regenerated worker-starter template. Commands used, for the record:
 
 ```
 cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
@@ -118,14 +125,12 @@ cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH
 ./scripts/deploy.sh --only provisioner
 ```
 
-The `provisioner` line ships the regenerated worker-starter template (AGENTS.md with `sync_base` and rework-loop guidance); without it new hives keep the old AGENTS.md. Its order relative to the others does not matter, and the live checks below use the existing hive `demo`, so they do not depend on it.
-
-**Live checks after the rework-loop deploy** (Herdr workers, hive `demo`, external executors):
+**Live checks run after the rework-loop deploy (record; results in §3)** (Herdr workers, hive `demo`, external executors):
 1. **Conflict → sync_base → rebase → land.** An orchestrator files two goals editing the same file (`src/features.js`). Two workers each take one. The second winner reads REJECTED `kind: "conflict"` with `rework.dueAt`, calls `sync_base`, runs `syncCommand`, rebases onto `queen/main`, pushes `--force-with-lease`, and lands as the same candidate (same race id, no follow-up item). Check: `get_item` shows one race; the dashboard shows "Reworking · ... due in mm:ss" while it is fixed.
 2. **Mid-race fix after entry close.** A goal with `entryWindowMs: 120000` and two workers; one pushes a deliberate lint failure. After the window closes it pushes the fix. The fix rejoins the race (no "(follow-up)" item) and the race decides with both.
 3. **Reject all with a reason.** A `judge: "pick"` goal with two passing candidates. Click **Reject all**, type a reason, Send. The race goes back to RACING with entries open; both agents' `get_verdict` read `kind: "human"` with the reason; their fixes come back, and the race picks again.
 
-Record the results (pass / fail, race ids, anything odd) in HANDOFF §3.
+Results: all three passed on 2026-10-14 (HANDOFF §3).
 
 **MCP fix-wave deploy: DONE (confirmed via the deployments API, Oct 13 UTC).** queen, queenos-gatekeepers, queenos-mcp, queenos-edge and queenos-provisioner 14:10-14:12; queenos-genesis and queenos-drones 14:17-14:18. That wave shipped schema v18, `GateCommand.notBefore`, the 19-tool MCP, the registry header and the `-att-`/`-base-` slug guard. The **Access Bypass for `/mcp` is DONE** (Access app "QueenOS MCP (edge checks tokens)").
 
@@ -160,6 +165,20 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 - Live latency: builds 40-220 s; drone generation budget 200 s; watchdog 10 min.
 
 ## 6. Next steps (recommended order; ONE at a time, ask first)
+
+**NEXT: dashboard redesign for the agent/race direction.** Needs a brainstorm and a spec first (use the brainstorming skill); do not start coding. Points the user raised from the rework-loop live checks:
+- Goal and item pages must never differ, on any hive (swarm too). Make one page per goal that shows its work: all child items, and each item's race with pick/reject.
+- Pick / Reject must be reachable from the War Room and the goal page. The user could not find them (they live only on the `-c1` item page).
+- PICKING races and passed candidates must not show as "building" or TESTING (War Room "2 building", item badge "ACTIVE · building", attempt rows TESTING). The UI must read the race state.
+- Show each candidate's preview LINK as soon as the agent submits, during RACING, so the human can judge early and decide to end the race. Never embed previews (no iframes). Never show previews of rejected or superseded heads; only each candidate's current live preview.
+- Add a dashboard "close entries" action. Consider auto-closing a reopened window once every rejected candidate has re-passed: reject-all otherwise waits the full `reworkWindowMs` (30 min).
+- The War Room is crowded and the lanes page is unused, so remove the lanes page. The user wants a more elegant UI overall.
+
+Smaller follow-ups after that:
+- Investigate gate/preview infra failures (w4 hit them twice in one session).
+- The AI reviewer repeatedly flags "not registered in index" from its diff-only view (false positives that cost rounds).
+
+Deferred minors from the rework-loop review: `.superpowers/sdd/2026-10-13-queenos-rework-loop/final-review.md` §2 (all OK-TO-DEFER, including the R4 residual, whose proper fix needs a v20 column recording the slot's race id on the attempt).
 
 **Done Oct 8:** T9a/T9d you-pick races (0cd85a5, deployed: Queen PICKING state, pick route `POST /hives/:hive/races/:raceId/pick`, deadline auto-pick, `maxPickingRaces` cap, sim `[you-pick]`; dashboard Pick view + "you pick (3)" composer option; NOT yet seen live or in a browser; not built: re-pick after the winner boarded a car (409), a human push joining a PICKING race as a candidate). T2n notes pack (fa648e6 + 6e53603: bounded LRU cache, refresh TTL, SHA validation, 9 cache tests) and T7 dashboard (03609d9: Push code page, origin badges, landed-in-window count; user eyeballed it, looks good). Full gate 46/46.
 
