@@ -50,6 +50,22 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 
 ## 2. State of the system
 
+- **2026-10-14: dashboard redesign** (spec `docs/superpowers/specs/2026-10-14-queenos-dashboard-redesign-design.md`, plan `docs/superpowers/plans/2026-10-14-queenos-dashboard-redesign.md`). On `main` (commits 210f128..973c9fb), NOT deployed: the dashboard ships with the edge, so `./scripts/deploy.sh --only edge` (needs `QUEENOS_URL` only for `--only queen`).
+  - Every item URL renders its root goal's page. A child's race card is highlighted. Loose items get their own page.
+  - The home is goal-first:
+    - a two-column row of Add a goal and Needs you (inline Pick / Reject / Reject all, and an ASCII bee when empty)
+    - the merge tree panel with a Cars sub-section
+    - goal cards with agent tiles
+    - Hive health collapsed at the bottom
+  - All race labels come from `apps/dashboard/src/raceStatus.ts`, so PICKING never reads "building". Previews are links only (the iframe is removed), and rejected or superseded heads get no preview.
+  - The lanes page is removed (`/lanes` redirects home), the Model Board moved to Metrics, and the demo-swarm buttons are gone.
+  - The neon visual treatment animates only on a change, and reduced motion is respected.
+  - Dashboard tests: 283. Full gate: 49/49.
+  - Sim-checked: the you-pick race, Pick → landed, and the rework demo landing as the same candidate.
+  - Not checked: 390 px phone width.
+  - **For the user to confirm:**
+    - R5: older races of an item appear only under the card's "details".
+    - The sim `[you-pick]` marker no longer works from the swarm composer, which always decomposes. Film you-pick on an external hive, or seed it with `curl -X POST localhost:8787/hives/<hive>/prompts -d '{"namespace":"<hive>","promptText":"... [you-pick]"}'`.
 - **2026-10-13: rework loop** (spec `docs/superpowers/specs/2026-10-13-queenos-rework-loop-design.md`, plan `docs/superpowers/plans/2026-10-13-queenos-rework-loop.md`). Implemented on `main` and **deployed 2026-10-14** (§4); all three live checks pass (§3). A rejected attempt gets a rework slot (findings, conflict, human) and re-pushes as the same candidate. `sync_base` and `reject` (MCP, 19 tools), dashboard Reject / Reject all, races `REWORKING`, migration v19, sim `POST /sim/rework-demo`. Deploy order: Queen, then `queenos-mcp`, then the edge (Task 12 has the commands).
 
 `main` is green (49/49 turbo tasks; schema v19; Queen 919 passing + 1 skipped, mcp 63, dashboard 223). v2 swarm (Phases 0-3) is complete; the git proxy path (T0-T4) is built and live. Swarm internals: `docs/v2-design.md` §8, `apps/queen/README.md`.
@@ -168,17 +184,12 @@ Verify with the Cloudflare deployments API before assuming it is or isn't done.
 
 ## 6. Next steps (recommended order; ONE at a time, ask first)
 
-**NEXT: dashboard redesign for the agent/race direction.** Needs a brainstorm and a spec first (use the brainstorming skill); do not start coding. Points the user raised from the rework-loop live checks:
-- Goal and item pages must never differ, on any hive (swarm too). Make one page per goal that shows its work: all child items, and each item's race with pick/reject.
-- Pick / Reject must be reachable from the War Room and the goal page. The user could not find them (they live only on the `-c1` item page).
-- PICKING races and passed candidates must not show as "building" or TESTING (War Room "2 building", item badge "ACTIVE · building", attempt rows TESTING). The UI must read the race state.
-- Show each candidate's preview LINK as soon as the agent submits, during RACING, so the human can judge early and decide to end the race. Never embed previews (no iframes). Never show previews of rejected or superseded heads; only each candidate's current live preview.
-- Add a dashboard "close entries" action. Consider auto-closing a reopened window once every rejected candidate has re-passed: reject-all otherwise waits the full `reworkWindowMs` (30 min).
-- The War Room is crowded and the lanes page is unused, so remove the lanes page. The user wants a more elegant UI overall.
+**Dashboard redesign: DONE 2026-10-14 (§2).** Deploy the edge, then eyeball it on prod.
 
 Smaller follow-ups after that:
 - Investigate gate/preview infra failures (w4 hit them twice in one session).
 - The AI reviewer repeatedly flags "not registered in index" from its diff-only view (false positives that cost rounds).
+- Deferred redesign minors: dead code and CSS from the lanes and ItemView era (homeLogic `showPushHint`/`externalPrompt`/`liveTrainsOf`, status `goalTrees`, `demo.ts`, old `acard`/`lane__`/`item__` CSS); no Retry for failed children on the goal page (use Hive health); EscalationCard not disabled in mock mode; the push hint is shown on swarm hives; Queen-side auto-close of a reopened entry window.
 
 Deferred minors from the rework-loop review: `.superpowers/sdd/2026-10-13-queenos-rework-loop/final-review.md` §2 (all OK-TO-DEFER, including the R4 residual, whose proper fix needs a v20 column recording the slot's race id on the attempt).
 
