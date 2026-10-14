@@ -21,7 +21,7 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 | "Why" | Item intent + git notes + trace |
 | Comparing changes | Races + pick |
 
-- **README TODO:** it still leads with the old "army of virtual engineers". Reframe it as agent-native git, plus the table above.
+- **README TODO: done (3c582a6).** Reframed as agent-native git, with the table above.
 - **Long-term product (after the hackathon): the git merge engine.** Coordinate agentic submissions through speculative merge trains and strict gates, hooking into existing CI/CD (pluggable gates; the engine's job ends at "landed on main"). Hackathon first (Oct 14), then refocus on the merge core.
 - **Inbox model:** every change is a Submission. The item is the competition (the inbox).
   - A correlated push (branch `item/<id>`, or `goal/<slug>` with one item) joins that item's race.
@@ -120,10 +120,12 @@ QueenOS is an entry for Cloudflare's "next Git platform" challenge (https://blog
 ```
 cd ~/repositories/queenos && export PATH=~/.nvm/versions/node/v24.17.0/bin:$PATH CLOUDFLARE_ACCOUNT_ID=4773fbabdff038e3b907b14cd212c062
 ./scripts/deploy.sh --only queen
-(cd apps/mcp && pnpm exec wrangler deploy)
+./scripts/deploy.sh --only mcp
 ./scripts/deploy.sh --only edge
 ./scripts/deploy.sh --only provisioner
 ```
+
+`--only queen` now needs `QUEENOS_URL=https://queenos.kaikeru.com` (with Access creds) or `--force`.
 
 **Live checks run after the rework-loop deploy (record; results in §3)** (Herdr workers, hive `demo`, external executors):
 1. **Conflict → sync_base → rebase → land.** An orchestrator files two goals editing the same file (`src/features.js`). Two workers each take one. The second winner reads REJECTED `kind: "conflict"` with `rework.dueAt`, calls `sync_base`, runs `syncCommand`, rebases onto `queen/main`, pushes `--force-with-lease`, and lands as the same candidate (same race id, no follow-up item). Check: `get_item` shows one race; the dashboard shows "Reworking · ... due in mm:ss" while it is fixed.
@@ -138,9 +140,9 @@ External mode is live on the Queen. Switch hive `demo` (or a new hive) to extern
 Verify with the Cloudflare deployments API before assuming it is or isn't done.
 
 - **Access:** the user created a second Access app "QueenOS git (edge checks tokens)" on `queenos.kaikeru.com/git` with a **Bypass** policy (the edge checks `qgt_` tokens itself). Verified: `/git` without creds gives 401 Basic; the dashboard still 302s to Access.
-- **Deploying the git Worker:** `queenos-git` is NOT in `scripts/deploy.sh`'s WORKERS list yet (TODO, T8). Deploy it with `(cd apps/git && pnpm exec wrangler deploy)`, BEFORE the edge (the edge's `GIT` service binding needs it).
+- **Deploying the git and MCP Workers:** `scripts/deploy.sh` now deploys `git` and `mcp` before the edge (`--only git` / `--only mcp`). The edge's `GIT` service binding needs `git` first.
 - **Order:** gatekeepers before the Queen (the Queen binds `gatekeeper-workflow` for its own gates). Design §13: queen -> provisioner, drones, gatekeepers -> git Worker -> edge.
-- `deploy.sh` runs a v1-train safety check (R16 guard: needs `CF_ACCESS_CLIENT_ID`/`CF_ACCESS_CLIENT_SECRET` or `CF_ACCESS_TOKEN`). `--force` skips it. With no in-flight trains a plain `--only <worker>` is fine. Ignore the "one-time manual steps" footer.
+- `deploy.sh` runs a v1-train safety check (R16 guard). Redeploying an existing Queen needs `QUEENOS_URL=https://queenos.kaikeru.com` plus `CF_ACCESS_CLIENT_ID`/`CF_ACCESS_CLIENT_SECRET` (or `CF_ACCESS_TOKEN`), or `--force`. The check is skipped when the Queen was never deployed. With no in-flight trains a plain `--only <worker>` is fine.
 - **Live config:** governor lease 12 builds (`SWARM_AI_RPM` 240, `SWARM_RPM_PER_BUILD` 20); hive `demo` autonomous, `maxChildrenPerItem` 12; `ANALYTICS_API_TOKEN` NOT set by design.
 - **Do not deploy the Queen from a commit between 33d28ed and 191c167.** Main is fine.
 
@@ -214,8 +216,8 @@ Build order (Opus for the planner part, Sonnet for UI/template): (a) **DONE Oct 
 3. **Live-check T9** (sim: `pnpm --filter @queenos/queen dev:sim`, file a prompt with `[you-pick]`; prod: "you pick (3)" in the composer), then **T9b manual reject** (cheap; design §10.4) if wanted. T9c preference weighting is cut to a "next" slide. Ask the user before starting.
 4. **T5 drones:** the REWORK brief comes from notes; the rework commit writes `Queen-Replies-To`.
 5. **T6 sim** (the sim already gates pushed code via GATE commands); the all-sim fallback recording needs inbox and pick in the sim. Known: the sim has no git push, so an external hive in `dev:sim` just waits.
-6. **T8:** add `git` to `deploy.sh`; update the plugin and agent-protocol for the proxy UX and the `---` note entry separator (from T0b); live rehearsal.
-7. **README / video reframe** (agent-native git, "Git, reimagined" table) and a `docs/demo-script.md` update (it predates the merge-train graph and the git proxy). Demo beat: push, `remote:` lines, a deliberate edit-only push with `eval(` that gets REJECTED, a note in the terminal, Claude Code with the plugin fixes it, it lands.
+6. **T8:** `git` added to `deploy.sh` (done, 3c582a6). Still open: update the plugin and agent-protocol for the proxy UX and the `---` note entry separator (from T0b); live rehearsal.
+7. **README / video reframe:** README part done (3c582a6, agent-native git, "Git, reimagined" table). Still open: a `docs/demo-script.md` update (it predates the merge-train graph and the git proxy). Demo beat: push, `remote:` lines, a deliberate edit-only push with `eval(` that gets REJECTED, a note in the terminal, Claude Code with the plugin fixes it, it lands.
 8. **Optional / cut:** T1b drone adapter; an external-gate (verdict webhook) contract for "bring your CI"; the Queen reading `TrainResult.changedPaths` (from T4) to widen path claims; auto-correlation of uncorrelated pushes. Cut order if time runs out: T9c, T9b, T1b, `/t/<trainId>`.
 9. **Also open:** demo prod cleanup of old internal feature slugs on the Toy box chips; no reliable live reviewer REJECT in the swarm path (the sim has `[review-fail]`); dashboard doesn't show whether the builder used recalled memories; 390 px layout only verified headless; mock mode (`VITE_MOCK_API=1`) has no POST actions (use `pnpm dev:sim`). Screenshots and video stay deferred until the user asks.
 
@@ -227,8 +229,8 @@ Build order (Opus for the planner part, Sonnet for UI/template): (a) **DONE Oct 
 |---|---|
 | `queen` (apps/queen) | `QueenNode` DO per hive: SQLite state, work ledger, `decide()` pipeline, merge queue, races, autonomy and error budget, model router, watchdog, event log, coalesced WS room. Git intake RPCs (`gitIntent` / `gitPushed` / `gitAborted` / `notesFor`). Attempt RPCs (v17 `attempts` ledger: `attemptIntent` / `attemptReady` / `attemptPushed` / `attemptRefresh` / `attemptEnd` ...). Also hosts the **`SwarmGovernor` DO**. Reachable only through the edge. `sim` env = localhost-only fakes. |
 | `queenos-edge` (apps/edge) | `queenos.kaikeru.com` front door: Access JWT, dashboard assets, `/api/*` and `/hives/*` routing, `HiveRegistry` DO, `/api/metrics/:hive`. **`/git/*` route** (before Access middleware): `qgt_` token check (Basic/Bearer), 401 challenge, failure rate limit, forwards to the `GIT` service binding with `x-queen-user`; `/api/git-tokens` behind Access. `dev` env = auth bypass. **`/mcp` route**: Bearer `qgt_` only (push scope), forwards to the `MCP` service binding with the owner; the token is stripped before forwarding. |
-| `queenos-git` (apps/git) | **Agent-native git proxy.** Smart-HTTP front door over Artifacts: pre-receive rules, `gitIntent`, one fork per push (+ readiness probe, `-rN` re-fork), ref rewrite, `remote:` lines, `gitPushed`/`gitAborted`, filtered read advert, read-only `/t/<trainId>`. No routes of its own (reached via the edge); notes pack (`notes-pack.ts`) synthesizes v1 notes from the Queen's `notesFor` (bounded per-hive LRU cache). NOT in `deploy.sh` yet. |
-| `queenos-mcp` (apps/mcp) | MCP server for agents: `QueenMcp` (McpAgent DO per session, owner-bound), `AgentIdentity` DO per agent, 16 tools. Forks the item's read-only race base `<hive>-base-<12hex>` and one attempt fork `<hive>-att-<12hex>` per attempt (forkRepo from `@queenos/hive-kit/artifacts`), mints 2 h fork-scoped tokens. Reached only via the edge's `MCP` binding. NOT in `deploy.sh`. |
+| `queenos-git` (apps/git) | **Agent-native git proxy.** Smart-HTTP front door over Artifacts: pre-receive rules, `gitIntent`, one fork per push (+ readiness probe, `-rN` re-fork), ref rewrite, `remote:` lines, `gitPushed`/`gitAborted`, filtered read advert, read-only `/t/<trainId>`. No routes of its own (reached via the edge); notes pack (`notes-pack.ts`) synthesizes v1 notes from the Queen's `notesFor` (bounded per-hive LRU cache). |
+| `queenos-mcp` (apps/mcp) | MCP server for agents: `QueenMcp` (McpAgent DO per session, owner-bound), `AgentIdentity` DO per agent, 16 tools. Forks the item's read-only race base `<hive>-base-<12hex>` and one attempt fork `<hive>-att-<12hex>` per attempt (forkRepo from `@queenos/hive-kit/artifacts`), mints 2 h fork-scoped tokens. Reached only via the edge's `MCP` binding. |
 | `queenos-oracle` | Workflow: DECOMPOSE goals, TRIAGE bugs. |
 | `queenos-provisioner` | Workflow: Artifacts fork/delete, CREATE_HIVE seeds from `templates/worker-starter`, recalls hive memories on FORK. |
 | `queenos-drones` | Workflow: BUILD/REWORK/MERGE/LAND. Builder is a Think tool-loop agent (`docs/harness-design.md`) verifying in a Dynamic Worker. |
@@ -280,4 +282,4 @@ Build order (Opus for the planner part, Sonnet for UI/template): (a) **DONE Oct 
 
 ## 10. Key docs
 
-`README.md` (judge-facing; needs the agent-native-git reframe), `CLAUDE.md` (rules), **`docs/human-push-design.md`** (rev 2: git proxy, Submissions, notes, races; §13 plan, §14 demo shot), **`docs/agent-protocol.md`** (v1 protocol for agents that speak git; plugin `plugins/queenos`), `docs/v2-design.md` (swarm design, decisions D1-D11 in §10), `apps/queen/README.md` (decide pipeline, routes, planners, release semantics), `docs/demo-script.md` (13 shots, sim-backed; predates merge-train graph and git proxy), `docs/discovery.md` + `docs/deploy-discovery.md` (API research), `docs/day1-results.md` (real-account facts), `docs/day1-verification.md`, `docs/model-bakeoff.md`, `docs/harness-spike.md`, `docs/harness-design.md`, `docs/harness-build-brief.md`.
+`README.md` (judge-facing; agent-native-git reframe done, 3c582a6), `CLAUDE.md` (rules), **`docs/human-push-design.md`** (rev 2: git proxy, Submissions, notes, races; §13 plan, §14 demo shot), **`docs/agent-protocol.md`** (v1 protocol for agents that speak git; plugin `plugins/queenos`), `docs/v2-design.md` (swarm design, decisions D1-D11 in §10), `apps/queen/README.md` (decide pipeline, routes, planners, release semantics), `docs/demo-script.md` (13 shots, sim-backed; predates merge-train graph and git proxy), `docs/discovery.md` + `docs/deploy-discovery.md` (API research), `docs/day1-results.md` (real-account facts), `docs/day1-verification.md`, `docs/model-bakeoff.md`, `docs/harness-spike.md`, `docs/harness-design.md`, `docs/harness-build-brief.md`.
