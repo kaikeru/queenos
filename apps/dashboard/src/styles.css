@@ -863,10 +863,10 @@ input, textarea { font: inherit; color: var(--text); }
 
 /* goal list rows: projects-home card language with a state-colored edge */
 .goals__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
-.goal-row { --edge: var(--faint); --wash: transparent; position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 12px 16px; border-radius: 12px; border: 1px solid var(--line); border-left: 4px solid var(--edge); background: linear-gradient(100deg, var(--wash), transparent 55%), var(--panel-2); transition: transform 0.25s, box-shadow 0.25s, border-color 0.25s; animation: slide-in 0.4s ease; }
+.goal-row { --edge: var(--faint); --wash: transparent; position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 12px 16px; border-radius: 12px; border: 1px solid var(--line); border-left: 4px solid var(--edge); background: linear-gradient(100deg, var(--wash), transparent 55%), var(--panel-2); transition: transform 0.25s, box-shadow 0.25s, border-color 0.25s; }
 .goal-row:hover, .goal-row:focus-within { transform: translateY(-2px); box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45); }
 .goal-row--cyan { --edge: var(--cyan); --wash: rgba(60, 217, 255, 0.08); }
-.goal-row--gold { --edge: var(--yellow); --wash: rgba(255, 210, 63, 0.12); animation: slide-in 0.4s ease, glow-yellow 1.8s infinite; }
+.goal-row--gold { --edge: var(--yellow); --wash: rgba(255, 210, 63, 0.12); animation: glow-yellow 1.8s infinite; }
 .goal-row--violet { --edge: var(--violet); --wash: rgba(167, 139, 250, 0.1); }
 .goal-row--green { --edge: var(--green); --wash: rgba(53, 242, 160, 0.07); }
 .goal-row--red { --edge: var(--red); --wash: rgba(255, 77, 99, 0.08); }
@@ -883,7 +883,7 @@ input, textarea { font: inherit; color: var(--text); }
 /* agent tiles: race-outlined per race, filled = passed, hollow = still working */
 .atiles { display: inline-flex; gap: 3px; padding: 3px; border: 1px dashed var(--violet); border-radius: 8px; background: rgba(167, 139, 250, 0.08); }
 .atiles--last-minute { position: relative; }
-.atiles--last-minute::after { content: ""; position: absolute; inset: -2px; border-radius: 9px; border: 1px solid var(--violet); animation: ring 1.2s infinite; pointer-events: none; }
+.atiles--last-minute::after { content: ""; position: absolute; inset: -2px; border-radius: 9px; border: 1px solid var(--violet); animation: ring 1.2s 3; pointer-events: none; }
 .atile { --c: var(--cyan); display: block; width: 18px; height: 18px; border-radius: 5px; border: 2px solid var(--c); background: transparent; }
 .atile--filled { background: var(--c); box-shadow: 0 0 10px var(--c); }
 .atile--passed { --c: var(--green); }
@@ -904,7 +904,7 @@ input, textarea { font: inherit; color: var(--text); }
 .mtree__list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
 .mtree__car { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line-2); background: var(--panel-2); font: 13px var(--mono); }
 .mtree__car-label { color: var(--violet); }
-.mtree__car--gating { border-color: rgba(60, 217, 255, 0.6); animation: step-pulse 1.6s infinite; }
+.mtree__car--gating { border-color: rgba(60, 217, 255, 0.6); animation: step-pulse 1.6s 2; }
 .mtree__car--landing, .mtree__car--passed { border-color: rgba(53, 242, 160, 0.55); }
 .mtree__car--bisect { border-color: rgba(255, 77, 99, 0.6); animation: shake 0.5s 2; }
 .mtree__members { display: inline-flex; flex-wrap: wrap; gap: 6px; }
@@ -959,5 +959,7 @@ input, textarea { font: inherit; color: var(--text); }
 @media (prefers-reduced-motion: reduce) {
   .race-chip--pulse, .needs--pending, .goal-row, .goal-row--gold, .goal-row--celebrate, .atile--changed, .atiles--last-minute::after,
   .mtree__landed, .mtree__car--gating, .mtree__car--bisect, .rc--highlight, .skel, .sh-hero__dot, .celebrate-banner__crown { animation: none !important; }
-  .celebrate-banner { display: none; }
+  .celebrate-banner { animation: none !important; }
+  .goal-row { transition: none; }
+  .goal-row:hover, .goal-row:focus-within { transform: none; }
 }
