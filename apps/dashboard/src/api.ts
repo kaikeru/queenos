@@ -28,6 +28,7 @@ import {
   type QueenEvent,
   type Race,
   type Release,
+  type RejectRace,
   type ResolveEscalation,
   type TraceView,
   type UpdateHiveSettings,
@@ -205,6 +206,11 @@ export function eventsQuery(q: EventQueryInput = {}): string {
   return s ? `?${s}` : "";
 }
 
+/** Request body for POST /hives/:hive/races/:raceId/reject: a trainId or "all", the reason trimmed and capped at 300. */
+export function rejectBody(trainId: string, reason: string): RejectRace {
+  return { trainId, reason: reason.trim().slice(0, 300) };
+}
+
 /** Request body for POST /hives/:hive/races/:raceId/pick; a blank reason is omitted. */
 export function pickBody(trainId: string, reason: string): PickRace {
   const r = reason.trim().slice(0, 300);
@@ -230,6 +236,9 @@ export const api = {
   /** Identity comes from Access via the edge. 409 = the race is no longer PICKING (see raceLogic.pickFailure). */
   pickRace: (hive: string, raceId: string, trainId: string, reason?: string) =>
     request("POST", `/hives/${enc(hive)}/races/${enc(raceId)}/pick`, AnyParser, pickBody(trainId, reason ?? ""), "include"),
+  /** Rework loop: send a PICKING race's candidate (or "all") back with a reason. 409 = no longer PICKING (raceLogic.rejectFailure). */
+  rejectRace: (hive: string, raceId: string, trainId: string, reason: string) =>
+    request("POST", `/hives/${enc(hive)}/races/${enc(raceId)}/reject`, AnyParser, rejectBody(trainId, reason), "include"),
   /** External hives: ends the race's entry window now (409 = not RACING, or entries already closed; see raceLogic.closeEntriesFailure). */
   closeRaceEntries: (hive: string, raceId: string) =>
     request("POST", `/hives/${enc(hive)}/races/${enc(raceId)}/close-entries`, AnyParser, {}, "include"),

@@ -3,7 +3,7 @@ import { useState } from "react";
 import { api } from "./api";
 import { useNow } from "./components";
 import { OriginChip } from "./shell";
-import { countdownLine, decidedSummary, pickCards, pickFailure, pickHint, PICK_REASON_MAX, type PickCard } from "./raceLogic";
+import { countdownLine, decidedSummary, pickCards, pickFailure, pickHint, PICK_REASON_MAX, canSendReject, rejectFailure, REJECT_REASON_MAX, type PickCard } from "./raceLogic";
 import { hrefFor } from "./route";
 import { Link } from "./router";
 import type { RaceView } from "./swarm";
@@ -61,13 +61,65 @@ export function RacePick({ hive, view, now: nowProp, onChanged, showItem = false
           </li>
         ))}
       </ul>
+      {picking && <RejectAll hive={hive} raceId={race.raceId} onChanged={onChanged} />}
       {cards.length === 0 && <p className="sh-muted">No candidate details yet.</p>}
     </section>
   );
 }
 
+/** The inline reason box of Reject / Reject all (no browser dialog): Send stays disabled until a reason is typed. */
+export function RejectBox({ label, onSend, onCancel, initialReason = "" }: { label: string; onSend: (reason: string) => Promise<void>; onCancel: () => void; initialReason?: string }) {
+  const [reason, setReason] = useState(initialReason);
+  const [busy, setBusy] = useState(false);
+  const send = async () => {
+    setBusy(true);
+    try {
+      await onSend(reason);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="rp__confirm rp__reject">
+      <textarea value={reason} maxLength={REJECT_REASON_MAX} rows={3} onChange={(e) => setReason(e.target.value)} placeholder="What is wrong, and what do you expect instead?" aria-label={label} />
+      <button type="button" className="btn btn--primary" disabled={busy || !canSendReject(reason)} onClick={() => void send()}>{busy ? "Sending…" : "Send"}</button>
+      <button type="button" className="btn" disabled={busy} onClick={onCancel}>Cancel</button>
+    </div>
+  );
+}
+
+/** "Reject all" on the race panel (PICKING only). */
+function RejectAll({ hive, raceId, onChanged }: { hive: string; raceId: string; onChanged?: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const send = async (reason: string) => {
+    setErr(null);
+    try {
+      await api.rejectRace(hive, raceId, "all", reason);
+      setOpen(false);
+      onChanged?.();
+    } catch (e) {
+      const f = rejectFailure(e);
+      setErr(f.message);
+      setOpen(false);
+      if (f.refresh) onChanged?.();
+    }
+  };
+  return (
+    <div className="rp__reject-all">
+      {open ? (
+        <RejectBox label="Reason for rejecting every candidate" onSend={send} onCancel={() => setOpen(false)} />
+      ) : (
+        <button type="button" className="btn" disabled={MOCK} title={MOCK ? "Mock mode: not available" : undefined} onClick={() => setOpen(true)}>Reject all</button>
+      )}
+      {err && <p className="sh-err" role="alert">{err}</p>}
+    </div>
+  );
+}
+
 function Card({ hive, raceId, c, picking, onChanged }: { hive: string; raceId: string; c: PickCard; picking: boolean; onChanged?: () => void }) {
   const [confirm, setConfirm] = useState(false);
+  const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -85,6 +137,19 @@ function Card({ hive, raceId, c, picking, onChanged }: { hive: string; raceId: s
       if (f.refresh) onChanged?.();
     } finally {
       setBusy(false);
+    }
+  };
+  const reject = async (why: string) => {
+    setErr(null);
+    try {
+      await api.rejectRace(hive, raceId, c.trainId, why);
+      setRejecting(false);
+      onChanged?.();
+    } catch (e) {
+      const f = rejectFailure(e);
+      setErr(f.message);
+      setRejecting(false);
+      if (f.refresh) onChanged?.();
     }
   };
   const cls = `rp__card${c.recommended ? " rp__card--rec" : ""}${c.winner ? " rp__card--winner" : ""}${c.rejectedReason || (!picking && !c.winner) ? " rp__card--out" : ""}`;
@@ -119,6 +184,13 @@ function Card({ hive, raceId, c, picking, onChanged }: { hive: string; raceId: s
           </div>
         ) : (
           <button type="button" className="btn btn--primary" disabled={MOCK} title={MOCK ? "Mock mode: picking is not available" : undefined} onClick={() => setConfirm(true)}>Pick this one</button>
+        )
+      )}
+      {picking && c.pickable && !confirm && (
+        rejecting ? (
+          <RejectBox label={`Reason for rejecting ${c.tag}`} onSend={reject} onCancel={() => setRejecting(false)} />
+        ) : (
+          <button type="button" className="btn" disabled={MOCK} title={MOCK ? "Mock mode: not available" : undefined} onClick={() => setRejecting(true)}>Reject</button>
         )
       )}
       {MOCK && picking && c.pickable && <p className="sh-muted">Mock mode has no pick API.</p>}

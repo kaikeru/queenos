@@ -354,7 +354,7 @@ export function raceView(state: Slice, raceId: string, now = Date.now()): RaceVi
   };
 }
 
-const isOpenRace = (r: Race): boolean => r.state === "RACING" || r.state === "PICKING";
+const isOpenRace = (r: Race): boolean => r.state === "RACING" || r.state === "PICKING" || r.state === "REWORKING";
 
 /** The race for an item: the active one, else the newest. */
 export function raceViewForItem(state: Slice, itemId: string, now = Date.now()): RaceView | null {

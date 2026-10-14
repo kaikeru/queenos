@@ -1,12 +1,12 @@
 /** T9d: the Pick view, its countdown / 409 / composer-judge logic, and the pick API call. */
 import { renderToString } from "react-dom/server";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import type { MergeTrain, Race, WorkItem } from "@queenos/queen-types";
+import { reworkReasonText, type MergeTrain, type Race, type WorkItem } from "@queenos/queen-types";
 
-import { api, ApiError, pickBody } from "../src/api";
+import { api, ApiError, pickBody, rejectBody } from "../src/api";
 import { RaceEntries } from "../src/RaceEntries";
-import { RacePick } from "../src/RacePick";
-import { closeEntriesFailure, composerRace, pickHint, countdownLine, countdownText, decidedSummary, entriesLine, entryState, pickCards, pickFailure, pickRemainingMs } from "../src/raceLogic";
+import { RacePick, RejectBox } from "../src/RacePick";
+import { canSendReject, rejectFailure, reworkLines, closeEntriesFailure, composerRace, pickHint, countdownLine, countdownText, decidedSummary, entriesLine, entryState, pickCards, pickFailure, pickRemainingMs } from "../src/raceLogic";
 import { raceView, raceViewForItem, swarmTiles } from "../src/swarm";
 
 const NOW = 1_800_000_000_000;
@@ -252,5 +252,64 @@ describe("attempt id reaches the chips through the callers", () => {
     const ts = [att("a", 0, "att_0123456789ab")];
     const tile = swarmTiles(state(race({ state: "RACING" }), ts)).find((t) => t.trainId === "a");
     expect(tile?.origin).toMatchObject({ attempt: "att_0123456789ab" });
+  });
+});
+
+describe("reject (rework loop §7.4)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const view = (r: Race, ts = three()) => raceView(state(r, ts), "r1", NOW)!;
+
+  test("Send needs a reason of 1..300 characters; the body trims and caps it", () => {
+    expect(canSendReject("")).toBe(false);
+    expect(canSendReject("   ")).toBe(false);
+    expect(canSendReject("ugly")).toBe(true);
+    expect(canSendReject("x".repeat(301))).toBe(false);
+    expect(rejectBody("all", "  none of these  ")).toEqual({ trainId: "all", reason: "none of these" });
+  });
+
+  test("rejectRace POSTs {trainId, reason} to the reject route; a 409 asks for a refresh", async () => {
+    const f = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    await api.rejectRace("demo", "r1", "b", "the jar overlaps the footer");
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("/hives/demo/races/r1/reject");
+    expect(JSON.parse(init.body as string)).toEqual({ trainId: "b", reason: "the jar overlaps the footer" });
+    const r = rejectFailure(new ApiError("race is RACING, not PICKING", 409));
+    expect(r.refresh).toBe(true);
+    expect(r.message).toContain("no longer waiting for a pick");
+    expect(rejectFailure(new ApiError("boom", 500))).toEqual({ message: "boom", refresh: false });
+  });
+
+  test("PICKING renders Reject on each pickable card and Reject all; a decided race renders neither", () => {
+    const html = renderToString(<RacePick hive="demo" view={view(race())} now={NOW} />);
+    expect(html.match(/>Reject</g)).toHaveLength(3);
+    expect(html).toContain("Reject all");
+    const done = renderToString(<RacePick hive="demo" view={view(race({ state: "DECIDED", winnerTrainId: "a", decidedBy: "human:k@kaikeru.com" }))} now={NOW} />);
+    expect(done).not.toContain("Reject");
+  });
+
+  test("the reason box: a textarea, Send disabled until a reason is typed, Cancel; no browser dialog", () => {
+    const empty = renderToString(<RejectBox label="Reason for rejecting c2" onSend={async () => undefined} onCancel={() => undefined} />);
+    expect(empty).toContain("<textarea");
+    expect(empty).toMatch(/<button[^>]*disabled=""[^>]*>Send<\/button>/);
+    const typed = renderToString(<RejectBox label="x" initialReason="ugly" onSend={async () => undefined} onCancel={() => undefined} />);
+    expect(typed).not.toMatch(/<button[^>]*disabled=""[^>]*>Send<\/button>/);
+    expect(typed).toContain("Cancel");
+  });
+
+  test("rework lines: a REWORK candidate in a RACING race, and the REWORKING race's winner, with their due time", () => {
+    const rw = (reason: "findings" | "conflict" | "human") => reworkReasonText(reason, NOW + 723_000, "failed: x");
+    const racing = view(race({ state: "RACING", pickDeadlineAt: undefined }), [train("a", 0), train("b", 1, { raceOutcome: "REWORK", status: "EJECTED", reason: rw("human") })]);
+    expect(reworkLines(racing, NOW)).toEqual(["model-b in rework (human) · due in 12:03"]);
+    const reworking = view(race({ state: "REWORKING", winnerTrainId: "a" }), [train("a", 0, { raceOutcome: "REWORK", status: "EJECTED", reason: rw("conflict") })]);
+    expect(reworkLines(reworking, NOW)).toEqual(["Reworking · model-a fixing a conflict rejection · due in 12:03"]);
+    const html = renderToString(<RaceEntries hive="demo" view={reworking} now={NOW} />);
+    expect(html).toContain("Reworking · model-a fixing a conflict rejection");
+  });
+
+  test("raceViewForItem treats a REWORKING race as open (it wins over a newer decided one)", () => {
+    const s = state(race({ state: "REWORKING", winnerTrainId: "a" }), three());
+    s.races = { r1: race({ state: "REWORKING", winnerTrainId: "a" }), r0: race({ raceId: "r0", state: "DECIDED", createdAt: NOW }) };
+    expect(raceViewForItem(s, "i1", NOW)?.race.raceId).toBe("r1");
   });
 });

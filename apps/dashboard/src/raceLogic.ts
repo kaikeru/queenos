@@ -1,5 +1,5 @@
 /** Pure helpers for the Pick view (docs/human-push-design.md §10): countdown, candidate cards, 409 handling, composer judge. */
-import type { Race } from "@queenos/queen-types";
+import { parseReworkReason, type Race } from "@queenos/queen-types";
 
 import { ApiError } from "./api";
 import { originBadge, type OriginBadge } from "./origin";
@@ -175,4 +175,38 @@ export function composerRace(choice: BestOfChoice): { bestOf?: number; judge?: "
   if (choice === "auto") return {};
   if (choice === "pick") return { bestOf: YOU_PICK_WIDTH, judge: "human" };
   return { bestOf: Number(choice) };
+}
+
+export const REJECT_REASON_MAX = 300;
+
+/** Send is enabled only with a reason the agent can act on: 1..300 characters after trimming. */
+export function canSendReject(reason: string): boolean {
+  const r = reason.trim();
+  return r.length > 0 && r.length <= REJECT_REASON_MAX;
+}
+
+/** 409: the race no longer waits for a pick (a reject already sent it back, or it was decided): refetch to show its state. */
+export function rejectFailure(e: unknown): PickFailure {
+  if (e instanceof ApiError && e.status === 409) {
+    return { message: "This race is no longer waiting for a pick (a reject already sent it back, or it was decided). Refreshing…", refresh: true };
+  }
+  return { message: e instanceof Error ? e.message : String(e), refresh: false };
+}
+
+/**
+ * Rework loop: "model-b in rework (human) · due in 12:03" for each REWORK candidate of a RACING race, or
+ * "Reworking · model-a fixing a conflict rejection · due in 12:03" for a REWORKING race. The due time comes from the
+ * train's rework reason text. Unknown or older trains are skipped.
+ */
+export function reworkLines(view: RaceView, now: number): string[] {
+  const out: string[] = [];
+  for (const c of view.candidates) {
+    if (c.train.raceOutcome !== "REWORK") continue;
+    const r = parseReworkReason(c.train.reason);
+    if (!r) continue;
+    const who = c.model ?? `c${c.candidate + 1}`;
+    const left = countdownText(r.dueAt - now);
+    out.push(view.race.state === "REWORKING" ? `Reworking · ${who} fixing a ${r.reason} rejection · due in ${left}` : `${who} in rework (${r.reason}) · due in ${left}`);
+  }
+  return out;
 }
