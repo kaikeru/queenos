@@ -25,6 +25,7 @@ import {
   NoteEntrySchema,
   NoteFindingSchema,
   isInfraStopped,
+  parseReworkReason,
   renderNotes,
   type NoteEntryInput,
   type NoteFinding,
@@ -55,6 +56,8 @@ export interface NotesTrain {
   origin?: SubmissionOrigin | null;
   /** The branch a pushed submission came from (`refs/heads/...`), when known. */
   ref?: string | null;
+  /** v17: the MCP attempt whose fork this train is (its notes speak MCP: sync_base, rework due times). */
+  attemptId?: string | null;
   /** The train's summary (an infra-stopped train's starts with INFRA_SUMMARY_PREFIX). */
   summary?: string | null;
 }
@@ -166,9 +169,15 @@ function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<stri
     ...(repliesTo ? { repliesTo } : {}),
   };
   const branch = t.ref?.replace(/^refs\/heads\//, "") ?? null;
-  const next = contributed(t)
-    ? `Push a fix to ${branch ?? "your branch"}, or hand off: a "Queen: rework" trailer, or "Let the swarm fix it" on item ${t.promptId}.`
-    : "The swarm reworks it.";
+  const rework = parseReworkReason(t.reason);
+  const due = rework && t.raceOutcome === "REWORK" ? new Date(rework.dueAt).toISOString() : null;
+  const next = t.attemptId
+    ? due
+      ? `Fix it and push again before ${due}.`
+      : "Fix it and push again."
+    : contributed(t)
+      ? `Push a fix to ${branch ?? "your branch"}, or hand off: a "Queen: rework" trailer, or "Let the swarm fix it" on item ${t.promptId}.`
+      : "The swarm reworks it.";
   /** The re-gates are spent: an infra verdict, never a rejection. */
   const infraExhausted = (seq: number, tries: number | null): Dated => ({
     seq,
@@ -223,6 +232,20 @@ function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<stri
         } else if (!exhaustedEvent && isInfraStopped({ summary: t.summary ?? null })) {
           // An infra-stopped train from before INFRA_EXHAUSTED events (or whose event was pruned).
           out[NOTES_REF_VERDICT].push(infraExhausted(e.seq, null));
+        } else if (/^(?:in rework \(human\) until \S+: |lost race \S+: )rejected by [^:]+: /.test(reason)) {
+          const text = reason.replace(/^(?:in rework \(human\) until \S+: |lost race \S+: )/, "");
+          const said = text.replace(/^rejected by [^:]+: /, "");
+          out[NOTES_REF_VERDICT].push({
+            seq: e.seq,
+            entry: {
+              ...common,
+              kind: "verdict",
+              verdict: "REJECTED",
+              summary: oneLine(`REJECTED by human: ${said}`, 300),
+              ...(due ? { body: `Address the reviewer's reason and push again before ${due}.` } : {}),
+              findings: [{ severity: "error", path: "review", message: oneLine(text, 500) }],
+            },
+          });
         } else if (/^lost race/i.test(reason)) {
           out[NOTES_REF_VERDICT].push({ seq: e.seq, entry: { ...common, kind: "verdict", verdict: "REJECTED", summary: oneLine(`REJECTED (lost the race): ${reason}`, 300) } });
         } else if (t.conflict) {
@@ -234,7 +257,13 @@ function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<stri
               kind: "verdict",
               verdict: "REJECTED",
               summary: oneLine(`REJECTED (CONFLICT): conflicts with work that landed: ${paths || t.conflict.summary}`, 300),
-              body: contributed(t) ? "Rebase on origin/main and push the branch again, or hand off." : "The swarm reworks it on top of main.",
+              body: t.attemptId
+                ? due
+                  ? `Call sync_base, rebase onto queen/main and push again before ${due}.`
+                  : "The rework slot is closed: the item is open to any agent (start_attempt)."
+                : contributed(t)
+                  ? "Rebase on origin/main and push the branch again, or hand off."
+                  : "The swarm reworks it on top of main.",
             },
           });
         }

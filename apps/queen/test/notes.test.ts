@@ -3,7 +3,7 @@
  * parser. The DO's notesFor / brief equality are covered in v2-flow.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import { currentVerdict, parseNotes, type QueenEvent } from "@queenos/queen-types";
+import { currentVerdict, parseNotes, reworkReasonText, type QueenEvent } from "@queenos/queen-types";
 import { findingsFromSteps, projectNotes, type NotesInput, type NotesTrain } from "../src/work/notes";
 
 const HEAD = "a".repeat(40);
@@ -181,5 +181,44 @@ describe("notes projection", () => {
       { severity: "warning", path: "a.js", message: "rule: m" },
       { severity: "error", path: "acceptance", message: "not satisfied: x" },
     ]);
+  });
+});
+
+describe("rework loop notes (rework-loop spec §6.2, R19)", () => {
+  const AGENT = { kind: "agent" as const, id: "opus@ada@example.com" };
+  const DUE = Date.UTC(2026, 9, 13, 12, 30);
+
+  it("an attempt's conflict says sync_base, rebase onto queen/main, push before the due time; a closed slot says it is open to any agent", () => {
+    const reason = reworkReasonText("conflict", DUE, "failed: Merge conflict in src/a.js");
+    const events = [ev("train.phase", { trainId: "t1", data: { to: "EJECTED", reason } })];
+    const t = train({ phase: "EJECTED", landedSha: null, origin: AGENT, attemptId: "att_0123456789ab", raceOutcome: "REWORK", reason, conflict: { paths: ["src/a.js"], summary: "conflict" } });
+    const [entry] = parseNotes(projectNotes({ trains: [t], events, releases: [] }, "refs/notes/verdict")[0]!.text);
+    expect(entry).toMatchObject({ verdict: "REJECTED", summary: "REJECTED (CONFLICT): conflicts with work that landed: src/a.js" });
+    expect(entry!.body).toBe("Call sync_base, rebase onto queen/main and push again before 2026-10-13T12:30:00.000Z.");
+    const closed = parseNotes(projectNotes({ trains: [{ ...t, raceOutcome: "FAILED" }], events, releases: [] }, "refs/notes/verdict")[0]!.text);
+    expect(closed[0]!.body).toBe("The rework slot is closed: the item is open to any agent (start_attempt).");
+    const human = parseNotes(projectNotes({ trains: [{ ...t, origin: { kind: "human", id: "ada@example.com" }, attemptId: null }], events, releases: [] }, "refs/notes/verdict")[0]!.text);
+    expect(human[0]!.body).toBe("Rebase on origin/main and push the branch again, or hand off.");
+  });
+
+  it("a human reject is a REJECTED verdict with the reason as a finding", () => {
+    const reason = reworkReasonText("human", DUE, "rejected by k@kaikeru.com: the jar overlaps the footer");
+    const events = [
+      ev("gate.verdict", { trainId: "t1", summary: "gate passed: ok", data: { outcome: "PASSED", applied: "applied" } }),
+      ev("train.phase", { trainId: "t1", data: { to: "EJECTED", reason } }),
+    ];
+    const t = train({ phase: "EJECTED", landedSha: null, origin: AGENT, attemptId: "att_0123456789ab", raceOutcome: "REWORK", reason });
+    const entries = parseNotes(projectNotes({ trains: [t], events, releases: [] }, "refs/notes/verdict")[0]!.text);
+    expect(currentVerdict(entries)).toBe("REJECTED");
+    expect(entries.at(-1)).toMatchObject({ summary: "REJECTED by human: the jar overlaps the footer", findings: [{ severity: "error", path: "review", message: "rejected by k@kaikeru.com: the jar overlaps the footer" }] });
+    expect(entries.at(-1)!.body).toBe("Address the reviewer's reason and push again before 2026-10-13T12:30:00.000Z.");
+  });
+
+  it("an attempt's gate findings body says fix and push before the due time", () => {
+    const reason = reworkReasonText("findings", DUE, "failed in race: lint");
+    const events = [ev("gate.verdict", { trainId: "t1", summary: "gate failed: lint", data: { outcome: "FAILED", applied: "applied" } })];
+    const t = train({ phase: "EJECTED", landedSha: null, origin: AGENT, attemptId: "att_0123456789ab", raceOutcome: "REWORK", reason });
+    const entries = parseNotes(projectNotes({ trains: [t], events, releases: [] }, "refs/notes/verdict")[0]!.text);
+    expect(entries[0]!.body).toBe("Fix it and push again before 2026-10-13T12:30:00.000Z.");
   });
 });

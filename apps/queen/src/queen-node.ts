@@ -52,6 +52,8 @@ import {
   AttemptReadySchema,
   AttemptRefreshSchema,
   AttemptRegateSchema,
+  AttemptSyncBaseSchema,
+  RejectRaceSchema,
   BASE_PENDING_POLL_MS,
   MAX_MANUAL_REGATES,
   RACE_GRACE_MS,
@@ -104,6 +106,9 @@ import {
   type AttemptReady,
   type AttemptRefusalCode,
   type AttemptResult,
+  type AttemptSyncBase,
+  type RejectRace,
+  type RejectRaceResult,
   type AttemptView,
   type GoalChild,
   type ItemAttempts,
@@ -767,6 +772,28 @@ export class QueenNode extends DurableObject<Env> {
     await this.commit(hive, acc);
     const after = this.sql.exec("SELECT * FROM races WHERE race_id = ?", race.raceId).toArray()[0];
     return { outcome: res.outcome, race: after ? rowToRace(after) : race };
+  }
+
+  /**
+   * `POST /hives/:hive/races/:raceId/reject` (user, rework-loop spec §7): a human sends a PICKING race's candidate (or all
+   * of them) back with a reason (`by: human:<email>`). 404 for an unknown race; 409 unless the race is PICKING and `trainId`
+   * a live passed candidate. `fallback`: the reject ended the race and the item reopened to any agent.
+   */
+  async rejectRace(input: { hive: string; raceId: string; user: string; reject: RejectRace }): Promise<RejectRaceResult> {
+    const reject = parseOrThrow(RejectRaceSchema, { ...input.reject, reason: input.reject.reason.trim() }, "reject");
+    const hive = this.hiveFor(input.hive);
+    const row = this.sql.exec("SELECT * FROM races WHERE race_id = ?", input.raceId).toArray()[0];
+    if (!row) throw new QueenError("NOT_FOUND", `race ${input.raceId} not found`);
+    const race = rowToRace(row);
+    const { value: res, acc } = this.decide(
+      hive,
+      (d) => d.acc.train(d.tp.reject({ raceId: race.raceId, target: reject.trainId, by: humanBy(input.user), reason: reject.reason })),
+      { races: [race.raceId], trains: race.trainIds, items: [race.itemId] },
+    );
+    if (res.refused) throw new QueenError(res.refused.status === 404 ? "NOT_FOUND" : "CONFLICT", res.refused.message);
+    await this.commit(hive, acc);
+    const after = this.sql.exec("SELECT * FROM races WHERE race_id = ?", race.raceId).toArray()[0];
+    return { outcome: res.outcome, race: after ? rowToRace(after) : race, fallback: res.rejected?.fallback ?? false };
   }
 
   /**
@@ -1453,6 +1480,35 @@ export class QueenNode extends DurableObject<Env> {
     return { ok: true, attempt: this.attemptView(entered.attempt), changed: true };
   }
 
+  /**
+   * `sync_base` (rework-loop spec §6.1): record hive main's sha (queenos-mcp read it from Artifacts; the Queen has no
+   * Artifacts binding) as the attempt's base. The gates and the reviewer diff its next push against it; the item's shared
+   * base is untouched. Only READY, or REJECTED with an open rework slot: anything else is CONFLICT.
+   */
+  async attemptSyncBase(input: AttemptSyncBase): Promise<AttemptResult> {
+    const r = parseOrThrow(AttemptSyncBaseSchema, input, "attempt sync base");
+    const hive = this.hiveFor(r.hive);
+    const a = getAttemptRow(this.sql, r.attemptId);
+    const refused = this.ownerRefusal(a, r);
+    if (refused) return refused;
+    const att = a!;
+    const slotOpen = !!att.rework && att.rework.dueAt > this.now();
+    if (att.state !== "READY" && !(att.state === "REJECTED" && slotOpen)) {
+      const why = att.state === "REJECTED" ? "REJECTED with no open rework slot" : att.state;
+      return { ok: false, code: "CONFLICT", message: clip(`attempt ${att.attemptId} is ${why}; sync_base needs READY or an open rework slot`, 200) };
+    }
+    if (att.baseSha === r.baseSha) return { ok: true, attempt: this.attemptView(att), changed: false };
+    const next: Attempt = { ...att, baseSha: r.baseSha };
+    const { acc } = this.decide(hive, (d) => {
+      d.acc.attempts.set(att.attemptId, next);
+      d.acc.events.push(
+        this.attemptEvent("attempt.state", att.itemId, att.attemptId, `attempt ${att.attemptId}: base synced to main@${short(r.baseSha)}`, { syncBase: true, from: att.baseSha, to: r.baseSha }, `agent:${att.agentName}@${att.owner}`),
+      );
+    });
+    await this.commit(hive, acc);
+    return { ok: true, attempt: this.attemptView(next), changed: true };
+  }
+
   /** `refresh_attempt`: the attempt's own owner and agent, a non-terminal attempt: expires_at = now + 2 h (queenos-mcp mints the token). */
   async attemptRefresh(input: AttemptOwnerAction): Promise<AttemptResult> {
     const r = parseOrThrow(AttemptRefreshSchema, input, "attempt refresh");
@@ -1942,6 +1998,7 @@ export class QueenNode extends DurableObject<Env> {
       conflict: t.conflict ?? null,
       origin: t.origin ?? null,
       ref: refOf.get(t.trainId) ?? null,
+      attemptId: t.attemptId ?? null,
       summary: t.summary,
     }));
     const releases = this.sql

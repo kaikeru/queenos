@@ -13,6 +13,7 @@ import {
   MergeResultSchema,
   OracleResultSchema,
   PickRaceSchema,
+  RejectRaceSchema,
   ProvisionResultSchema,
   ScribeSummarySchema,
   SentinelVerdictSchema,
@@ -178,6 +179,15 @@ hive.post("/races/:raceId/pick", async (c) => {
   const user = userOf(c);
   const pick = parseOrThrow(PickRaceSchema, await body(c), "pick");
   return c.json(await stub(c, hiveOf(c)).pick({ hive: hiveOf(c), raceId: c.req.param("raceId"), user, pick }));
+});
+
+// Rework loop (rework-loop spec §7): send a PICKING race's candidate (or "all") back with a reason. 409 unless the race is
+// PICKING and trainId a live passed candidate; 404 for an unknown race.
+hive.post("/races/:raceId/reject", async (c) => {
+  const user = userOf(c);
+  const raw = (await body(c)) as { reason?: unknown } | null;
+  const reject = parseOrThrow(RejectRaceSchema, raw && typeof raw.reason === "string" ? { ...raw, reason: raw.reason.trim() } : raw, "reject");
+  return c.json(await stub(c, hiveOf(c)).rejectRace({ hive: hiveOf(c), raceId: c.req.param("raceId"), user, reject }));
 });
 
 // External hives: a human ends a race's entry window now (the dashboard's "End entries now"). 409 unless the race
