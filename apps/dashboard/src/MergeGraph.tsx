@@ -15,7 +15,8 @@ import { modelLabel } from "./models";
 import type { State } from "./reducer";
 import { hrefFor } from "./route";
 import { Link } from "./router";
-import { itemIdOf } from "./swarm";
+import { whoOf } from "./raceStatus";
+import { itemIdOf, queueRail, recentBisects } from "./swarm";
 import { isPushed, originBadge } from "./origin";
 import { OriginChip } from "./shell";
 import "./mergeGraph.css";
@@ -447,12 +448,16 @@ function Legend({ layout }: { layout: MergeGraphLayout }) {
 export const STRIP_SPAN_MS = 30 * 60_000;
 
 /**
- * The status home's merge-train strip: header, the last 30 minutes of the graph, and the way to the queue page.
+ * The home's MERGE TREE panel (dashboard redesign §3.2 item 3): the last 30 minutes of the graph (always drawn, the demo's
+ * talking point), the newest commit on main, and a CARS sub-section with the current train ("No cars in line" when empty).
  * "N landed" counts landings inside the same 30-minute window the graph draws (not the session's total).
  */
-export function MergeTrainStrip({ state, hive, now }: { state: State; hive: string; now?: number }) {
+export function MergeTreePanel({ state, hive, now }: { state: State; hive: string; now?: number }) {
+  const rail = useMemo(() => queueRail(state), [state]);
+  const bisected = useMemo(() => new Set(recentBisects(state, 5).map((b) => b.trainId)), [state]);
+  const main = rail.main;
   return (
-    <section className="mq" aria-label="Merge train">
+    <section className="panel mtree" aria-label="Merge tree">
       <MergeGraph
         state={state}
         hive={hive}
@@ -460,12 +465,35 @@ export function MergeTrainStrip({ state, hive, now }: { state: State; hive: stri
         density="compact"
         now={now}
         head={(l) => (
-          <div className="mq__head">
-            <h3 className="eyebrow">MERGE TRAIN · LAST 30 MIN</h3>
+          <div className="mtree__head">
+            <h3 className="eyebrow">MERGE TREE</h3>
+            {main && <code key={main.sha} className="mtree__landed" title={`train ${main.trainId}`}>main ← {main.sha.slice(0, 7)}</code>}
             <Link to={hrefFor.queue(hive)} className="mq__meta">{l.landedInWindow} landed in 30 min · queue page ▸</Link>
           </div>
         )}
       />
+      <div className="mtree__cars" aria-label="Cars">
+        <p className="eyebrow">CARS</p>
+        {rail.cars.length === 0 ? (
+          <p className="mtree__empty sh-muted">No cars in line</p>
+        ) : (
+          <ul className="mtree__list">
+            {rail.cars.map((c) => (
+              <li key={c.train.trainId} className={`mtree__car mtree__car--${c.phase.toLowerCase()}${bisected.has(c.train.trainId) ? " mtree__car--bisect" : ""}`}>
+                <b className="mtree__car-label">{c.label}</b>
+                <span className="chip chip--sm mtree__phase">{c.phase.toLowerCase()}</span>
+                <span className="mtree__members">
+                  {c.members.map((m) => {
+                    const t = state.trains[m.trainId];
+                    const who = t ? whoOf(t).who : m.title;
+                    return m.itemId ? <Link key={m.trainId} to={hrefFor.item(hive, m.itemId)} title={m.title}>{who}</Link> : <span key={m.trainId} title={m.title}>{who}</span>;
+                  })}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </section>
   );
 }
