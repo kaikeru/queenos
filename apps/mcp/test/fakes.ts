@@ -1,5 +1,5 @@
 /** In-memory Artifacts (with the receive-pack probe), Queen, registry and identities. Only the network is faked. */
-import type { AttemptAborted, AttemptBaseFailed, AttemptBaseReady, AttemptIntent, AttemptIntentDecision, AttemptOwnerAction, AttemptReady, AttemptResult, AttemptView, HiveStatus, ItemAttempts, ItemDetail, McpAgentIdentity, Project, Race, WorkItem } from "@queenos/queen-types";
+import type { AttemptAborted, AttemptBaseFailed, AttemptBaseReady, AttemptIntent, AttemptIntentDecision, AttemptOwnerAction, AttemptReady, AttemptResult, AttemptSyncBase, AttemptView, HiveStatus, ItemAttempts, ItemDetail, McpAgentIdentity, Project, Race, RejectRace, RejectRaceResult, WorkItem } from "@queenos/queen-types";
 import { forkDepsFor } from "../src/fork";
 import type { AttemptRef, IdentityPort, McpArtifacts, McpPorts, McpRepoHandle, QueenPort, RegistryPort, Snapshot } from "../src/ports";
 import type { SessionPort } from "../src/tools";
@@ -23,7 +23,7 @@ interface FakeRepo {
   main: string;
   readOnly: boolean;
   source: string | null;
-  tokens: { id: string; state: string }[];
+  tokens: { id: string; state: string; scope: "read" | "write" }[];
 }
 
 export class FakeArtifacts implements McpArtifacts {
@@ -42,12 +42,12 @@ export class FakeArtifacts implements McpArtifacts {
     return {
       [Symbol.dispose]() {},
       info: async () => ({ remote: REMOTE(name) }),
-      createToken: async (_scope, ttl) => {
+      createToken: async (scope, ttl) => {
         const id = `tok-${++this.n}`;
-        st.tokens.push({ id, state: "active" });
+        st.tokens.push({ id, state: "active", scope });
         return { id, plaintext: `art_v1_${"f".repeat(40)}${this.n}?expires=${1_800_000_000 + ttl}`, expiresAt: new Date((1_800_000_000 + ttl) * 1000).toISOString() };
       },
-      listTokens: async () => ({ tokens: st.tokens.map((t) => ({ ...t })) }),
+      listTokens: async () => ({ tokens: st.tokens.map((t) => ({ id: t.id, state: t.state })) }),
       revokeToken: async (id) => {
         const t = st.tokens.find((x) => x.id === id);
         if (!t) return false;
@@ -154,7 +154,7 @@ export class FakeQueen implements QueenPort {
   }
   async getItemDetail(itemId: string) {
     this.rec("getItemDetail", itemId);
-    return { item: { itemId, status: "READY", waitReason: "awaiting submissions" }, children: [{ itemId: `${itemId}-c1` }], trains: [], races: [], release: null, escalations: [] } as unknown as ItemDetail;
+    return { item: { itemId, status: "READY", waitReason: "awaiting submissions" }, children: [{ itemId: `${itemId}-c1` }], trains: [], races: this.races, release: null, escalations: [] } as unknown as ItemDetail;
   }
   async getSnapshot() {
     this.rec("getSnapshot", null);
@@ -202,6 +202,32 @@ export class FakeQueen implements QueenPort {
     this.rec("attemptRegate", input);
     if (!this.regate) throw new Error('The RPC receiver does not implement the method "attemptRegate".');
     return this.regate(input);
+  }
+  /** Races getItemDetail answers (newest last). */
+  races: Race[] = [];
+  /** null = behave like a Queen without the RPC. */
+  syncBase: ((input: AttemptSyncBase) => AttemptResult) | null = (input) => {
+    const v = this.views.get(input.attemptId);
+    if (!v) return { ok: false, code: "NOT_FOUND", message: "no attempt" };
+    const next = { ...v, baseSha: input.baseSha };
+    this.views.set(input.attemptId, next);
+    return { ok: true, attempt: next, changed: true };
+  };
+  async attemptSyncBase(input: AttemptSyncBase): Promise<AttemptResult> {
+    this.rec("attemptSyncBase", input);
+    if (!this.syncBase) throw new Error('The RPC receiver does not implement the method "attemptSyncBase".');
+    return this.syncBase(input);
+  }
+  /** null = behave like a Queen without the RPC. */
+  reject: ((input: { hive: string; raceId: string; user: string; reject: RejectRace }) => RejectRaceResult) | null = (input) => ({
+    outcome: "applied",
+    race: { ...this.races.find((r) => r.raceId === input.raceId)!, state: "RACING", reopens: 1 },
+    fallback: false,
+  });
+  async rejectRace(input: { hive: string; raceId: string; user: string; reject: RejectRace }): Promise<RejectRaceResult> {
+    this.rec("rejectRace", input);
+    if (!this.reject) throw new Error('The RPC receiver does not implement the method "rejectRace".');
+    return this.reject(input);
   }
   async getAttempt(attemptId: string) {
     this.rec("getAttempt", attemptId);

@@ -38,10 +38,10 @@ describe("queenos-mcp Worker", () => {
     expect(await (await exports.default.fetch("http://mcp.test/health")).json()).toEqual({ ok: true, service: "mcp" });
   });
 
-  it("initialize, tools/list (17 tools), whoami and init_agent over Streamable HTTP", async () => {
+  it("initialize, tools/list (19 tools), whoami and init_agent over Streamable HTTP", async () => {
     const sid = await session();
     const list = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { "x-queen-user": OWNER, "mcp-session-id": sid });
-    expect(list.data.find((m) => m.id === 2)?.result?.tools).toHaveLength(17);
+    expect(list.data.find((m) => m.id === 2)?.result?.tools).toHaveLength(19);
     const who = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "whoami", arguments: {} } }, { "x-queen-user": OWNER, "mcp-session-id": sid });
     expect(JSON.parse(who.data.find((m) => m.id === 3)!.result!.content![0]!.text)).toEqual({ owner: OWNER, agent: null });
     const init = await rpc({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "init_agent", arguments: { name: "opus", model: "claude-opus-5-5", role: "worker" } } }, { "x-queen-user": OWNER, "mcp-session-id": sid });

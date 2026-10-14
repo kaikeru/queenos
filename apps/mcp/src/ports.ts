@@ -11,6 +11,7 @@ import type {
   AttemptOwnerAction,
   AttemptReady,
   AttemptResult,
+  AttemptSyncBase,
   AttemptView,
   HiveStatus,
   ItemAttempts,
@@ -21,6 +22,8 @@ import type {
   PromptRun,
   QueenServerMessage,
   Race,
+  RejectRace,
+  RejectRaceResult,
   SubmitPrompt,
   WorkItem,
 } from "@queenos/queen-types";
@@ -44,6 +47,10 @@ export interface QueenPort {
   attemptEnd(input: AttemptOwnerAction): Promise<AttemptResult>;
   /** A Queen older than the regate fix lacks this RPC: the call then throws "does not implement" (see retry_gates). */
   attemptRegate(input: AttemptOwnerAction): Promise<AttemptResult>;
+  /** Rework loop: record hive main as the attempt's base. A Queen older than the rework loop lacks it ("does not implement"). */
+  attemptSyncBase(input: AttemptSyncBase): Promise<AttemptResult>;
+  /** Rework loop: send PICKING candidates back with a reason (409 -> CONFLICT, 404 -> NOT_FOUND). */
+  rejectRace(input: { hive: string; raceId: string; user: string; reject: RejectRace }): Promise<RejectRaceResult>;
   getAttempt(attemptId: string): Promise<AttemptView | null>;
   attemptsForItem(itemId: string): Promise<ItemAttempts>;
   verdictNote(sha: string): Promise<string | null>;

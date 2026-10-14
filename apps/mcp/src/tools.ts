@@ -13,19 +13,22 @@ import {
   ClaimedModelSchema,
   ENTRY_WINDOW_MAX_MS,
   HiveSlugSchema,
+  SYNC_TOKEN_TTL_S,
   WAIT_MAX_MS,
   WorkStatusSchema,
   isTerminalAttemptState,
+  type AttemptResult,
   type AttemptState,
   type AttemptVerdict,
   type AttemptView,
   type McpAgentIdentity,
   type McpToolError,
+  type SyncBaseResult,
   type Race,
 } from "@queenos/queen-types";
-import { attemptDir, cleanupOf, configCommand } from "./commands";
+import { attemptDir, cleanupOf, configCommand, syncCommand, syncNext } from "./commands";
 import { ToolError, artifactsUnavailable, fromQueen, messageOf, refusal } from "./errors";
-import type { McpPorts } from "./ports";
+import type { McpPorts, McpRepoHandle } from "./ports";
 import { openAttempts, startAttempt } from "./start";
 
 export interface SessionPort {
@@ -92,7 +95,7 @@ async function requireHive(ctx: ToolCtx, hive: string): Promise<void> {
 
 /** The attempt view as the agent sees it: the v18 fields read `?? null` (an older Queen omits them), terminal ones carry the cleanup. */
 const withCleanup = (v: AttemptView) => {
-  const view = { ...v, verdictKind: v.verdictKind ?? null, regating: v.regating ?? null };
+  const view = { ...v, verdictKind: v.verdictKind ?? null, regating: v.regating ?? null, rework: v.rework ?? null };
   return isTerminalAttemptState(v.state) ? { ...view, cleanup: cleanupOf(v.attemptId) } : view;
 };
 
@@ -101,6 +104,11 @@ const FINDING = /^Queen-Finding: (.+)$/gm;
 /** The findings of a rejection: the note's `Queen-Finding` lines, else the train's reason. Infra has none. */
 function findingsOf(view: AttemptView, note: string | null): string[] {
   if (view.verdict !== "rejected" || view.verdictKind === "infra") return [];
+  if (view.verdictKind === "conflict") {
+    const c = view.train?.conflict;
+    if (c?.paths.length) return c.paths.slice(0, 50);
+    return [c?.summary ?? view.train?.reason ?? "merge conflict"];
+  }
   const lines = note ? [...note.matchAll(FINDING)].map((m) => m[1]!.trim().slice(0, 300)) : [];
   if (lines.length) return lines;
   return view.train?.reason ? [view.train.reason] : [];
@@ -109,10 +117,14 @@ function findingsOf(view: AttemptView, note: string | null): string[] {
 /** retry_gates against a Queen that predates the attemptRegate RPC: workerd's "The RPC receiver does not implement the method". */
 const lacksRpc = (e: unknown): boolean => /does not implement the method/i.test(messageOf(e));
 
-/** `wait` on an attempt: verdict = its head PASSED / REJECTED (or WON); decided = WON / LOST; landed = LANDED. Any terminal state ends every wait. */
+/**
+ * `wait` on an attempt: verdict = its head PASSED / REJECTED (or WON); decided = WON / LOST; landed = LANDED. Any terminal state ends every wait.
+ * REJECTED ends every wait too (rework spec 6.2): a WON / PASSED attempt that goes back to REJECTED (conflict, human reject) must wake the waiter.
+ */
 export function attemptReached(state: AttemptState, until: "verdict" | "decided" | "landed"): boolean {
   if (isTerminalAttemptState(state)) return true;
-  if (until === "verdict") return state === "PASSED" || state === "REJECTED" || state === "WON";
+  if (state === "REJECTED") return true;
+  if (until === "verdict") return state === "PASSED" || state === "WON";
   if (until === "decided") return state === "WON";
   return false;
 }
@@ -174,7 +186,7 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: "create_goal",
-    description: "Orchestrators only: file a goal in an external hive. It becomes one item agents race on. judge: auto (the Queen ranks) or pick (a human picks). entryWindowMs: how long the race takes entries after its first push (max 1 h).",
+    description: "Orchestrators only: file a goal in an external hive. Write it as a work spec, like a ticket, for whoever picks it up: the outcome, acceptance criteria and constraints. It becomes one item agents race on. judge: auto (the Queen ranks) or pick (a human or an orchestrator picks, and may reject with a reason). entryWindowMs: how long the race takes entries after its first push (max 1 h).",
     shape: {
       hive: HiveSlugSchema,
       title: z.string().min(1).max(120),
@@ -217,7 +229,7 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: "get_item",
-    description: "One item and its race: state, shared base commit, entry window and candidates (attempt, agent, claimed model, verdict, kind: findings or infra, preview).",
+    description: "One item and its race: state, shared base commit, entry window and candidates (attempt, agent, claimed model, verdict, kind: findings, infra, conflict or human; rework, preview).",
     shape: { hive: HiveSlugSchema, itemId: ItemIdSchema },
     run: async (ctx, a: { hive: string; itemId: string }) => {
       agentOf(ctx);
@@ -235,7 +247,7 @@ export const TOOLS: ToolSpec[] = [
               entryClosesAt: race.entryClosesAt ?? null,
               candidates: atts.attempts
                 .filter((x) => race.trainIds.includes(x.trainId))
-                .map((x) => ({ attemptId: x.attemptId, agent: x.agentName, claimedModel: x.model, verdict: x.verdict, kind: x.verdictKind ?? null, previewUrl: x.train?.previewUrl ?? null })),
+                .map((x) => ({ attemptId: x.attemptId, agent: x.agentName, claimedModel: x.model, verdict: x.verdict, kind: x.verdictKind ?? null, previewUrl: x.train?.previewUrl ?? null, rework: x.rework ?? null })),
             }
           : null,
       };
@@ -244,7 +256,7 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "start_attempt",
     description:
-      "Start an attempt on an item (or a goal with one open item): you get your own fork of the item's frozen base and a 2 h token for it. Run setupCommand (it creates the clone), commit, `git push origin main`. Can take up to a minute.",
+      "Start an attempt on an item (or a goal with one open item): you get your own fork of the item's frozen base and a 2 h token for it. Run setupCommand (it creates the clone), commit, `git push origin main`. Can take up to a minute. A rejection may come with a rework slot (rework.dueAt): fix it (for a conflict: sync_base, then rebase) and push again before dueAt, as the same candidate.",
     shape: { hive: HiveSlugSchema, itemId: ItemIdSchema.optional(), goalId: ItemIdSchema.optional() },
     run: async (ctx, a: { hive: string; itemId?: string; goalId?: string }) => {
       const agent = agentOf(ctx);
@@ -318,7 +330,7 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: "wait",
-    description: `Long-poll (at most ${WAIT_MAX_MS} ms) until your attempt (attemptId) or an item (hive + itemId) reaches: verdict, decided or landed. On timeout returns changed:false; call again.`,
+    description: `Long-poll (at most ${WAIT_MAX_MS} ms) until your attempt (attemptId) or an item (hive + itemId) reaches: verdict, decided or landed. On timeout returns changed:false; call again. A rejection may open a rework slot (attempt.rework): fix and push again before rework.dueAt.`,
     shape: {
       attemptId: AttemptIdSchema.optional(),
       hive: HiveSlugSchema.optional(),
@@ -360,12 +372,27 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: "get_verdict",
-    description: "Your attempt's verdict on its current head: the v1 verdict note (as on refs/notes/verdict), kind (findings = fix and push; infra = the gate could not run, call retry_gates), findings, regating and the preview URL.",
+    description: "Your attempt's verdict on its current head: the v1 verdict note, kind (findings = fix and push; infra = the gate could not run, call retry_gates; conflict = sync_base, rebase onto queen/main, push; human = a judge's reason, address it and push), findings, rework ({reason, dueAt, round}: you may push again as the same candidate before dueAt), next, regating and the preview URL.",
     shape: { attemptId: AttemptIdSchema },
     run: async (ctx, a: { attemptId: string }) => {
       const { hive, view } = await ownAttempt(ctx, agentOf(ctx), a.attemptId);
       const note = view.headSha ? await ctx.ports.queen(hive).verdictNote(view.headSha) : null;
       const kind = view.verdictKind ?? null;
+      // An older Queen has no `rework` key (keep today's next); a newer one says null when no slot is open.
+      const rework = view.rework;
+      const due = rework ? new Date(rework.dueAt).toISOString() : null;
+      const next =
+        kind === "infra"
+          ? "retry_gates"
+          : kind === "conflict"
+            ? due && `call sync_base, rebase onto queen/main, push again before ${due}`
+            : kind === "human"
+              ? due && `address the reviewer's reason, push again before ${due}`
+              : kind === "findings"
+                ? rework === undefined
+                  ? "fix and push"
+                  : due && `fix and push before ${due}`
+                : null;
       return {
         headSha: view.headSha,
         verdict: view.verdict,
@@ -375,7 +402,8 @@ export const TOOLS: ToolSpec[] = [
         note,
         previewUrl: view.train?.previewUrl ?? null,
         regating: view.regating ?? null,
-        next: kind === "infra" ? "retry_gates" : kind === "findings" ? "fix and push" : null,
+        rework: rework ?? null,
+        next: next || null,
       };
     },
   },
@@ -395,6 +423,59 @@ export const TOOLS: ToolSpec[] = [
       }
       if (!r.ok) throw refusal(r);
       return { changed: r.changed, state: r.attempt.state, trainId: r.attempt.trainId, race: r.attempt.race };
+    },
+  },
+  {
+    name: "sync_base",
+    description:
+      "Your attempt: bring the hive's current main into your clone as queen/main, to rebase on (READY, or REJECTED with an open rework slot, e.g. after a conflict). Run the returned syncCommand (fetch only; it fails if main moved, then call again), rebase, run the tests, push --force-with-lease origin HEAD:main. Your next push is gated against baseSha.",
+    shape: { attemptId: AttemptIdSchema },
+    run: async (ctx, a: { attemptId: string }): Promise<SyncBaseResult> => {
+      const agent = agentOf(ctx);
+      const { hive, view } = await ownAttempt(ctx, agent, a.attemptId);
+      if (isTerminalAttemptState(view.state)) throw new ToolError("ATTEMPT_EXPIRED", `attempt ${a.attemptId} is ${view.state}`);
+      const slotOpen = !!view.rework && view.rework.dueAt > ctx.ports.now();
+      if (view.state !== "READY" && !(view.state === "REJECTED" && slotOpen)) {
+        throw new ToolError("CONFLICT", `attempt ${a.attemptId} is ${view.state === "REJECTED" ? "REJECTED with no open rework slot" : view.state}; sync_base needs READY or an open rework slot`);
+      }
+      const unavailable = () => new ToolError("ARTIFACTS_UNAVAILABLE", "reading the hive's main failed; retry sync_base", { retryAfterMs: 5000 });
+      let handle: McpRepoHandle;
+      try {
+        handle = await ctx.ports.artifacts.get(hive);
+      } catch {
+        throw unavailable();
+      }
+      using repo = handle;
+      let tok: { id: string; plaintext: string } | null = null;
+      // Only the token this call minted is ever revoked: the hive repo has other tokens.
+      const revoke = async () => {
+        if (tok) await repo.revokeToken(tok.id).catch(() => false);
+      };
+      let baseSha: string;
+      let cmd: string;
+      try {
+        const remote = (await repo.info()).remote.replace(/\/+$/, "");
+        baseSha = (await repo.log({ ref: "main", limit: 1 }))[0]?.hash ?? "";
+        if (!/^[0-9a-f]{40}$/.test(baseSha)) throw unavailable();
+        tok = await repo.createToken("read", SYNC_TOKEN_TTL_S);
+        cmd = syncCommand(remote, tok.plaintext, baseSha, attemptDir(a.attemptId));
+      } catch (e) {
+        await revoke();
+        throw e instanceof ToolError ? e : unavailable();
+      }
+      let r: AttemptResult;
+      try {
+        r = await ctx.ports.queen(hive).attemptSyncBase({ hive, attemptId: a.attemptId, owner: agent.owner, agentId: agent.agentId, baseSha });
+      } catch (e) {
+        await revoke();
+        if (lacksRpc(e)) throw new ToolError("UNAVAILABLE", "sync_base needs a newer Queen", { retryable: false });
+        throw e;
+      }
+      if (!r.ok) {
+        await revoke();
+        throw refusal(r);
+      }
+      return { baseSha, syncCommand: cmd, next: syncNext(attemptDir(a.attemptId)) };
     },
   },
   {
@@ -419,6 +500,35 @@ export const TOOLS: ToolSpec[] = [
       if (!view) throw new ToolError("NOT_FOUND", `attempt ${a.attemptId} not found`);
       if (isTerminalAttemptState(view.state)) throw new ToolError("ATTEMPT_EXPIRED", `attempt ${a.attemptId} is ${view.state}`);
       return queen.pick({ hive: a.hive, raceId: a.raceId, user: agent.owner, pick: { trainId: view.trainId } });
+    },
+  },
+  {
+    name: "reject",
+    description:
+      "Send candidates of a race you are judging back for rework, with a reason the agent can act on (what is wrong and what you expect instead). target: an attemptId, or \"all\". Only while the item's race waits for a pick (PICKING).",
+    shape: { hive: HiveSlugSchema, itemId: ItemIdSchema, target: z.union([AttemptIdSchema, z.literal("all")]), reason: z.string().min(1).max(300) },
+    run: async (ctx, a: { hive: string; itemId: string; target: string; reason: string }) => {
+      const agent = agentOf(ctx);
+      await requireHive(ctx, a.hive);
+      const queen = ctx.ports.queen(a.hive);
+      const detail = await queen.getItemDetail(a.itemId);
+      const race = detail.races.filter((r) => r.state === "PICKING").at(-1);
+      if (!race) throw new ToolError("CONFLICT", `item ${a.itemId} has no race waiting for a pick`);
+      let trainId = "all";
+      if (a.target !== "all") {
+        const view = await queen.getAttempt(a.target);
+        if (!view) throw new ToolError("NOT_FOUND", `attempt ${a.target} not found`);
+        if (!race.trainIds.includes(view.trainId)) throw new ToolError("CONFLICT", `attempt ${a.target} is not a candidate of race ${race.raceId}`);
+        trainId = view.trainId;
+      }
+      let r;
+      try {
+        r = await queen.rejectRace({ hive: a.hive, raceId: race.raceId, user: agent.owner, reject: { trainId, reason: a.reason } });
+      } catch (e) {
+        if (lacksRpc(e)) throw new ToolError("UNAVAILABLE", "reject needs a newer Queen", { retryable: false });
+        throw e;
+      }
+      return { outcome: r.outcome, race: { raceId: r.race.raceId, state: r.race.state, reopens: r.race.reopens ?? 0 }, fallback: r.fallback };
     },
   },
 ];

@@ -29,3 +29,27 @@ export const cleanupOf = (attemptId: string): string => `remove ${attemptDir(att
 
 export const GIT_NOTE =
   "Run setupCommand once (it creates the clone with the token in its local git config only). Never set a global credential helper or a global http.extraHeader. Commit, then `git push origin main`; call wait({attemptId, until: \"verdict\"}). Before the token expires, refresh_attempt and run its configCommand.";
+
+const SHA_OK = /^[0-9a-f]{40}$/;
+
+/**
+ * `sync_base` (rework-loop spec 6.1): one `&&` chain that (re)adds a read-only `queen` remote for hive main, sets its read
+ * token in the clone's local config (the token appears only here; `--replace-all` rotates it on a rerun), fetches main
+ * as refs/remotes/queen/main, and fails loudly when main moved after the read. Fetch only: the rebase is the agent's.
+ */
+export function syncCommand(hiveRemote: string, readToken: string, baseSha: string, dir: string): string {
+  const header = configCommand(hiveRemote, readToken, dir); // validates remote and token
+  if (!SHA_OK.test(baseSha)) throw new ToolError("ARTIFACTS_UNAVAILABLE", "reading the hive's main failed; retry sync_base", { retryAfterMs: 5000 });
+  const d = sq(dir);
+  return [
+    `(git -C ${d} remote remove queen || true)`,
+    `git -C ${d} remote add queen ${sq(hiveRemote)}`,
+    header,
+    `git -C ${d} fetch queen +main:refs/remotes/queen/main`,
+    `{ test "$(git -C ${d} rev-parse refs/remotes/queen/main)" = ${sq(baseSha)} || { echo ${sq("main moved; call sync_base again")} >&2; false; }; }`,
+  ].join(" && ");
+}
+
+/** What to do after `syncCommand` (6.1 `next`). */
+export const syncNext = (dir: string): string =>
+  `Rebase onto queen/main (git -C ${sq(dir)} rebase queen/main), resolve conflicts keeping both behaviours, run the tests, then git -C ${sq(dir)} push --force-with-lease origin HEAD:main.`;

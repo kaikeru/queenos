@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { McpAgentIdentity } from "@queenos/queen-types";
+import type { McpAgentIdentity, Race } from "@queenos/queen-types";
 import { configCommand, setupCommand } from "../src/commands";
 import { TOOLS, callTool, type ToolOutcome } from "../src/tools";
 import { ATT, ATT_REPO, BASE_REPO, FakeSession, FakeWorld, HIVE, MAIN_SHA, OTHER, OWNER, REMOTE, acceptCreate, viewOf } from "./fakes";
@@ -18,9 +18,9 @@ async function worker(w: FakeWorld, role: "worker" | "orchestrator" = "worker"):
 }
 
 describe("tool table", () => {
-  it("has the 17 tools of spec §6", () => {
+  it("has the 19 tools of spec §6 plus the rework loop", () => {
     expect(TOOLS.map((t) => t.name).sort()).toEqual(
-      ["close_entries", "create_goal", "end_attempt", "get_attempt", "get_item", "get_verdict", "init_agent", "list_attempts", "list_hives", "list_items", "pick", "refresh_attempt", "resume_agent", "retry_gates", "start_attempt", "wait", "whoami"].sort(),
+      ["close_entries", "create_goal", "end_attempt", "get_attempt", "get_item", "get_verdict", "init_agent", "list_attempts", "list_hives", "list_items", "pick", "refresh_attempt", "reject", "resume_agent", "retry_gates", "start_attempt", "sync_base", "wait", "whoami"].sort(),
     );
   });
 });
@@ -245,7 +245,7 @@ describe("own-attempt tools", () => {
     const head = "c".repeat(40);
     w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "REJECTED", headSha: head, verdict: "rejected", train: { trainId: "train-1", phase: "EJECTED", raceOutcome: "FAILED", headSha: head, previewUrl: "https://p.dev", summary: "security: nope", reason: "failed: security: nope", score: null } }));
     w.queen.notes.set(head, "Queen-Verdict: REJECTED");
-    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toEqual({ headSha: head, verdict: "rejected", kind: null, findings: ["failed: security: nope"], summary: "security: nope", note: "Queen-Verdict: REJECTED", previewUrl: "https://p.dev", regating: null, next: null });
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toEqual({ headSha: head, verdict: "rejected", kind: null, findings: ["failed: security: nope"], summary: "security: nope", note: "Queen-Verdict: REJECTED", previewUrl: "https://p.dev", regating: null, rework: null, next: null });
   });
 
   it("end_attempt returns the state and the cleanup, and closes the attempt in the agent's identity", async () => {
@@ -322,6 +322,8 @@ describe("fix round 1", () => {
       close_entries: { hive: HIVE, raceId: "r" },
       pick: { hive: HIVE, raceId: "r", attemptId: ATT },
       retry_gates: { attemptId: ATT },
+      sync_base: { attemptId: ATT },
+      reject: { hive: HIVE, itemId: "item-1", target: "all", reason: "x" },
     };
     for (const t of TOOLS.filter((x) => !["whoami", "init_agent", "resume_agent"].includes(x.name))) {
       expect(errOf(await run(w, new FakeSession(), t.name, args[t.name] ?? {})), t.name).toMatchObject({ code: "NOT_INITIALIZED" });
@@ -593,5 +595,166 @@ describe("batch B: shell-safe commands", () => {
   it("a hostile token is refused too", () => {
     expect(() => setupCommand(REMOTE(ATT_REPO), "tok'; rm -rf ~ #", "d")).toThrow(/unexpected remote or token/);
     expect(() => configCommand(REMOTE(ATT_REPO), "ok_token?expires=1", "d")).not.toThrow();
+  });
+});
+
+describe("rework loop: sync_base (§6.1)", () => {
+  async function withSlot(state: "READY" | "REJECTED" = "REJECTED", rework: unknown = { reason: "conflict", dueAt: 9e12, round: 1 }) {
+    const w = new FakeWorld();
+    const { s, agent } = await worker(w);
+    value(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }));
+    w.queen.views.set(ATT, viewOf({ attemptId: ATT, state, ...(state === "REJECTED" ? { verdict: "rejected", rework } : {}) } as never));
+    return { w, s, agent };
+  }
+
+  it("mints one read token on the hive repo, reads main, records it with the Queen; the token appears once, in syncCommand only", async () => {
+    const { w, s, agent } = await withSlot();
+    w.artifacts.repos.get(HIVE)!.main = "e".repeat(40);
+    const r = value<{ baseSha: string; syncCommand: string; next: string }>(await run(w, s, "sync_base", { attemptId: ATT }));
+    expect(r.baseSha).toBe("e".repeat(40));
+    expect(w.queen.inputs("attemptSyncBase")).toEqual([{ hive: HIVE, attemptId: ATT, owner: OWNER, agentId: agent.agentId, baseSha: "e".repeat(40) }]);
+    const hiveTokens = w.artifacts.repos.get(HIVE)!.tokens;
+    expect(hiveTokens).toEqual([expect.objectContaining({ state: "active", scope: "read" })]);
+    expect(JSON.stringify(r).match(/art_v1_/g)).toHaveLength(1);
+    const dir = `.queenos/attempts/${ATT}`;
+    expect(r.syncCommand).toContain(`(git -C '${dir}' remote remove queen || true) && git -C '${dir}' remote add queen '${REMOTE(HIVE)}'`);
+    expect(r.syncCommand).toContain(`config --local --replace-all 'http.${REMOTE(HIVE)}.extraHeader' 'Authorization: Bearer art_v1_`);
+    expect(r.syncCommand).toContain(`git -C '${dir}' fetch queen +main:refs/remotes/queen/main`);
+    expect(r.syncCommand).toContain(`test "$(git -C '${dir}' rev-parse refs/remotes/queen/main)" = '${"e".repeat(40)}' || { echo 'main moved; call sync_base again' >&2; false; }`);
+    expect(r.next).toContain(`git -C '${dir}' rebase queen/main`);
+    expect(r.next).toContain("push --force-with-lease origin HEAD:main");
+  });
+
+  it("READY is allowed; PUSHED or REJECTED without a slot is CONFLICT, before any token is minted; terminal is ATTEMPT_EXPIRED", async () => {
+    const ready = await withSlot("READY");
+    expect(value(await run(ready.w, ready.s, "sync_base", { attemptId: ATT }))).toMatchObject({ baseSha: MAIN_SHA });
+    const noSlot = await withSlot("REJECTED", null);
+    expect(errOf(await run(noSlot.w, noSlot.s, "sync_base", { attemptId: ATT }))).toMatchObject({ code: "CONFLICT", retryable: false });
+    noSlot.w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "PUSHED" }));
+    expect(errOf(await run(noSlot.w, noSlot.s, "sync_base", { attemptId: ATT }))).toMatchObject({ code: "CONFLICT" });
+    expect(noSlot.w.artifacts.repos.get(HIVE)!.tokens).toEqual([]);
+    noSlot.w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "ABANDONED" }));
+    expect(errOf(await run(noSlot.w, noSlot.s, "sync_base", { attemptId: ATT }))).toMatchObject({ code: "ATTEMPT_EXPIRED" });
+  });
+
+  it("a Queen refusal revokes the read token it minted; a Queen without the RPC is UNAVAILABLE (not retryable), token revoked", async () => {
+    const { w, s } = await withSlot();
+    w.queen.syncBase = () => ({ ok: false, code: "CONFLICT", message: "slot closed" });
+    expect(errOf(await run(w, s, "sync_base", { attemptId: ATT }))).toEqual({ code: "CONFLICT", message: "slot closed", retryable: false });
+    expect(w.artifacts.repos.get(HIVE)!.tokens.map((t) => t.state)).toEqual(["revoked"]);
+    w.queen.syncBase = null;
+    expect(errOf(await run(w, s, "sync_base", { attemptId: ATT }))).toEqual({ code: "UNAVAILABLE", message: "sync_base needs a newer Queen", retryable: false });
+    expect(w.artifacts.activeTokens(HIVE)).toEqual([]);
+  });
+
+  it("an unreadable main is ARTIFACTS_UNAVAILABLE (retry in 5 s), no token is minted, the Queen is not called", async () => {
+    const { w, s } = await withSlot();
+    w.artifacts.repos.get(HIVE)!.main = "";
+    expect(errOf(await run(w, s, "sync_base", { attemptId: ATT }))).toMatchObject({ code: "ARTIFACTS_UNAVAILABLE", retryable: true, retryAfterMs: 5000 });
+    expect(w.queen.inputs("attemptSyncBase")).toEqual([]);
+    expect(w.artifacts.activeTokens(HIVE)).toEqual([]);
+  });
+
+  it("someone else's attempt is FORBIDDEN_OWNER", async () => {
+    const { w } = await withSlot();
+    const { s: other } = await worker(w);
+    expect(errOf(await run(w, other, "sync_base", { attemptId: ATT }))).toMatchObject({ code: "FORBIDDEN_OWNER" });
+  });
+
+  it("a second sync_base rotates the header and revokes nothing it did not mint (Review Focus 5)", async () => {
+    const { w, s } = await withSlot();
+    w.artifacts.repos.get(HIVE)!.tokens.push({ id: "proxy-token", state: "active", scope: "write" });
+    const first = value<{ syncCommand: string }>(await run(w, s, "sync_base", { attemptId: ATT }));
+    const second = value<{ syncCommand: string }>(await run(w, s, "sync_base", { attemptId: ATT }));
+    expect(second.syncCommand).toContain("--replace-all");
+    expect(second.syncCommand).not.toBe(first.syncCommand);
+    expect(w.artifacts.activeTokens(HIVE)).toEqual(expect.arrayContaining(["proxy-token"]));
+    expect(w.artifacts.activeTokens(HIVE)).toHaveLength(3);
+  });
+});
+
+describe("rework loop: reject (§7.4)", () => {
+  const race = (over: Partial<Race> = {}): Race => ({ raceId: "race-1", itemId: "item-1", width: 2, state: "PICKING", trainIds: ["train-1", "train-2"], winnerTrainId: null, reason: null, deadlineAt: null, createdAt: 1, decidedAt: null, ...over });
+
+  it("resolves the item's PICKING race and the attempt's current train; any role; returns the race and fallback", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w, "orchestrator");
+    w.queen.races = [race({ raceId: "race-0", state: "ABANDONED" }), race()];
+    w.queen.views.set(ATT, viewOf({ attemptId: ATT, trainId: "train-2", state: "PASSED" }));
+    expect(value(await run(w, s, "reject", { hive: HIVE, itemId: "item-1", target: ATT, reason: "the jar overlaps the footer" }))).toEqual({ outcome: "applied", race: { raceId: "race-1", state: "RACING", reopens: 1 }, fallback: false });
+    expect(w.queen.inputs("rejectRace")).toEqual([{ hive: HIVE, raceId: "race-1", user: OWNER, reject: { trainId: "train-2", reason: "the jar overlaps the footer" } }]);
+    value(await run(w, s, "reject", { hive: HIVE, itemId: "item-1", target: "all", reason: "none of these" }));
+    expect(w.queen.inputs<{ reject: { trainId: string } }>("rejectRace")[1]!.reject.trainId).toBe("all");
+  });
+
+  it("errors: no PICKING race CONFLICT; a target not in the race CONFLICT; reason empty or > 300 INVALID_INPUT; unknown attempt NOT_FOUND; old Queen UNAVAILABLE", async () => {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    w.queen.races = [race({ state: "RACING" })];
+    expect(errOf(await run(w, s, "reject", { hive: HIVE, itemId: "item-1", target: "all", reason: "x" }))).toMatchObject({ code: "CONFLICT" });
+    w.queen.races = [race()];
+    w.queen.views.set(ATT, viewOf({ attemptId: ATT, trainId: "train-9" }));
+    expect(errOf(await run(w, s, "reject", { hive: HIVE, itemId: "item-1", target: ATT, reason: "x" }))).toMatchObject({ code: "CONFLICT" });
+    expect(errOf(await run(w, s, "reject", { hive: HIVE, itemId: "item-1", target: "all", reason: "" }))).toMatchObject({ code: "INVALID_INPUT" });
+    expect(errOf(await run(w, s, "reject", { hive: HIVE, itemId: "item-1", target: "all", reason: "x".repeat(301) }))).toMatchObject({ code: "INVALID_INPUT" });
+    expect(errOf(await run(w, s, "reject", { hive: HIVE, itemId: "item-1", target: "att_ffffffffffff", reason: "x" }))).toMatchObject({ code: "NOT_FOUND" });
+    w.queen.reject = null;
+    expect(errOf(await run(w, s, "reject", { hive: HIVE, itemId: "item-1", target: "all", reason: "x" }))).toEqual({ code: "UNAVAILABLE", message: "reject needs a newer Queen", retryable: false });
+  });
+});
+
+describe("rework loop: verdicts (§6.2, §7.4)", () => {
+  const DUE = Date.UTC(2026, 9, 13, 12, 30);
+  async function withAttempt() {
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    value(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }));
+    return { w, s };
+  }
+  const train = (over: Record<string, unknown> = {}) => ({ trainId: "train-1", phase: "EJECTED", raceOutcome: "REWORK", headSha: "c".repeat(40), previewUrl: null, summary: "s", reason: "r", score: null, ...over });
+
+  it("conflict: the conflicting paths are the findings; next says sync_base and the due time; rework passes through", async () => {
+    const { w, s } = await withAttempt();
+    w.queen.views.set(ATT, REJ({ verdictKind: "conflict", rework: { reason: "conflict", dueAt: DUE, round: 1 }, train: train({ conflict: { paths: ["src/a.js", "src/b.js"], summary: "Merge conflict" } }) }));
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({
+      kind: "conflict",
+      findings: ["src/a.js", "src/b.js"],
+      rework: { reason: "conflict", dueAt: DUE, round: 1 },
+      next: "call sync_base, rebase onto queen/main, push again before 2026-10-13T12:30:00.000Z",
+    });
+  });
+
+  it("human: the reason is the finding; findings with a slot: fix and push before; no slot on a newer Queen: next null", async () => {
+    const { w, s } = await withAttempt();
+    const head = "c".repeat(40);
+    w.queen.views.set(ATT, REJ({ verdictKind: "human", rework: { reason: "human", dueAt: DUE, round: 1 }, train: train() }));
+    w.queen.notes.set(head, "Queen-Verdict: REJECTED\nQueen-Finding: error review rejected by k@kaikeru.com: ugly");
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({ kind: "human", findings: ["error review rejected by k@kaikeru.com: ugly"], next: "address the reviewer's reason, push again before 2026-10-13T12:30:00.000Z" });
+    w.queen.views.set(ATT, REJ({ verdictKind: "findings", rework: { reason: "findings", dueAt: DUE, round: 2 }, train: train() }));
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({ kind: "findings", next: "fix and push before 2026-10-13T12:30:00.000Z" });
+    w.queen.views.set(ATT, REJ({ verdictKind: "findings", rework: null, train: train({ raceOutcome: "FAILED" }) }));
+    expect(value(await run(w, s, "get_verdict", { attemptId: ATT }))).toMatchObject({ kind: "findings", rework: null, next: null });
+  });
+
+  it("get_attempt and get_item carry rework (null when absent)", async () => {
+    const { w, s } = await withAttempt();
+    w.queen.views.set(ATT, REJ({ verdictKind: "conflict", rework: { reason: "conflict", dueAt: DUE, round: 1 } }));
+    expect(value(await run(w, s, "get_attempt", { attemptId: ATT }))).toMatchObject({ rework: { reason: "conflict", dueAt: DUE, round: 1 } });
+    w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "PUSHED" }));
+    expect(value(await run(w, s, "get_attempt", { attemptId: ATT }))).toMatchObject({ rework: null });
+  });
+});
+
+describe("rework loop: wait wakes on REJECTED (F1, §6.2)", () => {
+  it("REJECTED ends a verdict, decided and landed wait; a WON / PASSED head does not end landed", async () => {
+    const { attemptReached } = await import("../src/tools");
+    for (const until of ["verdict", "decided", "landed"] as const) expect(attemptReached("REJECTED", until)).toBe(true);
+    expect(attemptReached("WON", "landed")).toBe(false);
+    expect(attemptReached("PASSED", "decided")).toBe(false);
+    const w = new FakeWorld();
+    const { s } = await worker(w);
+    value(await run(w, s, "start_attempt", { hive: HIVE, itemId: "item-1" }));
+    w.queen.views.set(ATT, viewOf({ attemptId: ATT, state: "REJECTED", verdict: "rejected" }));
+    for (const until of ["decided", "landed"]) expect(value(await run(w, s, "wait", { attemptId: ATT, until }))).toMatchObject({ changed: true, state: "REJECTED" });
   });
 });
