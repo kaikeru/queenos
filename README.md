@@ -1,19 +1,43 @@
 # QueenOS
 
-**An army of virtual engineers, built on Cloudflare Artifacts. Not a GitHub clone.**
+**Agent-native git, built on Cloudflare Artifacts.**
 
-Built for Cloudflare's [next Git platform](https://blog.cloudflare.com/next-git-platform-on-cloudflare/) challenge. MIT licensed. Needs Node 22+ (`.nvmrc` pins 24; wrangler requires 22 or later).
+Git for agents isn't a review tool, it's a selection-and-integration engine. You don't open a PR; you submit a candidate, and the swarm decides.
 
-QueenOS applies decades of software-engineering practice (tickets, design review, trunk-based development, merge queues, canaries, SLOs, runbooks, postmortems), adapted for agents that work in minutes and never get tired of re-running a pipeline. You state goals. The Queen, a Durable Object per hive, splits them into work items, hands the independent ones to many builder agents **at the same time**, reviews every change several ways, lands it through a speculative merge queue, ships it through canaries and files its own bugs when something breaks. A hive is **autonomous by default**: humans hear about it only when something escalates.
+Built for Cloudflare's [next Git platform](https://blog.cloudflare.com/next-git-platform-on-cloudflare/) challenge. MIT licensed. Needs Node 22+ (`.nvmrc` pins 24).
 
-What makes it more than a pipeline:
+Agents and humans push through the QueenOS git proxy (`git push` to `https://<host>/git/<hive>`) or connect over MCP (`https://<host>/mcp`). Each push is a **Submission** into an item's inbox. The Queen gates it, races it against other candidates for the same item, picks a winner and lands it through a speculative merge queue. Verdicts come back as `remote:` lines in the push output and as git notes (`refs/notes/verdict`, `refs/notes/review`, `refs/notes/provenance`) that any git client can fetch. Humans can join anywhere and are required nowhere.
 
-- **Parallel builds.** Independent items fork from `main` at the same moment and build concurrently. Only dependent items wait.
-- **A speculative, batched merge queue.** Passed builds board *cars*; a MERGE drone 3-way merges each car onto the speculative tip, the merged tree is re-gated, and a fast-forward push lands it. A failed batch is bisected; a conflict becomes an agent-driven rework, not a human merge session.
-- **Best-of-N races.** Hard items and reworks are built by 2 to 3 agents on different models from the same base; the best passing candidate lands.
-- **Self-filed bugs.** Builders and gates file follow-up bugs for what they notice outside the diff, and a rolled-back release files a P0. Hard caps and dedupe keep bugs from breeding bugs.
-- **SLO-gated autonomy.** Releases ship themselves while the gates, Sentinel and the change-success error budget are green. An exhausted budget or a rollback streak drops the hive to `supervised`, where a human taps to ship.
-- **Trace drill-down.** One trace id runs from item to build to merge-queue car to gate to release to Sentinel. The dashboard drills from the status home down to an item, a lane, a trace waterfall and the raw event log.
+### Git, reimagined
+
+| Git today | QueenOS |
+|---|---|
+| Repository | Hive |
+| Branch / worktree | Ephemeral fork |
+| Pull request | Submission into an item's inbox |
+| Code review | Gates, reviewer, human pick |
+| Merge conflict | Queue, bisect, agent rework |
+| "Why" | Item intent + git notes + trace |
+| Comparing changes | Races + pick |
+
+### External coding agents are the headline workers
+
+A hive can run `executors: "external"` (the dashboard's workers select, or `PATCH /hives/<hive>/settings {"executors":"external"}`): the Queen files items and waits for outside agents (Claude Code, Codex, anything that speaks git or MCP) instead of dispatching its own drones.
+
+- **Git path:** push `item/<id>` (or `goal/<slug>`) to join an item's race. Any other branch name files a new item, still fully gated. Pushing `main` is refused.
+- **MCP path:** `init_agent`, then `start_attempt` gives the agent its own Artifacts fork of the item's frozen base and a 2 h token for that fork only. It works there, pushes `main`, and `wait`s for the verdict. See [docs/agent-protocol.md](docs/agent-protocol.md) §8.
+- **Rework loop:** a REJECTED verdict says why (`findings`, `conflict` or `human`). For a conflict the agent calls `sync_base`, rebases onto `queen/main` and re-pushes; before the rework deadline the push stays the same candidate in the same race. A human can reject a candidate (or all of them) with a reason from the dashboard.
+
+### The swarm proves the git layer works
+
+The git layer sits on a full delivery pipeline, so a submission goes all the way to production:
+
+- **Parallel builds and best-of-N races.** Independent items fork from `main` at the same moment; hard items are raced by 2 to 3 candidates and the best passing one lands. The built-in drones (a `@cloudflare/think` coding agent) compete in the same races as external agents.
+- **A speculative, batched merge queue.** Passed candidates board *cars*; a MERGE drone 3-way merges each car onto the speculative tip, the merged tree is re-gated, and a fast-forward push lands it. A failed batch is bisected; a conflict becomes an agent-driven rework, not a human merge session.
+- **Deploy pipeline and SRE.** Landing is not shipping: staging, Sentinel probes, canary at 1, 10, 50 and 100 percent, automatic rollback, a change-success error budget that drops a hive to `supervised` when exhausted, and self-filed bugs (a rollback files a P0).
+- **Trace drill-down.** One trace id runs from item to build to car to gate to release to Sentinel; the dashboard drills from status home to the raw event log.
+
+A hive is **autonomous by default**: humans hear about it only when something escalates.
 
 ## Practices, adapted
 
@@ -164,7 +188,9 @@ flowchart LR
 | Worker | Role |
 |---|---|
 | `queen` | Scheduler and state: the `decide()` pipeline (work, train, merge-queue, release and escalation planners), model router, autonomy and error budget, event log, watchdogs, coalesced WebSocket room. Also hosts the `SwarmGovernor` DO. Reachable only through the edge. |
-| `queenos-edge` | Front door at `queenos.kaikeru.com`: Access JWT verification, dashboard assets, routing, project registry, allowlisted metrics proxy. |
+| `queenos-edge` | Front door at your custom domain: Access JWT verification, dashboard assets, routing, project registry, git-token auth for `/git/*` and `/mcp`, allowlisted metrics proxy. |
+| `queenos-git` | The git proxy: smart-HTTP over Artifacts, pre-receive rules, one fork per push, `remote:` verdict lines and synthesized git notes. Reached only through the edge. |
+| `queenos-mcp` | MCP server for agents: one Artifacts fork per attempt. Reached only through the edge. |
 | dashboard | React + Vite: status-first home, swarm floor, merge-queue page, item page, lanes, trace waterfall, event log, metrics. Served by the edge. |
 | `queenos-oracle` | DECOMPOSE a goal into items (dependencies, difficulty, predicted paths) and TRIAGE bugs (dedupe). |
 | `queenos-provisioner` | Artifacts fork and delete, seeds new hives from `templates/worker-starter`, recalls hive memories on fork. |
@@ -322,46 +348,83 @@ sleep 12
 
 Open http://localhost:8787. Any 32-hex account id and any fake token work. The edge's `dev` env and the Queen's `sim` env refuse non-localhost requests, so deploying them by mistake can't bypass Access.
 
-## Deploy to Cloudflare
+## Deploy your own
 
-Needs a Workers Paid account (Artifacts) and wrangler 4.145+. Steps marked **(unverified)** have not been run against a real account; [docs/day1-verification.md](docs/day1-verification.md) is the runbook for resolving them.
+The reference deployment runs at queenos.kaikeru.com; nothing below assumes that account. Placeholders: `<host>` is your custom domain, `<team>` is your Zero Trust team name.
 
-The public front door is one Worker, `queenos-edge`, at **https://queenos.kaikeru.com**, behind Cloudflare Access. It verifies the Access JWT, serves the dashboard, hosts the project registry, and forwards to `queenos-vault`, `queenos-genesis` and the `queen` over service bindings. The queen has `workers_dev: false`, so it is reachable only through the edge.
+### Prerequisites
+
+- A Cloudflare account on Workers Paid, with access to Artifacts (the platform is in beta; billing starts 2026-10-14) and a domain on Cloudflare for the edge's custom domain.
+- Node 22+ (24 recommended, `nvm use`), pnpm via `corepack enable`, wrangler 4.147+ (installed by `pnpm install`).
+- `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` in your shell, or run `pnpm exec wrangler login`.
+- A Zero Trust (Access) plan on the account; the free plan works.
+- The account's workers.dev subdomain must exist: each hive's staging and production apps are deployed as `<hive>-app` and `<hive>-staging` on `workers.dev`.
+
+### Values to change
+
+Only the top-level config is deployed (`scripts/deploy.sh` passes `--env=""`); the `dev` and `test` env blocks in the same file repeat these values but are never deployed.
+
+| File | Key | Set it to |
+|---|---|---|
+| `apps/edge/wrangler.jsonc` | `routes[0].pattern` (line 15) | Your custom domain, `<host>`. It must be a zone on your account. |
+| `apps/edge/wrangler.jsonc` | `vars.ACCESS_TEAM` (line 34) | Your Zero Trust team name (`<team>.cloudflareaccess.com`). |
+| `apps/edge/wrangler.jsonc` | `vars.ALLOWED_EMAIL_DOMAINS` (line 35) | Comma-separated email domains allowed to sign in. |
+| `apps/edge/wrangler.jsonc` | `vars.ACCESS_AUD` (line 37) | The AUD tag of your main Access app (see below). Empty fails closed with 503. |
+| `apps/edge/wrangler.jsonc` | `vars.ACCOUNT_ID` (line 40) | Your account id. Only used by the optional Metrics page. |
+
+Nothing else under `apps/*/wrangler.jsonc` or `apps/*/src` is account-specific. Names that every deployer shares and that you create yourself are listed next; keep the names, or change them everywhere they appear.
 
 ### One-time resources
 
-- Vectorize indexes (768 dims, cosine, matching the 768-dim `@cf/baai/bge-base-en-v1.5` embeddings): `wrangler vectorize create queenos-failures --dimensions=768 --metric=cosine` for failure logs, and `wrangler vectorize create queenos-memory --dimensions=768 --metric=cosine` plus `wrangler vectorize create-metadata-index queenos-memory --property-name=namespace --type=string` for hive memory (the gatekeepers write it, the provisioner reads it; recall filters on `namespace`).
-- AI Gateway named `queenos` (authenticated). LLM calls use the Workers `AI` binding through the gateway, so there are no tokens or provider keys. The Queen's model router picks the builder model per task from `MODEL_CATALOG` (all Workers AI `@cf/...` models); `MODEL_BUILDER` is only the fallback. The Scribe and reviewer models are wrangler vars `MODEL_SCRIBE` and `MODEL_REVIEWER`. `DRONE_LLM_MODE` is `live` or `scripted` (deterministic); `DRONE_HARNESS` is `agent` (the Think builder) or `single-shot`; `REVIEW_MODE` is `llm`, `scripted` or `off`.
-- Worker Loader binding for the drones (`worker_loaders`, binding `LOADER`) so the builder can verify in a Dynamic Worker.
-- Event subscription: `cf.artifacts.repo.pushed` to the gatekeepers Workflow via `triggers.events`, filtered by namespace only (repo-name globs are accepted but never match, so the Workflow filters `<hive>-train-*` itself; see [docs/day1-results.md](docs/day1-results.md)).
+Create these before the first deploy (all names are used by the wrangler configs):
+
+```bash
+cd apps/gatekeepers
+pnpm exec wrangler vectorize create queenos-failures --dimensions=768 --metric=cosine
+pnpm exec wrangler vectorize create queenos-memory   --dimensions=768 --metric=cosine
+pnpm exec wrangler vectorize create-metadata-index queenos-memory --property-name=namespace --type=string
+pnpm exec wrangler vectorize create-metadata-index queenos-memory --property-name=kind --type=string
+```
+
+- **Artifacts namespace `queenos`.** Bound by name in git, mcp, provisioner, oracle, drones, herald and gatekeepers. The gatekeepers' `triggers.events` subscribes to `cf.artifacts.repo.pushed` filtered on namespace `queenos`.
+- **AI Gateway `queenos`** (`AI_GATEWAY_ID`), authenticated. LLM calls use the Workers `AI` binding through the gateway, so there are no provider keys. Models are Workers AI `@cf/...` models picked by the Queen's model router from `MODEL_CATALOG`; `MODEL_BUILDER`, `MODEL_SCRIBE` and `MODEL_REVIEWER` are wrangler vars. `DRONE_LLM_MODE` is `live` or `scripted`; `DRONE_HARNESS` is `agent` (the Think builder) or `single-shot`; `REVIEW_MODE` is `llm`, `scripted` or `off`.
+- **Analytics Engine dataset `queenos_events`** needs no setup: it appears after the first write.
+- **Worker Loader** (`LOADER`, for the builder's Dynamic Worker verify) is a binding in `apps/drones/wrangler.jsonc`; it needs no setup.
 
 ### Deploy
 
 ```bash
-scripts/deploy.sh              # bootstrap pass if needed, then full pass
-scripts/deploy.sh --bootstrap  # force the bootstrap pass
-scripts/deploy.sh --dry-run    # build every bundle into .deploy-dryrun/, deploy nothing
+scripts/deploy.sh --dry-run    # optional: build every bundle into .deploy-dryrun/, deploy nothing
+scripts/deploy.sh              # bootstrap pass if any Worker is missing, then the full pass
 ```
 
-The Workers bind to each other in cycles (queen and the executors, genesis and the provisioner, the edge to everything), and wrangler rejects a binding to a script that does not exist yet (code 10061, `docs/day1-results.md`). The script therefore runs two passes over queen, oracle, provisioner, herald, sentinel, drones, gatekeepers, vault, genesis and edge:
+The script deploys, in order: queen, provisioner, herald, sentinel, oracle, drones, gatekeepers, vault, genesis, git (`queenos-git`), mcp (`queenos-mcp`), edge. The Workers bind to each other in cycles (queen and the executors, genesis and the provisioner, the edge and mcp, the edge to everything), and wrangler rejects a binding to a script that does not exist yet (code 10061, [docs/day1-results.md](docs/day1-results.md)). So:
 
-1. **Bootstrap pass** (automatic when any script has never been deployed, or forced with `--bootstrap`): deploy every Worker from a temporary config with its cross-script bindings stripped (DO and Workflow bindings that have `script_name`, and all `services`). Own DOs, Workflows, migrations, assets and routes are kept. The real config files are untouched.
-2. **Full pass:** deploy every Worker with its full config.
+1. **Bootstrap pass** (automatic when any script has never been deployed, or forced with `--bootstrap`): every Worker is deployed from a temporary config with its cross-script bindings stripped (Durable Object and Workflow bindings with `script_name`, and all `services`). Own DOs, Workflows, migrations, assets and routes are kept. Your config files are untouched.
+2. **Full pass:** every Worker is deployed with its full config.
 
-The provisioner's template generator runs before it deploys, and the dashboard is built before the edge. It deploys with `--env=""` (the `sim`, `dev` and `test` envs are not for deployment) and prints the manual steps below when it finishes. `--only <app>` limits a pass to one app dir (e.g. `--only edge`).
+The provisioner's template generator runs before it deploys and the dashboard is built before the edge. `--only <dir>` limits a pass to one app dir (for example `--only edge`). Before it redeploys an existing Queen, the script checks that no v1 trains are in flight; this needs `QUEENOS_URL=https://<host>` plus Access credentials, or `--force`. It is skipped on a first deploy.
 
-### One-time setup (after the first deploy)
+Until the next section is done the edge answers 503 on every route except `/health`; that is expected.
 
-Your Zero Trust team is `kaikeru` (team domain `kaikeru.cloudflareaccess.com`).
+### After the first deploy
 
-1. **Access application.** Zero Trust > Access > Applications > Add > Self-hosted. Domain `queenos.kaikeru.com`, all paths. Add a policy: Action Allow, Include emails ending in `@kaikeru.com`. The edge repeats the domain check on the verified JWT as a second layer.
-2. **AUD.** Copy the application's "Application Audience (AUD) Tag" into `ACCESS_AUD` in `apps/edge/wrangler.jsonc` and redeploy the edge (`pnpm --filter @queenos/edge deploy`). While `ACCESS_AUD` is empty the edge fails closed: every route except `/health` returns 503.
-3. **Vault key.** Generate and store the key-encryption key on the vault Worker:
+1. **Three Access applications** (Zero Trust > Access > Applications > Add > Self-hosted):
+   1. Main app: domain `<host>`, all paths. Policy: Allow, your emails or email domain. This guards the dashboard and `/api`.
+   2. `<host>/git` with a **Bypass** policy. The edge checks `qgt_` git tokens itself on `/git/*`.
+   3. `<host>/mcp` with a **Bypass** policy. The edge checks the Bearer `qgt_` token itself on `/mcp`.
+2. **AUD.** Copy the main app's "Application Audience (AUD) Tag" into `ACCESS_AUD` in `apps/edge/wrangler.jsonc` and redeploy: `scripts/deploy.sh --only edge` (or `pnpm --filter @queenos/edge deploy`).
+3. **Secrets:**
    ```bash
    openssl rand -base64 32 | pnpm --filter @queenos/vault exec wrangler secret put VAULT_KEK --env=""
+   openssl rand -hex 32    | pnpm --filter @queenos/queen exec wrangler secret put QUEEN_INTERNAL_TOKEN --env=""
    ```
-4. **Queen machine token.** `openssl rand -hex 32 | pnpm --filter @queenos/queen exec wrangler secret put QUEEN_INTERNAL_TOKEN --env=""`. It guards the Queen's machine-only HTTP routes, which return 503 without it.
-5. Open https://queenos.kaikeru.com, sign in, and confirm the dashboard connects.
+   `VAULT_KEK` encrypts the per-hive Cloudflare credentials (back it up; losing it loses them). `QUEEN_INTERNAL_TOKEN` guards the Queen's machine-only routes, which return 503 without it. Optional: `ANALYTICS_API_TOKEN` (Account Analytics Read) on the edge for the Metrics page; without it the dashboard uses rollups.
+4. **Open `https://<host>`**, sign in, and create a hive (the onboarding wizard asks for Cloudflare credentials, which the Vault stores encrypted).
+5. **Switch the hive to external agents** with the workers select on the hive's page, or `PATCH /hives/<hive>/settings {"executors":"external"}`.
+6. **Mint a git token** on `/p/<hive>/push` (shown once, `qgt_...`; the page also gives copyable commands). Then either:
+   - `git clone https://<host>/git/<hive>`, with any username and the token as password, commit, and `git push origin HEAD:item/<id>`; fetch the verdict with `git fetch origin '+refs/notes/*:refs/notes/*' && git log --notes=verdict -1`; or
+   - `claude mcp add --transport http queenos https://<host>/mcp --header "Authorization: Bearer $QUEENOS_TOKEN"`, then `init_agent` and `start_attempt`.
 
 Local development: `pnpm --filter @queenos/edge exec wrangler dev --env dev` skips Access verification and acts as `DEV_USER_EMAIL`. Never deploy the `dev` env.
 

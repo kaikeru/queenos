@@ -15,13 +15,14 @@
 # Queen is v2 the check passes. It needs read access through Cloudflare Access:
 #   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET (an Access service token allowed
 #   on the QueenOS app), or CF_ACCESS_TOKEN (a `cf-access-token`, e.g. from
-#   `cloudflared access token -app=https://queenos.kaikeru.com`).
-#   QUEENOS_URL overrides https://queenos.kaikeru.com; QUEENOS_HIVES="demo pulse"
-#   skips the project listing. Without credentials it refuses; pass --force after
-#   checking the War Room yourself.
+#   `cloudflared access token -app=https://<your-host>`).
+#   Set QUEENOS_URL to your deployment (https://<your-host>); QUEENOS_HIVES="demo pulse"
+#   skips the project listing. The check is skipped on a first deploy (no Queen yet).
+#   Without credentials or QUEENOS_URL it refuses; pass --force after checking the
+#   War Room yourself.
 #
 # Why two passes: the Workers bind to each other in cycles (queen <-> executors,
-# genesis <-> provisioner, edge -> everything). Wrangler rejects a cross-script
+# genesis <-> provisioner, edge <-> mcp, edge -> everything). Wrangler rejects a cross-script
 # binding to a script that does not exist yet (code 10061, docs/day1-results.md 9b).
 #   Pass 1 (bootstrap): every Worker is deployed with its cross-script bindings
 #     stripped (durable_objects/workflows with `script_name`, and all `services`)
@@ -56,7 +57,7 @@ while [ $# -gt 0 ]; do
     --bootstrap) BOOTSTRAP=1 ;;
     --only) shift; ONLY="${1:?--only needs a value}" ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    -h|--help) sed -n "2,30p" "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -65,9 +66,11 @@ done
 OUTROOT="${DEPLOY_DRYRUN_DIR:-$ROOT/.deploy-dryrun}"
 TMP_CFG_NAME=".wrangler.bootstrap.jsonc"
 
-# dir:script-name. The edge is last: it needs the dashboard bundle. The Oracle
-# (v2) binds the Queen and the Queen binds its workflow: a new Worker, so the
-# first deploy takes the bootstrap pass (or deploy it alone first: see HANDOFF).
+# dir:script-name. The edge is last: it needs the dashboard bundle, and its GIT and
+# MCP service bindings need queenos-git and queenos-mcp to exist (so those go just
+# before it). git and mcp bind the Queen DO cross-script; mcp also binds the edge's
+# HiveRegistry (a cycle). The bootstrap pass strips those script_name bindings.
+# A first deploy of any Worker takes the bootstrap pass.
 WORKERS=(
   "queen:queen"
   "provisioner:queenos-provisioner"
@@ -78,6 +81,8 @@ WORKERS=(
   "gatekeepers:queenos-gatekeepers"
   "vault:queenos-vault"
   "genesis:queenos-genesis"
+  "git:queenos-git"
+  "mcp:queenos-mcp"
   "edge:queenos-edge"
 )
 
@@ -147,7 +152,11 @@ script_exists() {
 
 # R16: refuse to deploy the Queen while a v1 Queen has trains in flight.
 check_no_v1_trains() {
-  local base="${QUEENOS_URL:-https://queenos.kaikeru.com}"
+  local base="${QUEENOS_URL:-}"
+  if [ -z "$base" ]; then
+    echo "==> R16 check: set QUEENOS_URL=https://<your-host> (plus Access credentials) to read hive snapshots." >&2
+    return 1
+  fi
   local -a auth=()
   if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
     auth=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
@@ -184,7 +193,7 @@ check_no_v1_trains() {
   [ "$busy" = 0 ]
 }
 
-if [ "$DRY_RUN" = 0 ] && [ "$FORCE" = 0 ] && want queen; then
+if [ "$DRY_RUN" = 0 ] && [ "$FORCE" = 0 ] && want queen && script_exists queen queen; then
   if ! check_no_v1_trains; then
     echo "Refusing to deploy the Queen (risk R16). Use --force to override." >&2
     exit 1
@@ -233,11 +242,19 @@ fi
 
 cat <<'MSG'
 
-Deploy finished. One-time manual steps (first deploy only):
+Deploy finished. One-time manual steps (first deploy only). <host> is the custom domain
+in apps/edge/wrangler.jsonc "routes"; <team> is your Zero Trust team name.
 
-  1. Cloudflare Zero Trust (team: kaikeru) > Access > Applications > Add > Self-hosted.
-     Domain queenos.kaikeru.com, all paths. Policy: Allow, emails ending in @kaikeru.com.
-  2. Copy the application's "Application Audience (AUD) Tag" into "ACCESS_AUD" in
+  1. Cloudflare Zero Trust (team: <team>) > Access > Applications > Add > Self-hosted.
+     Create THREE applications:
+       a. Main app: domain <host>, all paths. Policy: Allow, your emails (or your email
+          domain). This is the dashboard and /api.
+       b. <host>/git with a Bypass policy (Everyone). The edge checks `qgt_` git tokens
+          itself on /git/*.
+       c. <host>/mcp with a Bypass policy (Everyone). The edge checks the Bearer `qgt_`
+          token itself on /mcp.
+     Without (b) and (c), git clients and MCP clients are stopped by the Access login page.
+  2. Copy the main app's "Application Audience (AUD) Tag" into "ACCESS_AUD" in
      apps/edge/wrangler.jsonc, then redeploy the edge:
        pnpm --filter @queenos/edge deploy
      (until then the edge fails closed with 503 on every route except /health).
@@ -245,9 +262,9 @@ Deploy finished. One-time manual steps (first deploy only):
        openssl rand -base64 32 | pnpm --filter @queenos/vault exec wrangler secret put VAULT_KEK --env=""
   4. Queen machine token (once):
        openssl rand -hex 32 | pnpm --filter @queenos/queen exec wrangler secret put QUEEN_INTERNAL_TOKEN --env=""
-  5. v2 (once): the Vectorize metadata index the Oracle's dedupe filters on:
+  5. Vectorize metadata index the Oracle's dedupe filters on (once):
        pnpm --filter @queenos/oracle exec wrangler vectorize create-metadata-index queenos-memory --property-name=kind --type=string
-     and the edge's Analytics Engine read token (Account Analytics Read):
+     Optional: the edge's Analytics Engine read token (Account Analytics Read), for the Metrics page:
        pnpm --filter @queenos/edge exec wrangler secret put ANALYTICS_API_TOKEN --env=""
-  6. Open https://queenos.kaikeru.com and sign in.
+  6. Open https://<host>, sign in, create a hive.
 MSG
