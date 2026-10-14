@@ -1,19 +1,18 @@
 /** Pure client-side route matching (no React, no DOM; unit-tested). */
 
 /** Hive-scoped pages (v2 design §5). */
-export type HivePage = "status" | "lanes" | "queue" | "item" | "trace" | "events" | "metrics" | "push";
+export type HivePage = "status" | "queue" | "item" | "trace" | "events" | "metrics" | "push";
 
 export type Route =
   | { name: "home" }
   | { name: "new" }
   | { name: "setup"; hive: string }
   /**
-   * Every hive-scoped page. `page` picks the view: `/p/:hive` is the status
-   * home ("status"), `/p/:hive/lanes` is today's War Room ("lanes"). `id` is the
-   * item id or trace id for "item" and "trace". Until the v2 UI lands, App
-   * renders the War Room for all of them.
+   * Every hive-scoped page. `page` picks the view: `/p/:hive` is the status home ("status"), `/p/:hive/items/:id` the
+   * goal page ("item"). `id` is the item id or trace id for "item" and "trace". `redirectTo`: the removed lanes page
+   * (`/p/:hive/lanes`) renders home and App replaces the URL with it.
    */
-  | { name: "warroom"; hive: string; page: HivePage; id?: string; legacy?: boolean }
+  | { name: "warroom"; hive: string; page: HivePage; id?: string; legacy?: boolean; redirectTo?: string }
   | { name: "notfound"; path: string };
 
 const SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -29,7 +28,7 @@ function seg(raw: string): string | null {
   return SEGMENT.test(s) ? s : null;
 }
 
-const SIMPLE_PAGES: Record<string, HivePage> = { lanes: "lanes", queue: "queue", events: "events", metrics: "metrics", push: "push" };
+const SIMPLE_PAGES: Record<string, HivePage> = { queue: "queue", events: "events", metrics: "metrics", push: "push" };
 
 /**
  * Match a location to a route. `/?hive=x` keeps working (it maps to the status
@@ -50,6 +49,7 @@ export function matchRoute(pathname: string, search = ""): Route {
       const sub = parts[2]!;
       if (parts.length === 3) {
         if (sub === "setup") return { name: "setup", hive };
+        if (sub === "lanes") return { name: "warroom", hive, page: "status", redirectTo: hv(hive) };
         const page = SIMPLE_PAGES[sub];
         if (page) return { name: "warroom", hive, page };
       } else if (sub === "items") {
@@ -73,7 +73,6 @@ export const hrefFor = {
   /** The hive's landing page: the status home. */
   warroom: (hive: string) => hv(hive),
   status: (hive: string) => hv(hive),
-  lanes: (hive: string) => `${hv(hive)}/lanes`,
   queue: (hive: string) => `${hv(hive)}/queue`,
   item: (hive: string, itemId: string) => `${hv(hive)}/items/${encodeURIComponent(itemId)}`,
   trace: (hive: string, traceId: string) => `${hv(hive)}/traces/${encodeURIComponent(traceId)}`,

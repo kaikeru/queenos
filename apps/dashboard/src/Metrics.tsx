@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { HiveStatus, HourlyMetric, QueenEvent } from "@queenos/queen-types";
 import { api, type MetricsView, type MetricsWindow } from "./api";
+import { ModelBoard } from "./components";
+import { isExternal } from "./homeLogic";
 import { ErrorNotice } from "./shell";
 import { useResource } from "./hooks";
 import { fmtDuration } from "./TraceView";
@@ -453,6 +455,11 @@ export function Metrics(props: { hive: string; state: State }) {
       <ErrorNotice error={res.error} onRetry={res.reload} />
       {!res.data && !res.error && <p className="obs__empty">Loading metrics…</p>}
       {res.data && <MetricsBoard data={res.data} window={win} events={state.events} now={now} />}
+      {!isExternal(state.hive) && (
+        <section className="metrics-models" id="models" aria-label="Model board">
+          <ModelBoard stats={state.modelStats} floor={state.routerFloor} />
+        </section>
+      )}
     </div>
   );
 }

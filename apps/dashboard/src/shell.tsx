@@ -135,12 +135,10 @@ export function HiveFooter({ hive }: { hive: string }) {
   return (
     <footer className="hf">
       <Link to={hrefFor.status(hive)}>status ▸</Link>
-      <Link to={hrefFor.lanes(hive)}>lanes ▸</Link>
       <Link to={hrefFor.queue(hive)}>queue ▸</Link>
       <Link to={hrefFor.events(hive)}>events ▸</Link>
       <Link to={hrefFor.metrics(hive)}>metrics ▸</Link>
       <Link to={hrefFor.push(hive)}>push code ▸</Link>
-      <Link to={`${hrefFor.lanes(hive)}#models`}>models ▸</Link>
     </footer>
   );
 }

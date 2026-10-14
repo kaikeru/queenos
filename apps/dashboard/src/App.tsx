@@ -1,16 +1,16 @@
+import { useEffect } from "react";
 import { Home } from "./Home";
 import { NewProject } from "./NewProject";
 import { Wizard } from "./Wizard";
-import { WarRoom } from "./WarRoom";
 import { useRoom } from "./room";
 import { StatusHome } from "./StatusHome";
-import { ItemView } from "./ItemView";
+import { GoalPage } from "./GoalPage";
 import { QueuePage } from "./QueuePage";
 import { TraceView } from "./TraceView";
 import { EventLog } from "./EventLog";
 import { Metrics } from "./Metrics";
 import { PushCode } from "./PushCode";
-import { Link, useRoute } from "./router";
+import { Link, navigate, useRoute } from "./router";
 import { hrefFor, type Route } from "./route";
 import { isSimulation } from "./homeLogic";
 import { HiveFooter, HiveHeader, Shell } from "./shell";
@@ -23,11 +23,14 @@ function HiveRoot({ route }: { route: HiveRoute }) {
   const room = useRoom(hive);
   const { state, status, latencyMs } = room;
   const id = route.id ?? "";
+  // The lanes page is gone: /p/<hive>/lanes renders home and swaps the URL.
+  useEffect(() => {
+    if (route.redirectTo) navigate(route.redirectTo, { replace: true });
+  }, [route.redirectTo]);
   if (page === "status") return <StatusHome hive={hive} room={room} />;
-  if (page === "lanes") return <WarRoom hive={hive} room={room} backTo={hrefFor.status(hive)} />;
   const crumbs: Record<string, { label: string }[]> = {
     queue: [{ label: "queue" }],
-    item: [{ label: "item" }, { label: id }],
+    item: [{ label: "goal" }],
     trace: [{ label: "trace" }, { label: id.slice(0, 8) }],
     events: [{ label: "events" }],
     metrics: [{ label: "metrics" }],
@@ -43,7 +46,7 @@ function HiveRoot({ route }: { route: HiveRoute }) {
       )}
       <HiveHeader hive={hive} crumbs={crumbs[page]} status={status} latencyMs={latencyMs} sim={isSimulation(state.hive)} />
       {page === "queue" && <QueuePage hive={hive} state={state} />}
-      {page === "item" && <ItemView hive={hive} itemId={id} state={state} />}
+      {page === "item" && <GoalPage hive={hive} itemId={id} state={state} />}
       {page === "trace" && <TraceView hive={hive} traceId={id} state={state} />}
       {page === "events" && <EventLog hive={hive} state={state} />}
       {page === "metrics" && <Metrics hive={hive} state={state} />}
