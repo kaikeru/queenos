@@ -127,7 +127,7 @@ Every tool compares the request's `props.owner` with the identity's `owner` and 
 
 ## 6. Tools
 
-17 tools. All take and return JSON. "Own" means attempts whose `agentId` is the session's agent. Every tool error carries `retryable` (and, where the cause clears on its own, `retryAfterMs`), see §11.
+19 tools (17 originally; see the rework-loop amendments). All take and return JSON. "Own" means attempts whose `agentId` is the session's agent. Every tool error carries `retryable` (and, where the cause clears on its own, `retryAfterMs`), see §11.
 
 | Tool | Role | Input | Output | Backing route / RPC |
 |---|---|---|---|---|
@@ -446,3 +446,7 @@ Found in the first live runs (a two-agent "you pick" race, a four-goal train tes
 - **One `setupCommand`**, no separate `token`, no `cloneCommand` (the token showed up twice in the transcript); `refresh_attempt` returns `{expiresAt, configCommand}`. Commands single-quote every argument.
 - **Smaller:** `start_attempt` keeps a base the Queen already pinned when the pin RPC throws after committing; an unknown hive is `NOT_FOUND` before a Queen DO is opened; open attempt refs are never pruned from the identity; a wrong-owner request on an existing session answers 403 JSON; `BASE_PENDING` (not `BASE_MOVED`) while a base is being created; new hives may not end in `-att-<12 hex>` or `-base-<12 hex>` (their pushes would be misrouted); the race panel tells you when the pick buttons appear; the template's feature-registry header says the file is meant to be edited in its exact shape.
 - **Still open:** the 2 h token re-check (§13.1 P4) has not been run.
+
+## Amendments (Oct 13, rework loop)
+
+Design: `docs/superpowers/specs/2026-10-13-queenos-rework-loop-design.md`. A rejected attempt fixes and re-pushes as the same candidate within a rework slot. The tool count is now **19** (`sync_base`, `reject`). The verdict kinds are `findings | infra | conflict | human`, and attempt views carry `rework {reason, dueAt, round}`. A race can be `REWORKING`, a candidate `REWORK`. A conflicted winner now reads `verdict: "rejected"`, `kind: "conflict"` (it read `passed`).

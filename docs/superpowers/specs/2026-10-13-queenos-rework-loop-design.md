@@ -254,6 +254,15 @@ Per package: its tests and `tsc -p test`; then the full gate `pnpm turbo run bui
 | C3 | Cheapest way to read hive `main`'s sha: `repo.log({ref: "main", limit: 1})` (as `forkOnce` does) vs. another binding call; latency | Use `log` |
 | C4 | The design said "the Queen reads main from Artifacts", but the Queen has no Artifacts binding by rule (`apps/queen/wrangler.jsonc`). This spec has `queenos-mcp` read it and the Queen record it | If the user wants the Queen itself to read it, that adds a binding: ask first |
 
+### 13.1 Check results
+
+Probe run by the user on 2026-10-13 (prefix `rwprobe1791923923`).
+
+- **C1: PASS.** The read token reads the hive, cannot push it, and gets 403 on another repo. Both receive-pack on the hive and upload-pack on the other repo returned 403.
+- **C2: PASS.** A non-fast-forward push to a fork was accepted with `--force-with-lease`. The fork's `main` is the rewritten head (113957f to 64acb21).
+- **C3:** `log({ref:"main",limit:1})` took 376-1015 ms over 5 reads, so it is used.
+- **C4: resolved.** `queenos-mcp` reads `main` and the Queen records it.
+
 ## 14. Future (no code)
 
 - A goal may carry an external ticket link (Jira and similar), shown with the item and passed to agents.
