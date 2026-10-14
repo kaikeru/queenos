@@ -2,6 +2,7 @@
 import { exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { parseNotes } from "@queenos/queen-types";
 import type { QueenNode } from "../src/queen-node";
 import { BASE_SHA, OTHER, OWNER, agent, externalHive, fileItem, gateFail, gatePass, goLive, look, own, push, readyAttempt, rpcError, stubFor } from "./attempt-helpers";
 
@@ -107,5 +108,22 @@ describe("rejectRace (§7.4)", () => {
     const res = await rejectRoute(hive, "r1", { trainId: "all", reason: "x" }, OWNER);
     expect(res.status).toBe(404);
     expect(await res.json()).toMatchObject({ error: { code: "NOT_FOUND" } });
+  });
+});
+
+describe("closed-slot note wording (F9 round 1)", () => {
+  it("a real push that closes the slot leaves the old train's note neutral, never claiming the item reopened", async () => {
+    const { ns, stub } = await externalHive({ race: { entryWindowMs: 0 } });
+    const itemId = await fileItem(ns);
+    const a = await readyAttempt(ns, itemId);
+    const first = await push(ns, a);
+    await goLive(ns, a.trainId);
+    await gateFail(ns, a.trainId);
+    const fix = await push(ns, a);
+    expect(fix.res.trainId).not.toBe(a.trainId);
+    const text = (await stub.notesFor(ns, "refs/notes/verdict")).notes.find((n) => n.sha === first.after)!.text;
+    const bodies = parseNotes(text).map((e) => e.body);
+    expect(bodies.at(-1)).toBe("This rework slot is closed. If you pushed a fix, follow that push's verdict; otherwise check get_item: the item may take new attempts.");
+    expect(bodies.join("\n")).not.toMatch(/reopened/);
   });
 });

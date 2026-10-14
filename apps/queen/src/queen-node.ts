@@ -780,7 +780,10 @@ export class QueenNode extends DurableObject<Env> {
    * a live passed candidate. `fallback`: the reject ended the race and the item reopened to any agent.
    */
   async rejectRace(input: { hive: string; raceId: string; user: string; reject: RejectRace }): Promise<RejectRaceResult> {
-    const reject = parseOrThrow(RejectRaceSchema, { ...input.reject, reason: input.reject.reason.trim() }, "reject");
+    const reject = parseOrThrow(RejectRaceSchema, input.reject, "reject");
+    const reason = reject.reason.trim();
+    if (!reason) throw new QueenError("INVALID_INPUT", "reject: reason must not be blank");
+    reject.reason = reason;
     const hive = this.hiveFor(input.hive);
     const row = this.sql.exec("SELECT * FROM races WHERE race_id = ?", input.raceId).toArray()[0];
     if (!row) throw new QueenError("NOT_FOUND", `race ${input.raceId} not found`);

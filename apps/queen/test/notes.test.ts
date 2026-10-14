@@ -196,7 +196,7 @@ describe("rework loop notes (rework-loop spec §6.2, R19)", () => {
     expect(entry).toMatchObject({ verdict: "REJECTED", summary: "REJECTED (CONFLICT): conflicts with work that landed: src/a.js" });
     expect(entry!.body).toBe("Call sync_base, rebase onto queen/main and push again before 2026-10-13T12:30:00.000Z.");
     const closed = parseNotes(projectNotes({ trains: [{ ...t, raceOutcome: "FAILED" }], events, releases: [] }, "refs/notes/verdict")[0]!.text);
-    expect(closed[0]!.body).toBe("The rework slot is closed: the item is open to any agent (start_attempt).");
+    expect(closed[0]!.body).toBe("This rework slot is closed. If you pushed a fix, follow that push's verdict; otherwise check get_item: the item may take new attempts.");
     const human = parseNotes(projectNotes({ trains: [{ ...t, origin: { kind: "human", id: "ada@example.com" }, attemptId: null }], events, releases: [] }, "refs/notes/verdict")[0]!.text);
     expect(human[0]!.body).toBe("Rebase on origin/main and push the branch again, or hand off.");
   });

@@ -174,7 +174,7 @@ function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<stri
   const next = t.attemptId
     ? due
       ? `Fix it and push again before ${due}.`
-      : "Fix it and push again."
+      : "This rework slot is closed. If you pushed a fix, follow that push's verdict; otherwise check get_item: the item may take new attempts."
     : contributed(t)
       ? `Push a fix to ${branch ?? "your branch"}, or hand off: a "Queen: rework" trailer, or "Let the swarm fix it" on item ${t.promptId}.`
       : "The swarm reworks it.";
@@ -260,7 +260,7 @@ function trainEntries(t: NotesTrain, input: NotesInput, byHead: ReadonlyMap<stri
               body: t.attemptId
                 ? due
                   ? `Call sync_base, rebase onto queen/main and push again before ${due}.`
-                  : "The rework slot is closed: the item is open to any agent (start_attempt)."
+                  : "This rework slot is closed. If you pushed a fix, follow that push's verdict; otherwise check get_item: the item may take new attempts."
                 : contributed(t)
                   ? "Rebase on origin/main and push the branch again, or hand off."
                   : "The swarm reworks it on top of main.",

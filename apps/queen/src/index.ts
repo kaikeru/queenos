@@ -185,8 +185,7 @@ hive.post("/races/:raceId/pick", async (c) => {
 // PICKING and trainId a live passed candidate; 404 for an unknown race.
 hive.post("/races/:raceId/reject", async (c) => {
   const user = userOf(c);
-  const raw = (await body(c)) as { reason?: unknown } | null;
-  const reject = parseOrThrow(RejectRaceSchema, raw && typeof raw.reason === "string" ? { ...raw, reason: raw.reason.trim() } : raw, "reject");
+  const reject = parseOrThrow(RejectRaceSchema, await body(c), "reject");
   return c.json(await stub(c, hiveOf(c)).rejectRace({ hive: hiveOf(c), raceId: c.req.param("raceId"), user, reject }));
 });
 
